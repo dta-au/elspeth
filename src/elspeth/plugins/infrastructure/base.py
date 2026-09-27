@@ -772,8 +772,10 @@ class BaseTransform(ABC):
                 f"Transform {self.name!r} declares declared_input_fields "
                 f"{sorted(declared_input_fields)!r} but is batch-aware. No "
                 f"batch-pre-execution dispatch site exists; ADR-013 scopes "
-                f"DeclaredRequiredFieldsContract to non-batch transforms until "
-                f"an ADR-010 amendment lands."
+                f"DeclaredRequiredFieldsContract to non-batch transforms. A batch "
+                f"plugin declares the columns every buffered row must carry through "
+                f"schema.required_fields, which the flush's input check classifies "
+                f"with the same rule (ADR-013 Amendment 2026-09-27)."
             )
         self._validated_config = validated_config
         self.declared_input_fields = declared_input_fields
@@ -1549,8 +1551,10 @@ class BaseTransform(ABC):
         Deliberately NOT the column-option limb of ``consumed_input_fields``:
         an option that stays off those surfaces is a row LOOKUP, resolved
         through ``PipelineRow`` under either spelling (truncate's ``fields``,
-        field_mapper's mapping sources, json_explode's ``array_field``), and
-        the ruling keeps lookups spelling-free.
+        field_mapper's non-normalized mapping sources), and the ruling keeps lookups
+        spelling-free. json_explode's ``array_field`` was one until it became a
+        declared input (elspeth-5887fb7928 R2): it is on ``declared_input_fields``
+        now, so it is spelled as rows carry the field.
 
         The build (``validate_declared_field_spellings``), the Web Composer's
         Stage-1 mirror and the transform and batch preflights all read this one

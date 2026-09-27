@@ -15,11 +15,14 @@ run (ADR-008 §"TIER_1 registration is load-bearing", Correction 2026-08-21).
 The value is never coerced: iterating a str or a mapping would fabricate rows
 the operator never supplied.
 
-A row that lacks array_field altogether is NOT converted: ``row[array_field]``
-raises KeyError, which escapes to the engine unconverted, and the run aborts.
-Declaring the field in the source schema (for example ``'items: any'``) makes
-the source reject such a row at ingest, per its ``on_validation_failure``,
-instead.
+``array_field`` is a DECLARED INPUT (``declared_input_fields``): the transform
+cannot run on a row without it. The build refuses a pipeline whose upstream
+certainly omits it; behind an observed or open upstream the engine settles each
+row before ``process()`` — a row that lacks the field is a fact about that row
+and is routed via ``on_error`` with reason ``missing_field`` (ADR-013 Amendment
+2026-09-27). It used to reach ``row[array_field]`` as a raw KeyError that ended
+the run. Being a declaration, it is spelled as rows carry the field (the
+field-name spelling rule): a header spelling of a carried field is refused.
 
 JSONExplodeConfig extends DataPluginConfig (not TransformDataConfig), so it
 does not accept ``required_input_fields``. ``on_success`` and ``on_error`` are
@@ -280,8 +283,9 @@ class JSONExplode(BaseTransform):
           ``invalid_input``/``wrong_type`` error, routed by on_error.
         - array_field is an empty list: returns a non-retryable
           ``invalid_input`` error ("empty array"), routed by on_error.
-        - array_field is absent from the row: ``row[array_field]`` raises
-          KeyError and the run aborts.
+        - array_field is absent from the row: the engine refuses the row before
+          ``process()`` (declared input) and routes it by on_error as
+          ``missing_field``.
     """
 
     # array_field is the INPUT column being exploded; output_field is emitted.
@@ -289,7 +293,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:26471026c209f7ef"
+    source_file_hash: str | None = "sha256:1919e96964500441"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -341,6 +345,10 @@ class JSONExplode(BaseTransform):
         self._array_field = cfg.array_field
         self._output_field = cfg.output_field
         self._include_index = cfg.include_index
+        # The array field is the one column this transform cannot run without:
+        # a declared input, so the build and the engine's pre-process check
+        # settle its presence (see module docstring), never a KeyError in process().
+        self.declared_input_fields = frozenset({cfg.array_field})
 
         # Sibling fields are duplicated onto every emitted element row (the
         # plugin's own assistance text says so); only the consumed array field
@@ -483,14 +491,13 @@ class JSONExplode(BaseTransform):
             array_field
 
         Raises:
-            KeyError: If array_field is absent from the row (not converted; the
-                run aborts - see module docstring)
             PluginContractViolation: If output_field or item_index would
                 overwrite a field already present in the row (Tier 2: the
                 engine converts it into a routed, non-retryable error)
         """
-        # Direct access, no membership check: an absent array_field raises
-        # KeyError here and the run aborts (see module docstring).
+        # Direct access: array_field is a declared input, so the engine refused
+        # (routed or, for a proven field, aborted on) any row lacking it before
+        # process() ran (see module docstring).
         array_value = row[self._array_field]
 
         # Contract enforcement: array_field must be list or tuple.

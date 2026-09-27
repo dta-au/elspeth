@@ -445,6 +445,30 @@ class TestTypeCoerceConversionField:
         assert {(r["reason"], tuple(r["fields"])) for r in reasons} == {("missing_field", ("nope",))}
 
 
+class TestJSONExplodeArrayField:
+    """R2: json_explode's ``array_field`` is a declared input, so the rule governs it (it was a lookup)."""
+
+    def _explode(self, field: str) -> dict[str, Any]:
+        return _transform("json_explode", {"array_field": field, "schema": _OBSERVED})
+
+    def test_a_header_spelled_array_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """Behaviour change (CHANGELOG): the lookup resolved ``Name`` inside ``process()``; it now routes before it."""
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._explode("Name")]))
+
+        _assert_routed(tmp_path, result, reason=_READ, literal="Name", canonical="name")
+
+    def test_a_missing_array_field_behind_an_observed_upstream_routes(self, tmp_path: Path) -> None:
+        """Before R2: ``row[array_field]`` raised a raw KeyError that ended the run (exit 4)."""
+        result = _run(_settings(tmp_path, source=_csv_source(tmp_path), transforms=[self._explode("nope")]))
+
+        assert result.exit_code == 2, result.output
+        assert "Traceback" not in result.output
+        assert _terminal_outcomes(tmp_path) == {"failure/on_error_routed": 2}
+        reasons = _reasons(tmp_path)
+        assert {(r["reason"], tuple(r["fields"])) for r in reasons} == {("missing_field", ("nope",))}
+        assert all(SENTINEL not in json.dumps(r) for r in reasons)
+
+
 # ---------------------------------------------------------------------------
 # Created names (S7 c)
 # ---------------------------------------------------------------------------

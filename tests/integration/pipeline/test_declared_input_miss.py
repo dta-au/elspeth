@@ -65,6 +65,8 @@ _CENSUS: list[tuple[str, str, dict[str, Any], bool]] = [
     ("blob_json_expand-text_field", "blob_json_expand", {"source": "field", "text_field": "b", "format": "json", "fields": ["x"]}, False),
     ("blob_text_expand-blob_ref_field", "blob_text_expand", {"blob_ref_field": "b"}, False),
     ("pdf_rasterize-blob_ref_field", "pdf_rasterize", {"blob_ref_field": "b"}, False),
+    # json_explode's array_field became a declared input in R2 (was a raw KeyError that ended the run).
+    ("json_explode-array_field", "json_explode", {"array_field": "b"}, False),
     ("blob_fetch-url_field", "blob_fetch", {"url_field": "b", "http": _HTTP}, False),
     ("web_scrape-url_field", "web_scrape", {"url_field": "b", "content_field": "pc", "fingerprint_field": "pf", "http": _WS_HTTP}, False),
     (

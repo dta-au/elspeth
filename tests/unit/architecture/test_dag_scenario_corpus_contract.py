@@ -886,7 +886,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48f
 # observed_error), whose only user pinned the abort, is deleted, so its nine
 # `"expected_error": null` manifest literals dropped. Exactly one oracle_freeze
 # snapshot moved (this case's), sanctioned by the same ruling.
-EXPECTED_CASE_REGISTRY_SHA256 = "7c11c485d085d128914319b804a8e1121f191d9e254aa0812b176ac534acd620"
+# Rotated 2026-09-27 (elspeth-5887fb7928, R2 declared-input miss): a PLUGIN
+# PROVENANCE rotation. json_explode now declares array_field as an input
+# (declared_input_fields), so its source_file_hash moved 26471026c209f7ef ->
+# 1919e96964500441 (the 1 manifest pin in json-explode-parent-child;
+# scripts/cicd/plugin_hash). No count, terminal, projection, resume digest or
+# oracle_freeze snapshot moved (test_oracle_freeze + production-path files green).
+EXPECTED_CASE_REGISTRY_SHA256 = "b8446343b2e0f43b3c74a007c3933b666b348892fe6f0ea76225b283726d90e0"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
