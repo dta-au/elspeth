@@ -251,8 +251,9 @@ class TemplateRow(Mapping[str, Any]):
 
     Used as a value, the row is the mapping it holds: ``{{ row }}`` and every
     string conversion render its field values as a plain mapping (a nested
-    value as its data, not ELSPETH's frozen carrier), ``tojson`` serializes it, and
-    ``last`` / ``reverse`` see the field names in order (``__reversed__``).
+    value as its data, not ELSPETH's frozen carrier), ``tojson`` serializes it,
+    ``last`` reads the last field name (``__reversed__``) and ``reverse`` is
+    the list of field names in reverse order (``_reverse_row_names``).
     ``repr`` names the fields and never a value, because a repr can reach an
     exception message.
 
@@ -388,6 +389,7 @@ class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
         self.policies["json.dumps_function"] = _template_json_dumps
         for name in _MAPPING_TYPED_FILTERS:
             self.filters[name] = _row_as_mapping(self.filters[name])
+        self.filters["reverse"] = _reverse_row_names(self.filters["reverse"])
 
     def getattr(self, obj: Any, attribute: str) -> Any:
         if type(obj) is TemplateRow:
@@ -429,6 +431,25 @@ def _row_as_mapping(filter_function: Callable[..., Any]) -> Callable[..., Any]:
         return filter_function(_shown_value(value), *args, **kwargs)
 
     return row_as_mapping
+
+
+def _reverse_row_names(filter_function: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """``row | reverse`` is the list of the row's field names in reverse order.
+
+    The builtin returns ``reversed(value)`` whenever that succeeds, and
+    ``reversed`` of a template row is a lazy iterator (``__reversed__``, which
+    ``last`` reads), so printed bare it would send the iterator's repr, a
+    memory address, to the provider. The names themselves are what the row
+    holds, so the row's reverse is them, in a list.
+    """
+
+    @wraps(filter_function)
+    def reverse_row_names(value: Any) -> Any:
+        if type(value) is TemplateRow:
+            return list(reversed(value))
+        return filter_function(value)
+
+    return reverse_row_names
 
 
 def _template_json_default(value: object) -> object:

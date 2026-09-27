@@ -138,6 +138,13 @@ _MISUSES = (
     pytest.param("{{ dict(R).F() }}", "a call on a row field", id="field-of-a-dict-built-from-the-row-called"),
     pytest.param("{% set d = dict(R) %}{{ d.F() }}", "a call on a row field", id="field-of-an-aliased-dict-called"),
     pytest.param("{{ dict(R)['F']() }}", "a call on a row field", id="item-of-a-whole-row-value-called"),
+    pytest.param("{{ (R | first)() }}", "a call on a row field", id="element-of-the-row-called"),
+    pytest.param("{{ (R | list | last)() }}", "a call on a row field", id="element-of-the-row-names-called"),
+    pytest.param("{{ (dict(R) | max)() }}", "a call on a row field", id="element-of-a-whole-row-value-called"),
+    pytest.param("{{ R.get('F', R.F)() }}", "a call on a row field", id="get-result-with-a-row-field-default-called"),
+    pytest.param("{{ R.get('F', R.get('F'))() }}", "a call on a row field", id="get-result-with-a-get-result-default-called"),
+    pytest.param("{{ (R.F | default('x'))() }}", "a call on a row field", id="defaulted-field-called"),
+    pytest.param("{{ R.get('F', R.F | default('x'))() }}", "a call on a row field", id="get-result-with-a-defaulted-field-default-called"),
     pytest.param("{{ R.get }}", "row.get without a call", id="uncalled-get"),
     pytest.param("{{ R | attr('get') }}", "row.get without a call", id="uncalled-get-through-attr"),
 )
@@ -244,6 +251,40 @@ def test_a_method_on_a_whole_row_value_is_admitted_by_the_opt_out_and_renders(bu
     template = form.replace("R", "row")
     build(template, [])
     assert _ADDRESS.search(_render(template, ALL_FIELDS)) is None
+
+
+# A callable the template itself supplies, through a default the check cannot
+# see or a keyword of dict(), is not row data: calling it is not a row call
+# (G3 fix round 2, review F4). Each renders a non-empty list, so an empty
+# render cannot pass.
+_SUPPLIED_CALLABLES = (
+    pytest.param("{{ R.get('absent', range)(2) | list }}", "[0, 1]", id="get-with-a-callable-default"),
+    pytest.param("{% set a = [range] %}{{ R.get('absent', *a)(2) | list }}", "[0, 1]", id="get-with-a-splatted-default"),
+    pytest.param(
+        "{% set k = {'default': range} %}{{ R.get('absent', **k)(2) | list }}", "[0, 1]", id="get-with-a-keyword-splatted-default"
+    ),
+    pytest.param("{{ dict(R, f=range).f(2) | list }}", "[0, 1]", id="a-keyword-of-dict-called"),
+    pytest.param("{% set d = dict(R, f=range) %}{{ d.f(2) | list }}", "[0, 1]", id="a-keyword-of-an-aliased-dict-called"),
+    pytest.param("{{ (R.absent | default(range))(2) | list }}", "[0, 1]", id="a-field-defaulted-to-a-callable"),
+    pytest.param("{% set a = [range] %}{{ (R.absent | default(*a))(2) | list }}", "[0, 1]", id="a-field-with-a-splatted-default"),
+)
+
+
+@pytest.mark.parametrize("receiver", [pytest.param("row", id="row"), pytest.param("row.source_row", id="source-row")])
+@pytest.mark.parametrize(("form", "rendered"), _SUPPLIED_CALLABLES)
+def test_a_callable_the_template_supplies_is_not_a_row_call(receiver: str, form: str, rendered: str) -> None:
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    row_attribute = "source_row" if receiver == "row.source_row" else None
+    assert extract_jinja2_field_usage(form.replace("R", receiver), row_attribute=row_attribute).row_api_misuses == ()
+
+
+@pytest.mark.parametrize("build", [pytest.param(_single, id="single-query-row"), pytest.param(_rag, id="rag-row")])
+@pytest.mark.parametrize(("form", "rendered"), _SUPPLIED_CALLABLES)
+def test_a_callable_the_template_supplies_is_admitted_by_the_opt_out_and_renders(build: Any, form: str, rendered: str) -> None:
+    template = form.replace("R", "row")
+    build(template, [])
+    assert _render(template, ALL_FIELDS) == rendered
 
 
 def test_a_column_named_like_a_method_or_a_reserved_name_is_read_by_item_or_attribute() -> None:
@@ -385,6 +426,19 @@ def test_last_and_urlencode_see_the_mapping() -> None:
     assert _render("{{ row | urlencode }}", projection) == "note=first&k=contract"
 
 
+@pytest.mark.parametrize("projection", _PROJECTIONS)
+def test_reverse_is_the_list_of_field_names_not_a_lazy_iterator(projection: RowProjection) -> None:
+    """``row | reverse`` printed bare sends the names, as it did before the row had ``__reversed__``, never an address."""
+    names = list(TemplateRow.project(_row(), projection))
+    rendered = _render("{{ row | reverse }}", projection)
+    assert rendered == str(names[::-1])
+    assert not _ADDRESS.search(rendered)
+    assert _render("{% for name in row | reverse %}{{ name }};{% endfor %}", projection) == "".join(f"{n};" for n in names[::-1])
+    assert _render("{{ row | last }}", projection) == names[-1]
+    # Any other value keeps the builtin: a list's reverse is still its lazy iterator.
+    assert _ADDRESS.search(_render("{{ [1, 2] | reverse }}", projection))
+
+
 _SCALAR_ROW = {"id": 1, "note": "first", "items": "COL-ITEMS", "keys": "COL-KEYS", "contract": "COL-CONTRACT"}
 
 
@@ -405,9 +459,9 @@ def test_every_builtin_filter_sees_the_row_as_the_mapping_it_holds(name: str, pr
 
     Both fail, or both render the same text. The one filter that reads a row
     field instead is ``attr`` (attribute syntax), and it needs an argument, so
-    bare ``attr`` fails on both. ``reverse`` returns a lazy iterator for both,
-    whose printed form is its own class and address, so it is compared
-    materialised.
+    bare ``attr`` fails on both. ``reverse`` of a dict is a lazy iterator
+    whose printed form is its own class and address, while the row's is the
+    list of its names, so the two are compared materialised.
     """
     row = TemplateRow.project(_row(_SCALAR_ROW), projection)
     plain = dict(row)

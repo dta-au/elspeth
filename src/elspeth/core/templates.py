@@ -574,9 +574,10 @@ def _called_nodes(ast: Node) -> frozenset[int]:
     invariant=(
         "classifies the callee by AST node type only: True for an attribute or attr-filter lookup that reads a "
         "field (any name but the row's one method or a reserved name on the row object; a name that is not a "
-        "dict attribute on a dict built from the row), an item lookup on anything carrying the row's fields, "
-        "or a row.get(...) whose default is absent or a literal; every other shape returns False, the explicit "
-        "no-match result; nothing is evaluated or coerced"
+        "dict attribute on a dict built from the row), an item lookup or element filter on anything carrying the "
+        "row's fields, or a row.get(...) or default filter whose fallback is absent, a literal or itself row data "
+        "by this same test; every other shape returns False, the explicit no-match result; nothing is evaluated "
+        "or coerced"
     ),
     non_raising=True,
 )
@@ -605,10 +606,14 @@ def _is_row_field_call(
 
     An item of anything that carries the row's fields
     (``_node_is_row_object_expression``) is data, a field value, a field name
-    or a character, so calling one is a row call whatever the receiver. So is
-    calling what ``get`` returns, a field value, when ``get`` cannot return its
-    default or the default is a literal: an operator-supplied default
-    (``row.get('x', range)``) may be callable.
+    or a character, so calling one is a row call whatever the receiver; so is
+    an element one of ``first``, ``last``, ``random``, ``min`` or ``max``
+    takes from it (``(row | first)()`` calls a field name). So is calling what
+    ``get`` returns, a field value, when ``get`` cannot return its default or
+    the default is a literal or is itself row data by this same test
+    (``row.get('x', row.y)()``): any other default (``row.get('x', range)``)
+    may be callable. ``default`` over row data with such a fallback is row
+    data too (``(row.x | default('y'))()``).
     """
     if isinstance(callee, Getattr):
         return not _is_blocked_row_attribute_name(callee.attr) and _receiver_reads_field(
@@ -629,13 +634,32 @@ def _is_row_field_call(
         )
     if isinstance(callee, Getitem):
         return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+    if isinstance(callee, Filter) and callee.name in _ELEMENT_RETURNING_FILTERS:
+        return callee.node is not None and _node_is_row_object_expression(
+            callee.node, namespaces, row_collection_aliases, row_container_aliases
+        )
+    if isinstance(callee, Filter) and callee.name in _OPERAND_RETURNING_FILTERS:
+        if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):
+            return False
+        fallback = _filter_positional_or_keyword_value(callee, 0, "default_value")
+        return (
+            callee.node is not None
+            and _is_row_field_call(callee.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+            and (
+                fallback is None
+                or isinstance(fallback, _LITERAL_NODES)
+                or _is_row_field_call(fallback, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+            )
+        )
     if isinstance(callee, Call) and isinstance(callee.node, Getattr) and callee.node.attr in TEMPLATE_ROW_METHODS:
         if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):
             return False
         default = _call_positional_or_keyword_value(callee, 1, "default")
-        return (default is None or isinstance(default, _LITERAL_NODES)) and _node_is_row_object_expression(
-            callee.node.node, namespaces, row_collection_aliases, row_container_aliases
-        )
+        return (
+            default is None
+            or isinstance(default, _LITERAL_NODES)
+            or _is_row_field_call(default, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+        ) and _node_is_row_object_expression(callee.node.node, namespaces, row_collection_aliases, row_container_aliases)
     return False
 
 
