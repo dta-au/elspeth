@@ -976,7 +976,7 @@ allowed_dict_patterns:
   # same checkpoint-argument dict with the verdict-format re-prompt appended to
   # ``problem_summary``. Identical shape, identical rationale — it cannot be a
   # TypedDict without ``_build_checkpoint_arguments`` becoming one first.
-  - "src/elspeth/web/composer/service.py:_advisor_arguments_with_format_reprompt:return"
+  - "src/elspeth/web/composer/advisor_policy.py:advisor_arguments_with_format_reprompt:return"
   # Guided chat audit records hash the exact LiteLLM/OpenAI chat-completion
   # message list sent to the provider. The payload shape is the provider API
   # boundary ({role, content, optional tool fields}) and is intentionally open.

@@ -32,6 +32,7 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
+from elspeth.web.composer.advisor_context import build_advisor_user_message
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.prompts import SYSTEM_PROMPT
@@ -39,7 +40,6 @@ from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
-    _build_advisor_user_message,
     composer_loop_tool_definitions,
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -487,7 +487,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
     }
     if excerpt is not None:
         arguments["schema_excerpt"] = excerpt
-    expected = _build_advisor_user_message(arguments)
+    expected = build_advisor_user_message(arguments)
     with (
         patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
         patch("litellm.acompletion", new_callable=AsyncMock) as mock_provider,
@@ -1516,7 +1516,7 @@ async def test_f3b_advisor_rejects_oversized_prompt() -> None:
         "attempted_actions": ["x"],
     }
     RequestAdvisorHintArgumentsModel.model_validate(big_args)
-    assert len(_build_advisor_user_message(big_args)) > settings.composer_advisor_max_prompt_tokens * 4
+    assert len(build_advisor_user_message(big_args)) > settings.composer_advisor_max_prompt_tokens * 4
     huge_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(
@@ -1587,7 +1587,7 @@ async def test_f3c_advisor_prompt_size_counts_formatting_overhead(prompt_tokens:
     RequestAdvisorHintArgumentsModel.model_validate(overhead_args)
     # Pin the real formatted baseline: 77 tokens admits exactly 308 chars;
     # 76 tokens rejects it despite the raw supplied text being just one char.
-    assert len(_build_advisor_user_message(overhead_args)) == 308
+    assert len(build_advisor_user_message(overhead_args)) == 308
     overhead_response = _FakeLLMResponse(
         choices=[
             _FakeChoice(

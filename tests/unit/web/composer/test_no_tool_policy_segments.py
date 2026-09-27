@@ -809,9 +809,9 @@ def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reaso
     unchanged graph meets the END gate's skip), so no persisted suggestion may
     offer a retry, and the chat notice and the DecisionPanel must agree.
     """
-    from elspeth.web.composer.service import _advisor_signoff_blocked_wording
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
-    _detail, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings, findings_backend_authored=authored)
+    _detail, suggestion = advisor_signoff_blocked_wording(reason=reason, findings=findings, findings_backend_authored=authored)
     assert "after your next pipeline change" in suggestion
     assert "on your next message" not in suggestion
     assert "retry the request" not in suggestion.lower()
@@ -819,8 +819,8 @@ def test_durable_blocker_wording_promises_a_review_after_a_pipeline_change(reaso
 
 @pytest.mark.parametrize("reason", ["unavailable", "malformed"])
 def test_transient_advisor_blocker_offers_retry_without_graph_edit(reason: str) -> None:
-    from elspeth.web.composer.service import _advisor_signoff_blocked_wording
+    from elspeth.web.composer.advisor_policy import advisor_signoff_blocked_wording
 
-    _, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings="No verdict.")
+    _, suggestion = advisor_signoff_blocked_wording(reason=reason, findings="No verdict.")
     assert "on your next message" in suggestion
     assert "pipeline change" not in suggestion
