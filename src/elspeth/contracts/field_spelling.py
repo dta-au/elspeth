@@ -245,7 +245,10 @@ class FieldNameResolution:
       headered source keys an unmapped header by it; a headerless source emits
       its unmapped columns as written, so behind one this leg can only fire on
       a literal that normalizes to a field the upstream carries, which the rule
-      refuses as a spelling of that field whatever the source's mode.
+      refuses as a spelling of that field whatever the source's mode. A
+      rename moves this leg's field only when a lookup of its source can read
+      it (``then_renamed``), so the leg never names a field the upstream does
+      not carry.
     - each transform rename on the way (build time,
       ``TransformProtocol.renamed_input_fields``, composed by
       ``then_renamed``): a transform that renames a field carries its identity
@@ -254,7 +257,16 @@ class FieldNameResolution:
       follows every rename between the sources and the node; each leg above
       stores the names rows carry its field as HERE, not at the source.
       ``normalized_moves`` holds the normalization leg's names that a rename
-      moved; any other normalized name is carried as itself.
+      moved; any other normalized name is carried as itself. A literal a
+      rename read that is no normalization fixed point (a headerless column
+      ``Name``) is carried on the as-written leg, which a lookup matches as
+      written.
+      ``normalizes_names`` says whether any upstream source keys an unmapped
+      external name by its normalized form (``SourceFieldRenames.keys`` is
+      ``normalized``). Behind only headerless sources it is False: they emit
+      every unmapped column as written and record it as its own original
+      name, so no lookup of a literal ever reads the field ``normalize``
+      makes of it, and a rename moves no such field (``then_renamed``).
 
     The run time does not re-derive a source's renames: its contract already
     records every identity the renames carried, which ``recorded`` reads.
@@ -264,6 +276,7 @@ class FieldNameResolution:
     renames: Mapping[str, tuple[ResolvedName, ...]]
     normalized_moves: Mapping[str, tuple[ResolvedName, ...]]
     recorded: SchemaContract | None
+    normalizes_names: bool
 
     def __post_init__(self) -> None:
         freeze_fields(self, "renames_as_written", "renames", "normalized_moves")
@@ -273,7 +286,9 @@ class FieldNameResolution:
         """The build-time resolution over the ``field_renames`` of the given sources, at the sources themselves."""
         targets: dict[FieldMappingKeys, dict[str, list[ResolvedName]]] = {"as_written": {}, "normalized": {}}
         legs: dict[FieldMappingKeys, SpellingLeg] = {"as_written": "renamed_as_written", "normalized": "renamed"}
+        normalizes_names = False
         for source in sources:
+            normalizes_names = normalizes_names or source.keys == "normalized"
             keyed = targets[source.keys]
             for key, target in source.mapping.items():
                 if key not in keyed:
@@ -284,12 +299,13 @@ class FieldNameResolution:
             renames={key: _ordered(found) for key, found in targets["normalized"].items()},
             normalized_moves={},
             recorded=None,
+            normalizes_names=normalizes_names,
         )
 
     @classmethod
     def of_contract(cls, contract: SchemaContract) -> FieldNameResolution:
-        """The run-time resolution: the arriving row's own contract."""
-        return cls(renames_as_written={}, renames={}, normalized_moves={}, recorded=contract)
+        """The run-time resolution: the arriving row's own contract (``then_renamed`` is build-time only)."""
+        return cls(renames_as_written={}, renames={}, normalized_moves={}, recorded=contract, normalizes_names=True)
 
     @classmethod
     def union(cls, resolutions: Iterable[FieldNameResolution]) -> FieldNameResolution:
@@ -321,24 +337,53 @@ class FieldNameResolution:
             renames={key: _ordered(entries) for key, entries in merged[1].items()},
             normalized_moves=moves,
             recorded=None,
+            # No predecessor known: the normalization rule alone, as NORMALIZATION_ONLY.
+            normalizes_names=not parts or any(resolution.normalizes_names for resolution in parts),
         )
 
     def then_renamed(self, renamed: Mapping[str, str]) -> FieldNameResolution:
         """This resolution on the far side of a transform that renames ``renamed`` (source spelling -> new name).
 
         A rename's source is itself a LOOKUP (the transform reads it through
-        the row's contract), so the field it renames is whatever this
-        resolution resolves the source to, the literal included — the renames
-        of one transform are applied together, from the resolution the
-        transform's input carries. Every leg naming a renamed field now names
-        the new one. So does the normalization leg of the renamed name itself,
-        unless that name is a field some other leg already names (a source's
-        ``field_mapping`` target, an earlier rename's): its identity is that
-        other spelling, and the old name no longer reaches it.
+        the row's contract), so the field it renames is whatever a lookup of
+        the source reads — the renames of one transform are applied together,
+        from the resolution the transform's input carries. ``find_name``
+        matches a field's own name before any original name, so:
+
+        - a source some leg already names as a field (a source's
+          ``field_mapping`` target, an earlier rename's) reads exactly that
+          field, and nothing its normalized form might name;
+        - any other source reads the literal, what the renames make of it,
+          and — only when an upstream source keys headers by their
+          normalized form (``normalizes_names``) — the field ``normalize``
+          makes of a header spelled like it. Behind headerless sources alone
+          no lookup of a literal reads that field, so it does not move.
+
+        Only a field the lookup can read moves: renaming a field away never
+        makes a later declaration stricter than keeping it would. Every leg
+        naming a renamed field now names the new one. So does the
+        normalization leg of the renamed name itself, unless that name is a
+        field some other leg already names: its identity is that other
+        spelling, and the old name no longer reaches it.
         """
+        named_elsewhere = {
+            name
+            for legs in (self.renames_as_written, self.renames, self.normalized_moves)
+            for key, entries in legs.items()
+            for name, _ in entries
+            if legs is not self.normalized_moves or name != key
+        }
         moved_to: dict[str, set[str]] = {}
         for source, target in renamed.items():
-            for field_name in {source, *(found for found, _ in self.resolve(DeclaredName.of(source)))}:
+            reads = (
+                {source}
+                if source in named_elsewhere
+                else {
+                    source,
+                    *(found for found, leg in self.resolve(DeclaredName.of(source)) if leg != "normalized" or self.normalizes_names),
+                }
+            )
+            for field_name in reads:
                 if field_name == target:
                     continue
                 if field_name not in moved_to:
@@ -354,25 +399,25 @@ class FieldNameResolution:
                 for entry in (((target, "carried") for target in moved_to[name]) if name in moved_to else ((name, leg),))
             )
 
-        named_elsewhere = {
-            name
-            for legs in (self.renames_as_written, self.renames, self.normalized_moves)
-            for key, entries in legs.items()
-            for name, _ in entries
-            if legs is not self.normalized_moves or name != key
-        }
+        as_written = {key: moved(entries) for key, entries in self.renames_as_written.items()}
         moves = {name: moved(entries) for name, entries in self.normalized_moves.items()}
         for field_name in moved_to:
             if field_name in moves or field_name in named_elsewhere:
                 continue
-            # Only a normalization fixed point is ever looked up on this leg.
             if normalized_field_name_or_empty(field_name) == field_name:
+                # A normalization fixed point is looked up on the normalization leg.
                 moves[field_name] = moved(((field_name, "normalized"),))
+            elif field_name not in as_written:
+                # Any other literal the rename read is looked up as written: a
+                # headerless column keeps its own spelling as its recorded
+                # original, so after the rename a lookup of it reads the new name.
+                as_written[field_name] = moved(((field_name, "renamed_as_written"),))
         return FieldNameResolution(
-            renames_as_written={key: moved(entries) for key, entries in self.renames_as_written.items()},
+            renames_as_written=as_written,
             renames={key: moved(entries) for key, entries in self.renames.items()},
             normalized_moves=moves,
             recorded=None,
+            normalizes_names=self.normalizes_names,
         )
 
     def resolve(self, name: DeclaredName) -> Iterator[ResolvedName]:
@@ -392,7 +437,7 @@ class FieldNameResolution:
                 yield name.normalized, "normalized"
 
 
-NORMALIZATION_ONLY = FieldNameResolution(renames_as_written={}, renames={}, normalized_moves={}, recorded=None)
+NORMALIZATION_ONLY = FieldNameResolution(renames_as_written={}, renames={}, normalized_moves={}, recorded=None, normalizes_names=True)
 """The resolution with no upstream rename and no row contract: ``normalize(T)`` alone.
 
 For names checked against names the SAME node creates (value_transform's targets

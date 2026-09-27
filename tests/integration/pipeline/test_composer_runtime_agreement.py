@@ -8622,6 +8622,62 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         """Behind source {name: b} -> {b: c}, b's identity is 'Name': 'b' names nothing, 'c' is the field itself."""
         self._assert_both_accept(self._renamed_state(tmp_path, mapped=True, consumer=self._value_transform(**consumer)), tmp_path)
 
+    # --- Only a field the lookup of a rename's source reads moves (review-C1-alias-bypass-r3 F1) ---
+    # Both surfaces call the one FieldNameResolution.then_renamed, so they
+    # admit and refuse these together.
+
+    def _rename_name_state(self, tmp_path: Path, *, source_options: dict[str, Any], old: str, consumer: NodeSpec) -> CompositionState:
+        """source -> hop (closed field_mapper {old: c}) -> consumer."""
+        hop = replace(
+            self._field_mapper({old: "c"}, schema={"mode": "fixed", "fields": ["id: str", f"{old}: str"]}),
+            id="hop",
+            input="t_in",
+            on_success="t2_in",
+        )
+        source = SourceSpec(plugin="csv", on_success="t_in", options=source_options, on_validation_failure="discard")
+        return CompositionState(
+            source=source,
+            nodes=(hop, replace(consumer, input="t2_in")),
+            edges=(),
+            outputs=(self._output(tmp_path),),
+            metadata=PipelineMetadata(name="spelling"),
+            version=1,
+        )
+
+    def _rename_source_options(self, tmp_path: Path, shape: str) -> dict[str, Any]:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / f"{shape}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if shape == "fmval-create":
+            path.write_text("ID,x\n1,Ann\n", encoding="utf-8")
+            return {"path": str(path), "field_mapping": {"x": "Name"}, "schema": {"mode": "fixed", "fields": ["id: str", "Name: str"]}}
+        path.write_text("1,Ann\n", encoding="utf-8")
+        column = "Name" if shape == "hl-create" else "name"
+        return {"path": str(path), "columns": ["id", column], "schema": {"mode": "fixed", "fields": ["id: str", f"{column}: str"]}}
+
+    @pytest.mark.parametrize("shape", ["fmval-create", "hl-create"])
+    def test_both_accept_creating_a_normalized_name_the_renamed_field_never_carried(self, tmp_path: Path, shape: str) -> None:
+        state = self._rename_name_state(
+            tmp_path,
+            source_options=self._rename_source_options(tmp_path, shape),
+            old="Name",
+            consumer=self._value_transform(target="name", reads="c"),
+        )
+        self._assert_both_accept(state, tmp_path)
+
+    def test_both_reject_recreating_a_renamed_headerless_fixed_point_column(self, tmp_path: Path) -> None:
+        state = self._rename_name_state(
+            tmp_path,
+            source_options=self._rename_source_options(tmp_path, "hl-create-lc"),
+            old="name",
+            consumer=self._value_transform(target="name", reads="c"),
+        )
+        composer, runtime = self._both(state, tmp_path)
+        spelling = "'name' is a header spelling of the arriving field 'c'"
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert spelling in entry.message
+        assert not runtime.is_valid
+        assert any("Field name header spelling" in e.message and spelling in e.message for e in runtime.errors), runtime.errors
+
     @pytest.mark.parametrize("target", ["Total", "name"], ids=["probe-C-new-capitalised-name", "probe-E-canonical-overwrite"])
     def test_both_accept_targets_that_are_not_header_spellings(self, tmp_path: Path, target: str) -> None:
         state = self._state(

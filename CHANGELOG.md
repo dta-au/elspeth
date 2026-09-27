@@ -629,7 +629,18 @@ These ran and delivered rows before:
   string. Declare the normalized name (`name`, `price`). Two `value_transform`
   targets of one node that spell one another (`total`, then `Total`) are
   refused at configuration ("target 'Total' is a header spelling of target
-  'total'"); before, both keys were written to the row.
+  'total'"); before, both keys were written to the row. Re-creating the
+  normalized name of a field a `field_mapper` renamed away (a
+  `value_transform` target `name` behind `{name: c}` over a header `Name` or
+  `name`) is refused at build ("'name' is a header spelling of the arriving
+  field 'c'"). A rename now carries the field's original header onto `c`
+  (above), so behind header `name` a lookup of `name` reads `c` and a created
+  `name` would be a second field under that spelling; behind header `Name` it
+  would not, but the build cannot tell the two headers apart. Before, both
+  delivered `c` and `name`. Choose another name, or target `c`. Renaming a
+  field that no lookup of `name` reads (`{Name: c}` behind a source
+  `field_mapping: {x: Name}`, or behind a headerless `columns: [Name]`)
+  leaves `name` free, as keeping the field does.
 - **A `type_coerce` conversion field that some rows lack** ends the run
   with `DeclaredRequiredInputFieldsViolation` at the first such row behind
   an observed source, and is refused at build behind a `fixed` one. Before,

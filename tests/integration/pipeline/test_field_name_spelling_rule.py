@@ -1011,3 +1011,76 @@ def test_the_header_name_of_an_unmapped_field_follows_the_rename(tmp_path: Path)
     )
 
     assert "'name' is a header spelling of the arriving field 'c'" in output
+
+
+# Only a field the lookup of a rename's source can read moves (review-C1-alias-bypass-r3
+# F1): renaming a field away never makes a later declaration stricter than keeping it.
+# A source that is itself a field (a field_mapping target) reads exactly that field, and
+# behind a headerless source no lookup reads the field normalize() makes of a column.
+
+
+def _rename_to_c_hop(old: str) -> dict[str, Any]:
+    return {
+        **_renaming_hop(mapped=True),
+        "options": {"mapping": {old: "c"}, "schema": {"mode": "fixed", "fields": ["id: str", f"{old}: str"]}},
+    }
+
+
+_CREATE_NAME = _transform("value_transform", {"operations": [{"target": "name", "expression": "row['c'] + '!'"}], "schema": _OBSERVED})
+
+
+def _mapped_to_name_source(tmp_path: Path) -> dict[str, Any]:
+    source = _csv_source(tmp_path, f"ID,x\n1,{SENTINEL}\n2,Bob\n", schema={"mode": "fixed", "fields": ["id: str", "Name: str"]})
+    source["options"]["field_mapping"] = {"x": "Name"}
+    return source
+
+
+@pytest.mark.parametrize("shape", ["fmval-create", "hl-create"])
+def test_creating_the_normalized_name_of_a_renamed_field_that_never_carried_it_delivers(tmp_path: Path, shape: str) -> None:
+    if shape == "fmval-create":
+        source = _mapped_to_name_source(tmp_path)
+    else:
+        source = _headerless_source(
+            tmp_path, columns=["id", "Name"], field_mapping={}, schema={"mode": "fixed", "fields": ["id: str", "Name: str"]}
+        )
+    result = _run(_settings(tmp_path, source=source, transforms=[_rename_to_c_hop("Name"), {**_CREATE_NAME, "input": "mid"}]))
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+    rows = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert [(row["c"], row["name"]) for row in rows] == [(SENTINEL, f"{SENTINEL}!"), ("Bob", "Bob!")]
+
+
+def test_a_renamed_headerless_column_is_still_read_by_its_own_spelling(tmp_path: Path) -> None:
+    """columns [Name], {Name: c}: c records 'Name' as its original, so a declared 'Name' names c and is refused."""
+    source = _headerless_source(
+        tmp_path, columns=["id", "Name"], field_mapping={}, schema={"mode": "fixed", "fields": ["id: str", "Name: str"]}
+    )
+    consumer = _transform(
+        "value_transform",
+        {"operations": [{"target": "d", "expression": "row['c']"}], "schema": {"mode": "flexible", "fields": ["Name: int?"]}},
+    )
+    output = _refused_at_build(_settings(tmp_path, source=source, transforms=[_rename_to_c_hop("Name"), {**consumer, "input": "mid"}]))
+
+    assert _CARRIED_READ in output
+
+
+def test_a_renamed_headerless_fixed_point_column_is_not_recreated(tmp_path: Path) -> None:
+    """columns [name], {name: c}: c records 'name' as its original, so creating 'name' would sit beside it."""
+    source = _headerless_source(tmp_path, columns=["id", "name"], field_mapping={}, schema=_FIXED_ID_NAME)
+    output = _refused_at_build(_settings(tmp_path, source=source, transforms=[_rename_to_c_hop("name"), {**_CREATE_NAME, "input": "mid"}]))
+
+    assert "'name' is a header spelling of the arriving field 'c'" in output
+
+
+def test_the_mapped_header_follows_a_rename_of_the_mapping_target(tmp_path: Path) -> None:
+    """Source {x: Name}, then {Name: c}: 'x' is c's recorded original, so a declared 'x' names c (the literal leg, r3 F3)."""
+    consumer = _transform(
+        "value_transform",
+        {"operations": [{"target": "d", "expression": "row['c']"}], "schema": {"mode": "flexible", "fields": ["x: int?"]}},
+    )
+    output = _refused_at_build(
+        _settings(tmp_path, source=_mapped_to_name_source(tmp_path), transforms=[_rename_to_c_hop("Name"), {**consumer, "input": "mid"}])
+    )
+
+    assert "'x' is a header spelling of 'c'" in output

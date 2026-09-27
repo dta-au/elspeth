@@ -274,6 +274,66 @@ class TestTransformRenames:
         assert RENAMED.then_renamed({}) is RENAMED
         assert RENAMED.then_renamed({"b": "b"}) is RENAMED
 
+    # -- only a field the lookup of a rename's source can read moves (review-C1-alias-bypass-r3 F1/F3) --
+
+    _MAPPED_TO_NAME = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"x": "Name"}, keys="normalized")])
+    _HEADERLESS = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={}, keys="as_written")])
+    _HEADERED = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={}, keys="normalized")])
+
+    def test_a_source_that_is_a_known_field_moves_that_field_only(self) -> None:
+        # fmval-create: source {x: Name}, then {Name: c}. The lookup of 'Name' reads the
+        # field Name exactly (find_name matches a field's own name first), never a header
+        # 'name' normalizes from, so creating 'name' afterwards shadows nothing — exactly
+        # as it does when Name is kept.
+        renamed = self._MAPPED_TO_NAME.then_renamed({"Name": "c"})
+        assert header_spelled_names(["name"], {"c"}, renamed, kind="create") == ()
+        assert header_spelled_names(["name"], {"Name"}, self._MAPPED_TO_NAME, kind="create") == ()
+
+    def test_the_literal_source_carries_the_mapped_header_onto_the_new_name(self) -> None:
+        # m5-witness-vt: 'x' is the header the source maps to Name; Name -> c carries it,
+        # so a declaration 'x' names c. Moving only resolve()'s normalized candidates of
+        # 'Name' would leave x -> Name and admit the declaration (every row then routed).
+        renamed = self._MAPPED_TO_NAME.then_renamed({"Name": "c"})
+        assert header_spelled_names(["x"], {"c"}, renamed, kind="read") == (
+            HeaderSpelling(literal="x", canonical="c", kind="read", leg="carried"),
+        )
+
+    def test_behind_a_headerless_source_the_normalized_form_of_a_renamed_column_does_not_move(self) -> None:
+        # hl-create: columns [Name] (no mapping), then {Name: c}. The column records 'Name'
+        # as its own original, so nothing reads c as 'name': creating it is admitted, as it
+        # is when Name is kept. A lookup of 'Name' itself does read c, so declaring it is
+        # still refused.
+        renamed = self._HEADERLESS.then_renamed({"Name": "c"})
+        assert header_spelled_names(["name"], {"c"}, renamed, kind="create") == ()
+        assert header_spelled_names(["name"], {"Name"}, self._HEADERLESS, kind="create") == ()
+        assert header_spelled_names(["Name"], {"c"}, renamed, kind="read") == (
+            HeaderSpelling(literal="Name", canonical="c", kind="read", leg="carried"),
+        )
+
+    def test_behind_a_headerless_source_a_renamed_fixed_point_column_still_moves(self) -> None:
+        # columns [name], {name: c}: c records 'name' as its original, so re-creating
+        # 'name' would sit beside c under a second key. The literal is the only thing
+        # that carries it here (the normalization leg does not apply headerless).
+        renamed = self._HEADERLESS.then_renamed({"name": "c"})
+        assert header_spelled_names(["name"], {"c"}, renamed, kind="create") == (
+            HeaderSpelling(literal="name", canonical="c", kind="create", leg="carried"),
+        )
+
+    def test_behind_a_headered_source_the_renamed_away_normalized_name_is_refused(self) -> None:
+        # recap-name: header Name or name (the build cannot tell), {name: c}, create 'name'.
+        # Under header 'name' c records 'name' as its original (Duplicate original_name on
+        # creation), so the build refuses both spellings — the recorded over-approximation.
+        for rename in ({"name": "c"}, {"Name": "c"}):
+            renamed = self._HEADERED.then_renamed(rename)
+            assert [spelling.canonical for spelling in header_spelled_names(["name"], {"c"}, renamed, kind="create")] == ["c"]
+
+    def test_a_join_with_a_headered_branch_keeps_the_normalization_leg(self) -> None:
+        merged = FieldNameResolution.union([self._HEADERLESS, self._HEADERED])
+        assert merged.normalizes_names is True
+        assert FieldNameResolution.union([self._HEADERLESS, self._HEADERLESS]).normalizes_names is False
+        renamed = merged.then_renamed({"Name": "c"})
+        assert [spelling.canonical for spelling in header_spelled_names(["name"], {"c"}, renamed, kind="create")] == ["c"]
+
     def test_the_remedy_names_the_carried_field(self) -> None:
         [spelling] = header_spelled_names(["Name"], {"c"}, RENAMED.then_renamed({"b": "c"}), kind="read")
         assert describe_header_spelling(spelling) == (
