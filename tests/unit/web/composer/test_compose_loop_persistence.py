@@ -21,6 +21,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
@@ -2173,7 +2174,7 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
         assert not compose_task.done(), "cancellation escaped while the synchronous tool still owned an in-flight side effect"
     finally:
         release_worker.set()
-        await asyncio.to_thread(worker_finished.wait, 5.0)
+        await run_sync_in_worker(worker_finished.wait, 5.0)
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(compose_task, timeout=5.0)
