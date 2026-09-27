@@ -876,7 +876,17 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33
 # (aaaf6619345f0665 -> b491b922f1b34cb4) and azure_blob (6bf3a35d44316f7b ->
 # 719563e76907222d) moved too with no manifest pin. No oracle_freeze snapshot
 # moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "5134cb964dceaa39db5a08eca38e7e5f0c8f10c102884e413dd2a4804a7b3124"
+# Rotated 2026-09-27 (elspeth-5887fb7928, C3 value-free reasons, review r1 F1):
+# a PLUGIN PROVENANCE rotation. value_transform records the evaluator's
+# value-free ``kind`` as ``error_type`` in its failure reason, so its
+# source_file_hash moved f645e8e83a012f3f -> de648209de2ccdd6
+# (scripts/cicd/plugin_hash). Order: (1) the 3 manifest pins, plain and
+# JSON-escaped, in fork-coalesce-policies/union-collision-fail; (2) this
+# digest 5134cb96... -> 1908eb05... — with the new code and the OLD manifest
+# pins this parity test passed and only the provenance-pin test failed, so the
+# move is the pin literal alone. No union-collision-fail row hits an
+# evaluation error; no resume digest and no oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "1908eb05ace692750621092999fefa7693ecc58f7af6a22d1218fa1ea1ad7855"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

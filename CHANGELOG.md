@@ -571,6 +571,13 @@ drained and repair this release forward.
   prompt's row data and stays in the recorded call. `rag_retrieval`'s
   `no_results` reason drops the query text, and `blob_json_expand`'s
   `data_key_not_found` no longer lists the document's own keys.
+  An expression evaluation error (`value_transform`'s reason, a gate's failed
+  node state) no longer names a lookup key or index the expression computes
+  from the row (`row[row['code']]` wrote `Key 'CUSTOMER_…' not found`): it
+  prints `<a key the expression does not spell out>`, while a key written in
+  the expression is still named, and no Python operand error text is kept.
+  `value_transform` adds the arm as `error_type` (`missing_key`,
+  `index_out_of_range`, `incompatible_types`, …).
 
 ### Newly refused configurations
 

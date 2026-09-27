@@ -3,7 +3,9 @@
 import hashlib
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -36,6 +38,7 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.config import GateSettings
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
+    ExpressionEvaluationKind,
     ExpressionParser,
     ExpressionSecurityError,
     ExpressionSyntaxError,
@@ -54,22 +57,27 @@ slog = structlog.get_logger(__name__)
 _GATE_VALUE_PREVIEW_CHARS = 80
 
 
+_HANDLED_GATE_EVALUATION_ERRORS: Mapping[ExpressionEvaluationKind, str] = MappingProxyType(
+    {
+        "missing_key": "gate expression evaluation failed: missing key",
+        "index_out_of_range": "gate expression evaluation failed: index out of range",
+        "incompatible_types": "gate expression evaluation failed: incompatible runtime types",
+        "division_by_zero": "gate expression evaluation failed: division by zero",
+        "arithmetic_overflow": "gate expression evaluation failed: arithmetic overflow",
+        "invalid_value": "gate expression evaluation failed: invalid runtime value",
+        "non_finite_result": "gate expression evaluation failed",
+        "unexpected_error": "gate expression evaluation failed",
+    }
+)
+
+
 def _classify_handled_gate_evaluation_error(exc: ExpressionEvaluationError) -> str:
-    """Return bounded failure evidence without copying row-derived exception text."""
-    cause_type = type(exc.__cause__)
-    if cause_type is KeyError:
-        return "gate expression evaluation failed: missing key"
-    if cause_type is IndexError:
-        return "gate expression evaluation failed: index out of range"
-    if cause_type is TypeError:
-        return "gate expression evaluation failed: incompatible runtime types"
-    if cause_type is ZeroDivisionError:
-        return "gate expression evaluation failed: division by zero"
-    if cause_type is OverflowError:
-        return "gate expression evaluation failed: arithmetic overflow"
-    if cause_type is ValueError:
-        return "gate expression evaluation failed: invalid runtime value"
-    return "gate expression evaluation failed"
+    """Return the closed classification of the failed arm (``exc.kind``).
+
+    The handled route records only this sentence, never the condition's
+    evaluation message: the reason is a closed set a reviewer can group by.
+    """
+    return _HANDLED_GATE_EVALUATION_ERRORS[exc.kind]
 
 
 @observation_boundary(

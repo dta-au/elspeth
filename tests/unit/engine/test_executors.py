@@ -2870,6 +2870,15 @@ class TestGateExecutor:
         persisted_evidence = repr((outcome.error, failed_kwargs["error"], routing_reason))
         assert row_derived_text not in persisted_evidence
 
+    def test_handled_gate_classification_covers_every_evaluation_kind(self) -> None:
+        """The handled route's closed sentence is keyed on ``ExpressionEvaluationError.kind``, every kind mapped."""
+        from typing import get_args
+
+        from elspeth.core.expression_parser import ExpressionEvaluationKind
+        from elspeth.engine.executors.gate import _HANDLED_GATE_EVALUATION_ERRORS
+
+        assert set(_HANDLED_GATE_EVALUATION_ERRORS) == set(get_args(ExpressionEvaluationKind))
+
     def test_config_gate_error_route_without_divert_edge_fails_closed(self) -> None:
         """Missing structural audit evidence must not silently route the row."""
         factory = _make_factory()

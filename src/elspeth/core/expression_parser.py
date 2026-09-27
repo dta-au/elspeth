@@ -20,7 +20,7 @@ import math
 import operator
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -37,6 +37,18 @@ class ExpressionSyntaxError(Exception):
     """Raised when expression is not valid Python syntax."""
 
 
+ExpressionEvaluationKind = Literal[
+    "missing_key",
+    "index_out_of_range",
+    "incompatible_types",
+    "division_by_zero",
+    "arithmetic_overflow",
+    "invalid_value",
+    "non_finite_result",
+    "unexpected_error",
+]
+
+
 class ExpressionEvaluationError(Exception):
     """Raised when expression evaluation fails at runtime.
 
@@ -46,8 +58,19 @@ class ExpressionEvaluationError(Exception):
     (invalid Python syntax), this occurs when the expression is valid but
     fails during evaluation.
 
-    The original exception is chained via __cause__ for debugging.
+    The message is value-free, so every consumer may record it as audit text
+    (value_transform's reason, a gate's failed node state): it names types,
+    lengths and what the operator wrote into the expression, never a value
+    the row supplied. A lookup key or index computed from the row prints as a
+    placeholder (the rule ``templates.py`` applies to a template's lookups),
+    and the operand exception is not chained (``from None``): the text of a
+    ``KeyError`` or ``int()`` failure is the row value itself. ``kind`` is the
+    stable, value-free classification of the failed arm.
     """
+
+    def __init__(self, message: str, *, kind: ExpressionEvaluationKind) -> None:
+        super().__init__(message)
+        self.kind: ExpressionEvaluationKind = kind
 
 
 # Allowed comparison operators (immutable to prevent runtime tampering)
@@ -120,6 +143,12 @@ _SAFE_BUILTINS: MappingProxyType[str, Any] = MappingProxyType(
 
 
 _SAFE_CONSTANTS: frozenset[str] = frozenset({"True", "False", "None"})
+
+# Stand in for a subscript key / index the expression computes from the row
+# (``row[row['code']]``, ``row['items'][row['i']]``): its value is row data.
+# Same wording as templates.py's ``_UNSPELLED_KEY``.
+_UNSPELLED_KEY = "<a key the expression does not spell out>"
+_UNSPELLED_INDEX = "<an index the expression does not spell out>"
 
 # Allowed builtins whose result is statically guaranteed to be numeric (never
 # bool or str). Used by is_provably_non_routable() to reject gate conditions
@@ -556,7 +585,8 @@ class _ExpressionEvaluator(ast.NodeVisitor):
     def _ensure_finite_float(self, value: Any, *, context: str) -> Any:
         """Reject non-finite floats produced inside expression evaluation."""
         if isinstance(value, float) and not math.isfinite(value):
-            raise ExpressionEvaluationError(f"{context} produced non-finite float: {value!r}")
+            # repr is one of inf / -inf / nan: a closed category, not a row value.
+            raise ExpressionEvaluationError(f"{context} produced non-finite float: {value!r}", kind="non_finite_result")
         return value
 
     def visit_Expression(self, node: ast.Expression) -> Any:
@@ -587,26 +617,41 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         """Evaluate constants."""
         return self._ensure_finite_float(node.value, context="expression literal")
 
+    def _key_is_spelled_out(self, key_node: ast.expr) -> bool:
+        """Whether the expression text alone determines this subscript key.
+
+        A key built only from literals (``row['price']``, ``row['items'][-1]``)
+        is config text the operator wrote and is named in the message. A key
+        that reads an allowed name (``row[row['code']]``) is computed from the
+        row, so its value is row data and is withheld.
+        """
+        return not any(isinstance(sub, ast.Name) and sub.id in self._allowed_names for sub in ast.walk(key_node))
+
     def visit_Subscript(self, node: ast.Subscript) -> Any:
         """Evaluate subscript access."""
         value = self.visit(node.value)
         key = self.visit(node.slice)
+        spelled_out = self._key_is_spelled_out(node.slice)
+        container = type(value).__name__
         try:
             return value[key]
-        except KeyError as e:
+        except KeyError:
+            key_text = f"'{key}'" if spelled_out else _UNSPELLED_KEY
             if isinstance(value, dict):
-                msg = f"Field '{key}' not found in dict"
+                msg = f"Field {key_text} not found in dict"
             else:
-                msg = f"Key '{key}' not found in {type(value).__name__}"
-            raise ExpressionEvaluationError(msg) from e
-        except IndexError as e:
+                msg = f"Key {key_text} not found in {container}"
+            raise ExpressionEvaluationError(msg, kind="missing_key") from None
+        except IndexError:
             # Handle out-of-range index on lists/tuples
-            msg = f"Index {key} out of range for {type(value).__name__} of length {len(value)}"
-            raise ExpressionEvaluationError(msg) from e
-        except TypeError as e:
+            index_text = f"{key}" if spelled_out else _UNSPELLED_INDEX
+            msg = f"Index {index_text} out of range for {container} of length {len(value)}"
+            raise ExpressionEvaluationError(msg, kind="index_out_of_range") from None
+        except TypeError:
             # Handle cases like subscripting None or non-subscriptable types
-            msg = f"Cannot access '{key}' on {type(value).__name__}: {e}"
-            raise ExpressionEvaluationError(msg) from e
+            key_text = f"'{key}'" if spelled_out else _UNSPELLED_KEY
+            msg = f"Cannot access {key_text} (a {type(key).__name__} key) on {container}"
+            raise ExpressionEvaluationError(msg, kind="incompatible_types") from None
 
     def visit_Attribute(self, node: ast.Attribute) -> Any:
         """Evaluate attribute access (only .get on allowed-name values)."""
@@ -634,14 +679,19 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         else:
             func_label = "unknown"
 
+        # Argument TYPES only: the builtins' own messages can quote an argument.
+        arg_types = ", ".join(type(arg).__name__ for arg in args)
         try:
             return func(*args)
-        except TypeError as e:
-            msg = f"invalid argument to {func_label}(): {e}"
-            raise ExpressionEvaluationError(msg) from e
-        except (ValueError, OverflowError) as e:
-            msg = f"{func_label}() evaluation error: {e}"
-            raise ExpressionEvaluationError(msg) from e
+        except TypeError:
+            msg = f"invalid argument to {func_label}(): cannot apply to ({arg_types})"
+            raise ExpressionEvaluationError(msg, kind="incompatible_types") from None
+        except OverflowError:
+            msg = f"{func_label}() evaluation error: arithmetic overflow on ({arg_types})"
+            raise ExpressionEvaluationError(msg, kind="arithmetic_overflow") from None
+        except ValueError:
+            msg = f"{func_label}() evaluation error: invalid value for ({arg_types})"
+            raise ExpressionEvaluationError(msg, kind="invalid_value") from None
 
     def visit_Compare(self, node: ast.Compare) -> Any:
         """Evaluate comparison chains."""
@@ -652,10 +702,10 @@ class _ExpressionEvaluator(ast.NodeVisitor):
             try:
                 if not op_func(left, right):
                     return False
-            except TypeError as e:
+            except TypeError:
                 op_name = type(op).__name__
                 msg = f"type error in comparison ({op_name}): cannot compare {type(left).__name__} and {type(right).__name__}"
-                raise ExpressionEvaluationError(msg) from e
+                raise ExpressionEvaluationError(msg, kind="incompatible_types") from None
             left = right
         return True
 
@@ -684,12 +734,12 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         op_func = _BINARY_OPS[type(node.op)]
         try:
             result = op_func(left, right)
-        except ZeroDivisionError as e:
+        except ZeroDivisionError:
             msg = f"division by zero in {op_name} operation"
-            raise ExpressionEvaluationError(msg) from e
-        except TypeError as e:
+            raise ExpressionEvaluationError(msg, kind="division_by_zero") from None
+        except TypeError:
             msg = f"type error in {op_name}: cannot apply to {type(left).__name__} and {type(right).__name__}"
-            raise ExpressionEvaluationError(msg) from e
+            raise ExpressionEvaluationError(msg, kind="incompatible_types") from None
         return self._ensure_finite_float(result, context=f"{op_name} operation")
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
@@ -699,9 +749,9 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         op_func = _UNARY_OPS[type(node.op)]
         try:
             result = op_func(operand)
-        except TypeError as e:
+        except TypeError:
             msg = f"type error in unary {op_name}: cannot apply to {type(operand).__name__}"
-            raise ExpressionEvaluationError(msg) from e
+            raise ExpressionEvaluationError(msg, kind="incompatible_types") from None
         return self._ensure_finite_float(result, context=f"unary {op_name}")
 
     def visit_List(self, node: ast.List) -> Any:
@@ -717,10 +767,9 @@ class _ExpressionEvaluator(ast.NodeVisitor):
                     raise ExpressionSecurityError("Dict spread (**) reached evaluator — validation bypass detected")
                 keys.append(k)
             return {self.visit(k): self.visit(v) for k, v in zip(keys, node.values, strict=True)}
-        except TypeError as e:
+        except TypeError:
             # Unhashable key type in dict literal
-            msg = f"cannot create dict literal: {e}"
-            raise ExpressionEvaluationError(msg) from e
+            raise ExpressionEvaluationError("cannot create dict literal: a key is unhashable", kind="incompatible_types") from None
 
     def visit_Tuple(self, node: ast.Tuple) -> Any:
         """Evaluate tuple literals."""
@@ -730,10 +779,9 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         """Evaluate set literals."""
         try:
             return {self.visit(elt) for elt in node.elts}
-        except TypeError as e:
+        except TypeError:
             # Unhashable type in set literal (e.g., {[1]})
-            msg = f"cannot create set literal: {e}"
-            raise ExpressionEvaluationError(msg) from e
+            raise ExpressionEvaluationError("cannot create set literal: an element is unhashable", kind="incompatible_types") from None
 
     def visit_IfExp(self, node: ast.IfExp) -> Any:
         """Evaluate ternary expressions."""
@@ -1135,9 +1183,19 @@ class ExpressionParser:
         except (TypeError, AttributeError, KeyError, NameError, AssertionError, RecursionError):
             raise  # Programming errors in the evaluator must crash through
         except Exception as exc:
+            # The expression is config text; the exception's own text can quote
+            # an operand (a row value), so only its type is named.
+            kind: ExpressionEvaluationKind
+            if isinstance(exc, OverflowError):
+                kind = "arithmetic_overflow"
+            elif isinstance(exc, ValueError):
+                kind = "invalid_value"
+            else:
+                kind = "unexpected_error"
             raise ExpressionEvaluationError(
-                f"Unexpected error evaluating expression {self._expression!r}: {type(exc).__name__}: {exc}"
-            ) from exc
+                f"Unexpected error evaluating expression {self._expression!r}: {type(exc).__name__}",
+                kind=kind,
+            ) from None
 
     def __repr__(self) -> str:
         return f"ExpressionParser({self._expression!r})"
