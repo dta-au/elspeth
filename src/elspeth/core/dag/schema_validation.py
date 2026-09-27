@@ -1530,15 +1530,16 @@ class DeclaredInputDisposition:
     The two are disjoint by construction: a refused field is outside that
     predecessor's ``fields``, so it is outside the intersection.
 
-    Two edges of the intersection are stated rather than left to set algebra,
-    because each errs toward PROVING, the direction that turns a routed row
-    fact into a run abort: a node with NO live predecessor proves nothing (the
-    empty intersection is the universe, not ∅), and a node with ANY DIVERT
-    in-edge proves nothing (a row can arrive through error handling carrying
-    an error envelope, not the producer's declared row; since spec §7 rule 9 a
-    DIVERT edge can land on a coalesce, row_union or collector). The refusal
-    keeps ignoring DIVERT predecessors (``_live_predecessors``): it must never
-    reject a runnable pipeline, while the proof must never over-claim.
+    One edge of the intersection is stated rather than left to set algebra,
+    because it errs toward PROVING, the direction that turns a routed row fact
+    into a run abort: a node with NO live predecessor proves nothing (the empty
+    intersection is the universe, not ∅). DIVERT predecessors are excluded
+    from both halves (``_live_predecessors``) because no row travels a DIVERT
+    edge into a node that enforces a declaration: the builder lands DIVERT
+    edges on sinks, and on a closer only under spec §7 rule 9, where the edge
+    is a structural audit marker — the failing token settles as a lost member
+    before the closer (engine/token_traversal.py) — so the only rows a
+    collector buffers arrived over its live edges.
     """
 
     certain_missing: tuple[tuple[str, tuple[str, ...]], ...]
@@ -1558,9 +1559,6 @@ def declared_input_disposition(
     (``compute_declared_input_proof``); see ``DeclaredInputDisposition``.
     """
     live_predecessors = _live_predecessors(graph, node_id)
-    has_divert_in_edge = any(
-        edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True)
-    )
     certain_missing: list[tuple[str, tuple[str, ...]]] = []
     presence: list[frozenset[str]] = []
     for predecessor_id in live_predecessors:
@@ -1570,7 +1568,7 @@ def declared_input_disposition(
             if missing:
                 certain_missing.append((predecessor_id, missing))
         presence.append(vote.fields if vote.participated else frozenset())
-    if not live_predecessors or has_divert_in_edge:
+    if not live_predecessors:
         proven: frozenset[str] = frozenset()
     else:
         proven = declared.intersection(*presence)

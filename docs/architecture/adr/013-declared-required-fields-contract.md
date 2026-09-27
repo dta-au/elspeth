@@ -17,7 +17,7 @@
 > `schema_validation.declared_input_disposition`, the same walk that refuses a certain miss). Explicit
 > `required_input_fields` and `schema.required_fields` are refused at build (Phase 1) unless the producer guarantees
 > them, so a field that passes that check is normally trusted too; the runtime never asks which surface a field came
-> from, only whether the build trusted it (a node with a DIVERT in-edge trusts nothing, conservatively). A runtime
+> from, only whether the build trusted it. A runtime
 > miss is Tier 1 when any missing field was trusted, or when the row's payload
 > carries a field its contract lacks (contract/payload divergence). Otherwise the declaration was derived from options
 > the build could not settle against an abstaining or open upstream (`url_field`, `conversions[].field`, `mapping`

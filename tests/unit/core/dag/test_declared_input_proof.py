@@ -26,7 +26,7 @@ import pytest
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName
+from elspeth.contracts.types import CoalesceName, CollectorName
 from elspeth.core.dag import schema_validation
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.guarantees import EffectiveGuaranteeVote
@@ -128,15 +128,15 @@ class TestConservativeEdges:
 
         assert _disposition(graph).proven == frozenset()
 
-    def test_a_divert_in_edge_unproves_every_field(self) -> None:
-        """A row can arrive through error handling as an error envelope; the refusal still ignores that edge."""
+    def test_a_divert_predecessor_is_ignored_by_both_halves(self) -> None:
+        """No row travels a DIVERT edge: it neither proves nor refuses (``_live_predecessors``)."""
         graph = _consumer_graph({"mode": "fixed", "fields": ["b: str"]})
         _source(graph, "errsrc", {"mode": "fixed", "fields": ["a: str"]})
         graph.add_edge("errsrc", "t", label="__error_x__", mode=RoutingMode.DIVERT)
 
         disposition = _disposition(graph)
 
-        assert disposition.proven == frozenset()
+        assert disposition.proven == frozenset({"b"})
         # The DIVERT predecessor would be a certain miss; the refusal never rejects a runnable pipeline for it.
         assert disposition.certain_missing == ()
 
@@ -352,6 +352,24 @@ class TestPublishedOnTheFinalGraph:
         assert dict(validation_graph.get_declared_input_proof()) == run_proof
         assert dict(execution_graph.get_declared_input_proof()) == run_proof
         assert frozenset({"b"}) in run_proof.values()
+
+
+class TestRule9IntoACollector:
+    """A rule-9 error edge into a collector closer is an audit marker, so the collector's proof is unchanged."""
+
+    def test_the_collector_proves_the_same_with_and_without_the_error_edge(self, tmp_path: Path) -> None:
+        example = (Path(__file__).resolve().parents[4] / "examples" / "scope_collector" / "settings.yaml").read_text()
+        marker = "  on_success: pages\n  on_error: discard\n"
+        assert example.count(marker) == 1
+        proofs: dict[str, frozenset[str]] = {}
+        for on_error in ("discard", "page_stitcher"):
+            graph = _build(example.replace(marker, f"  on_success: pages\n  on_error: {on_error}\n"))
+            collector = graph.get_collector_id_map()[CollectorName("page_stitcher")]
+            divert_in = [edge for edge in graph.get_incoming_edges(collector) if edge.mode == RoutingMode.DIVERT]
+            assert len(divert_in) == (1 if on_error == "page_stitcher" else 0)
+            proofs[on_error] = graph.get_declared_input_proof()[collector]
+
+        assert proofs == {"discard": frozenset({"reading"}), "page_stitcher": frozenset({"reading"})}
 
 
 class TestFirewallOverPromise:
