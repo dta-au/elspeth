@@ -158,8 +158,9 @@ drained and repair this release forward.
   `field_mapping` renames is a spelling of the rename's TARGET: under
   `field_mapping: {name: b}` a declaration `Name`, `NAME` or the mapping key
   `name` itself names `b` and is refused ("... and the source's field_mapping
-  renames 'name' to 'b'. Declare 'b'"). A headerless CSV source (`columns`,
-  or csv/aws_s3/azure_blob with `has_header: false`) matches `field_mapping`
+  renames 'name' to 'b'. Declare 'b'"). A headerless CSV source (csv with
+  `columns`, or aws_s3/azure_blob `format: csv` with
+  `csv_options: {has_header: false}`) matches `field_mapping`
   keys against the column names as written, so under `columns: [Name]` and
   `field_mapping: {Name: b}` the declaration `Name` names `b` and is refused
   ("... renames its column 'Name' to 'b'. Declare 'b'"). Only the normalized form used to be
