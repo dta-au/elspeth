@@ -617,6 +617,13 @@ drained and repair this release forward.
   serialization diversion reasons carry the exception class instead of the
   codec's text, which quoted the character it could not encode (`CSV
   encoding (ascii) failed: UnicodeEncodeError`) or the non-finite float.
+  The `database` sink's constraint diversion reason no longer carries the
+  driver's message, which on PostgreSQL quotes the row (`Key (email)=(…)
+  already exists`, `Failing row contains (…)`, `invalid input syntax for type
+  integer: "…"`, and with psycopg2 the statement with its parameters) and
+  reached `node_states.error_json`: it names a stable kind and the driver's
+  condition, e.g. `Constraint violation: unique_violation (UniqueViolation)`
+  or, on SQLite, `(SQLITE_CONSTRAINT_UNIQUE)`.
 
 ### Newly refused configurations
 

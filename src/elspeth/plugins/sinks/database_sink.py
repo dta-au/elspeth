@@ -71,6 +71,60 @@ SCHEMA_TYPE_TO_SQLALCHEMY: Mapping[str, type[TypeEngine[Any]]] = MappingProxyTyp
     }
 )
 
+# The stable failure kind a row's diversion reason names, keyed by the
+# driver's value-free condition name: PostgreSQL's per-SQLSTATE error class
+# (psycopg and psycopg2 both name them after the SQLSTATE condition, e.g.
+# 23505 unique_violation -> UniqueViolation) or SQLite's extended result code.
+# A condition not listed here falls back to the SQLAlchemy wrapper's kind.
+_CONSTRAINT_KIND_BY_CONDITION: Mapping[str, str] = MappingProxyType(
+    {
+        "UniqueViolation": "unique_violation",
+        "ForeignKeyViolation": "foreign_key_violation",
+        "NotNullViolation": "not_null_violation",
+        "CheckViolation": "check_violation",
+        "ExclusionViolation": "exclusion_violation",
+        "SQLITE_CONSTRAINT_UNIQUE": "unique_violation",
+        "SQLITE_CONSTRAINT_PRIMARYKEY": "unique_violation",
+        "SQLITE_CONSTRAINT_FOREIGNKEY": "foreign_key_violation",
+        "SQLITE_CONSTRAINT_NOTNULL": "not_null_violation",
+        "SQLITE_CONSTRAINT_CHECK": "check_violation",
+    }
+)
+
+
+@trust_boundary(
+    tier=3,
+    source="the database driver's exception for a row the target database refused (an external system's error object)",
+    source_param="exc",
+    suppresses=("R5",),
+    invariant=(
+        "returns a reason built only from the driver's error class or SQLite result-code name and a stable kind; "
+        "never reads or returns the driver's message; never raises on an unrecognised driver error"
+    ),
+    non_raising=True,
+)
+def _constraint_failure_reason(exc: IntegrityError | DataError) -> str:
+    """Name why the database refused a row without the driver's message.
+
+    The message is not value-free: PostgreSQL's DETAIL quotes the row
+    (``Key (email)=(<value>) already exists``, ``Failing row contains
+    (<the row>)``, ``invalid input syntax for type integer: "<value>"``), and
+    psycopg2 appends the statement with its parameters. The reason is recorded
+    in the audit trail and routed, so it is built only from the driver's error
+    class or SQLite's result-code name — closed driver vocabularies — plus the
+    stable kind they map to.
+    """
+    driver_error = exc.orig
+    condition = driver_error.sqlite_errorname if isinstance(driver_error, sqlite3.Error) else type(driver_error).__name__
+    if condition in _CONSTRAINT_KIND_BY_CONDITION:
+        kind = _CONSTRAINT_KIND_BY_CONDITION[condition]
+    elif isinstance(exc, DataError):
+        kind = "data_error"
+    else:
+        kind = "integrity_error"
+    return f"Constraint violation: {kind} ({condition})"
+
+
 _DATABASE_EFFECT_LEDGER_SCHEMA_VERSION = 1
 _DATABASE_EFFECT_LEDGER_PERMISSIONS = frozenset({"insert", "select"})
 _DATABASE_EFFECT_SUPPORTED_DIALECTS = frozenset({"postgresql", "sqlite"})
@@ -215,7 +269,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3980d51683d66ca6"
+    source_file_hash: str | None = "sha256:b3a6120272a86bcc"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -721,7 +775,7 @@ class DatabaseSink(BaseSink):
                 row_savepoint.commit()
             except (IntegrityError, DataError) as exc:
                 row_savepoint.rollback()
-                reason = f"Constraint violation: {exc.orig}"
+                reason = _constraint_failure_reason(exc)
                 # Populate the live diversion log BEFORE the marker commits, so
                 # the executor can route the diverted row with its real reason.
                 # If no on_write_failure policy is configured this raises inside
