@@ -1856,7 +1856,7 @@ class TestDataverseSourceLoadFetchXML:
 
         def validate_candidate(url: str, **_kwargs: Any) -> SSRFSafeRequest:
             if "fetchXml=" in url:
-                raise SSRFBlockedError("candidate rejected")
+                raise SSRFBlockedError("candidate rejected", kind="blocked_range")
             return _make_ssrf_safe(url)
 
         try:

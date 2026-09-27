@@ -52,9 +52,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.transforms.web_scrape_errors import (
     URL_FIELD_MISSING,
-    URL_HOST_UNRESOLVED,
     URL_NOT_A_STRING,
-    URL_REFUSED_BY_SSRF_POLICY,
     BodyTooLargeError,
     ClientError,
     ForbiddenError,
@@ -65,7 +63,8 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     ServerError,
     UnauthorizedError,
     WebScrapeError,
-    row_url_refusal,
+    row_url_policy_refusal,
+    row_url_value_refusal,
 )
 from elspeth.plugins.transforms.web_scrape_extraction import extract_content
 from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
@@ -496,7 +495,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b7051b6fc092d707"
+    source_file_hash: str | None = "sha256:2958fbbd405f4505"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -841,13 +840,13 @@ class WebScrapeTransform(BaseTransform):
         # Missing row fields, security violations, DNS failures, and invalid
         # URL value types are row-level validation failures, not retries.
         except SSRFBlockedError as e:
-            return TransformResult.error(row_url_refusal(URL_REFUSED_BY_SSRF_POLICY, e))
+            return TransformResult.error(row_url_policy_refusal(e))
         except SSRFNetworkError as e:
-            return TransformResult.error(row_url_refusal(URL_HOST_UNRESOLVED, e))
+            return TransformResult.error(row_url_policy_refusal(e))
         except TypeError as e:
-            return TransformResult.error(row_url_refusal(URL_NOT_A_STRING, e))
+            return TransformResult.error(row_url_value_refusal(URL_NOT_A_STRING, e))
         except KeyError as e:
-            return TransformResult.error(row_url_refusal(URL_FIELD_MISSING, e))
+            return TransformResult.error(row_url_value_refusal(URL_FIELD_MISSING, e))
 
         # Fetch URL using pinned IP (prevents DNS rebinding between validation and fetch)
         try:

@@ -205,7 +205,7 @@ def test_ssrf_blocks_file_scheme(transform, mock_ctx):
 
     assert result.status == "error"
     assert result.reason["error_type"] == "SSRFBlockedError"
-    assert "SSRF policy" in result.reason["error"]
+    assert result.reason["cause"] == "forbidden_scheme"
     # The refused URL is row data: the reason never repeats it (C3).
     assert "/etc/passwd" not in repr(result.reason)
 
@@ -229,6 +229,7 @@ def test_dns_failure_reason_does_not_name_the_host(transform, mock_ctx):
 
     assert result.status == "error"
     assert result.reason["reason"] == "validation_failed"
+    assert result.reason["cause"] == "dns_failed"
     assert result.reason["error"] == "the row's URL host could not be resolved"
     assert "sntlhost" not in repr(result.reason)
 
@@ -703,7 +704,7 @@ class TestRedirectAllowedRangesBehavior:
             ),
             patch(
                 "elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("Blocked IP range: 192.168.1.1"),
+                side_effect=SSRFBlockedError("Blocked IP range: 192.168.1.1", kind="blocked_range"),
             ),
             patch("httpx.Client") as httpx_client_factory,
         ):
@@ -740,7 +741,7 @@ class TestRedirectAllowedRangesBehavior:
             ),
             patch(
                 "elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf",
-                side_effect=SSRFBlockedError("Always-blocked IP range: 169.254.169.254"),
+                side_effect=SSRFBlockedError("Always-blocked IP range: 169.254.169.254", kind="always_blocked_range"),
             ),
             patch("httpx.Client") as httpx_client_factory,
         ):

@@ -4,7 +4,13 @@ Follows LLM plugin pattern: retryable errors are re-raised for engine
 RetryManager, non-retryable errors return TransformResult.error().
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 from elspeth.contracts.errors import PluginRetryableError, TransformErrorReason
+from elspeth.core.security.web import DNSFailureKind, SSRFRefusalKind
+from elspeth.core.security.web import NetworkError as SSRFNetworkError
+from elspeth.core.security.web import SSRFBlockedError as PolicySSRFBlockedError
 
 
 class WebScrapeError(PluginRetryableError):
@@ -97,17 +103,44 @@ class BodyTooLargeError(WebScrapeError):
 
 
 # Value-free audit text for a row URL refused before any fetch. The refusing
-# exceptions' own text names the URL, its host or the address it resolved to —
-# row data, which stays in the row carrier and never enters the reason. Each
-# except clause picks its sentence; error_type beside it keeps the class.
-URL_REFUSED_BY_SSRF_POLICY = (
-    "the row's URL is refused by the SSRF policy (malformed, forbidden scheme or credentials, or a blocked address)"
+# exceptions' own text names the URL, its scheme, host, hash or the address it
+# resolved to — row data, which stays in the row carrier and never enters the
+# reason. The policy's structured ``kind`` travels as ``cause`` (which check
+# refused: always-blocked vs blocked range, malformed, forbidden scheme, ...)
+# with one fixed sentence per kind.
+URL_POLICY_REFUSAL_TEXT: Mapping[SSRFRefusalKind | DNSFailureKind, str] = MappingProxyType(
+    {
+        "malformed_url": "the row's URL is malformed",
+        "invalid_port": "the row's URL has an invalid port",
+        "missing_scheme": "the row's URL has no scheme (expected http:// or https://)",
+        "credentials_in_url": "the row's URL carries credentials, which are not allowed",
+        "forbidden_scheme": "the row's URL uses a forbidden scheme (only http and https are allowed)",
+        "missing_hostname": "the row's URL has no hostname",
+        "port_zero": "the row's URL uses port 0, which is not allowed",
+        "unparseable_ip": "the row's URL host resolved to an unparseable address",
+        "always_blocked_range": "the row's URL host resolves to an always-blocked address range",
+        "blocked_range": "the row's URL host resolves to a blocked address range",
+        "archived_request_mismatch": "the row's URL does not match the archived request",
+        "dns_failed": "the row's URL host could not be resolved",
+        "dns_capacity_exhausted": "DNS resolution capacity was exhausted",
+        "dns_timeout": "DNS resolution of the row's URL host timed out",
+        "dns_no_addresses": "the row's URL host resolved to no addresses",
+    }
 )
-URL_HOST_UNRESOLVED = "the row's URL host could not be resolved"
 URL_NOT_A_STRING = "the row's URL value is not a string"
 URL_FIELD_MISSING = "the row has no URL field"
 
 
-def row_url_refusal(message: str, exc: Exception) -> TransformErrorReason:
-    """The validation_failed reason for a refused row URL: fixed message, exception class."""
+def row_url_policy_refusal(exc: PolicySSRFBlockedError | SSRFNetworkError) -> TransformErrorReason:
+    """The validation_failed reason for a row URL the SSRF policy or DNS refused."""
+    return {
+        "reason": "validation_failed",
+        "error": URL_POLICY_REFUSAL_TEXT[exc.kind],
+        "error_type": type(exc).__name__,
+        "cause": exc.kind,
+    }
+
+
+def row_url_value_refusal(message: str, exc: KeyError | TypeError) -> TransformErrorReason:
+    """The validation_failed reason for a row whose URL field is absent or not a string."""
     return {"reason": "validation_failed", "error": message, "error_type": type(exc).__name__}

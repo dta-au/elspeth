@@ -206,7 +206,7 @@ def test_blob_fetch_blocks_ssrf_rejected_urls(monkeypatch: pytest.MonkeyPatch) -
     from elspeth.plugins.transforms.blob_fetch import BlobFetch
 
     def _blocked(url: str, allowed_ranges=()) -> SSRFSafeRequest:
-        raise SSRFBlockedError(f"blocked: {url}")
+        raise SSRFBlockedError(f"blocked: {url}", kind="blocked_range")
 
     monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _blocked)
 

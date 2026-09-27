@@ -191,7 +191,7 @@ class TestDnsTimeoutEffectiveness:
         """SSRFBlockedError from resolver must propagate unwrapped."""
 
         def _ssrf_resolve(hostname: str) -> list[str]:
-            raise SSRFBlockedError("blocked by test")
+            raise SSRFBlockedError("blocked by test", kind="blocked_range")
 
         monkeypatch.setattr("elspeth.core.security.web._resolve_hostname", _ssrf_resolve)
 
@@ -303,7 +303,7 @@ class TestDnsTimeoutEffectiveness:
                 self.submitted += 1
                 future: Future[list[str]] = Future()
                 if self.submitted == 1:
-                    future.set_exception(NetworkError("resolver failure"))
+                    future.set_exception(NetworkError("resolver failure", kind="dns_failed"))
                 else:
                     future.set_result(["93.184.216.34"])
                 return future

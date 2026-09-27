@@ -561,6 +561,9 @@ drained and repair this release forward.
   error fetching <url>` — the last reached `node_states.error_json` with the
   query string unredacted), and an SSRF or DNS refusal no longer repeats the
   host or resolved address; the URL stays in the row and the recorded call.
+  Which check refused the URL (always-blocked vs blocked address range,
+  malformed, forbidden scheme, credentials, DNS failure, …) is kept, value-free,
+  as the reason's `cause`.
   The `llm` structured-output reasons no longer carry response content
   (`raw_response_preview` becomes `content_length`; a type mismatch drops
   `value`, an enum miss drops the value from its message, a missing field

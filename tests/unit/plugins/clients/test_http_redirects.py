@@ -632,7 +632,7 @@ class TestRedirectValidationFailuresPreserveEvidence:
             request=httpx.Request("GET", "http://93.184.216.34:80/start"),
         )
 
-        ssrf_validator.queue(SSRFBlockedError("blocked redirect"))
+        ssrf_validator.queue(SSRFBlockedError("blocked redirect", kind="blocked_range"))
         http_client._test_ephemeral_client.queue_get(redirect_response)
 
         with pytest.raises(SSRFBlockedError, match="blocked redirect"):

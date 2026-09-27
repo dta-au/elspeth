@@ -33,9 +33,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.transforms.web_scrape_errors import (
     URL_FIELD_MISSING,
-    URL_HOST_UNRESOLVED,
     URL_NOT_A_STRING,
-    URL_REFUSED_BY_SSRF_POLICY,
     BodyTooLargeError,
     ClientError,
     ForbiddenError,
@@ -46,7 +44,8 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     ServerError,
     UnauthorizedError,
     WebScrapeError,
-    row_url_refusal,
+    row_url_policy_refusal,
+    row_url_value_refusal,
 )
 
 DEFAULT_ALLOWED_CONTENT_TYPES: tuple[str, ...] = (
@@ -293,7 +292,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:535ec34f91d3f7d6"
+    source_file_hash: str | None = "sha256:5c5f3cb31af5a344"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -526,13 +525,13 @@ class BlobFetch(BaseTransform):
         # Missing row fields, security violations, DNS failures, and invalid
         # URL value types are row-level validation failures, not retries.
         except SSRFBlockedError as exc:
-            return TransformResult.error(row_url_refusal(URL_REFUSED_BY_SSRF_POLICY, exc))
+            return TransformResult.error(row_url_policy_refusal(exc))
         except SSRFNetworkError as exc:
-            return TransformResult.error(row_url_refusal(URL_HOST_UNRESOLVED, exc))
+            return TransformResult.error(row_url_policy_refusal(exc))
         except TypeError as exc:
-            return TransformResult.error(row_url_refusal(URL_NOT_A_STRING, exc))
+            return TransformResult.error(row_url_value_refusal(URL_NOT_A_STRING, exc))
         except KeyError as exc:
-            return TransformResult.error(row_url_refusal(URL_FIELD_MISSING, exc))
+            return TransformResult.error(row_url_value_refusal(URL_FIELD_MISSING, exc))
 
         try:
             response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
