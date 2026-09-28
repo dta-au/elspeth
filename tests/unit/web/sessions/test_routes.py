@@ -7467,7 +7467,7 @@ class TestRevertEndpoint:
             session.id,
             CompositionStateData(
                 sources={"source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}},
-                metadata_={"name": "before"},
+                metadata_={"name": "before", "description": ""},
                 is_valid=True,
             ),
             provenance="session_seed",
@@ -7477,7 +7477,7 @@ class TestRevertEndpoint:
             session.id,
             CompositionStateData(
                 sources={"source": {"plugin": "json", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}},
-                metadata_={"name": "after"},
+                metadata_={"name": "after", "description": ""},
                 is_valid=True,
             ),
             provenance="session_seed",
@@ -7493,7 +7493,7 @@ class TestRevertEndpoint:
         body = resp.json()
         assert body["version"] == 3
         # Should match v1's source, not v2's
-        assert body["sources"] == {"source": {"plugin": "csv"}}
+        assert body["sources"] == {"source": {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": "discard"}}
         # Lineage: new version derives from v1
         assert body["derived_from_state_id"] == str(v1.id)
 

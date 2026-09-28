@@ -4,8 +4,7 @@ Reads the SOURCE files under website/tutorial-site/, which is the GitHub Pages
 publish tree. Two kinds live there: the 3 scrape pages the tutorial
 fetches, which must be unmistakably marked test data, noindexed, and carry
 three tables whose values DIFFER across the three projects so the derived facts
-vary; and multi-doc-sections.json, the corpus the collector-authoring scenario
-prompt cites.
+vary; and multi-doc-sections.json, the published collector calibration corpus.
 """
 
 from __future__ import annotations
@@ -89,14 +88,9 @@ def test_synthetic_pages_have_distinct_project_names() -> None:
 
 
 # --- multi-doc-sections.json -------------------------------------------------
-# The collector-authoring scenario's canonical prompt cites
-# {base}/tutorial-site/multi-doc-sections.json. It is published from the same
-# tree as the 3 scrape pages, so the URL resolves like they do; the shape below
-# is what the corpus-register variant of that prompt describes (document id,
-# title, list of sections of text).
+# Published collector calibration input: document id, title, and sections.
 
 _MULTI_DOC = _WEBSITE / "multi-doc-sections.json"
-_COLLECTOR_SPEC = _ROOT / "src/elspeth/web/frontend/tests/e2e/tutorial-reliability.staging.spec.ts"
 
 
 def _load_multi_doc() -> dict:
@@ -131,16 +125,3 @@ def test_multi_doc_fixture_section_counts_differ() -> None:
 
 def test_frontend_public_tree_does_not_duplicate_multi_doc_fixture() -> None:
     assert not (_FRONTEND_PUBLIC / _MULTI_DOC.name).exists()
-
-
-def test_collector_scenario_prompt_url_resolves_to_a_published_file() -> None:
-    # Derived from the prompt itself rather than restated: the scenario's URL
-    # is the authority for what must be published, so a renamed fixture (or a
-    # renamed prompt target) fails here instead of 404-ing at run time.
-    import re
-
-    spec = _COLLECTOR_SPEC.read_text(encoding="utf-8")
-    cited = set(re.findall(r"https://dta-au\.github\.io/elspeth/tutorial-site/([\w.-]+)", spec))
-    assert cited, "collector scenario spec cites no tutorial-site URL"
-    for name in sorted(cited):
-        assert (_WEBSITE / name).exists(), f"{name} is cited by the collector scenario but not published"

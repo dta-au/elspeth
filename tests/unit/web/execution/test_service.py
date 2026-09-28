@@ -8174,20 +8174,7 @@ class TestBlobOwnership:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """Cross-session blob_ref raises ``BlobNotFoundError`` (IDOR collapse).
-
-        The exception type is load-bearing: the route handler relies
-        on cross-session and nonexistent blobs BOTH surfacing as
-        ``BlobNotFoundError`` so they produce byte-identical 404
-        responses.  Earlier this branch raised ``ValueError`` with a
-        "does not belong to session" message — a distinguishable
-        body AND a distinguishable status (404 vs the 500 that an
-        uncaught ``BlobNotFoundError`` produced for the nonexistent
-        case).  Do not revert to ``ValueError`` or add a specialised
-        subclass without also updating the route handler in
-        lockstep.
-        """
-        from elspeth.web.blobs.protocol import BlobNotFoundError
+        """The authoritative proof collapses cross-session custody to a generic rejection."""
 
         executing_session_id = uuid4()
         other_session_id = uuid4()
@@ -8210,8 +8197,11 @@ class TestBlobOwnership:
             "on_validation_failure": "quarantine",
         }
 
-        with pytest.raises(BlobNotFoundError):
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=executing_session_id)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert "session-owned path match" in str(exc_info.value)
+        assert str(other_session_id) not in str(exc_info.value)
 
         # Critical: create_run was never called (rejected before run creation)
         mock_session_service.create_run.assert_not_called()
@@ -8223,7 +8213,6 @@ class TestBlobOwnership:
         mock_session_service: MagicMock,
     ) -> None:
         """Cross-session blob_ref on a non-first named source preserves IDOR collapse."""
-        from elspeth.web.blobs.protocol import BlobNotFoundError
 
         executing_session_id = uuid4()
         other_session_id = uuid4()
@@ -8257,8 +8246,9 @@ class TestBlobOwnership:
             },
         }
 
-        with pytest.raises(BlobNotFoundError):
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=executing_session_id)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
 
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
@@ -8301,24 +8291,7 @@ class TestBlobOwnership:
 
 
 class TestBlobSourcePathReadGuard:
-    """Runtime read guard for composer-stored blob source paths.
-
-    The composer's write-side defenses make wrong-shape blob source paths
-    impossible to persist going forward, but the audit-integrity contract
-    also requires that runtime crash informatively if a previously-
-    persisted state row carries a path that disagrees with the canonical
-    ``BlobRecord.storage_path``.  Per docs/guides/data-trust-and-error-handling.md
-    §The Defensive Programming Prohibition,
-    the runtime must not silently coerce or fall back to ``FileNotFoundError``.
-
-    Bug-verification protocol (cf.
-    ``tests/integration/pipeline/test_composer_runtime_agreement.py``
-    module docstring lines 76-88): manually revert the
-    ``if stored_path != canonical_path: raise BlobSourcePathMismatchError``
-    block in ``ExecutionServiceImpl._execute_locked`` and confirm the
-    mismatch test below fails with the canonical-path branch silently
-    accepting the divergent stored path.  Then restore.
-    """
+    """Authoritative preflight rejects noncanonical blob paths before creating a run."""
 
     @pytest.mark.asyncio
     async def test_diverging_stored_path_raises_structured_error(
@@ -8326,21 +8299,7 @@ class TestBlobSourcePathReadGuard:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """Tier 1: stored path != blob.storage_path crashes at execute time.
-
-        Reproduces the captured staging defect (session
-        588b94c8-919c-43ab-ae2c-8a3033de8109): the persisted
-        ``source.options.path`` does not match the canonical
-        ``BlobRecord.storage_path``.  The captured shape was
-        ``data/blobs/<bid>/<filename>`` (rejected first by the source
-        path allowlist after the legacy resolver was removed); this test
-        exercises the divergence case where the path is allowlist-valid
-        but still not the canonical one (e.g. a stale absolute path
-        pointing at a different file under ``data_dir/blobs/``).  The
-        guard fires before the run record is created so the session is
-        not poisoned with a pending run.
-        """
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
+        """A stale allowlisted path is rejected before a run is created."""
 
         session_id = uuid4()
         blob_ref = str(uuid4())
@@ -8365,13 +8324,10 @@ class TestBlobSourcePathReadGuard:
             "on_validation_failure": "quarantine",
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.stored_path == diverging_path
-        assert exc_info.value.canonical_path == canonical_path
-        assert exc_info.value.blob_id == blob_ref
-        assert "bug in composer persistence" in str(exc_info.value)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert "session-owned path match" in str(exc_info.value)
 
         # Critical: create_run was never called — the session is not
         # poisoned with a pending run that the operator must clean up.
@@ -8386,15 +8342,7 @@ class TestBlobSourcePathReadGuard:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """Tier 1: stored path is None for a blob-backed source crashes.
-
-        A composition state with ``blob_ref`` set but no ``path`` is
-        structurally invalid — the blob binding requires the canonical
-        path to be present.  This branch protects against a regression
-        where a future composer-side bug omits the path entirely while
-        still persisting the blob_ref.
-        """
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
+        """A blob_ref with no stored path fails authoritative proof."""
 
         session_id = uuid4()
         blob_ref = str(uuid4())
@@ -8417,11 +8365,9 @@ class TestBlobSourcePathReadGuard:
             "on_validation_failure": "quarantine",
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.stored_path is None
-        assert exc_info.value.canonical_path == canonical_path
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
 
     @pytest.mark.asyncio
     async def test_named_blob_source_path_mismatch_raises_structured_error(
@@ -8430,7 +8376,6 @@ class TestBlobSourcePathReadGuard:
         mock_session_service: MagicMock,
     ) -> None:
         """Every named source blob_ref gets the same ownership/path guard."""
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
 
         session_id = uuid4()
         blob_ref = str(uuid4())
@@ -8456,11 +8401,9 @@ class TestBlobSourcePathReadGuard:
             }
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.stored_path == diverging_path
-        assert exc_info.value.canonical_path == canonical_path
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 
@@ -8471,7 +8414,6 @@ class TestBlobSourcePathReadGuard:
         mock_session_service: MagicMock,
     ) -> None:
         """A non-first named source must also match the canonical blob path."""
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
 
         session_id = uuid4()
         orders_blob = str(uuid4())
@@ -8505,12 +8447,9 @@ class TestBlobSourcePathReadGuard:
             },
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.blob_id == refunds_blob
-        assert exc_info.value.stored_path == refunds_diverging_path
-        assert exc_info.value.canonical_path == refunds_canonical_path
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 

@@ -355,7 +355,6 @@ async def test_cancellation_after_ordinary_accept_commit_drains_lease_cleanup(
     persisted = await service.get_authoritative_composition_proposal(
         session_id=UUID(session["id"]),
         proposal_id=proposal.id,
-        reviewed_facts=None,
     )
     assert persisted.row.status == "committed"
 

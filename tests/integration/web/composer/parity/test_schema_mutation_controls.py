@@ -258,8 +258,8 @@ async def test_freeform_drive_narrowed_advertised_schema_trips_gate_upstream_of_
     """
     real_terminal = planner_module.planner_terminal_tool_definition
 
-    def _narrowed_terminal(terminal_contract: Any = None, *, dialect: ToolContractDialect) -> dict[str, Any]:
-        definition = real_terminal(terminal_contract, dialect=dialect)
+    def _narrowed_terminal(*, dialect: ToolContractDialect) -> dict[str, Any]:
+        definition = real_terminal(dialect=dialect)
         _remove_fork_to(definition["function"]["parameters"]["properties"]["pipeline"])
         return definition
 

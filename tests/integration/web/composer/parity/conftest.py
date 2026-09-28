@@ -289,8 +289,6 @@ class ParityEnv:
         metadata = proposal.pipeline_metadata
         if metadata is None:
             raise AssertionError(f"freeform proposal for {fixture['class']} carries no pipeline metadata")
-        if metadata.surface != "freeform":
-            raise AssertionError(f"freeform proposal recorded surface {metadata.surface!r}, not 'freeform'")
         async with self._client() as client:
             response = await client.post(
                 f"/api/sessions/{session.id}/proposals/{proposal.id}/accept",

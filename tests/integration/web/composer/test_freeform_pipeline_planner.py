@@ -589,9 +589,10 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
 
     monkeypatch.setattr("litellm.acompletion", completion)
 
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
-    worker_finished = threading.Event()
+    worker_finished = asyncio.Event()
     original_run_sync = sessions._run_sync  # type: ignore[attr-defined]
 
     async def pause_create_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
@@ -599,13 +600,13 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
             return await original_run_sync(func, *args, **kwargs)
 
         def paused_create() -> Any:
-            worker_started.set()
+            loop.call_soon_threadsafe(worker_started.set)
             if not release_worker.wait(timeout=5.0):
                 raise TimeoutError("test did not release proposal creation worker")
             try:
                 return func(*args, **kwargs)
             finally:
-                worker_finished.set()
+                loop.call_soon_threadsafe(worker_finished.set)
 
         return await original_run_sync(paused_create)
 
@@ -620,13 +621,13 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
             user_message_id=str(user_message.id),
         )
     )
-    assert await asyncio.to_thread(worker_started.wait, 5.0), "proposal creation worker did not start"
+    await asyncio.wait_for(worker_started.wait(), timeout=5.0)
     compose_task.cancel()
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     cancellation_escaped_before_worker = compose_task.done()
     release_worker.set()
-    assert await asyncio.to_thread(worker_finished.wait, 5.0), "proposal creation worker did not finish"
+    await asyncio.wait_for(worker_finished.wait(), timeout=5.0)
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(compose_task, timeout=5.0)
@@ -639,7 +640,6 @@ async def test_cancellation_during_proposal_create_preserves_trust_mode_lifecycl
     authority = await sessions.get_authoritative_pipeline_proposal(
         session_id=session.id,
         proposal_id=proposals[0].id,
-        reviewed_facts={},
     )
     assert authority.row.status == expected_status
 
@@ -1084,9 +1084,10 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
 
     monkeypatch.setattr("litellm.acompletion", mutating_completion)
 
-    audit_worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    audit_worker_started = asyncio.Event()
     release_audit_worker = threading.Event()
-    audit_worker_finished = threading.Event()
+    audit_worker_finished = asyncio.Event()
     original_insert = sessions._insert_chat_message  # type: ignore[attr-defined]
 
     def pause_mismatch_audit_insert(*args: Any, **kwargs: Any) -> Any:
@@ -1094,10 +1095,10 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
         tool_calls = kwargs["tool_calls"]
         # Physical evidence already checkpointed; race the manifest-mismatch cohort.
         if kwargs["role"] == "audit" and tool_calls and tool_calls[0]["_kind"] == "planner_attempt_audit":
-            audit_worker_started.set()
+            loop.call_soon_threadsafe(audit_worker_started.set)
             if not release_audit_worker.wait(timeout=5.0):
                 raise TimeoutError("test did not release mismatch audit worker")
-            audit_worker_finished.set()
+            loop.call_soon_threadsafe(audit_worker_finished.set)
         return row_id
 
     monkeypatch.setattr(sessions, "_insert_chat_message", pause_mismatch_audit_insert)
@@ -1111,12 +1112,12 @@ async def test_freeform_manifest_mismatch_audit_write_defers_request_cancellatio
             user_message_id=str(user_message.id),
         )
     )
-    assert await asyncio.to_thread(audit_worker_started.wait, 5.0), "mismatch audit worker did not start"
+    await asyncio.wait_for(audit_worker_started.wait(), timeout=5.0)
     compose_task.cancel("request cancelled during mismatch audit persistence")
     await asyncio.sleep(0)
     cancellation_escaped_before_worker = compose_task.done()
     release_audit_worker.set()
-    assert await asyncio.to_thread(audit_worker_finished.wait, 5.0), "mismatch audit worker did not finish"
+    await asyncio.wait_for(audit_worker_finished.wait(), timeout=5.0)
 
     with pytest.raises(asyncio.CancelledError) as caught:
         await asyncio.wait_for(compose_task, timeout=5.0)
