@@ -1418,6 +1418,8 @@ async def _create_canonical_pipeline_route_proposal(
                     "profile": "task-role",
                     "system_prompt": "You rate CSV rows.",
                     "prompt_template": "Rate {{ row }}.",
+                    # The template renders the whole row, so it declares it (G3).
+                    "required_input_fields": [],
                     "schema": {"mode": "observed"},
                     "interpretation_requirements": [
                         {

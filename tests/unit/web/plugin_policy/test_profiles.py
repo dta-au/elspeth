@@ -2185,7 +2185,7 @@ def test_azure_profile_lowering_honors_deployment_derived_model_contract() -> No
     lowered = registry.lower_options(
         PluginId("transform", "llm"),
         alias="azure-task",
-        safe_options={"prompt_template": "Summarise {{ row }}", "schema": {"mode": "observed"}},
+        safe_options={"prompt_template": "Summarise {{ row }}", "required_input_fields": [], "schema": {"mode": "observed"}},
     )
     executable = deep_thaw(lowered.executable_options)
     executable["api_key"] = "resolved-secret"
@@ -2353,7 +2353,7 @@ def test_gateway_profile_lowering_round_trips_into_gateway_config() -> None:
     lowered = _profile_registry().lower_options(
         PluginId("transform", "llm"),
         alias="gateway-task",
-        safe_options={"prompt_template": "Summarise {{ row }}", "schema": {"mode": "observed"}},
+        safe_options={"prompt_template": "Summarise {{ row }}", "required_input_fields": [], "schema": {"mode": "observed"}},
     )
     executable = deep_thaw(lowered.executable_options)
     executable["api_key"] = "resolved-bearer-token"

@@ -483,7 +483,13 @@ class TestBatchRunAuditRecordsAlias:
     ``profile`` would be unsafe.
     """
 
-    _SAFE_OPTIONS: ClassVar[dict[str, object]] = {"prompt_template": "{{ row }}", "schema": {"mode": "observed"}}
+    # ``{{ row }}`` renders the whole row, so the transform must declare it
+    # (``required_input_fields: []`` keeps the whole row; G3 refuses the bare form).
+    _SAFE_OPTIONS: ClassVar[dict[str, object]] = {
+        "prompt_template": "{{ row }}",
+        "required_input_fields": [],
+        "schema": {"mode": "observed"},
+    }
 
     def test_resolved_run_config_contains_the_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
