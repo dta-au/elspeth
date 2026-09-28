@@ -2094,20 +2094,29 @@ class TestLifespanShutdown:
             surfaces.append(request.surface)
             return True
 
+        real_wait_for = asyncio.wait_for
+        timeouts: list[float] = []
+
+        async def _wait_with_delay(awaitable: Awaitable[bool], *, timeout: float) -> bool:
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                await asyncio.sleep(0.1)
+            return await real_wait_for(awaitable, timeout=timeout)
+
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
         with (
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
-            patch("elspeth.web.app.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for,
+            patch("elspeth.web.app.asyncio.wait_for", new=_wait_with_delay),
         ):
             async with lifespan(app):
                 pass
 
         assert surfaces == ["loop_tools", "planner_tools", "advisor"]
-        timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list]
         assert timeouts[:2] == [5.0, 5.0]
-        # The advisor gets what is left of the one deadline, not a timeout of
-        # its own: every probe returned at once, so almost all of it.
-        assert 44.0 < timeouts[2] <= 45.0
+        # The first probe consumed at least 0.1 seconds of the shared deadline.
+        # A fresh 45-second advisor timeout would fail this control.
+        assert len(timeouts) == 3
+        assert 0 < timeouts[2] < 44.95
 
     @pytest.mark.asyncio
     async def test_lifespan_caps_three_planner_role_probes_on_a_forwarding_hatch(self, monkeypatch, tmp_path) -> None:
@@ -2122,21 +2131,29 @@ class TestLifespanShutdown:
             surfaces.append(request.surface)
             return True
 
+        real_wait_for = asyncio.wait_for
+        timeouts: list[float] = []
+
+        async def _wait_with_delay(awaitable: Awaitable[bool], *, timeout: float) -> bool:
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                await asyncio.sleep(0.1)
+            return await real_wait_for(awaitable, timeout=timeout)
+
         monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
         with (
             patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
-            patch("elspeth.web.app.asyncio.wait_for", wraps=asyncio.wait_for) as wait_for,
+            patch("elspeth.web.app.asyncio.wait_for", new=_wait_with_delay),
         ):
             async with lifespan(app):
                 pass
 
         assert surfaces == ["loop_tools", "planner_tools", "hatch_terminal", "advisor"]
-        timeouts = [call.kwargs["timeout"] for call in wait_for.call_args_list]
         # Every planner-role probe is capped at min(remaining, 5 s); the
-        # advisor gets what is left of the one deadline after all three
-        # (every probe returned at once, so almost all of it).
+        # advisor gets what is left after the first probe's controlled delay.
         assert timeouts[:3] == [5.0, 5.0, 5.0]
-        assert 44.0 < timeouts[3] <= 45.0
+        assert len(timeouts) == 4
+        assert 0 < timeouts[3] < 44.95
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("rejected_surface", ["hatch_terminal", "planner_tools", "loop_tools", "advisor"])

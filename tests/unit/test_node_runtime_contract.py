@@ -120,6 +120,7 @@ def test_source_checkout_install_docs_use_locked_toolchains() -> None:
     paths = (
         REPO_ROOT / "README.md",
         REPO_ROOT / "CONTRIBUTING.md",
+        REPO_ROOT / "docs/guides/web-local-development.md",
         REPO_ROOT / "docs/guides/telemetry.md",
         REPO_ROOT / "docs/guides/tier2-tracing.md",
         REPO_ROOT / "docs/guides/troubleshooting.md",
@@ -139,13 +140,16 @@ def test_source_checkout_install_docs_use_locked_toolchains() -> None:
 
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     contributing = (REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    web_local = (REPO_ROOT / "docs/guides/web-local-development.md").read_text(encoding="utf-8")
     first_pipeline = (REPO_ROOT / "docs/guides/your-first-pipeline.md").read_text(encoding="utf-8")
     user_manual = (REPO_ROOT / "docs/guides/user-manual.md").read_text(encoding="utf-8")
     landscape_mcp = (REPO_ROOT / "docs/guides/landscape-mcp-analysis.md").read_text(encoding="utf-8")
     web_scrape = (REPO_ROOT / "docs/reference/web-scrape-transform.md").read_text(encoding="utf-8")
 
-    assert "Node.js 24 and npm 11" in readme
-    assert "npm --prefix src/elspeth/web/frontend ci" in readme
+    assert "uv sync --frozen" in readme
+    assert "[local web setup guide](docs/guides/web-local-development.md)" in readme
+    assert "Node.js 24 and npm 11" in web_local
+    assert "npm --prefix src/elspeth/web/frontend ci" in web_local
     assert "Node.js 24, and npm 11" in contributing
     assert "npm --prefix src/elspeth/web/frontend ci" in contributing
     assert "Python 3.12+" in first_pipeline
