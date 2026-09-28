@@ -22,9 +22,11 @@ import time
 from elspeth_llm_gateway import CONTRACT_MAJOR
 from elspeth_llm_gateway.core.config import GatewayConfig
 from elspeth_llm_gateway.core.contract import (
+    Bounds,
     ChatMessage,
     ChatRequest,
     ChatTool,
+    ChatToolCall,
     ResponseFormat,
     bounds_check,
     build_completion_response,
@@ -132,20 +134,43 @@ def _check_capabilities(request: ChatRequest, capabilities: frozenset[Capability
         raise GatewayError(GatewayErrorCode.CAPABILITY_UNSUPPORTED)
 
 
-def _validate_canonical_response(response: CanonicalResponse, request: ChatRequest) -> None:
+def _validate_canonical_response(response: CanonicalResponse, request: ChatRequest, bounds: Bounds) -> None:
     """Step 5's post-``parse_success`` validation.
 
     ``finish_reason`` is already pydantic-typed as ``FinishReason`` on
     ``CanonicalResponse``, so this ``isinstance`` check is defense-in-depth
     against an adapter that satisfies ``AdapterProtocol`` structurally
     (it is a ``runtime_checkable`` ``Protocol``, not an enforced base class)
-    without actually going through normal construction. Tool-call responses
-    are rejected unless the request itself declared tools.
+    without actually going through normal construction. A successful tool
+    response must also be valid as the assistant message in the caller's next
+    request; otherwise the gateway would emit a 200 that it cannot replay.
     """
+    if type(response) is not CanonicalResponse:
+        raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
     if not isinstance(response.finish_reason, FinishReason):
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
     if response.tool_calls and not request.tools:
         raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+    if not response.tool_calls and (
+        response.text is None or (response.text == "" and response.finish_reason is not FinishReason.CONTENT_FILTER)
+    ):
+        raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+    if response.text is not None and (type(response.text) is not str or len(response.text) > bounds.max_string_chars):
+        raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+
+    seen_ids = {call.id for message in request.messages for call in (message.tool_calls or [])}
+    for call in response.tool_calls:
+        try:
+            validated = ChatToolCall.model_validate(
+                {"id": call.call_id, "type": "function", "function": {"name": call.name, "arguments": call.arguments_json}}
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID) from None
+        if len(validated.function.arguments) > bounds.max_string_chars:
+            raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+        if validated.id in seen_ids:
+            raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID)
+        seen_ids.add(validated.id)
 
 
 class CompletionService:
@@ -218,7 +243,7 @@ class CompletionService:
                 canonical_response = self._adapter.parse_success(result.body if result.body is not None else {})
             except Exception:
                 raise GatewayError(GatewayErrorCode.UPSTREAM_RESPONSE_INVALID) from None
-            _validate_canonical_response(canonical_response, request)
+            _validate_canonical_response(canonical_response, request, self._config.bounds)
             return canonical_response
 
         # Step 6: classify_error.

@@ -328,6 +328,16 @@ async def test_capability_unsupported_returns_422_with_both_headers():
 
 
 @respx.mock
+async def test_oversized_integer_literal_is_invalid_request_not_internal_error():
+    raw = b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"n":' + b"9" * 5000 + b"}"
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", content=raw, headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@respx.mock
 async def test_happy_path_echoes_request_id_and_contract_header():
     _mock_token()
     respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))

@@ -101,6 +101,10 @@ def test_tool_batch_admission_accepts_a_real_litellm_tool_call() -> None:
             {"function": SimpleNamespace(name=12, arguments="{}")},
             "Composer tool batch contains malformed provider function metadata",
         ),
+        (
+            {"function": SimpleNamespace(name=" ", arguments="{}")},
+            "Composer tool batch contains blank provider function name",
+        ),
     ),
 )
 def test_tool_batch_admission_still_rejects_malformed_real_litellm_tool_calls(

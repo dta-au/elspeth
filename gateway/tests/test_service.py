@@ -366,6 +366,148 @@ async def test_tool_call_response_without_tools_requested_raises_upstream_respon
     assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
 
 
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        (CanonicalToolCall(call_id="", name="lookup", arguments_json="{}"),),
+        (CanonicalToolCall(call_id="c1", name="", arguments_json="{}"),),
+        (CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{"),),
+        (
+            CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}"),
+            CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}"),
+        ),
+    ],
+)
+@respx.mock
+async def test_unreplayable_tool_response_raises_upstream_response_invalid(client, tool_calls):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(
+        capabilities=frozenset({Capability.TEXT, Capability.TOOLS}),
+        parse_success_result=CanonicalResponse(text=None, tool_calls=tool_calls, finish_reason=FinishReason.TOOL_CALLS),
+    )
+    service = _service(_config(), adapter, client)
+    request = _chat_request(tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}])
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(request, "req-unreplayable-tool")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+
+
+@respx.mock
+async def test_tool_response_cannot_reuse_prior_conversation_call_id(client):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(
+        capabilities=frozenset({Capability.TEXT, Capability.TOOLS}),
+        parse_success_result=CanonicalResponse(
+            text=None,
+            tool_calls=(CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}"),),
+            finish_reason=FinishReason.TOOL_CALLS,
+        ),
+    )
+    service = _service(_config(), adapter, client)
+    request = _chat_request(
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        messages=[
+            {"role": "user", "content": "First lookup"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "found"},
+        ],
+    )
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(request, "req-reused-tool-id")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+
+
+@respx.mock
+async def test_empty_text_only_response_raises_upstream_response_invalid(client):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(parse_success_result=CanonicalResponse(text="", finish_reason=FinishReason.STOP))
+    service = _service(_config(), adapter, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(), "req-empty-text")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+
+
+@respx.mock
+async def test_screened_response_may_have_empty_text(client):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(parse_success_result=CanonicalResponse(text="", finish_reason=FinishReason.CONTENT_FILTER))
+    service = _service(_config(), adapter, client)
+
+    response = await service.complete(_chat_request(), "req-screened")
+
+    assert response["choices"][0]["message"]["content"] == ""
+    assert response["choices"][0]["finish_reason"] == "content_filter"
+
+
+@pytest.mark.parametrize("response_kind", ["text", "tool_arguments"])
+@respx.mock
+async def test_response_strings_must_fit_next_request_bounds(client, response_kind):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    long_text = "x" * 100
+    canonical = (
+        CanonicalResponse(text=long_text, finish_reason=FinishReason.STOP)
+        if response_kind == "text"
+        else CanonicalResponse(
+            text=None,
+            tool_calls=(CanonicalToolCall(call_id="c1", name="lookup", arguments_json=json.dumps({"q": long_text})),),
+            finish_reason=FinishReason.TOOL_CALLS,
+        )
+    )
+    adapter = FakeAdapter(capabilities=frozenset({Capability.TEXT, Capability.TOOLS}), parse_success_result=canonical)
+    service = _service(_config(ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS="40"), adapter, client)
+    request = _chat_request(tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}])
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(request, "req-oversized-response")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+
+
+@respx.mock
+async def test_tool_response_can_be_replayed_in_next_request(client):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+    adapter = FakeAdapter(
+        capabilities=frozenset({Capability.TEXT, Capability.TOOLS}),
+        parse_success_result=CanonicalResponse(
+            text="I will check.",
+            tool_calls=(CanonicalToolCall(call_id="c1", name="lookup", arguments_json='{"q":"x"}'),),
+            finish_reason=FinishReason.TOOL_CALLS,
+        ),
+    )
+    service = _service(_config(), adapter, client)
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+    response = await service.complete(_chat_request(tools=tools), "req-replayable-tool")
+    assistant = response["choices"][0]["message"]
+    continuation = _chat_request(
+        tools=tools,
+        messages=[
+            {"role": "user", "content": "Look it up"},
+            assistant,
+            {"role": "tool", "tool_call_id": "c1", "content": "found"},
+        ],
+    )
+
+    assert continuation.messages[1].tool_calls[0].id == "c1"
+    assert continuation.messages[2].tool_call_id == "c1"
+
+
 # --- step 6: classify_error / non-2xx -------------------------------------------
 
 

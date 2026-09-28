@@ -108,5 +108,9 @@ def parse_strict_json(raw: bytes, *, max_bytes: int) -> Any:
         raise
     except json.JSONDecodeError as exc:
         raise StrictJsonError("invalid_json") from exc
+    except ValueError as exc:
+        # CPython raises ValueError, rather than JSONDecodeError, when an
+        # integer literal exceeds its configured conversion digit limit.
+        raise StrictJsonError("invalid_json") from exc
     _check_finite(result)
     return result

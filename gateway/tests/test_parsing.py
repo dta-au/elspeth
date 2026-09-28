@@ -44,6 +44,18 @@ def test_normal_float_still_parses():
     assert parse_strict_json(b'{"t": 1.5}', max_bytes=100) == {"t": 1.5}
 
 
+def test_integer_over_python_digit_limit_is_a_strict_json_error():
+    raw = b'{"n":' + b"9" * 5000 + b"}"
+    with pytest.raises(StrictJsonError) as exc:
+        parse_strict_json(raw, max_bytes=10_000)
+    assert exc.value.reason == "invalid_json"
+
+
+def test_large_but_supported_integer_still_parses():
+    digits = "9" * 30
+    assert parse_strict_json(f'{{"n":{digits}}}'.encode(), max_bytes=100) == {"n": int(digits)}
+
+
 def test_deeply_nested_but_small_body_rejected_as_too_deep_not_recursion_error():
     """A deeply-nested-but-individually-tiny payload (well under max_bytes)
     must be rejected with StrictJsonError(reason="too_deep") -- never let a
