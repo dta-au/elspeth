@@ -287,6 +287,7 @@ test.describe("Composer deterministic workspace geometry", () => {
             completion: true,
             catalog: true,
             importYaml: false,
+            fullscreen: scenario !== "empty-freeform",
           });
           await expectIntendedPaneScrollers(page, {
             transcriptMustScroll: scenario === "populated-long-transcript",

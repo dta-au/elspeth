@@ -36,6 +36,8 @@ export const WORKSPACE_SCROLL_OWNERS = [
   // The active artifact tab panel — the one owner that may also scroll
   // horizontally (wide YAML, wide graphs).
   "artifact",
+  // Expanded Workflow Wiring table, capped so it does not consume the graph.
+  "wiring",
 ] as const;
 
 export type WorkspaceScrollOwner = (typeof WORKSPACE_SCROLL_OWNERS)[number];

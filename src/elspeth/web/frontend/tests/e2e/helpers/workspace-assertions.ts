@@ -41,6 +41,7 @@ export interface WorkspaceControlCapabilities {
   completion: boolean;
   catalog: boolean;
   importYaml: boolean;
+  fullscreen: boolean;
 }
 
 export async function boxWidth(locator: Locator): Promise<number> {
@@ -142,7 +143,7 @@ export async function expectPrimaryControlsInViewport(
   composer: ComposerPage,
   capabilities: WorkspaceControlCapabilities,
 ): Promise<void> {
-  for (const name of ["Workflow", "Spec", "YAML", "Run"] as const) {
+  for (const name of ["Workflow", "Approvals", "Spec", "YAML", "Run"] as const) {
     await expectControlReachable(composer.artifactTab(name));
   }
   // The Checks tab replaced the action-bar status chips; it is present in
@@ -159,15 +160,18 @@ export async function expectPrimaryControlsInViewport(
     await expect(control).toHaveCount(present ? 1 : 0);
     if (present) await expectControlReachable(control);
   }
-  // The catalog trigger lives in the artifact toolbar beside Focus graph
-  // since the More-actions popover retired (2026-08-15 UX review).
+  // The catalog trigger lives in the artifact toolbar. Fullscreen is a
+  // Workflow canvas control and exists only when a pipeline can be drawn.
   await expect(composer.catalogButton()).toHaveCount(
     capabilities.catalog ? 1 : 0,
   );
   if (capabilities.catalog) {
     await expectControlReachable(composer.catalogButton());
   }
-  await expectControlReachable(composer.focusGraph());
+  await expect(composer.focusGraph()).toHaveCount(capabilities.fullscreen ? 1 : 0);
+  if (capabilities.fullscreen) {
+    await expectControlReachable(composer.focusGraph());
+  }
 
   await expectControlReachable(composer.collapseAuthoring());
   await composer.collapseAuthoring().click();

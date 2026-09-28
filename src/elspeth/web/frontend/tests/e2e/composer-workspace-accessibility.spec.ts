@@ -110,7 +110,6 @@ test.describe("Composer workspace browser accessibility", () => {
         "separator",
         "artifact",
         "action-bar",
-        "inspector",
       ]);
 
       const authoring = await composer.authoringPane().boundingBox();
@@ -148,11 +147,15 @@ test.describe("Composer workspace browser accessibility", () => {
     );
     try {
       const graph = composer.artifactTab("Workflow");
+      const approvals = composer.artifactTab("Approvals");
       const spec = composer.artifactTab("Spec");
       const run = composer.artifactTab("Run");
       await expect(spec).toBeEnabled();
       await graph.focus();
       await graph.press("ArrowRight");
+      await expect(approvals).toBeFocused();
+      await expect(approvals).toHaveAttribute("aria-selected", "true");
+      await approvals.press("ArrowRight");
       await expect(spec).toBeFocused();
       await expect(spec).toHaveAttribute("aria-selected", "true");
       await spec.press("End");

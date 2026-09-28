@@ -350,6 +350,8 @@
 }
 
 .graph-detail-table-scroll {
+  --scroll-owner: wiring;
+
   max-height: 12rem;
   overflow: auto;
 }

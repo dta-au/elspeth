@@ -100,11 +100,13 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
       try {
         const session = await createSession(ctx, "pw-3b-graph-open-close");
         sessionId = session.id;
+        await seedExportableCompositionState(ctx, sessionId);
         const composer = new ComposerPage(page);
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
-        await page.getByRole("button", { name: "Fullscreen" }).click();
+        await expect(composer.focusGraph()).toBeVisible();
+        await composer.focusGraph().click();
 
         const dialog = page.getByRole("dialog", { name: /pipeline graph/i });
         await expect(dialog).toBeVisible();
