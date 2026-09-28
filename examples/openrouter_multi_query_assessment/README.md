@@ -63,7 +63,7 @@ Enable the optional JSONL change journal for an append-only backup stream:
 uv run elspeth run -s examples/openrouter_multi_query_assessment/settings_journal.yaml --execute
 ```
 
-The journal is disabled by default. See [JSONL Change Journal](../../README.md#jsonl-change-journal-optional) for configuration details.
+The journal is disabled by default. See [JSONL Change Journal](../../docs/reference/configuration.md#jsonl-change-journal) for configuration details.
 
 ## Model Selection
 

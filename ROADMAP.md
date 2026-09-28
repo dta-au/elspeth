@@ -1,4 +1,4 @@
-# ELSPETH roadmap
+# ELSPETH roadmap (planning snapshot)
 
 The proposed delivery path is to prepare a controlled pilot, complete the
 platform and identity changes needed for durable use, and establish the
@@ -8,14 +8,15 @@ The first decision is whether users can join a named pilot with an agreed
 data-disposal date, or need their data retained from the outset. This decision
 is required before any onboarding commitment.
 
-**Planning basis:** [Work package inventory, 3 September 2026](docs/project-control/2026-09-03-work-packages.md).
-Supplemented by the [web API seam design, 8 September 2026](docs/specs/2026-09-08-application-api-seam-design.md)
-the [Composer wires remediation plan, 8 September 2026](docs/plans/2026-09-08-composer-wires-campaign.md)
-and the compiler specifications linked below.
+**Planning basis:** a maintainer work-package assessment dated 3 September
+2026. The source assessment is not published in a repository clone; see
+[project control](docs/project-control/README.md) for access information.
+The [web API seam design, 8 September 2026](docs/specs/2026-09-08-application-api-seam-design.md)
+and the compiler specifications linked below supplement that assessment.
 Multi-replica implementation remediation also draws on the
 [0.8.0 changelog](CHANGELOG.md#080---2026-09-07-unified-lineage-and-production-hardening)
 and the
-[0.8.1 changelog](CHANGELOG.md#081---2026-09-10-coordination-clock-correctness-and-deployment-hardening).
+[0.8.1 changelog](CHANGELOG.md#081---2026-09-10-replica-recovery-and-deployment-hardening).
 This roadmap summarises their scope and proposed dependencies. It
 does not report current completion status; work may have progressed since the
 assessment. Delivery dates are not committed. Confirm remaining scope against
@@ -167,6 +168,6 @@ The source assigns engineering rulings to the maintainer. It records the
 accountable authority for scope, milestone commitments and release as not
 assigned. It sets the next review at the onboarding decision or 3 October 2026.
 
-Detailed dependencies, risks and assumptions remain in the
-[work package inventory](docs/project-control/2026-09-03-work-packages.md) and its
-[companion register](docs/project-control/2026-09-03-implementation-raid-register.md).
+The underlying work-package inventory and risk register are maintained outside
+the published repository. See [project control](docs/project-control/README.md)
+for access information.
