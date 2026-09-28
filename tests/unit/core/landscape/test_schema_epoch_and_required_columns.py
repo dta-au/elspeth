@@ -52,9 +52,9 @@ def test_epoch_is_forty_seven() -> None:
     # Epoch 43 gives every digest column a shape CHECK (SQLite ignores VARCHAR width).
     # Epoch 44 adds replay/verify evidence. Epoch 45 records collector-group failures.
     # Epoch 46 stores each valid source row's exact contract.
-    # Epoch 47 gives source quarantine a durable PENDING_SINK handoff, deletes
+    # Epoch 48 gives source quarantine a durable PENDING_SINK handoff, deletes
     # source-row replay, and admits the resume_refused coordination event.
-    assert SQLITE_SCHEMA_EPOCH == 47
+    assert SQLITE_SCHEMA_EPOCH == 48
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
 
 

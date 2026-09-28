@@ -208,7 +208,7 @@ class TestRunCoordinationEvents:
         ],
     )
     def test_every_event_type_is_accepted(self, engine: Engine, event_type: str) -> None:
-        """All design-§A.2 event types — including the slice-4 producers — and epoch 47's resume_refused pass the CHECK."""
+        """All design-§A.2 event types — including the slice-4 producers — and epoch 48's resume_refused pass the CHECK."""
         self._insert_event(engine, event_id=f"ev-{event_type}", event_type=event_type)
 
     def test_unknown_event_type_is_rejected(self, engine: Engine) -> None:

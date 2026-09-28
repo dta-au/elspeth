@@ -466,7 +466,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        2026-09-26, no bump; a store created before the fold carries the
 #        narrower CHECK and startup shape validation refuses it). Populated
 #        epoch-45 stores require delete/recreate.
-#  47 → A source-quarantined row is handed to its sink through a durable
+#  48 → A source-quarantined row is handed to its sink through a durable
 #        PENDING_SINK work item written in its ingest transaction (the fifth
 #        pending_sink_bundle_clause arm), resume re-drives only scheduler work
 #        and never re-derives a row, and the run_coordination_events
@@ -476,7 +476,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        item that the new resume refuses as corruption, so only a bump — not
 #        a fold — keeps such a store from opening. Populated epoch-46 stores
 #        require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 47
+SQLITE_SCHEMA_EPOCH = 48
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -1295,7 +1295,7 @@ run_coordination_events_table = Table(
     Column("context_json", Text, nullable=False, server_default=text("'{}'")),
     # All 10 event types from the design DDL (§A.2), including the slice-4
     # producers worker_stalled and heartbeat_degraded — pinned into the
-    # epoch-21 CHECK now so slice 4 needs no schema change — plus epoch 47's
+    # epoch-21 CHECK now so slice 4 needs no schema change — plus epoch 48's
     # resume_refused: the resuming leader's value-free record of a run whose
     # tokens resume cannot account for (SchedulerLeaseRepository.verify_resume_coverage).
     CheckConstraint(
