@@ -24,6 +24,7 @@ from elspeth.core.landscape.schema import (
     aggregation_results_table,
     artifacts_table,
     batches_table,
+    call_verifications_table,
     checkpoints_table,
     metadata,
     node_states_table,
@@ -37,7 +38,7 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
-def test_epoch_is_forty_six() -> None:
+def test_epoch_is_forty_seven() -> None:
     # Epoch 37 (elspeth-07cd19ba73, pluggable SSO) widened the auth provider
     # CHECKs. Epoch 38 (elspeth-2d436dd6e8, elspeth-5d66fc5ed1): scheduler_events
     # gains an AUTOINCREMENT ``seq`` primary key that every reader orders by,
@@ -52,8 +53,12 @@ def test_epoch_is_forty_six() -> None:
     # Epoch 43 gives every digest column a shape CHECK (SQLite ignores VARCHAR width).
     # Epoch 44 adds replay/verify evidence. Epoch 45 records collector-group failures.
     # Epoch 46 stores each valid source row's exact contract.
-    assert SQLITE_SCHEMA_EPOCH == 46
+    # Epoch 47 gives verification reads indexed run ordering and parent checks.
+    assert SQLITE_SCHEMA_EPOCH == 47
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
+    assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)
+    index = next(index for index in call_verifications_table.indexes if index.name == "ix_call_verifications_run")
+    assert [column.name for column in index.columns] == ["current_run_id", "recorded_at", "current_call_id"]
 
 
 def test_epoch_45_collector_group_failure_reason_is_the_closed_vocabulary() -> None:

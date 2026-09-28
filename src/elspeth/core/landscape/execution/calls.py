@@ -926,15 +926,15 @@ class CallAuditRepository:
         )
 
     def get_verification_decision(self, current_call_id: str) -> CallVerification | None:
-        with self._db.engine.connect() as conn:
+        with self._db.read_only_connection() as conn:
             return get_verification_decision(conn, current_call_id)
 
     def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
-        with self._db.engine.connect() as conn:
+        with self._db.read_only_connection() as conn:
             return get_verification_decisions_for_run(conn, current_run_id)
 
     def iter_verification_decisions_for_run(self, current_run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
-        with self._db.engine.connect() as conn:
+        with self._db.read_only_connection() as conn:
             yield from iter_verification_decisions_for_run(conn, current_run_id, batch_size=batch_size)
 
     def find_call_by_request_hash(

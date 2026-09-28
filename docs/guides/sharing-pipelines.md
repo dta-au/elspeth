@@ -71,7 +71,7 @@ accept this trade-off.
 
 For 0.8.1, shareable-review state is part of the broader web session database
 contract. The candidate currently expects `SESSION_SCHEMA_EPOCH=71` and
-`SQLITE_SCHEMA_EPOCH=46`; confirm both against the deployed service's live
+`SQLITE_SCHEMA_EPOCH=47`; confirm both against the deployed service's live
 schema constants before recreating a store. Landscape epoch 30 adds durable
 row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public

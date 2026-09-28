@@ -52,7 +52,7 @@ Audit and Graduation steps.
 Session epoch 71 removes mode-specific operation state and adds mode-neutral
 durable receipts for session fork and state revert. Earlier Sessions stores
 must be recreated; there is no compatibility reader or in-place migration.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 46 for immutable web
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 47 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective
@@ -77,16 +77,20 @@ of sparse source streams. Its scheduler event vocabulary also includes
 `resume_requeue_failed`; a Landscape store created from an earlier 0.8.1
 pre-release build at epoch 46 has the narrower `event_type` CHECK and is
 refused at startup; recreate it.
+Epoch 47 indexes verification decisions by run, time, and call ID for bounded
+exports and indexes node states by run to detect misplaced verdicts without a
+full verification-table scan. Populated epoch-46 Landscape stores must be
+recreated.
 These changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 71 (including epoch 70) and Landscape databases below epoch 46 must be
+epoch 71 (including epoch 70) and Landscape databases below epoch 47 must be
 recreated together.
 Startup accepts an empty database or an existing database matching the exact
-current schema epoch (session 71, Landscape 46); these are not minimum versions.
+current schema epoch (session 71, Landscape 47); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service

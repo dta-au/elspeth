@@ -2453,7 +2453,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 46
+### Landscape schema epoch 47
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2523,14 +2523,17 @@ even though it reports epoch 46; recreate it.
 Epoch 46 stores each valid source row's exact contract in `rows.source_contract_json`.
 Replay and verify use that row-level evidence when sparse sources add fields
 after the first row; older Landscape stores must be recreated.
+Epoch 47 gives verification exports an index ordered by run, recorded time,
+and call ID, and indexes node states by run for corrupt verdict ownership
+checks. Populated epoch-46 stores must be recreated.
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-46, either automatically at startup or through an operator migration command.
+47, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-46 database.
+an older epoch must not be rolled back over an epoch-47 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

@@ -800,6 +800,7 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("calls", "ix_calls_operation_call_index_unique"),
     ("calls", "ix_calls_approved_prompt_artifact_hash"),
     ("call_verifications", "ix_call_verifications_run"),
+    ("node_states", "ix_node_states_run"),
     ("checkpoints", "ix_checkpoints_run_sequence_unique"),
     ("preflight_results", "ix_preflight_results_run"),
     ("token_outcomes", "ix_token_outcomes_terminal_unique"),
