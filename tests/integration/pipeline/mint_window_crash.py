@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,7 @@ from elspeth.contracts import RunStatus
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.landscape.data_flow.tokens import RowTokenRepository
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 from elspeth.core.landscape.schema import (
     runs_table,
     token_outcomes_table,
@@ -294,47 +295,124 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     return sorted((json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()), key=json.dumps)
 
 
-def scenario_mint_window_death_resumes_to_the_clean_image(tmp_path: Path, *, window_name: str, db_url: str) -> None:
-    window = WINDOWS[window_name]
+def _die_after_mint(tmp_path: Path, window: MintWindow, db_url: str) -> Path:
+    """Write the window's settings and run them in a child that dies right after the aimed mint commits."""
     settings = write_settings(tmp_path, window.pipeline, db_url)
     child = multiprocessing.get_context("spawn").Process(target=_die_after_mint_child, args=(str(settings), window.verb, window.call))
     child.start()
     child.join(timeout=300)
     assert child.exitcode == 137, f"the run did not die after {window.verb} #{window.call}: exit {child.exitcode}"
+    return settings
+
+
+def _resume_to_the_clean_image(db: LandscapeDB, tmp_path: Path, settings: Path, window: MintWindow, image: CrashImage) -> None:
+    """A real resume finishes the run exactly as a clean run of the same settings does."""
+    result = CliRunner().invoke(app, ["resume", image.run_id, "-s", str(settings), "--execute"])
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output, result.output
+    with db.connection() as conn:
+        status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == image.run_id)).scalar_one()
+        tokens = set(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == image.run_id)).scalars())
+        completed = [
+            str(token_id)
+            for token_id in conn.execute(
+                select(token_outcomes_table.c.token_id)
+                .where(token_outcomes_table.c.run_id == image.run_id)
+                .where(token_outcomes_table.c.completed == 1)
+            ).scalars()
+        ]
+        open_items = conn.execute(
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == image.run_id)
+            .where(token_work_items_table.c.status.in_(_OPEN))
+        ).all()
+    assert status == RunStatus.COMPLETED.value
+    # Every token reaches exactly one recorded terminal outcome and no work is left open.
+    assert sorted(completed) == sorted(tokens)
+    assert open_items == []
+    # The committed products were reconciled, not re-minted: each finished,
+    # and the run holds exactly the tokens a clean run of these settings mints.
+    assert image.products <= tokens
+    assert len(tokens) == window.clean_tokens
+    # One publication per result row, the rows a clean run writes.
+    assert _rows(tmp_path / "out" / "out.jsonl") == sorted(window.clean_rows, key=json.dumps)
+
+
+def scenario_mint_window_death_resumes_to_the_clean_image(tmp_path: Path, *, window_name: str, db_url: str) -> None:
+    window = WINDOWS[window_name]
+    settings = _die_after_mint(tmp_path, window, db_url)
 
     db = LandscapeDB.from_url(db_url, create_tables=False)
     try:
         image = assert_crash_image(db, window)
         _lapse_dead_run(db, image.run_id)
+        _resume_to_the_clean_image(db, tmp_path, settings, window, image)
+    finally:
+        db.close()
 
-        result = CliRunner().invoke(app, ["resume", image.run_id, "-s", str(settings), "--execute"])
-        assert result.exit_code == 0, result.output
-        assert "Traceback" not in result.output, result.output
+
+def _die_after_lease_recovery_child(settings: str, run_id: str) -> None:
+    """Spawned child: a real resume whose process dies right after its lease sweep returns expired LEASED work to READY."""
+    original = SchedulerLeaseRepository.recover_expired_leases
+
+    def recover_then_die(self: SchedulerLeaseRepository, *args: Any, **kwargs: Any) -> int:
+        recovered = original(self, *args, **kwargs)
+        if recovered > 0:
+            os._exit(137)
+        return recovered
+
+    pytest.MonkeyPatch().setattr(SchedulerLeaseRepository, "recover_expired_leases", recover_then_die)
+    app(["resume", run_id, "-s", settings, "--execute"], standalone_mode=False)
+    os._exit(0)
+
+
+def scenario_resume_death_after_lease_recovery_resumes_to_the_clean_image(tmp_path: Path, *, db_url: str) -> None:
+    """A second crash leaves the products under a READY producer; the next resume still counts them covered.
+
+    The run dies after ``fork_token`` commits (products with no item under a
+    LEASED fork parent). The first resume's drain maintenance returns that
+    expired lease to READY (``recover_expired_leases``) and the process dies
+    before re-driving the parent. The products now sit under a READY producer
+    only, which is the image the READY arm of the coverage check's open
+    producer set exists for (review QR r2, F1): without it the second resume
+    refuses a healthy run.
+    """
+    window = WINDOWS["fork"]
+    settings = _die_after_mint(tmp_path, window, db_url)
+
+    db = LandscapeDB.from_url(db_url, create_tables=False)
+    try:
+        first_image = assert_crash_image(db, window)
+        _lapse_dead_run(db, first_image.run_id)
+
+        resume = multiprocessing.get_context("spawn").Process(
+            target=_die_after_lease_recovery_child, args=(str(settings), first_image.run_id)
+        )
+        resume.start()
+        resume.join(timeout=300)
+        assert resume.exitcode == 137, f"the first resume did not die after returning a lease to READY: exit {resume.exitcode}"
+
+        # The same products, now under a producer whose only item is READY: no
+        # LEASED or BLOCKED parent item is left to cover them by another arm.
+        image = assert_crash_image(db, replace(window, producer_status=TokenWorkStatus.READY.value))
+        assert image.products == first_image.products
         with db.connection() as conn:
-            status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == image.run_id)).scalar_one()
-            tokens = set(conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.run_id == image.run_id)).scalars())
-            completed = [
-                str(token_id)
-                for token_id in conn.execute(
-                    select(token_outcomes_table.c.token_id)
-                    .where(token_outcomes_table.c.run_id == image.run_id)
-                    .where(token_outcomes_table.c.completed == 1)
+            parent_statuses = set(
+                conn.execute(
+                    select(token_work_items_table.c.status)
+                    .where(token_work_items_table.c.run_id == image.run_id)
+                    .where(
+                        token_work_items_table.c.token_id.in_(
+                            select(token_parents_table.c.parent_token_id)
+                            .where(token_parents_table.c.run_id == image.run_id)
+                            .where(token_parents_table.c.token_id.in_(image.products))
+                        )
+                    )
                 ).scalars()
-            ]
-            open_items = conn.execute(
-                select(token_work_items_table.c.work_item_id)
-                .where(token_work_items_table.c.run_id == image.run_id)
-                .where(token_work_items_table.c.status.in_(_OPEN))
-            ).all()
-        assert status == RunStatus.COMPLETED.value
-        # Every token reaches exactly one recorded terminal outcome and no work is left open.
-        assert sorted(completed) == sorted(tokens)
-        assert open_items == []
-        # The committed products were reconciled, not re-minted: each finished,
-        # and the run holds exactly the tokens a clean run of these settings mints.
-        assert image.products <= tokens
-        assert len(tokens) == window.clean_tokens
-        # One publication per result row, the rows a clean run writes.
-        assert _rows(tmp_path / "out" / "out.jsonl") == sorted(window.clean_rows, key=json.dumps)
+            )
+        assert parent_statuses == {TokenWorkStatus.READY.value}, parent_statuses
+
+        _lapse_dead_run(db, image.run_id)
+        _resume_to_the_clean_image(db, tmp_path, settings, window, image)
     finally:
         db.close()

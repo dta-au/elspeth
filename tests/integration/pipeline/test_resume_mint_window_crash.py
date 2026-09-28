@@ -15,10 +15,20 @@ from pathlib import Path
 
 import pytest
 
-from tests.integration.pipeline.mint_window_crash import WINDOWS, scenario_mint_window_death_resumes_to_the_clean_image
+from tests.integration.pipeline.mint_window_crash import (
+    WINDOWS,
+    scenario_mint_window_death_resumes_to_the_clean_image,
+    scenario_resume_death_after_lease_recovery_resumes_to_the_clean_image,
+)
 
 
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("window_name", sorted(WINDOWS))
 def test_mint_window_death_resumes_to_the_clean_image(tmp_path: Path, window_name: str) -> None:
     scenario_mint_window_death_resumes_to_the_clean_image(tmp_path, window_name=window_name, db_url=f"sqlite:///{tmp_path / 'audit.db'}")
+
+
+@pytest.mark.timeout(600)
+def test_resume_death_after_lease_recovery_resumes_to_the_clean_image(tmp_path: Path) -> None:
+    """A product whose producer's only item is READY is covered (the READY arm of the open-producer set)."""
+    scenario_resume_death_after_lease_recovery_resumes_to_the_clean_image(tmp_path, db_url=f"sqlite:///{tmp_path / 'audit.db'}")
