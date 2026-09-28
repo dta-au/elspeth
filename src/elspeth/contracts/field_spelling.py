@@ -524,9 +524,10 @@ def header_spelled_declarations(
     ``present`` is the upstream's guaranteed fields; ``forwarded`` is the part
     of it the consumer carries onto its output (``present`` minus the fields
     the consumer removes, empty when it forwards nothing), which is what a
-    created name can shadow. ``resolution`` is the upstream's name resolution
-    at the consumer: the renames of every source whose rows reach it, followed
-    through every transform rename on the way (``upstream_name_resolution``).
+    created name can shadow. ``resolution`` is THIS upstream's name resolution:
+    the renames of every source whose rows reach it, followed through every
+    transform rename on the way — never the union over a fan-in consumer's
+    other upstreams, whose aliases name none of this upstream's fields.
 
     A READ declaration (a field the node looks up on arriving rows) is refused
     only when the upstream vote is PARTICIPATING and CLOSED. The predicate's

@@ -180,7 +180,14 @@ drained and repair this release forward.
   `elspeth validate` and the Composer admitted it. The build and the Composer
   resolve a declaration through the `field_mapping` of every source whose rows
   reach the node, followed through every transform rename on the way; the run
-  time resolves it through the row's own contract, exactly as a lookup does. A
+  time resolves it through the row's own contract, exactly as a lookup does.
+  Where several upstreams meet (two sources or arms writing to one sink), each
+  upstream is checked through the renames on its own path only, narrowing
+  this rule's build refusal: an alias one arm's `field_mapping: {name: b}`
+  gives `b` no longer refuses an optional `name` against a `b` another arm
+  carries (a false refusal of a pipeline that runs), and the Composer no
+  longer checks a sink declaration against a producer that reaches the sink
+  only through `on_error`, which the build never did. A
   `field_mapper` rename carries the field's original header onto its new name,
   so behind `{name: c}` (or a source `{name: b}` then `{b: c}`) a declaration
   `Name` names `c` and is refused at validation ("... a transform upstream

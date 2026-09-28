@@ -15,12 +15,14 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.enums import NodeType, RoutingMode
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.core.dag import schema_validation
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import GraphValidationError, NodeInfo
 
 _FIXED_ID_NAME: dict[str, object] = {"mode": "fixed", "fields": ["id: str", "name: str"]}
 _FLEXIBLE_ID_NAME: dict[str, object] = {"mode": "flexible", "fields": ["id: str", "name: str"]}
+_FIXED_ID_B: dict[str, object] = {"mode": "fixed", "fields": ["id: str", "b: str"]}
 
 
 def _graph(
@@ -143,6 +145,65 @@ class TestCreatedNames:
         graph = _graph(source_schema={"mode": "observed"}, creates=frozenset({"Name"}), passes_through_input=True)
 
         schema_validation.validate_declared_field_spellings(graph)
+
+
+class TestFanInPredecessors:
+    """At a fan-in consumer each predecessor's vote is checked through THAT predecessor's resolution.
+
+    Arm A's source renames ``name`` -> ``b`` and a transform then drops ``b``;
+    arm B's source carries a ``b`` of its own. A row from B cannot resolve
+    ``name`` to ``b`` and a row from A no longer carries ``b``, so an optional
+    ``name`` is a spelling of nothing either arm delivers.
+    """
+
+    def _fan_in(self, *, b_renames: SourceFieldRenames = NO_SOURCE_RENAMES, a_drops_b: bool = True) -> ExecutionGraph:
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src_a",
+            node_type=NodeType.SOURCE,
+            plugin_name="csv",
+            config={"schema": _FIXED_ID_B},
+            field_renames=SourceFieldRenames(mapping={"name": "b"}, keys="normalized"),
+        )
+        graph.add_node("src_b", node_type=NodeType.SOURCE, plugin_name="csv", config={"schema": _FIXED_ID_B}, field_renames=b_renames)
+        graph.add_node(
+            "sink",
+            node_type=NodeType.SINK,
+            plugin_name="json",
+            config={"schema": {"mode": "observed"}},
+            declared_read_fields=frozenset({"name"}),
+        )
+        if a_drops_b:
+            graph.add_node(
+                "drop_b",
+                node_type=NodeType.TRANSFORM,
+                plugin_name="field_mapper",
+                # A select_only mapper keeping 'id': its rows carry 'id' alone.
+                config={"schema": {"mode": "fixed", "fields": ["id: str"]}},
+            )
+            graph.add_edge("src_a", "drop_b", label="continue", mode=RoutingMode.MOVE)
+            graph.add_edge("drop_b", "sink", label="continue", mode=RoutingMode.MOVE)
+        else:
+            graph.add_edge("src_a", "sink", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("src_b", "sink", label="continue", mode=RoutingMode.MOVE)
+        return graph
+
+    def test_an_alias_from_one_arm_does_not_match_another_arms_field(self) -> None:
+        schema_validation.validate_declared_field_spellings(self._fan_in())
+
+    def test_the_arm_that_renames_and_carries_the_field_is_still_refused(self) -> None:
+        with pytest.raises(GraphValidationError, match="'name' is a header spelling of 'b'") as exc_info:
+            schema_validation.validate_declared_field_spellings(self._fan_in(a_drops_b=False))
+
+        assert "upstream 'src_a'" in str(exc_info.value)
+
+    def test_an_arm_whose_own_source_renames_the_field_is_still_refused(self) -> None:
+        with pytest.raises(GraphValidationError, match="'name' is a header spelling of 'b'") as exc_info:
+            schema_validation.validate_declared_field_spellings(
+                self._fan_in(b_renames=SourceFieldRenames(mapping={"name": "b"}, keys="normalized"))
+            )
+
+        assert "upstream 'src_b'" in str(exc_info.value)
 
 
 def test_it_speaks_before_the_missing_field_checks() -> None:

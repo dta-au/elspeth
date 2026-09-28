@@ -1136,3 +1136,60 @@ def test_the_mapped_header_follows_a_rename_of_the_mapping_target(tmp_path: Path
     )
 
     assert "'x' is a header spelling of 'c'" in output
+
+
+# ---------------------------------------------------------------------------
+# A fan-in consumer resolves each arm through that arm's renames (review P2)
+# ---------------------------------------------------------------------------
+#
+# Two sources write to one sink declaring an optional 'name'. Arm 'mapped'
+# renames name -> b and then drops b; arm 'plain' carries a 'b' of its own.
+# Resolving every arm's vote through the union of the sink's whole reach
+# refused 'name' against 'plain' as a spelling of 'b', though no row from
+# 'plain' resolves 'name' to its 'b' and no row from 'mapped' carries a 'b'.
+
+
+def _fan_in_settings(tmp_path: Path, *, plain_renames: bool) -> Path:
+    mapped = _mapped_source(tmp_path, schema=_FIXED_ID_B)
+    mapped["on_success"] = "mapped_rows"
+    plain_path = tmp_path / "plain.csv"
+    plain_path.write_text("ID,Name\n3,carol\n4,dave\n" if plain_renames else "ID,B\n3,carol\n4,dave\n")
+    plain_options: dict[str, Any] = {"path": str(plain_path), "on_validation_failure": "discard", "schema": _FIXED_ID_B}
+    if plain_renames:
+        plain_options["field_mapping"] = dict(_MAPPED)
+    drop_b = {**_transform("field_mapper", {"mapping": {"id": "id"}, "select_only": True, "schema": _OBSERVED}), "input": "mapped_rows"}
+    settings: dict[str, Any] = {
+        "sources": {"mapped": mapped, "plain": {"plugin": "csv", "on_success": "out", "options": plain_options}},
+        "transforms": [drop_b],
+        "concurrency": {"max_workers": 1},
+        "sinks": {
+            "out": _json_sink(tmp_path / "out.jsonl", schema={"mode": "flexible", "fields": ["name: str?"]}),
+            "quarantine": _json_sink(tmp_path / "q.jsonl"),
+        },
+        "landscape": {"url": f"sqlite:///{tmp_path / 'audit.db'}"},
+        "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
+    }
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(settings, sort_keys=False))
+    return path
+
+
+def test_an_alias_from_one_fan_in_arm_does_not_refuse_another_arms_field(tmp_path: Path) -> None:
+    result = _run(_fan_in_settings(tmp_path, plain_renames=False))
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 4}
+    delivered = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert sorted(delivered, key=lambda row: row["id"]) == [
+        {"id": "1"},
+        {"id": "2"},
+        {"id": "3", "b": "carol"},
+        {"id": "4", "b": "dave"},
+    ]
+
+
+def test_the_fan_in_arm_whose_own_source_renames_the_field_is_still_refused(tmp_path: Path) -> None:
+    output = _refused_at_build(_fan_in_settings(tmp_path, plain_renames=True))
+
+    assert "its upstream 'source_plain_" in output
+    assert "'name' is a header spelling of 'b': the source's field_mapping renames 'name' to 'b'. Declare 'b'" in output
