@@ -1037,6 +1037,13 @@ key or a top-level name other than `query` or `row`. A header-spelled `web_scrap
 `url_field` or `blob_ref_field` now routes each row instead of ending the
 run. The composer now refuses an optional declared field whose upstream type
 the build already refused (`edge_field_type_incompatible`).
+A `csv` source wider than 1024 columns under an `observed` or `flexible`
+schema is refused at header read ("CSV header has 1025 fields; observed and
+flexible schemas infer at most 1024. Declare the schema with mode: fixed and
+list every one of the 1025 fields ..."); before, the run failed (exit 4) at
+the first valid row with "row exceeds maximum inferred schema fields (1024);
+field 'c1024' cannot be added", after abandoning any row already quarantined.
+A `mode: fixed` schema that declares every column loads the file.
 
 ---
 

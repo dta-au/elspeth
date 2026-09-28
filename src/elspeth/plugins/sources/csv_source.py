@@ -99,7 +99,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:040ed5b1c21f4dae"
+    source_file_hash: str | None = "sha256:678589d6b1a6bf62"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -463,6 +463,13 @@ class CSVSource(BaseSource):
             field_resolution=self._field_resolution.resolution_mapping,
         )
         self._contract_builder = ContractBuilder(initial_contract)
+        # Width is a file-level property: every row of an over-wide file would
+        # exceed the inference cap, so refuse at header read, before any row
+        # (valid or quarantined) is yielded and then abandoned.
+        self._contract_builder.refuse_uninferable_width(
+            headers,
+            subject="CSV header" if raw_headers is not None else "CSV columns",
+        )
 
         # Track whether first valid row has been processed (for type inference)
         first_valid_row_processed = False
