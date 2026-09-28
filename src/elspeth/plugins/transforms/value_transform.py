@@ -363,7 +363,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d96273a02341c8eb"
+    source_file_hash: str | None = "sha256:1a8ad03e147600d0"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -479,7 +479,7 @@ class ValueTransform(BaseTransform):
         for operation in self._operations:
             kinds = derived_kinds[operation.target]
             declaration = authored.get(operation.target)
-            if declaration is None or declaration.field_type == "any" or not kinds:
+            if declaration is None or declaration.field_type == "any" or not isinstance(kinds, frozenset) or not kinds:
                 continue
             if any(
                 (kind == "none" and declaration.nullable)

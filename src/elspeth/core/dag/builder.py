@@ -1777,7 +1777,7 @@ def build_execution_graph(
             cid = coalesce_ids[CoalesceName(coalesce_config.name)]
             coalesce_id_to_config[cid] = coalesce_config
 
-    deferred_gate_input_by_id = {gate_id: input_connection for gate_id, _gate_name, input_connection in deferred_config_gate_schemas}
+    gate_input_by_id = {gate_id: input_connection for gate_id, _gate_name, input_connection in config_gate_schema_inputs}
 
     # Human labels for the nodes a union-merge type resolution can name as a
     # declarer (sources and the plugin-bearing kinds), for refusal messages.
@@ -1806,7 +1806,7 @@ def build_execution_graph(
             }
             bound_inputs: dict[str, FieldDefinition] = {}
             for field_name in sorted(reads - authored):
-                resolved = [resolve_guaranteed_field_type(graph, predecessor, field_name) for predecessor in incoming]
+                resolved = [resolve_guaranteed_field_type(graph, predecessor, field_name, mode="union_merge") for predecessor in incoming]
                 if not resolved or resolved[0] is None:
                     continue
                 first_type = resolved[0].field_type
@@ -1826,8 +1826,8 @@ def build_execution_graph(
                 output_schema=value_transform.output_schema,
                 declarations=_published_output_declarations(candidate_transform).output_field_declarations,
             )
-        if pass_through_id in deferred_gate_input_by_id:
-            input_connection = deferred_gate_input_by_id[pass_through_id]
+        if pass_through_id in gate_input_by_id:
+            input_connection = gate_input_by_id[pass_through_id]
             producer_id, _producer_label = producers[input_connection]
             _assign_schema(pass_through_id, _best_schema_config(producer_id))
 

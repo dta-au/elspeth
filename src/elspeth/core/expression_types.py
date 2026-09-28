@@ -13,7 +13,15 @@ from typing import Literal
 from elspeth.contracts.schema import FieldDefinition
 from elspeth.core.expression_parser import ExpressionParser
 
-type ResultKinds = frozenset[str] | None
+
+class _Unresolved:
+    """A caller's graph walk stopped before it could determine an input type."""
+
+    __slots__ = ()
+
+
+UNRESOLVED = _Unresolved()
+type ResultKinds = frozenset[str] | None | _Unresolved
 type SchemaFieldType = Literal["str", "int", "float", "bool", "any"]
 _NUMERIC = frozenset({"bool", "int", "float"})
 
@@ -31,9 +39,11 @@ def input_kinds(field: FieldDefinition | None, *, unknown_nullable: bool = False
 def _union(*groups: ResultKinds) -> ResultKinds:
     if any(group is None for group in groups):
         return None
+    if any(group is UNRESOLVED for group in groups):
+        return UNRESOLVED
     result: set[str] = set()
     for group in groups:
-        assert group is not None
+        assert isinstance(group, frozenset)
         result.update(group)
     return frozenset(result)
 
@@ -41,6 +51,9 @@ def _union(*groups: ResultKinds) -> ResultKinds:
 def _binary(op: ast.operator, left: ResultKinds, right: ResultKinds) -> ResultKinds:
     if left is None or right is None:
         return None
+    if left is UNRESOLVED or right is UNRESOLVED:
+        return UNRESOLVED
+    assert isinstance(left, frozenset) and isinstance(right, frozenset)
     results: set[str] = set()
     for a in left:
         for b in right:
@@ -98,6 +111,9 @@ def expression_kinds(parser: ExpressionParser, lookup: Callable[[str], ResultKin
                     argument = infer(node.args[0])
                     if argument is None:
                         return None
+                    if argument is UNRESOLVED:
+                        return UNRESOLVED
+                    assert isinstance(argument, frozenset)
                     return frozenset("float" if kind == "float" else "int" for kind in argument if kind in _NUMERIC)
             return None
         if isinstance(node, ast.Compare):
@@ -108,6 +124,9 @@ def expression_kinds(parser: ExpressionParser, lookup: Callable[[str], ResultKin
             argument = infer(node.operand)
             if argument is None:
                 return None
+            if argument is UNRESOLVED:
+                return UNRESOLVED
+            assert isinstance(argument, frozenset)
             return frozenset("float" if kind == "float" else "int" for kind in argument if kind in _NUMERIC)
         if isinstance(node, (ast.BoolOp, ast.IfExp)):
             arms = node.values if isinstance(node, ast.BoolOp) else [node.body, node.orelse]
@@ -127,7 +146,7 @@ def expression_kinds(parser: ExpressionParser, lookup: Callable[[str], ResultKin
 
 def declared_result(kinds: ResultKinds) -> tuple[SchemaFieldType, bool]:
     """Collapse runtime kinds to the schema vocabulary and nullability."""
-    if kinds is None:
+    if not isinstance(kinds, frozenset):
         return "any", True
     non_null = kinds - {"none"}
     field_type: SchemaFieldType

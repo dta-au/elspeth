@@ -79,7 +79,7 @@ from elspeth.core.dag.bound_regions import BOUND_REGION_EXIT_RULE
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
 from elspeth.core.dag.guarantees import ResolutionMode
 from elspeth.core.dag.models import GraphValidationError
-from elspeth.core.expression_types import SchemaFieldType
+from elspeth.core.expression_types import UNRESOLVED, ResultKinds, SchemaFieldType, expression_kinds, input_kinds
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -103,7 +103,7 @@ if TYPE_CHECKING:
     from elspeth.plugins.transforms.value_transform import ValueTransform
 
     # Runtime import would be circular: the resolver imports this module.
-    from elspeth.web.composer._producer_resolver import ProducerEntry
+    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver
 
 NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue", "collector"]
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
@@ -4420,6 +4420,198 @@ def _sink_locked_input_set(output: OutputSpec) -> frozenset[str] | None:
         "re-raise guards)"
     ),
 )
+def _bind_composer_value_transforms(
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+    *,
+    resolver: ProducerResolver,
+    probe_cache: ValidationProbeCache,
+) -> tuple[dict[str, frozenset[str]], dict[str, str]]:
+    """Bind probe stamps in dependency order before schema-contract readers run."""
+    from elspeth.plugins.transforms.value_transform import _row_key_aliases
+    from elspeth.web.composer._producer_resolver import ProducerEntry, is_source_producer_id
+
+    unresolved_targets: dict[str, frozenset[str]] = {}
+    bind_errors: dict[str, str] = {}
+    attempted: set[str] = set()
+    visiting: set[str] = set()
+
+    def input_producer(connection: str) -> ProducerEntry | None | object:
+        seen: set[str] = set()
+        while connection not in seen:
+            seen.add(connection)
+            producer = resolver.find_producer_for(connection)
+            if producer is None or is_source_producer_id(producer.producer_id):
+                return producer
+            node = resolver.get_node(producer.producer_id)
+            if node is None:
+                return None
+            if node.node_type == "gate":
+                connection = node.input
+                continue
+            if node.node_type in {"coalesce", "queue", "row_union", "collector"}:
+                return UNRESOLVED
+            return producer
+        return None
+
+    def field_type(producer: ProducerEntry, name: str, seen: frozenset[str] = frozenset()) -> str | None | object:
+        if producer.producer_id in seen:
+            return None
+        if is_source_producer_id(producer.producer_id):
+            try:
+                schema = get_raw_schema_config(producer.options, owner=producer.producer_id)
+            except ValueError:
+                return UNRESOLVED
+            if schema is None:
+                return None
+            if schema.fields is not None:
+                return next((field.field_type for field in schema.fields if field.name == name), None)
+            if not schema.is_observed or name not in (schema.guaranteed_fields or ()):
+                return None
+            source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+            source_spec = sources.get(source_name)
+            if source_spec is None or producer.plugin_name is None:
+                return UNRESOLVED
+            source: SourceProtocol | None = None
+            try:
+                from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+                options = prepare_validation_probe_options(source_spec.options, plugin=producer.plugin_name)
+                options["on_validation_failure"] = source_spec.on_validation_failure
+                source = get_shared_plugin_manager().create_source(producer.plugin_name, options)
+                return source.observed_value_type
+            except Exception as exc:
+                if _is_source_config_probe_exception(exc):
+                    return UNRESOLVED
+                raise
+            finally:
+                if source is not None:
+                    source.close()
+
+        node = resolver.get_node(producer.producer_id)
+        if node is None:
+            return None
+        if node.node_type in {"coalesce", "queue", "row_union", "collector"}:
+            return UNRESOLVED
+        if node.node_type not in {"transform", "aggregation"} or node.plugin is None:
+            return None
+        try:
+            transform = probe_cache.transform(node.plugin, node)
+        except Exception as exc:
+            if _is_config_probe_exception(exc):
+                return UNRESOLVED
+            raise
+        if transform.name == "value_transform":
+            bind(node)
+            if node.id in bind_errors or name in unresolved_targets.get(node.id, frozenset()):
+                return UNRESOLVED
+        declaration = transform.output_field_declarations().get(name)
+        if declaration is not None:
+            return declaration.field_type
+        carried = transform.carried_output_sources()
+        upstream_name = carried.get(name, name)
+        output = transform._output_schema_config
+        if name not in carried and output is not None and output.fields is not None:
+            field = next((item for item in output.fields if item.name == name), None)
+            if field is not None:
+                # The runtime's union-merge walk requires a stamp for a
+                # plugin-authored field; a bare output config is not enough.
+                return None
+        forwards = (
+            transform.forwards_input_fields
+            and transform.preserves_input_values
+            and name not in transform.removed_input_fields
+            and (output is None or output.allows_extra_fields)
+        )
+        if name not in carried and not ((transform.passes_through_input and transform.preserves_input_values) or forwards):
+            # The DAG walk has additional declaring-pass-through and
+            # selection arms the Composer mirror cannot prove here.
+            if transform.passes_through_input and output is not None and output.fields:
+                return UNRESOLVED
+            if (
+                node.node_type == "transform"
+                and transform.preserves_input_values
+                and name in transform.declared_input_fields
+                and name not in transform.declared_output_fields
+                and name not in transform.removed_input_fields
+                and output is not None
+                and name in (output.guaranteed_fields or ())
+            ):
+                return UNRESOLVED
+            return None
+        upstream = input_producer(node.input)
+        if upstream is UNRESOLVED:
+            return UNRESOLVED
+        if upstream is None:
+            return None
+        assert isinstance(upstream, ProducerEntry)
+        return field_type(upstream, upstream_name, seen | {producer.producer_id})
+
+    def bind(node: NodeSpec) -> None:
+        if node.id in attempted or node.id in visiting or node.plugin != "value_transform":
+            return
+        visiting.add(node.id)
+        try:
+            transform = cast("ValueTransform", probe_cache.transform(node.plugin, node))
+            authored = (
+                {field.name: field for field in transform._schema_config.fields or ()} if transform._schema_config is not None else {}
+            )
+            producer = input_producer(node.input)
+            bound: dict[str, FieldDefinition] = {}
+            unresolved_inputs: set[str] = set()
+            reads = {name for operation in transform._operations for name in operation.get_parser().static_field_reads().fields}
+            for name in sorted(reads - authored.keys()):
+                if producer is UNRESOLVED:
+                    resolved: str | None | object = UNRESOLVED
+                elif producer is None:
+                    resolved = None
+                else:
+                    assert isinstance(producer, ProducerEntry)
+                    resolved = field_type(producer, name)
+                if resolved is UNRESOLVED:
+                    unresolved_inputs.add(name)
+                elif isinstance(resolved, str):
+                    bound[name] = FieldDefinition(name=name, field_type=cast("SchemaFieldType", resolved), required=True, nullable=True)
+
+            previous: dict[str, ResultKinds] = {}
+
+            def lookup(name: str) -> ResultKinds:
+                aliases = _row_key_aliases(name)
+                for alias in aliases:
+                    if alias in previous:
+                        return previous[alias]
+                for field in (*authored.values(), *bound.values()):
+                    if aliases & _row_key_aliases(field.name):
+                        return input_kinds(field)
+                if any(aliases & _row_key_aliases(field) for field in unresolved_inputs):
+                    return UNRESOLVED
+                return None
+
+            unresolved: set[str] = set()
+            for operation in transform._operations:
+                kinds = expression_kinds(operation.get_parser(), lookup)
+                if kinds is UNRESOLVED:
+                    unresolved.add(operation.target)
+                for alias in _row_key_aliases(operation.target):
+                    previous[alias] = kinds
+            unresolved_targets[node.id] = frozenset(unresolved)
+            try:
+                transform.bind_upstream_input_types(bound)
+            except GraphValidationError as exc:
+                bind_errors[node.id] = str(exc)
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+        finally:
+            visiting.remove(node.id)
+            attempted.add(node.id)
+
+    for node in nodes:
+        if node.node_type == "transform" and node.plugin == "value_transform":
+            bind(node)
+    return unresolved_targets, bind_errors
+
+
 def _check_schema_contracts(
     sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],
@@ -4442,7 +4634,6 @@ def _check_schema_contracts(
             return _check_schema_contracts(sources, nodes, outputs, probe_cache=owned_cache)
 
     from elspeth.web.composer._producer_resolver import (
-        ProducerEntry,
         ProducerResolver,
         is_source_producer_id,
         published_success_connection,
@@ -4450,7 +4641,6 @@ def _check_schema_contracts(
     )
 
     errors: list[ValidationEntry] = []
-    value_transform_bind_errors: dict[str, str] = {}
     contract_warnings: list[ValidationEntry] = []
     edge_contracts: list[EdgeContract] = []
     parse_failed_producers: set[str] = set()
@@ -4495,6 +4685,9 @@ def _check_schema_contracts(
         sink_names=sink_names_frozen,
     )
     node_by_id = {node.id: node for node in nodes}
+    unresolved_value_targets, value_transform_bind_errors = _bind_composer_value_transforms(
+        source_map, nodes, resolver=resolver, probe_cache=probe_cache
+    )
 
     # Schema-specific bookkeeping: track per-connection producer
     # description, for richer duplicate-error messages. Mirror the
@@ -6468,37 +6661,10 @@ def _check_schema_contracts(
             if _is_config_probe_exception(exc):
                 return None
             raise
-        if transform.name == "value_transform":
-            value_transform = cast("ValueTransform", transform)
-        else:
-            value_transform = None
-        if value_transform is not None and not value_transform.upstream_types_bound:
-            input_producer = _value_producer_through_gates(producer_node.input)
-            bound_fields: dict[str, FieldDefinition] = {}
-            authored_schema = value_transform._schema_config
-            authored_names = {field.name for field in authored_schema.fields or ()} if authored_schema is not None else set()
-            if input_producer is not None:
-                reads = {name for operation in value_transform._operations for name in operation.get_parser().static_field_reads().fields}
-                for name in sorted(reads - authored_names):
-                    upstream = _resolved_producer_field_type(
-                        input_producer,
-                        name,
-                        source_map=source_map,
-                        mode="union_merge",
-                        visited=visited | {producer.producer_id},
-                    )
-                    if upstream is not None:
-                        bound_fields[name] = FieldDefinition(
-                            name=name,
-                            field_type=cast("SchemaFieldType", upstream.field_type),
-                            required=True,
-                            nullable=True,
-                        )
-            try:
-                value_transform.bind_upstream_input_types(bound_fields)
-            except GraphValidationError as exc:
-                value_transform_bind_errors[producer_node.id] = str(exc)
-                return None
+        if transform.name == "value_transform" and (
+            producer_node.id in value_transform_bind_errors or field_name in unresolved_value_targets.get(producer_node.id, frozenset())
+        ):
+            return None
         output_config = transform._output_schema_config
         config_declares_field = (
             output_config is not None
@@ -6709,28 +6875,8 @@ def _check_schema_contracts(
             "edge_field_type_incompatible",
         )
 
-    # Every value_transform gets a graph-tier bind even when no typed consumer
-    # or union merge asks for its result. The same plugin predicate as the
-    # runtime builder then refuses a certain authored type contradiction.
-    for node in nodes:
-        if node.node_type != "transform" or node.plugin != "value_transform":
-            continue
-        try:
-            transform = probe_cache.transform(node.plugin, node)
-        except Exception as exc:
-            if _is_config_probe_exception(exc):
-                continue
-            raise
-        if cast("ValueTransform", transform).upstream_types_bound:
-            continue
-        for target in cast("ValueTransform", transform)._configured_targets:
-            _resolved_producer_field_type(
-                ProducerEntry(node.id, node.plugin, node.options),
-                target,
-                source_map=source_map,
-            )
-        if message := value_transform_bind_errors.get(node.id):
-            errors.append(_err(f"node:{node.id}", message, "high", "value_transform_result_type_incompatible"))
+    for node_id, message in value_transform_bind_errors.items():
+        errors.append(_err(f"node:{node_id}", message, "high", "value_transform_result_type_incompatible"))
 
     # A union coalesce whose every row would fail the runtime merge (two
     # branches each guaranteeing a field and certainly typing it differently —

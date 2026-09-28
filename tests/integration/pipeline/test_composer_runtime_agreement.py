@@ -9399,6 +9399,8 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
                 aggregations=plugins.aggregations,
                 gates=list(config.gates),
                 coalesce_settings=list(config.coalesce) or None,
+                queues=config.queues,
+                row_union_settings=list(config.row_unions) or None,
             )
         except GraphValidationError as exc:
             return None, str(exc), plugins
@@ -9437,6 +9439,65 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == expected_types
         # One predicate, one message: the composer's text is the build's text with the node label.
         assert entry.message == runtime_refusal.replace(runtime_refusal.split("'")[1], "merge_results")
+
+    @pytest.mark.parametrize("consumer_type", ["int", "str"])
+    def test_queue_mirror_gap_abstains_after_topological_bind(self, consumer_type: str, tmp_path: Path) -> None:
+        """A queue input can type the build even when Composer's walk stops there."""
+        import yaml
+
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        document = {
+            "sources": {
+                name: {
+                    "plugin": "csv",
+                    "on_success": "inbound",
+                    "options": {
+                        "path": str(tmp_path / f"{name}.csv"),
+                        "on_validation_failure": "discard",
+                        "schema": {"mode": "fixed", "fields": ["a: int"]},
+                    },
+                }
+                for name in ("left", "right")
+            },
+            "queues": {"inbound": {}},
+            "transforms": [
+                {
+                    "name": "calculate",
+                    "plugin": "value_transform",
+                    "input": "inbound",
+                    "on_success": "calculated",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": [{"target": "x", "expression": "row['a'] + 1"}]},
+                },
+                {
+                    "name": "consume",
+                    "plugin": "passthrough",
+                    "input": "calculated",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "flexible", "fields": [f"x: {consumer_type}"]}},
+                },
+            ],
+            "sinks": {
+                "out": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {"path": str(tmp_path / "out.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+                }
+            },
+        }
+        pipeline_yaml = yaml.safe_dump(document, sort_keys=False)
+        graph, runtime_refusal, _plugins = self._runtime(pipeline_yaml, tmp_path)
+        composer = composition_state_from_runtime_yaml(pipeline_yaml).validate()
+        if consumer_type == "int":
+            assert graph is not None, runtime_refusal
+            assert not any(error.error_code == "edge_field_type_incompatible" for error in composer.errors), composer.errors
+        else:
+            assert runtime_refusal is not None and "x" in runtime_refusal
+            # This is an acknowledged Composer mirror gap: it must abstain
+            # rather than invent an `any` type and over-refuse this draft.
+            assert not any(error.error_code == "edge_field_type_incompatible" for error in composer.errors)
 
     @pytest.mark.parametrize("case", ["rewrite", "dotted", "control-declared-every-branch"])
     def test_one_table_probe_instance_equals_runtime_instance_and_node_info(self, case: str, tmp_path: Path) -> None:

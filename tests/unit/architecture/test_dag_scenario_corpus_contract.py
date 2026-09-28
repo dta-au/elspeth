@@ -955,8 +955,8 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # snapshot moved (test_oracle_freeze green: the frozen surface carries no
 # scheduler_work or audit records).
 # T1 expression typing: value_transform's three union-collision-fail
-# provenance pins changed to d96273a02341c8eb. The case outcome is unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "a00b0e42d775e48b9ece9684a57b55f7e3805df6004bac36cefaf844e26da0a8"
+# provenance pins changed to 1a8ad03e147600d0. The case outcome is unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "95cff05d16d8f8c515b5eb4f44c7865151ded21798c513ff7baee4c824879246"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
