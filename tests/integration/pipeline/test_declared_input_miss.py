@@ -47,8 +47,8 @@ _AZ = {"endpoint": "https://r2-probe.cognitiveservices.azure.com", "api_key": "r
 # (id, plugin, options naming `b`, present row usable without a network call or blob)
 _CENSUS: list[tuple[str, str, dict[str, Any], bool]] = [
     ("type_coerce-conversions", "type_coerce", {"conversions": [{"field": "b", "to": "int"}]}, True),
-    ("field_mapper-strict_false", "field_mapper", {"mapping": {"b": "target"}, "strict": False}, True),
-    ("field_mapper-strict_true", "field_mapper", {"mapping": {"b": "target"}, "strict": True}, True),
+    # field_mapper has no `strict` option (retired 286be0b92): every mapping source is a declared input.
+    ("field_mapper-mapping", "field_mapper", {"mapping": {"b": "target"}}, True),
     (
         "reference_join-key_field",
         "reference_join",
