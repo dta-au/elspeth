@@ -3,7 +3,7 @@
 The [v3 catalog](v3/catalog.json) is the current finite proof universe for
 state-engine assessments: catalog schema 2 with assessment schema 3. It keeps
 the 73 stable legs and ten dimensions, replaces shared applicability profiles
-with an explicit policy for every case/profile/dimension cell (7,010 required
+with an explicit policy for every case/profile/dimension cell (7,130 required
 executable cells), names every PB-09 first-party plugin and provider/auth
 variant as its own case, and records per-evidence runner, exact argv, and
 provenance. The committed [evidence selector manifest](v3/evidence_selectors.json)
@@ -41,6 +41,11 @@ remains immutable 68-leg history. New assessments must use v3.
   their SQLite single-process and PostgreSQL cells are catalog-approved N/A.
   PB-11 is required only for PostgreSQL 16 on the AWS single-leader Landscape
   profile.
+- RM-09 and RM-10 retain their stable IDs as retired legs with reviewed N/A
+  cells: QR removed both read models. PB-01 reflects durable PENDING_SINK
+  work for source-quarantined rows. RC-02 boundary composition stays required
+  and has a retained public-resume test owner for the SQLite single-process
+  profile; see the [v3 amendment](v3/README.md).
 - Unless a leg declares named cases, its required case is `leg-contract` for
   every dimension.
 - A narrow arm is a case beneath its stable leg, never a new pseudo-leg.
@@ -53,7 +58,8 @@ remains immutable 68-leg history. New assessments must use v3.
   provider/authentication variant as its own required case, while PB-11 names
   PostgreSQL server-time, row-lock order, isolation, schema
   admission/migration, and ambiguous connection-loss cases.
-- `maintenance` is always required.
+- `maintenance` is required for every active leg; retired RM-09 and RM-10
+  have no executable cells.
 - Every hard gate declares the dimensions from which its status, affected legs,
   and evidence support are mechanically derived.
 - Catalog/assessment versions are dispatched as exact pairs: v1/1 is

@@ -183,11 +183,11 @@ repos:
         files: ^(config/cicd/enforce_contract_manifest/|elspeth-lints/src/elspeth_lints/rules/manifest/contract_manifest/)
         pass_filenames: false
 
-      - id: elspeth-lints-manifest-inventory
-        name: elspeth-lints manifest inventory
-        entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules manifest.symbol_inventory,manifest.test_to_source_mapping --root .
+      - id: elspeth-lints-symbol-inventory
+        name: elspeth-lints symbol inventory
+        entry: env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules manifest.symbol_inventory --root .
         language: system
-        files: ^(config/cicd/(symbol_inventory|test_to_source_mapping)/|elspeth-lints/src/elspeth_lints/rules/manifest/(symbol_inventory|test_to_source_mapping)/)
+        files: ^(config/cicd/symbol_inventory/|elspeth-lints/src/elspeth_lints/rules/manifest/symbol_inventory/)
         pass_filenames: false
 
       - id: elspeth-lints-trust-tier
@@ -196,7 +196,7 @@ repos:
         language: system
         # RATCHET, not the fail-closed CLI gate. The trust_tier.tier_model
         # corpus is deliberately non-empty until the operator signs the package
-        # (AGENTS.md "Judge-signature stage"), so `elspeth-lints check` exits 1
+        # (AGENTS.md "Operator signature verification"), so `elspeth-lints check` exits 1
         # on every tree and as a direct entry would refuse every commit touching
         # this hook's trigger paths, including ones that shrink the corpus.
         # scripts/trust_tier_ratchet.py runs the same rule with the
@@ -205,19 +205,19 @@ repos:
         # the commit ADDS a failing finding HEAD does not carry, comparing
         # line-insensitive (path, rule, message) keys as a multiset. This is
         # AGENTS.md's own obligation ("compare the corpus before and after your
-        # change, not to zero") made executable. CI still runs the CLI gate
-        # fail-closed; only the local hook ratchets.
+        # change, not to zero") made executable. CI does not run the signed
+        # trust-tier gate; this local hook ratchets.
         # The script pins ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE to
-        # shape-only-when-key-missing for both runs, mirroring CI's fork-PR
-        # treatment (ci.yaml). The mode is ADAPTIVE: with the operator's
+        # shape-only-when-key-missing for both runs. The mode is ADAPTIVE: with
+        # the operator's
         # ELSPETH_JUDGE_METADATA_HMAC_KEY present in the shell env, the load
         # does FULL judge-metadata signature verification; with the key absent
         # (keyless agents, or an operator shell without the key after the .env
         # O1 removal) it DOWNGRADES to shape-only and prints a prominent
         # load-time warning rather than hard-failing the commit. Without this,
         # the default `required` mode makes the hook raise on EVERY keyless
-        # local commit that touches the allowlist. Required-mode signature
-        # checking in CI stays fail-closed without the operator-held key.
+        # local commit that touches the allowlist. CI does not perform
+        # required-mode signature verification.
         # Authoritative signature verification runs in the trusted operator
         # context; Actions must never receive the HMAC key.
         # NO `types:` filter. pre-commit ANDs `types` with `files`; adding

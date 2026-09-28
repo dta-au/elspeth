@@ -264,6 +264,12 @@ drained and repair this release forward.
   `row`, and its remedy no longer suggests `[]`);
   a multi-query `row.source_row.<column>` read must be listed in
   `required_input_fields` itself (an `image_inputs` column is refused there),
+  read by the same analysis as a single-query `row` read, so a column read
+  through an attribute filter (`row.source_row | attr('x')`,
+  `map(attribute='x')`, `selectattr('x')`, `sort`/`join`/`sum(attribute='x')`,
+  `groupby('x')`) or a `set` alias of `row.source_row` counts too, and a
+  method on a column's value (`row.source_row.get('meta', '').upper()`) is not
+  mistaken for an unbound query variable;
   and a computed key through it (`row.source_row[k]`,
   `row.source_row.get(expr)`) is refused at configuration as one through
   `row` already was, unless `required_input_fields` is `[]`;
@@ -294,7 +300,7 @@ drained and repair this release forward.
   `template_rendering_failed` and the `Undeclared field` reason. Behaviour
   changes: under every declaration `row` is the template row rather than a
   plain dict, so `row.items()`, `row.keys()` and `row.values()` are refused at
-  configuration (they were dict methods; `row | items`, `row | list` and
+  configuration (they were dict methods; `row | items | list`, `row | list` and
   `dict(row)` replace them), and `{{ row }}` prints the declared fields. No
   shipped example sets `query_template`.
 - **One template row API, refused at configuration under every declaration
@@ -305,8 +311,17 @@ drained and repair this release forward.
   `row.source_row` and a RAG `query_template`, and under `required_input_fields:
   []` too, a call on a row field (`row.keys()`, `row.items()`,
   `row['keys']()`, `row.note()`, `dict(row).note()`, calling an element of
-  the row such as `(row | first)()`, and calling what `row.get('note')`
-  returns, also when its default is a row field, `row.get('note', row.id)()`),
+  the row such as `(row | first)()`, calling row data — a field's value,
+  an item or element of it (`row.tags[0]()`, `(row.tags | select | first)()`,
+  `(row.tags | batch(1) | first | first)()`), what a builtin filter or a
+  method builds from it (`(row.note | upper)()`, `row.note.upper()()`,
+  `row.meta.get('x')()`, `(row | tojson)()`), an operator over it
+  (`(row.note ~ 'x')()`), a list or tuple written of it
+  (`{% for c in [row.note] %}{{ c() }}{% endfor %}`), or a name every
+  binding of which is row data (`{% set m = row.tags %}{{ m[0]() }}`,
+  `{% for c in row.tags %}{{ c() }}{% endfor %}`) — and calling what
+  `row.get('note')` returns, also when its default is a row field,
+  `row.get('note', row.id)()`),
   `row.get` without a call, and the reserved
   names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` (also
   through `row | attr('contract')`). Before, under `[]` these validated and
@@ -314,7 +329,7 @@ drained and repair this release forward.
   bound-method or object repr with a memory address to the provider
   (`{{ row.get }}`, `{{ row }}`, `row | pprint`); `row.contract` under `[]`
   read a column named `contract` while the same text was refused under a
-  list. The refusal names the replacement (`row | list`, `row | items`,
+  list. The refusal names the replacement (`row | list`, `row | items | list`,
   `row | dictsort`, `dict(row)`, `row['contract']`) and never suggests `[]`.
   A method on a value built from the whole row is that value's own, not a row
   call: `dict(row).items()`, `(row | list).count('note')`,
@@ -331,7 +346,18 @@ drained and repair this release forward.
   fields, and `row | tojson` (also over a nested value such as
   `row.meta | tojson`), `row | last`, `row | urlencode` and `row | pprint`
   work, where each failed every row or printed an object repr;
-  `row | reverse` is still the list of field names in reverse order. With the
+  `row | reverse` is still the list of field names in reverse order, and
+  `row | random` (also over a mapping value, `row.meta | random`) picks one
+  of the field names, as `row | list | random` does, where Jinja's builtin
+  indexed the mapping by position and failed every row. Configuration does
+  not resolve an attribute of a value, so calling one is admitted: on a
+  string it is the value's method (`row.note.upper()`,
+  `(row.note | attr('upper'))()` work), while on a mapping Jinja reads the
+  item (`row.meta.x()`, `(row.recs | map(attribute='y') | first)()`), which
+  fails the row at render. Nor does it follow row data into a macro
+  parameter (`{{ f(row.note) }}` calling `v()`) or a `namespace()`
+  attribute; such a call also fails the row at render, routed with a
+  value-free reason. With the
   declaration omitted, a single-query prompt that uses `row` as a whole
   (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: it rendered an
   empty row. A multi-query `input_fields` variable named `source_row` or like
@@ -973,8 +999,12 @@ These ran and delivered rows before:
   leaves `name` free, as keeping the field does.
 - **A template test or read of a field the node does not declare** (the
   ADR-051 bullets above). In an LLM prompt or query template, `'x' in row`
-  or a `row.source_row` column read through a `set` alias fails each row
-  with `template_rendering_failed` ("Undeclared field"). In a RAG
+  fails each row with `template_rendering_failed` ("Undeclared field"). A
+  query template's `row.source_row` column outside `required_input_fields`
+  read through an attribute filter (`row.source_row | attr('x')`,
+  `map(attribute='x')`, `selectattr`, `sort`/`join`/`sum(attribute='x')`,
+  `groupby`) or a `set` alias is refused at configuration, as the plain
+  `row.source_row.x` read already was. In a RAG
   `query_template`, a `row.<field>` read outside `required_input_fields`
   and `query_field` is refused at configuration. A `'x' in row` test there
   fails each row.
@@ -990,7 +1020,7 @@ These ran and delivered rows before:
   `row.contract` / `row.to_dict()` / `row.to_checkpoint_format()` (also through
   `row | attr(...)`) are refused at configuration in an LLM prompt, a query's
   `row.source_row` and a RAG `query_template`, `required_input_fields: []`
-  included; replace them with `row | list`, `row | items`, `row | dictsort`,
+  included; replace them with `row | list`, `row | items | list`, `row | dictsort`,
   `dict(row)` or `row['contract']`. Before, `row.keys()` under `[]` (single-
   and multi-query) and RAG `row.keys()` / `row.items()` / `row.values()`
   under any declaration delivered, and the rest failed each row or sent an
@@ -1067,10 +1097,14 @@ the batch's rows left without an outcome); a `value_transform` or
 row without an outcome); a `union_collision_policy: fail` coalesce whose
 branches all guarantee a shared field (ended the run with exit 4 at the first
 row). Each of these failed every row: a template number literal that
-overflows to infinity; a `truncate` length shorter than its ending; a
-`<response>_usage` schema type other than `any`; a header-spelled scan field
-over a non-string column; and in a RAG `query_template`, a dynamic `row[...]`
-key or a top-level name other than `query` or `row`. A header-spelled `web_scrape`
+overflows to infinity; a `truncate` length shorter than its ending; a call on
+row data in an LLM prompt, a query or a RAG `query_template`
+(`row.tags[0]()`, `(row.tags | first)()`, `(row.get('tags') | list | last)()`,
+`(row.note | upper)()`, `{% set m = row.tags %}{{ m[0]() }}`),
+under every declaration; a `<response>_usage` schema type other than `any`; a
+header-spelled scan field over a non-string column; and in a RAG
+`query_template`, a dynamic `row[...]` key or a top-level name other than
+`query` or `row`. A header-spelled `web_scrape`
 `url_field` or `blob_ref_field` now routes each row instead of ending the
 run. The composer now refuses an optional declared field whose upstream type
 the build already refused (`edge_field_type_incompatible`).

@@ -6,8 +6,20 @@ applicability profiles with an explicit policy for every
 reviewed `not_applicable` cell has a non-empty catalog reason.
 
 The catalog and assessment schemas in this directory are normative. Catalog
-v3 preserves every v2 semantic contract outside PB-09. PB-09 cases additionally
+v3 preserves v2 semantic contracts except PB-09, PB-01, and retired RM-09/RM-10. PB-09 cases additionally
 carry a live plugin key and a closed provider/authentication variant identity.
+
+QR retired RM-09 and RM-10 when resume switched to durable scheduler work and
+barrier-journal restoration. Their stable leg IDs remain in the catalog, with
+reviewed `not_applicable` cells for every profile and dimension. PB-01 now
+requires durable PENDING_SINK work for a source-quarantined row. RC-02
+`boundary_composition` remains required: the retained SQLite single-process
+selector node
+`tests/e2e/recovery/test_concurrent_resume.py::TestTwoResumesSameRunId::test_running_with_dead_seat_is_resumable_takeover_completes_once`
+exercises the public resume boundary, expired-seat takeover, epoch fencing,
+and one completion. Later assessments must establish the other required
+profiles with their own executable evidence; the deleted payload-restore test
+is not an owner for this cell.
 
 Assessment schema 3 records the runner and exact argument vector on every
 evidence item. Local provenance binds the captured checkout Python executable
@@ -31,6 +43,5 @@ must byte-match an exact five-file envelope (`manifest.json`, `junit.xml`,
 deterministic per-lane publication names. Raw stdout, stderr, provider values,
 and environment values are never accepted.
 
-This directory is a Task 12 input, not the maintained-current pointer. The
-repository continues to identify v2 as current until the first full v3
-assessment and its documentation pointers are published atomically.
+This directory is the maintained current proof catalog. Historical v2 bytes
+remain pinned for strict reruns of v2 assessments.

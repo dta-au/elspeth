@@ -33,30 +33,48 @@ fields and declare only the truly required subset in required_input_fields.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from jinja2 import Environment, meta
 from jinja2.compiler import find_undeclared
+from jinja2.defaults import DEFAULT_NAMESPACE
 from jinja2.nodes import (
+    Add,
     And,
     Assign,
+    AssignBlock,
     Call,
     CallBlock,
+    Compare,
+    Concat,
     CondExpr,
     Const,
+    Div,
     Filter,
+    FloorDiv,
     For,
+    FromImport,
     Getattr,
     Getitem,
+    Import,
     List,
     Macro,
+    Mod,
+    Mul,
     Name,
+    Neg,
     Node,
+    Not,
     NSRef,
     Or,
     Pair,
+    Pos,
+    Pow,
+    Sub,
+    Template,
     Tuple,
     With,
 )
@@ -136,7 +154,10 @@ _DYNAMIC_ACCESS_EXAMPLES: dict[str, str] = {
 # kind's shape, never the template's own text, so a message stays one line.
 _ROW_API_MISUSE_EXAMPLES: dict[str, str] = {
     ROW_API_DYNAMIC_ACCESS: "row.contract, row.to_dict, row.to_checkpoint_format or a name starting with '_'",
-    ROW_FIELD_CALL_ACCESS: "a call on a row field, such as row.keys(), row.items(), row['keys'](), row.name() or row.get('name')()",
+    ROW_FIELD_CALL_ACCESS: (
+        "a call on a row field or on part of its value, such as row.keys(), row.items(), row['keys'](), row.name(), "
+        "row.get('name')() or row.name[0]()"
+    ),
     UNCALLED_GET_ACCESS: "row.get without a call",
 }
 
@@ -163,7 +184,7 @@ def describe_row_api_misuse(misuses: Iterable[str]) -> str:
         "row holds fields and one method, get: row.name, row['name'] and row.get('name', default) read a field, "
         "so row.keys() calls the value of a field named 'keys', and row.contract, row.to_dict and "
         "row.to_checkpoint_format are reserved names, not fields. For the field names use 'row | list', for "
-        "name and value pairs 'row | items' or 'row | dictsort', for a mapping 'dict(row)'; read a column whose "
+        "name and value pairs 'row | items | list' or 'row | dictsort', for a mapping 'dict(row)'; read a column whose "
         "name is reserved or matches a method as row['contract'] or row['keys']."
     )
 
@@ -274,9 +295,39 @@ def extract_jinja2_field_usage(
     env = _create_field_extraction_environment()
     ast = env.parse(template_string)
     if row_attribute is not None:
-        root = f"{namespace}.{row_attribute}"  # a dotted name no template can spell or shadow
+        root = _nested_row_root(namespace, row_attribute)
         ast = _NestedRowRoot(namespace, row_attribute, root).visit(ast)
         namespace = root
+    return _field_usage(ast, namespace)
+
+
+def extract_jinja2_context_fields(template_string: str, namespace: str = "row", *, row_attribute: str) -> frozenset[str]:
+    """The names a template reads on its context ``namespace`` itself, the row nested at ``namespace.row_attribute`` excluded.
+
+    Multi-query binds ``row`` to the query's variables and the row to
+    ``row.source_row``. A read through the nested row is a column read
+    (``extract_jinja2_field_usage(..., row_attribute=...)`` owns it), never a
+    context name: ``row.source_row.get('meta', '').upper()`` reads the
+    column ``meta`` and calls a method on its value, so the context names it
+    reads are none. Analysing the context with the nested row still in place
+    walks into that chain and reports ``upper`` as a variable the query
+    never binds. The nested row is rewritten to its own root first, exactly
+    as the column analysis does, so the two analyses split one template
+    between them.
+    """
+    validate_jinja_source(template_string)
+    ast = _create_field_extraction_environment().parse(template_string)
+    ast = _NestedRowRoot(namespace, row_attribute, _nested_row_root(namespace, row_attribute)).visit(ast)
+    return _field_usage(ast, namespace).fields
+
+
+def _nested_row_root(namespace: str, row_attribute: str) -> str:
+    """The root name a nested row is rewritten to: a dotted name no template can spell or shadow."""
+    return f"{namespace}.{row_attribute}"
+
+
+def _field_usage(ast: Template, namespace: str) -> Jinja2FieldExtraction:
+    """The concrete fields and dynamic accesses of ``namespace`` in a parsed template."""
     (
         namespaces,
         api_aliases,
@@ -423,6 +474,62 @@ _LITERAL_NODES: tuple[type[Node], ...] = (Const, List, Tuple, DictNode)
 # ``row | safe`` markup), so a method on its result is that value's method.
 _ELEMENT_RETURNING_FILTERS: frozenset[str] = frozenset({"first", "last", "random", "min", "max"})
 
+# The builtin filters whose result is made of their operand's own elements, one
+# element or a collection of them (reordered, filtered, grouped into chunks or
+# paired with their keys): over row data every element is still row data, and
+# over the row object or a dict built from it every element is a field name or
+# a name and value pair. ``groupby`` is not one: its grouper is an attribute of
+# each element, which may be a method. ``map`` is judged by the filter it maps
+# (``_is_row_field_call``).
+_ELEMENT_FILTERS: frozenset[str] = _ELEMENT_RETURNING_FILTERS | frozenset(
+    {"batch", "dictsort", "items", "list", "reject", "rejectattr", "reverse", "select", "selectattr", "slice", "sort", "unique"}
+)
+
+# The builtin filters that build a new string, number or markup value from
+# their operand, whatever it holds: their result is never callable. (``int`` and
+# ``float`` can return their default argument and ``sum`` its start argument,
+# so, like every filter here, they count only when each argument is a literal
+# or row data.)
+_VALUE_BUILDING_FILTERS: frozenset[str] = frozenset(
+    {
+        "abs",
+        "capitalize",
+        "center",
+        "count",
+        "e",
+        "escape",
+        "filesizeformat",
+        "float",
+        "forceescape",
+        "format",
+        "indent",
+        "int",
+        "join",
+        "length",
+        "lower",
+        "pprint",
+        "replace",
+        "round",
+        "safe",
+        "string",
+        "striptags",
+        "sum",
+        "title",
+        "tojson",
+        "trim",
+        "truncate",
+        "upper",
+        "urlencode",
+        "urlize",
+        "wordcount",
+        "wordwrap",
+        "xmlattr",
+    }
+)
+
+# The filters whose result over row data is row data, alone or mapped over its elements.
+_MAPPABLE_ROW_DATA_FILTERS: frozenset[str] = _ELEMENT_FILTERS | _VALUE_BUILDING_FILTERS
+
 # The builtin filters that can return their operand (or their default argument)
 # unchanged: ``(row | default({})).keys()`` still calls on the row object.
 _OPERAND_RETURNING_FILTERS: frozenset[str] = frozenset({"default", "d"})
@@ -440,11 +547,14 @@ class _RowReceiverNames:
     ``objects`` may hold the row object itself, on which attribute and item
     syntax always read a field. ``mappings`` may hold a dict built from the
     row (``{% set d = dict(row) %}``), on which a dict attribute is the dict's
-    own and any other name reads a field.
+    own and any other name reads a field. ``data`` holds row data at every
+    binding (``{% set m = row.meta %}``, ``{% for c in row.meta %}``,
+    ``_row_data_names``): calling one calls a field's value or part of it.
     """
 
     objects: frozenset[str]
     mappings: frozenset[str]
+    data: frozenset[str]
 
 
 def _walk_ast(
@@ -575,9 +685,13 @@ def _called_nodes(ast: Node) -> frozenset[int]:
         "classifies the callee by AST node type only: True for an attribute or attr-filter lookup that reads a "
         "field (any name but the row's one method or a reserved name on the row object; a name that is not a "
         "dict attribute on a dict built from the row), an item lookup or element filter on anything carrying the "
-        "row's fields, or a row.get(...) or default filter whose fallback is absent, a literal or itself row data "
-        "by this same test; every other shape returns False, the explicit no-match result; nothing is evaluated "
-        "or coerced"
+        "row's fields or on row data by this same test, a value-building builtin filter over either, a map of one "
+        "of those filters, a name every binding of which is row data, a method call on row data (a value's own get "
+        "included), a list or tuple literal of row data and literals, a concatenation, "
+        "arithmetic, comparison, negation, conditional or boolean expression over row data and literals, or a "
+        "row.get(...) or default filter whose fallback is absent, a literal or itself row data by this same "
+        "test, each filter or method counting only when every argument is a literal or row data; every other "
+        "shape returns False, the explicit no-match result; nothing is evaluated or coerced"
     ),
     non_raising=True,
 )
@@ -608,12 +722,48 @@ def _is_row_field_call(
     (``_node_is_row_object_expression``) is data, a field value, a field name
     or a character, so calling one is a row call whatever the receiver; so is
     an element one of ``first``, ``last``, ``random``, ``min`` or ``max``
-    takes from it (``(row | first)()`` calls a field name). So is calling what
-    ``get`` returns, a field value, when ``get`` cannot return its default or
-    the default is a literal or is itself row data by this same test
-    (``row.get('x', row.y)()``): any other default (``row.get('x', range)``)
-    may be callable. ``default`` over row data with such a fallback is row
-    data too (``(row.x | default('y'))()``).
+    takes from it (``(row | first)()`` calls a field name). This predicate is
+    also the test for ROW DATA: an expression whose value is a field's value
+    or is built only from row data and literals. Row data is never callable,
+    because a row holds plain data. It is:
+
+    - an item of row data, or an element an ``_ELEMENT_FILTERS`` filter takes
+      from row data, from the row object or from a dict built from it
+      (``row.tags[0]``, ``(row.tags | select | first)``, ``(row | items | list)``);
+    - the result of a ``_VALUE_BUILDING_FILTERS`` filter over anything that
+      carries the row's fields (``row.note | upper``, ``row | tojson``), or of
+      ``map`` of one of those filters or of an element filter over row data;
+    - a name every binding of which is row data (``_RowReceiverNames.data``:
+      ``{% set m = row.tags %}``, ``{% for c in row.tags %}``);
+    - what a method on row data returns (``row.note.upper()``,
+      ``row.note.split(',')``, a mapping value's own ``row.meta.get('x')``);
+    - a list or tuple written only of row data and literals
+      (``[row.note, 'x']``), so an item or element of it and a name a loop
+      over it binds (``{% for c in [row.note] %}``) are row data too;
+    - a concatenation with row data (``row.note ~ 'x'``, always a string), a
+      comparison or ``not`` of it (a boolean), and arithmetic, a negation, a
+      conditional or ``and``/``or`` whose operands are row data or literals.
+
+    A filter or a method counts only when every argument is a literal or row
+    data: ``int(default)``, ``sum(start)``, ``batch(n, fill_with)`` and
+    ``dict.get(key, default)`` can return an argument, which may be callable.
+    What this test does NOT take for row data, so a call on it is admitted:
+    an attribute of row data, which configuration cannot resolve without the
+    value's type — on a string it is the value's own method
+    (``row.tags[0].upper()`` and ``(row.note | attr('upper'))()`` work), on
+    a mapping Jinja reads the item (``row.meta.x()``, and an element of
+    ``map(attribute=...)``, calls row data and fails the row at render); an
+    element of ``groupby`` (its grouper is an attribute); a name bound
+    anywhere to anything else; and a name this flow-insensitive test does
+    not follow into a binding: a macro parameter, whatever its call sites
+    pass (``{{ f(row.note) }}``), and an attribute of a ``namespace()``. A
+    call the test admits that does call row data fails that row at render,
+    routed with a value-free reason like any render failure.
+    So is calling what ``get`` returns, a field value, when ``get`` cannot
+    return its default or the default is a literal or is itself row data by
+    this same test (``row.get('x', row.y)()``): any other default
+    (``row.get('x', range)``) may be callable. ``default`` over row data with
+    such a fallback is row data too (``(row.x | default('y'))()``).
     """
     if isinstance(callee, Getattr):
         return not _is_blocked_row_attribute_name(callee.attr) and _receiver_reads_field(
@@ -633,11 +783,16 @@ def _is_row_field_call(
             callee.node, literal_name, row_receivers, namespaces, row_collection_aliases, row_container_aliases
         )
     if isinstance(callee, Getitem):
-        return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
-    if isinstance(callee, Filter) and callee.name in _ELEMENT_RETURNING_FILTERS:
-        return callee.node is not None and _node_is_row_object_expression(
-            callee.node, namespaces, row_collection_aliases, row_container_aliases
+        return _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases) or _is_row_field_call(
+            callee.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
         )
+    if isinstance(callee, Filter) and callee.name in _ELEMENT_RETURNING_FILTERS:
+        return callee.node is not None and (
+            _node_is_row_object_expression(callee.node, namespaces, row_collection_aliases, row_container_aliases)
+            or _is_row_field_call(callee.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+        )
+    if isinstance(callee, Filter) and callee.name in _MAPPABLE_ROW_DATA_FILTERS | {"map"}:
+        return _is_row_data_filter(callee, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
     if isinstance(callee, Filter) and callee.name in _OPERAND_RETURNING_FILTERS:
         if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):
             return False
@@ -651,7 +806,13 @@ def _is_row_field_call(
                 or _is_row_field_call(fallback, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
             )
         )
-    if isinstance(callee, Call) and isinstance(callee.node, Getattr) and callee.node.attr in TEMPLATE_ROW_METHODS:
+    if (
+        isinstance(callee, Call)
+        and isinstance(callee.node, Getattr)
+        and callee.node.attr in TEMPLATE_ROW_METHODS
+        and _node_is_row_object_expression(callee.node.node, namespaces, row_collection_aliases, row_container_aliases)
+    ):
+        # The row's own ``get``; a ``get`` on a field's value is a method on row data (below).
         if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):
             return False
         default = _call_positional_or_keyword_value(callee, 1, "default")
@@ -659,7 +820,106 @@ def _is_row_field_call(
             default is None
             or isinstance(default, _LITERAL_NODES)
             or _is_row_field_call(default, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
-        ) and _node_is_row_object_expression(callee.node.node, namespaces, row_collection_aliases, row_container_aliases)
+        )
+    return _is_row_data_expression(callee, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+
+
+def _is_row_data_filter(
+    node: Filter,
+    namespaces: frozenset[str],
+    row_receivers: _RowReceiverNames,
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether a builtin filter's result is row data (``_is_row_field_call``): judged by its operand and arguments."""
+    if node.node is None or not _arguments_are_row_data_or_literals(
+        node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
+    ):
+        # A filter's operand is None only inside a {% filter %} block, where no call can take it.
+        return False
+    name = node.name
+    if name == "map":
+        mapped = _filter_positional_or_keyword_value(node, 0, "name")
+        if _filter_keyword_value(node, "attribute") is not None or not (
+            isinstance(mapped, Const) and isinstance(mapped.value, str) and mapped.value in _MAPPABLE_ROW_DATA_FILTERS
+        ):
+            return False
+        name = "list"
+    if name in _VALUE_BUILDING_FILTERS:
+        # A new string, number or markup: row data whenever the row went into it.
+        return _node_is_row_object_expression(node.node, namespaces, row_collection_aliases, row_container_aliases) or _is_row_field_call(
+            node.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
+        )
+    return (
+        _is_row_field_call(node.node, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+        or _node_may_be_the_row(node.node, row_receivers.objects, row_collection_aliases, row_container_aliases)
+        or _node_may_be_a_row_mapping(node.node, row_receivers.mappings, namespaces, row_collection_aliases, row_container_aliases)
+    )
+
+
+def _arguments_are_row_data_or_literals(
+    node: Filter | Call,
+    namespaces: frozenset[str],
+    row_receivers: _RowReceiverNames,
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """Whether every argument of a filter or call is a constant or row data, with no splat: none of them can be callable."""
+    if node.dyn_args is not None or node.dyn_kwargs is not None:
+        return False
+    return all(
+        isinstance(argument, Const)
+        or _is_row_field_call(argument, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+        for argument in (*node.args, *(keyword.value for keyword in node.kwargs))
+    )
+
+
+def _is_row_data_expression(
+    node: Node,
+    namespaces: frozenset[str],
+    row_receivers: _RowReceiverNames,
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> bool:
+    """The row-data arms of ``_is_row_field_call`` that are not lookups or filters: names, method results and operators."""
+
+    def is_data(operand: Node) -> bool:
+        return _is_row_field_call(operand, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
+
+    def is_data_or_literal(operand: Node | None) -> bool:
+        return operand is None or isinstance(operand, Const) or is_data(operand)
+
+    if isinstance(node, Name):
+        return node.name in row_receivers.data
+    if isinstance(node, Call) and isinstance(node.node, Getattr):
+        # A method on row data returns plain data, unless an argument it may return is not.
+        return is_data(node.node.node) and _arguments_are_row_data_or_literals(
+            node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
+        )
+    if isinstance(node, (List, Tuple)):
+        # A list or tuple written only of row data and literals holds plain data.
+        return any(is_data(item) for item in node.items) and all(is_data_or_literal(item) for item in node.items)
+    if isinstance(node, Concat):
+        # ``~`` always builds a string.
+        return any(
+            is_data(operand) or _node_is_row_object_expression(operand, namespaces, row_collection_aliases, row_container_aliases)
+            for operand in node.nodes
+        )
+    if isinstance(node, Compare):
+        # A comparison is always a boolean.
+        return any(is_data(operand) for operand in (node.expr, *(operand.expr for operand in node.ops)))
+    if isinstance(node, Not):
+        return is_data(node.node)
+    if isinstance(node, (Neg, Pos)):
+        return is_data(node.node)
+    if isinstance(node, (Add, Sub, Mul, Div, FloorDiv, Mod, Pow, And, Or)):
+        return is_data_or_literal(node.left) and is_data_or_literal(node.right) and (is_data(node.left) or is_data(node.right))
+    if isinstance(node, CondExpr):
+        return (
+            is_data_or_literal(node.expr1)
+            and is_data_or_literal(node.expr2)
+            and (is_data(node.expr1) or (node.expr2 is not None and is_data(node.expr2)))
+        )
     return False
 
 
@@ -918,7 +1178,7 @@ def _shifted_varargs_splat_kinds(
 
 
 def _field_extraction_context(
-    ast: Node,
+    ast: Template,
     namespace: str,
 ) -> tuple[
     frozenset[str],
@@ -1092,6 +1352,14 @@ def _field_extraction_context(
             iterable, names, frozen_namespaces, final_row_collection_aliases, final_row_container_aliases
         ),
     )
+    row_data_names = _row_data_names(
+        ast,
+        frozen_namespaces | row_object_names | row_mapping_names | final_row_collection_aliases | frozenset(final_row_container_aliases),
+        _RowReceiverNames(objects=row_object_names, mappings=row_mapping_names, data=frozenset()),
+        frozen_namespaces,
+        final_row_collection_aliases,
+        final_row_container_aliases,
+    )
     return (
         frozenset(namespaces),
         api_aliases,
@@ -1100,8 +1368,65 @@ def _field_extraction_context(
         final_row_collection_aliases,
         final_row_container_aliases,
         carrier_limit_reached,
-        _RowReceiverNames(objects=row_object_names, mappings=row_mapping_names),
+        _RowReceiverNames(objects=row_object_names, mappings=row_mapping_names, data=row_data_names),
     )
+
+
+def _row_data_names(
+    ast: Template,
+    carriers: frozenset[str],
+    row_receivers: _RowReceiverNames,
+    namespaces: frozenset[str],
+    row_collection_aliases: frozenset[str],
+    row_container_aliases: dict[str, frozenset[_CarrierPath]],
+) -> frozenset[str]:
+    """The names that hold row data at EVERY binding (``_RowReceiverNames.data``), to a greatest fixpoint.
+
+    A name counts only when each ``set``/``with`` binding of it is row data by
+    ``_is_row_field_call`` and each loop that binds it iterates row data, the
+    row object or a dict built from it (its elements are row data, field
+    names or name and value pairs). A name bound any other way (a macro or
+    call-block parameter, a ``{% set %}`` block, an import) or one that may
+    carry the row itself (``carriers``) never counts, so a name that holds a
+    callable on any path is never taken for data: the analysis is
+    flow-insensitive, and refusing a call on it must never refuse a template
+    that works. For the same reason a name some read may resolve before (or
+    without) any binding never counts: a context read
+    (``meta.find_undeclared_variables``: ``{{ f(1) }}{% set f = row.x %}``)
+    or a Jinja global (``range``, ``dict``, ``cycler`` ...: a ``set`` in a
+    branch not taken leaves the global in place). Jinja answers the first
+    question by compiling, which folds constants into the tree it is given,
+    so it compiles a copy: every later check reads the tree as parsed.
+    """
+    bindings = _assignment_pairs(ast)
+    loops = list(ast.find_all(For))
+    excluded = set(carriers) | meta.find_undeclared_variables(copy.deepcopy(ast)) | set(DEFAULT_NAMESPACE)
+    for macro in ast.find_all(Macro):
+        excluded.update(argument.name for argument in macro.args)
+    for call_block in ast.find_all(CallBlock):
+        excluded.update(argument.name for argument in call_block.args)
+    excluded.update(name for block in ast.find_all(AssignBlock) for name in _target_names(block.target))
+    excluded.update(node.target for node in ast.find_all(Import))
+    for node in ast.find_all(FromImport):
+        excluded.update(name if isinstance(name, str) else name[1] for name in node.names)
+    names = {name for target, _ in bindings for name in _target_names(target)}
+    names.update(name for loop in loops for name in _target_names(loop.target))
+    names -= excluded
+    while True:
+        receivers = _RowReceiverNames(objects=row_receivers.objects, mappings=row_receivers.mappings, data=frozenset(names))
+        current = frozenset(names)
+        for target, value in bindings:
+            if not _is_row_field_call(value, namespaces, receivers, row_collection_aliases, row_container_aliases):
+                names.difference_update(_target_names(target))
+        for loop in loops:
+            if not (
+                _is_row_field_call(loop.iter, namespaces, receivers, row_collection_aliases, row_container_aliases)
+                or _node_may_be_the_row(loop.iter, row_receivers.objects, row_collection_aliases, row_container_aliases)
+                or _node_may_be_a_row_mapping(loop.iter, row_receivers.mappings, namespaces, row_collection_aliases, row_container_aliases)
+            ):
+                names.difference_update(_target_names(loop.target))
+        if names == current:
+            return current
 
 
 def _record_context_binding(

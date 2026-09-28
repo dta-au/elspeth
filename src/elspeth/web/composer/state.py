@@ -89,6 +89,7 @@ from elspeth.plugins.sources.field_normalization import (
 from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
 from elspeth.plugins.transforms.llm.base import (
     MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY,
+    multi_query_context_names,
     multi_query_source_row_columns,
     multi_query_undeclared_columns_message,
 )
@@ -4064,12 +4065,6 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
     return tuple(errors)
 
 
-# The one name build_template_context injects beside the query's own
-# input_fields variables (multi_query.py): the full source row, reachable as
-# row.source_row.<column> inside a query template.
-_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
-
-
 @dataclass(frozen=True, slots=True)
 class PromptTemplateNames:
     """The names one prompt template reads.
@@ -4085,7 +4080,7 @@ class PromptTemplateNames:
     row_fields: frozenset[str]
 
 
-def _parse_template_names(template: str) -> tuple[PromptTemplateNames | None, str | None]:
+def _parse_template_names(template: str, *, multi_query: bool = False) -> tuple[PromptTemplateNames | None, str | None]:
     """Parse a prompt into its names, or return the syntax failure explicitly.
 
     ``{{interpretation:...}}`` placeholders are masked first — they resolve to
@@ -4095,14 +4090,20 @@ def _parse_template_names(template: str) -> tuple[PromptTemplateNames | None, st
     admit the text (``LLMConfig.validate_prompt_template``,
     ``QueryDefinition.validate_template``), so the advisory callers abstain
     on that shape rather than reporting it a second time.
+
+    ``multi_query`` parses a query's effective template: its ``row_fields``
+    are then the query variables it reads as ``row.<variable>``
+    (``multi_query_context_names``, shared with ``LLMConfig``), its
+    ``row.source_row`` reads excluded as column reads, so a method on a
+    column's value (``row.source_row.get('meta', '').upper()``) is no variable.
     """
     masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
     try:
         ast = create_sandboxed_environment().parse(masked)
-        usage = extract_jinja2_field_usage(masked)
+        row_fields = multi_query_context_names(masked) if multi_query else extract_jinja2_field_usage(masked).fields
     except (TemplateError, TemplateSyntaxError) as exc:
         return None, str(exc)
-    return PromptTemplateNames(context_names=find_runtime_unbound_variables(ast), row_fields=usage.fields), None
+    return PromptTemplateNames(context_names=find_runtime_unbound_variables(ast), row_fields=row_fields), None
 
 
 @observation_boundary(
@@ -4182,7 +4183,9 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
         return ()
 
     node_template = node.options.get("prompt_template")
-    node_parse, _node_syntax_error = _parse_template_names(node_template) if isinstance(node_template, str) else (None, None)
+    node_parse, _node_syntax_error = (
+        _parse_template_names(node_template, multi_query=True) if isinstance(node_template, str) else (None, None)
+    )
 
     errors: list[ValidationEntry] = []
     node_template_in_use = False
@@ -4197,7 +4200,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
 
         override = entry.get("template")
         if isinstance(override, str):
-            parsed, _override_syntax_error = _parse_template_names(override)
+            parsed, _override_syntax_error = _parse_template_names(override, multi_query=True)
             source_desc = "its template override"
         elif override is None:
             if node_parse is None:
@@ -4231,7 +4234,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
                     )
                 )
 
-        unbound_fields = sorted(row_fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+        unbound_fields = sorted(row_fields - bound)
         if unbound_fields:
             fields = ", ".join(f"'{name}'" for name in unbound_fields)
             bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
