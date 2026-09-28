@@ -111,6 +111,7 @@ class _ColourConsumer:
     forwards_input_fields = False
     removed_input_fields = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.name = "consumer"

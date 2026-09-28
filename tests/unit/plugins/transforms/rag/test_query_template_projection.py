@@ -409,3 +409,10 @@ def test_field_and_regex_modes_render_nothing(monkeypatch: pytest.MonkeyPatch) -
     builder = QueryBuilder("question", row_projection=_QUESTION_ONLY)
     assert builder.build(_row()).query == "how do plants eat"
     assert sent == []
+
+
+def test_header_spelled_lookups_are_published_for_the_build() -> None:
+    """A spelling of a declared field config admits is published: the build proves an arriving row can carry it (review r1 F1)."""
+    assert _config("{{ query }} {{ row['Topic'] }} {{ row.question }}", ["topic"]).header_spelled_row_lookups() == {"Topic": "topic"}
+    assert _config("{{ query }} {{ row['Topic'] }}", []).header_spelled_row_lookups() == {}
+    assert _config("{{ query }} {{ row.topic }}", ["topic"]).header_spelled_row_lookups() == {}

@@ -11,7 +11,7 @@ from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.errors import SchemaConfigModeViolation
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.dag.graph import ExecutionGraph
-from elspeth.core.dag.models import EdgeContractError
+from elspeth.core.dag.models import EdgeContractError, GraphValidationError
 from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
 from elspeth.plugins.sources.csv_source import CSVSource
 from elspeth.plugins.transforms.value_transform import ValueTransform
@@ -79,14 +79,8 @@ def test_csv_forwarded_fields_reconcile_declarations_without_losing_aliases(tmp_
 
 
 @pytest.mark.parametrize("expression, expected", [("row['X'] > 0", True), ("None", None)])
-def test_untyped_computed_target_declares_presence_as_any_before_row_one(tmp_path, expression, expected):
-    """The arriving int is not an output proof: an untyped target is declared ``any``, never typed by a row.
-
-    ADR-050 (reconciled with 63a2e1825): the declaration is fixed before the
-    first row, so the recorded contract is ``object``/``declared``/nullable on
-    every row whatever the expression computes; the value is written as
-    computed.
-    """
+def test_computed_target_declares_its_provable_type_before_row_one(tmp_path, expression, expected):
+    """A computed bool has a fixed type; a None-only expression abstains to any."""
     row = _csv_row(tmp_path, declared=True, numeric=True)
     transform = ValueTransform(
         {
@@ -101,17 +95,17 @@ def test_untyped_computed_target_declares_presence_as_any_before_row_one(tmp_pat
     assert result.row["x"] is expected
     assert result.row["X"] is expected
     field = result.row.contract.get_field("x")
-    assert field.python_type is object
+    assert field.python_type is (bool if expression != "None" else object)
     assert field.source == "declared"
     assert field.original_name == "X"
     assert field.required is True
-    assert field.nullable is True
+    assert field.nullable is (expression == "None")
     output = transform._output_schema_config
     assert output is not None and output.fields is not None
     declared = next(field for field in output.fields if field.name == "x")
-    assert declared.field_type == "any"
+    assert declared.field_type == ("bool" if expression != "None" else "any")
     assert declared.required is True
-    assert declared.nullable is True
+    assert declared.nullable is (expression == "None")
     assert "x" in output.get_effective_guaranteed_fields()
 
 
@@ -323,21 +317,20 @@ def _graph(tmp_path: Path, *, normalize: bool, calculate_fields: tuple[str, ...]
     )
 
 
-def test_untyped_computed_target_cannot_reuse_the_arriving_type_as_output_proof(tmp_path):
-    """The arriving ``x: int`` (source-declared) proves nothing about the computed ``x``: the edge refuses at build."""
+def test_computed_target_uses_expression_type_as_output_proof(tmp_path):
+    """The arriving ``x: int`` does not mask a computed bool at a typed edge."""
     with pytest.raises(EdgeContractError) as raised:
         _graph(tmp_path, normalize=False, calculate_fields=_UNTYPED_TARGET_FIELDS)
-    assert raised.value.compatibility_result.type_mismatches == (("x", "int", "typing.Any | None"),)
+    assert raised.value.compatibility_result.type_mismatches == (("x", "int", "bool"),)
 
 
 def test_typed_computed_target_is_the_output_proof_the_pin_enforces(tmp_path):
-    """A target the node's schema types is the output declaration (ADR-050), so the typed edge builds.
+    """A certain computed contradiction is refused at build.
 
-    The proof is honest because it is enforced: the same node returns a row
-    whose computed value breaks the declaration as a routed ``type_mismatch``
-    error instead of emitting it under ``int``.
+    Direct plugin invocation still pins and routes the mismatched row value.
     """
-    _graph(tmp_path, normalize=False)
+    with pytest.raises(GraphValidationError, match=r"target 'x' declares int.*computes bool"):
+        _graph(tmp_path, normalize=False)
 
     transform = ValueTransform(_calculate_options(_TYPED_TARGET_FIELDS))
     row = PipelineRow(
@@ -362,6 +355,20 @@ def test_typed_computed_target_is_the_output_proof_the_pin_enforces(tmp_path):
     )
 
 
+def test_certain_null_result_respects_authored_nullability():
+    nonnullable = ValueTransform(
+        {"schema": {"mode": "flexible", "fields": ["x: int"]}, "operations": [{"target": "x", "expression": "None"}]}
+    )
+    with pytest.raises(GraphValidationError, match=r"target 'x' declares int.*computes null"):
+        nonnullable.bind_upstream_input_types({})
+
+    nullable = ValueTransform(
+        {"schema": {"mode": "flexible", "fields": ["x: int?"]}, "operations": [{"target": "x", "expression": "None"}]}
+    )
+    nullable.bind_upstream_input_types({})
+
+
 def test_explicit_type_coerce_establishes_computed_output_type(tmp_path):
-    _graph(tmp_path, normalize=True)
+    with pytest.raises(GraphValidationError, match=r"target 'x' declares int.*computes bool"):
+        _graph(tmp_path, normalize=True)
     _graph(tmp_path, normalize=True, calculate_fields=_UNTYPED_TARGET_FIELDS)

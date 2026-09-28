@@ -545,6 +545,14 @@ class BaseTransform(ABC):
     # ``narrow_contract_to_output``; the build's name resolution follows them.
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
+    # Header-spelled row lookups (``TransformProtocol.header_spelled_lookups``):
+    # literal -> declared field for every row lookup the node makes by a
+    # spelling other than the field it declares (a template's row['Name']
+    # under required_input_fields [name]). Per-INSTANCE (computed from the
+    # template and the declaration), so a template consumer sets it in
+    # ``__init__``; the build proves each can resolve on an arriving row.
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
+
     # Value-preservation declaration (elspeth-e6e552ce34).
     #
     # `passes_through_input` and `forwards_input_fields` are PRESENCE
@@ -2713,11 +2721,19 @@ class BaseSource(ABC):
     # ``field_renames``.
     _field_mapping: dict[str, str] | None = None
     _field_mapping_keys: FieldMappingKeys = "normalized"
+    # A positive source capability: only sources that derive row keys from
+    # external headers may offer an original-header spelling to downstream
+    # lookups. Identity sources leave this False.
+    _normalizes_external_names: bool = False
 
     @property
     def field_renames(self) -> SourceFieldRenames:
         """The renames this source applies, keyed the way it keys them (``SourceProtocol.field_renames``)."""
-        return SourceFieldRenames(mapping={} if self._field_mapping is None else self._field_mapping, keys=self._field_mapping_keys)
+        return SourceFieldRenames(
+            mapping={} if self._field_mapping is None else self._field_mapping,
+            keys=self._field_mapping_keys,
+            normalizes_external_names=self._normalizes_external_names,
+        )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         # Enforces the contract documented in contracts/enums.py:Determinism —

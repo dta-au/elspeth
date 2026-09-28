@@ -1225,7 +1225,11 @@ the node does not declare cannot reach the prompt through any template form.
 Within that:
 
 - `row.name` and `row['name']` read a declared field by its normalized name,
-  and `row['Original Header']` reads it by the source's original header.
+  and `row['Original Header']` or `row['Name']` reads it by the source's
+  original header. Configuration admits a read spelled as a header of a
+  declared field (its normalized form is declared); whether a row's header is
+  spelled that way is data, so a row whose header is spelled otherwise fails
+  that row at render (`template_rendering_failed`, naming the spelling).
 - `row.get('name')` returns a declared field, or `None` when the row does not
   carry it; `'name' in row` is `False` then.
 - `{% for name in row %}`, `row | length`, `row | list`, `row | dictsort`,

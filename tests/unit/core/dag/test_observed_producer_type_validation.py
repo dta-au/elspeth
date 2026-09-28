@@ -555,6 +555,7 @@ class _ThreadingFakeBatchTransform:
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, preserves_input_values: bool) -> None:
         self.name = name
@@ -597,6 +598,7 @@ class _ThreadingFakeOpenerTransform:
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self.name = "json_explode"

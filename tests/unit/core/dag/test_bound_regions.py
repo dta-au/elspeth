@@ -105,6 +105,7 @@ class _BoundRegionTransform:
     forwards_input_fields = False
     removed_input_fields = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -146,6 +147,7 @@ class _BoundRegionMultiRowTransform:
     forwards_input_fields = False
     removed_input_fields = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -191,6 +193,7 @@ class _BoundRegionCollectorPlugin:
     forwards_input_fields = False
     removed_input_fields = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -235,6 +238,7 @@ class _BoundRegionAggregationTransform:
     forwards_input_fields = False
     removed_input_fields = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name

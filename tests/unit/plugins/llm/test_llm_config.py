@@ -2210,21 +2210,41 @@ class TestTemplateVariableBindings:
             self._single('Rate: {{ row["Original Header"] }}', required_input_fields=["something_else"])
         assert "declare as 'original_header'" in str(exc_info.value)
 
-    def test_single_prompt_case_variant_reference_rejected(self) -> None:
-        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident.
+    @pytest.mark.parametrize("template", ["Hello {{ row.Name }}", "Hello {{ row['Name'] }}", "Hello {{ row.get('Name', '') }}"])
+    def test_single_prompt_header_spelling_of_a_declared_field_accepted(self, template: str) -> None:
+        """``{{ row.Name }}`` under a declared ``name`` reads ``name`` by its header spelling (ADR-051 (b), S-02).
 
-        ``SchemaContract.find_name`` is an exact match on ``normalized_name`` OR
-        ``original_name``, and config time knows neither: the same YAML renders
-        or fails 100% of rows depending on a CSV header's capitalization that no
-        validator ever sees. An earlier version bridged this through
-        ``normalize_field_name`` and so also silenced plain typos of the
-        declared name (``a__b`` for ``a_b``) — the very class this check exists
-        for. The surviving advice is the message's first remedy: rewrite the
-        reference to ``row.name``.
+        The template row resolves a declared field by its canonical and its
+        recorded original name, so a source whose header is ``Name`` delivers
+        it; a row whose header is spelled otherwise fails that row at render.
         """
+        assert self._single(template, required_input_fields=["name"]).prompt_template == template
+
+    def test_header_spelled_lookups_are_published_for_the_build(self) -> None:
+        """Each spelling config admits is published (literal -> declared field): the build proves a row can carry it."""
+        config = self._single(
+            "{{ row['Name'] }} {{ row.score }} {{ row['Score_Text'] }}", required_input_fields=["name", "score", "score_text"]
+        )
+        assert config.header_spelled_row_lookups() == {"Name": "name", "Score_Text": "score_text"}
+
+    def test_the_opt_out_publishes_no_lookup(self) -> None:
+        assert self._single("{{ row['Name'] }}", required_input_fields=[]).header_spelled_row_lookups() == {}
+
+    def test_multi_query_columns_and_source_row_reads_are_published(self) -> None:
+        config = LLMConfig(
+            provider="azure",
+            prompt_template="Assess {{ row.text }} {{ row.source_row['Topic'] }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["name", "topic"],
+            queries={"q1": {"input_fields": {"text": "Name"}}},
+        )
+        assert config.header_spelled_row_lookups() == {"Name": "name", "Topic": "topic"}
+
+    def test_single_prompt_spelling_of_an_undeclared_field_rejected(self) -> None:
+        """A spelling of a field the node does not declare is still an undeclared read."""
         with pytest.raises(ValidationError, match="required_input_fields does not declare") as exc_info:
-            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
-        assert "'Name'" in str(exc_info.value)
+            self._single("Hello {{ row.Title }}", required_input_fields=["name"])
+        assert "'Title'" in str(exc_info.value)
 
     def test_single_prompt_keyword_literal_accepted(self) -> None:
         """``row["class"]`` cannot be declared — ``class`` is a Python keyword — so
@@ -2243,7 +2263,7 @@ class TestTemplateVariableBindings:
         and breaks the run.
         """
         with pytest.raises(ValidationError) as exc_info:
-            self._single("Hello {{ row.Name }}", required_input_fields=["name"])
+            self._single("Hello {{ row.title }}", required_input_fields=["name"])
         message = str(exc_info.value)
         assert message.index("Rewrite each reference") < message.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in message

@@ -23,8 +23,12 @@ from elspeth.contracts.field_spelling import (
     DeclaredSpellings,
     FieldNameResolution,
     describe_header_spellings,
+    describe_unreachable_spelled_lookups,
+    freshly_created_fields,
     header_spelled_declarations,
     header_spelled_names,
+    keeps_input_field_contracts,
+    unreachable_spelled_lookups,
 )
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
@@ -72,6 +76,7 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # name, and only this check names the remedy (operator ruling 2026-09-25,
     # field-name spelling rule).
     validate_declared_field_spellings(graph)
+    validate_spelled_row_lookups_reachable(graph)
 
     # Validate each edge (skip divert edges — quarantine/error data doesn't
     # conform to producer schemas because it failed validation or errored)
@@ -1236,10 +1241,21 @@ def upstream_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[st
 
 
 def _output_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str, FieldNameResolution]) -> FieldNameResolution:
-    """The name resolution of the rows ``node_id`` emits: a source's renames, else its input's past its own renames.
+    """The name resolution of the rows ``node_id`` emits: a source's own, else its input's past the node.
 
-    Iterative post-order over live predecessors, memoised in ``cache``, so a
-    deep chain does not recurse.
+    At a source (``FieldNameResolution.of_source``): its renames and the
+    closed upper bound of its output schema, which bounds the fields its
+    rows can carry under a header's spelling. Past the node
+    (``FieldNameResolution.past_node``): its renames, the fields a transform
+    creates fresh (``freshly_created_fields``), its named removals, the
+    closed upper bound of its output (``SchemaConfig.closed_field_names``) at
+    a transform or aggregation, whose computed output schema the build
+    assigns it, and whether its rows keep its input's field contracts at all
+    (``keeps_input_field_contracts``: a reductive aggregation or collector
+    records every field under its own name). The Web Composer's
+    ``_producer_name_resolution`` passes the same facts. Iterative post-order
+    over live predecessors, memoised in ``cache``, so a deep chain does not
+    recurse.
     """
     pending: list[tuple[str, bool]] = [(node_id, False)]
     while pending:
@@ -1248,15 +1264,36 @@ def _output_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str
             continue
         info = graph.get_node_info(current)
         if info.node_type is NodeType.SOURCE:
-            cache[current] = FieldNameResolution.of_source_renames((info.field_renames,))
+            cache[current] = FieldNameResolution.of_source(
+                info.field_renames,
+                carried_out=None if info.output_schema_config is None else info.output_schema_config.closed_field_names(),
+            )
             continue
         predecessors = _live_predecessors(graph, current)
         if not inputs_resolved:
             pending.append((current, True))
             pending.extend((predecessor_id, False) for predecessor_id in predecessors if predecessor_id not in cache)
             continue
-        cache[current] = FieldNameResolution.union(cache[predecessor_id] for predecessor_id in predecessors).then_renamed(
-            info.renamed_input_fields
+        output_config = info.output_schema_config
+        cache[current] = FieldNameResolution.union(cache[predecessor_id] for predecessor_id in predecessors).past_node(
+            renamed=info.renamed_input_fields,
+            created=freshly_created_fields(
+                declared_output_fields=info.declared_output_fields,
+                renamed_input_fields=info.renamed_input_fields,
+                passes_through_input=info.passes_through_input,
+                forwards_input_fields=info.forwards_input_fields,
+            ),
+            removed=info.removed_input_fields,
+            carried_out=(
+                output_config.closed_field_names()
+                if output_config is not None and info.node_type in (NodeType.TRANSFORM, NodeType.AGGREGATION)
+                else None
+            ),
+            keeps_input_contracts=keeps_input_field_contracts(
+                batch_output=info.node_type in (NodeType.AGGREGATION, NodeType.COLLECTOR),
+                passes_through_input=info.passes_through_input,
+                forwards_input_fields=info.forwards_input_fields,
+            ),
         )
     return cache[node_id]
 
@@ -1902,6 +1939,45 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
                 f"spelling: {describe_header_spellings(spellings)}. {HEADER_SPELLING_RULE}",
                 component_id=str(node_id),
                 component_type=component_type,
+            )
+
+
+def validate_spelled_row_lookups_reachable(graph: ExecutionGraph) -> None:
+    """Refuse a row lookup by a spelling no row arriving at the node can resolve to the field it names.
+
+    A template may read a declared field by a header spelling of it
+    (``row['Name']`` under ``required_input_fields: [name]``, ADR-051 (b)):
+    at render the lookup resolves only when the arriving row records the
+    literal as the field's original name. Configuration admits the spelling
+    (it has no upstream); the node publishes it
+    (``NodeInfo.header_spelled_lookups``) and this check proves it against
+    the upstream's name resolution, united over every live predecessor
+    (``upstream_name_resolution``): refused only when NO path can deliver the
+    field under that spelling — a field some transform created fresh on every
+    path records only its own name (``FieldNameResolution.past_node``), so
+    ``row['Score_Text']`` over an llm's created ``score_text`` fails every row.
+    Release refused that read at config; the one predicate is
+    ``field_spelling.unreachable_spelled_lookups``, which the Web Composer's
+    Stage-1 mirror calls with the same resolution.
+
+    Raises:
+        GraphValidationError: if a transform looks a field up by a spelling no
+            arriving row can carry it under.
+    """
+    name_resolution_cache: dict[str, FieldNameResolution] = {}
+    for node_id, data in graph._graph.nodes(data=True):
+        info = data["info"]
+        if not info.header_spelled_lookups:
+            continue
+        unreachable = unreachable_spelled_lookups(
+            info.header_spelled_lookups, upstream_name_resolution(graph, node_id, name_resolution_cache)
+        )
+        if unreachable:
+            raise GraphValidationError(
+                f"Unreachable header spelling: transform '{info.plugin_name}' (node '{node_id}') reads fields by a "
+                f"spelling no row arriving at it carries: {describe_unreachable_spelled_lookups(unreachable)}.",
+                component_id=str(node_id),
+                component_type="transform",
             )
 
 

@@ -45,6 +45,7 @@ from jinja2.visitor import NodeVisitor
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import PluginRetryableError
+from elspeth.contracts.field_spelling import header_spelling_canonical
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.tier_registry import FrameworkBugError
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -204,11 +205,17 @@ class _UndeclaredFieldError(Exception):
     The key may be computed from row data (``row[row.k]``), so it is an
     attribute, never the message: the worker turns it into value-free text
     (``_undeclared_field_text``) before anything leaves the process.
+    ``spells_declared`` says the key is a header spelling of a declared field
+    (``header_spelling_canonical``) that this row's producer did not record:
+    configuration admits ``row['Name']`` under ``[name]`` because a producer
+    whose header is ``Name`` records it, so this row's header is spelled
+    otherwise. That is a data-dependent miss, not an undeclared read.
     """
 
-    def __init__(self, key: object) -> None:
+    def __init__(self, key: object, *, spells_declared: bool) -> None:
         super().__init__()
         self.key = key
+        self.spells_declared = spells_declared
 
 
 class _RetiredRowNameError(Exception):
@@ -305,6 +312,11 @@ class TemplateRow(Mapping[str, Any]):
     def _is_undeclared(self, key: object) -> bool:
         return self._declared is not None and (type(key) is not str or key not in self._declared)
 
+    def _undeclared(self, key: object) -> _UndeclaredFieldError:
+        """The error for a read ``_is_undeclared`` refused, telling a spelling of a declared field from an undeclared name."""
+        spells_declared = type(key) is str and self._declared is not None and header_spelling_canonical(key, self._declared) is not None
+        return _UndeclaredFieldError(key, spells_declared=spells_declared)
+
     def __setattr__(self, key: str, value: Any) -> None:
         raise TypeError("TemplateRow is immutable")
 
@@ -315,14 +327,14 @@ class TemplateRow(Mapping[str, Any]):
         if type(key) is str and key in self._names:
             return self._values[self._names[key]]
         if self._is_undeclared(key):
-            raise _UndeclaredFieldError(key)
+            raise self._undeclared(key)
         raise KeyError(key)
 
     def __contains__(self, key: object) -> bool:
         if type(key) is str and key in self._names:
             return True
         if self._is_undeclared(key):
-            raise _UndeclaredFieldError(key)
+            raise self._undeclared(key)
         return False
 
     def __iter__(self) -> Iterator[str]:
@@ -746,7 +758,7 @@ def _serve_request(source: str, payload: bytes, value_free: bool) -> tuple[str, 
     except _UndefinedContractError as exc:
         return "undefined_contract", str(exc)[:1024]
     except _UndeclaredFieldError as exc:
-        return "undeclared_field", _undeclared_field_text(exc.key, source)
+        return "undeclared_field", _undeclared_field_text(exc.key, source, spells_declared=exc.spells_declared)
     except _RetiredRowNameError:
         return "retired_row_name", _RETIRED_ROW_NAME_TEXT
     except contract_errors.TIER_1_ERRORS as exc:
@@ -1314,16 +1326,27 @@ def _template_literals(ast: nodes.Template) -> frozenset[str | int]:
     return frozenset(literals)
 
 
-def _undeclared_field_text(key: object, source: str) -> str:
+def _undeclared_field_text(key: object, source: str, *, spells_declared: bool) -> str:
     """The value-free text of a read of an undeclared field: the key only when the template spells it out.
 
     A computed key (``row[row.k]``) can be a row value, so it prints as
-    ``_UNSPELLED_KEY`` unless it equals one of the template's own literals.
+    ``_UNSPELLED_KEY`` unless it equals one of the template's own literals,
+    and only a spelled key says it is a spelling of a declared field (whether
+    a computed key spells one is itself a fact about row data). The declared
+    field is not named: behind a source ``field_mapping`` the literal's
+    normalized form need not be the name the node declares.
     """
     parser = _LocalSandboxedEnvironment(undefined=StrictUndefined, autoescape=False, optimized=False)
     literals = _template_literals(parser.parse(source))
-    spelled = repr(key) if (type(key) is str or type(key) is int) and key in literals else _UNSPELLED_KEY
-    return f"the template reads {spelled}, a field this node does not declare in required_input_fields"
+    if (type(key) is str or type(key) is int) and key in literals:
+        if spells_declared:
+            return (
+                f"the template reads {key!r}, a spelling of a declared field that this row does not carry under "
+                "that spelling (its producer recorded another original name, or the field is absent); read the "
+                "field by its declared name"
+            )
+        return f"the template reads {key!r}, a field this node does not declare in required_input_fields"
+    return f"the template reads {_UNSPELLED_KEY}, a field this node does not declare in required_input_fields"
 
 
 def _value_free_undefined(literals: frozenset[str | int]) -> type[StrictUndefined]:

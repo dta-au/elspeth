@@ -68,6 +68,7 @@ class MockTransformWithSchemaConfig:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         # Computed schema config with guaranteed and audit fields
@@ -114,6 +115,7 @@ class MockTransformWithoutSchemaConfig:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
     _output_schema_config: SchemaConfig | None = None
 
 
@@ -539,6 +541,7 @@ class MockAggregationTransform:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self) -> None:
         self._output_schema_config = SchemaConfig(
@@ -1125,6 +1128,7 @@ class _ConfigurableTransform:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, guaranteed_fields: tuple[str, ...] | None) -> None:
         self.name = name

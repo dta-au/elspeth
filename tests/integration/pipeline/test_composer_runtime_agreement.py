@@ -9053,6 +9053,531 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
         self._assert_both_reject(state, tmp_path, "'Name' is a header spelling of the arriving field 'name'")
 
 
+class TestComposerRuntimeSpellingProvenanceAgreement:
+    """Shape 31b — what each node does to the names its rows carry, on both surfaces (review-B2-template-residuals-r1).
+
+    F5: a rename's alias dies with the field it renamed — a later, unrelated
+    field of that name must not inherit the dropped field's spellings.
+    F1: a field a transform creates records only its own name, so a template
+    lookup of another spelling of it can never resolve; both surfaces refuse
+    it, and admit a spelling a source header can carry.
+
+    Bug verification protocol: making ``FieldNameResolution.past_node`` keep
+    every leg (no pruning) refuses the F5 accepts on both sides; making
+    ``unreachable_spelled_lookups`` return () admits the F1 refusal on both.
+    """
+
+    @staticmethod
+    def _csv(tmp_path: Path, text: str) -> Path:
+        path = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "provenance.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _node(node_id: str, plugin: str, *, input_: str, on_success: str, options: dict[str, Any]) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin=plugin,
+            input=input_,
+            on_success=on_success,
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _state(self, tmp_path: Path, *, csv_text: str, source_schema: dict[str, Any], nodes: tuple[NodeSpec, ...]) -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success=nodes[0].input,
+                options={"path": str(self._csv(tmp_path, csv_text)), "schema": source_schema},
+                on_validation_failure="discard",
+            ),
+            nodes=nodes,
+            edges=(),
+            outputs=(TestComposerRuntimeFieldNameSpellingAgreement._output(tmp_path),),
+            metadata=PipelineMetadata(name="provenance"),
+            version=1,
+        )
+
+    def _drop_then_recreate(self, tmp_path: Path, *, drop: bool) -> CompositionState:
+        """name -> b, (optionally) drop b, c -> b (a new b), then create 'name' (scratch/fanin/linear_drop_create.yaml)."""
+        fixed = {"mode": "fixed", "fields": ["id: str", "name: str", "c: str"]}
+        nodes = [self._node("a_rename", "field_mapper", input_="n0", on_success="n1", options={"mapping": {"name": "b"}, "schema": fixed})]
+        if drop:
+            nodes.append(
+                self._node(
+                    "a_drop",
+                    "field_mapper",
+                    input_="n1",
+                    on_success="n2",
+                    options={
+                        "mapping": {"id": "id", "c": "c"},
+                        "select_only": True,
+                        "schema": {"mode": "fixed", "fields": ["id: str", "b: str", "c: str"]},
+                    },
+                )
+            )
+            nodes.append(
+                self._node(
+                    "b_rename",
+                    "field_mapper",
+                    input_="n2",
+                    on_success="n3",
+                    options={"mapping": {"c": "b"}, "schema": {"mode": "fixed", "fields": ["id: str", "c: str"]}},
+                )
+            )
+        last = nodes[-1].on_success
+        nodes.append(
+            self._node(
+                "make_name",
+                "value_transform",
+                input_=last,
+                on_success="main",
+                options={"operations": [{"target": "name", "expression": "'x'"}], "schema": {"mode": "observed"}},
+            )
+        )
+        return self._state(tmp_path, csv_text="id,name,c\n1,a,x\n", source_schema=fixed, nodes=tuple(nodes))
+
+    def test_both_accept_a_new_field_named_like_a_dropped_alias(self, tmp_path: Path) -> None:
+        """F5: once b is dropped, 'name' no longer spells anything; the later b is c's, not name's."""
+        composer, runtime = TestComposerRuntimeFieldNameSpellingAgreement._both(self._drop_then_recreate(tmp_path, drop=True), tmp_path)
+        assert not [e for e in composer.errors if e.error_code == "field_name_header_spelling"], composer.errors
+        assert composer.is_valid, composer.errors
+        assert runtime.is_valid, runtime.errors
+
+    def test_both_still_reject_the_alias_while_the_renamed_field_lives(self, tmp_path: Path) -> None:
+        """Control: without the drop, b still carries name's identity and a created 'name' would sit beside it."""
+        composer, runtime = TestComposerRuntimeFieldNameSpellingAgreement._both(self._drop_then_recreate(tmp_path, drop=False), tmp_path)
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert "'name' is a header spelling of the arriving field 'b'" in entry.message
+        assert not runtime.is_valid
+        assert any("'name' is a header spelling of the arriving field 'b'" in e.message for e in runtime.errors), runtime.errors
+
+    @staticmethod
+    def _llm_options(template: str, required: list[str], response_field: str) -> dict[str, Any]:
+        return {
+            "provider": "openrouter",
+            "model": "openai/gpt-4.1-nano",
+            "api_key": "sk-test-key",
+            "prompt_template": template,
+            "required_input_fields": required,
+            "response_field": response_field,
+            "schema": {"mode": "observed"},
+        }
+
+    _SOURCE_SCHEMA: ClassVar[dict[str, Any]] = {"mode": "observed", "guaranteed_fields": ["id", "name"]}
+    _PRE = ("Score {{ row.name }}", ["name"], "score_text")
+
+    def _created_then_read(self, tmp_path: Path, template: str, required: list[str]) -> CompositionState:
+        """llm_pre creates 'score_text'; llm_0 reads by ``template`` (review r1 F1's a2 chain)."""
+        return self._state(
+            tmp_path,
+            csv_text="id,Name\n1,alice\n",
+            source_schema=self._SOURCE_SCHEMA,
+            nodes=(
+                self._node("llm_pre", "llm", input_="n0", on_success="n1", options=self._llm_options(*self._PRE)),
+                self._node("llm_0", "llm", input_="n1", on_success="main", options=self._llm_options(template, required, "llm_out")),
+            ),
+        )
+
+    def _runtime_graph(self, tmp_path: Path, template: str, required: list[str]) -> ExecutionGraph:
+        """The same chain built as ``elspeth validate`` builds it (plugin instances, then the DAG build)."""
+        config = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="n0",
+                    options={
+                        "path": str(self._csv(tmp_path, "id,Name\n1,alice\n")),
+                        "schema": self._SOURCE_SCHEMA,
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="llm_pre", plugin="llm", input="n0", on_success="n1", on_error="discard", options=self._llm_options(*self._PRE)
+                ),
+                TransformSettings(
+                    name="llm_0",
+                    plugin="llm",
+                    input="n1",
+                    on_success="main",
+                    on_error="discard",
+                    options=self._llm_options(template, required, "llm_out"),
+                ),
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv", on_write_failure="discard", options={"path": str(tmp_path / "out.csv"), "schema": {"mode": "observed"}}
+                )
+            },
+        )
+        plugins = instantiate_plugins_from_config(config)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=None,
+        )
+
+    def test_both_reject_a_header_spelling_of_a_created_field(self, tmp_path: Path) -> None:
+        """F1: row['Score_Text'] over an llm's created score_text can never resolve (every row failed at render)."""
+        template, required = "Again {{ row['Score_Text'] }}", ["score_text"]
+        composer = self._created_then_read(tmp_path, template, required).validate()
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_lookup_unreachable"]
+        expected = (
+            "'Score_Text' reads 'score_text' by a spelling no arriving row carries it under: no row arrives here with "
+            "'score_text' recorded under a source header's spelling"
+        )
+        assert expected in entry.message
+        with pytest.raises(GraphValidationError, match="Unreachable header spelling") as caught:
+            self._runtime_graph(tmp_path, template, required)
+        assert expected in str(caught.value)
+
+    @pytest.mark.parametrize(
+        ("template", "required"),
+        [
+            pytest.param("Again {{ row['score_text'] }}", ["score_text"], id="the-created-name"),
+            pytest.param("Again {{ row['Name'] }} {{ row.score_text }}", ["name", "score_text"], id="a-source-header-spelling"),
+        ],
+    )
+    def test_both_admit_a_lookup_a_row_can_resolve(self, tmp_path: Path, template: str, required: list[str]) -> None:
+        """Controls: the created field by its own name, and a source field by a header spelling (ADR-051 (b), S-02)."""
+        composer = self._created_then_read(tmp_path, template, required).validate()
+        assert not [e for e in composer.errors if e.error_code == "field_name_lookup_unreachable"], composer.errors
+        self._runtime_graph(tmp_path, template, required)
+
+    # review-B2-fix-r1 M1: a field no source header can name. Each shape
+    # validated green and failed every row at render; release refused each.
+    _NO_HEADER_SHAPES = (
+        pytest.param(
+            {"columns": ["id", "score_text"], "schema": {"mode": "fixed", "fields": ["id: int", "score_text: str"]}},
+            "1,a\n",
+            (),
+            "Score_Text",
+            "score_text",
+            True,
+            id="x1-headerless-source",
+        ),
+        pytest.param(
+            {"schema": {"mode": "fixed", "fields": ["id: int", "score_text: str"]}},
+            "id,Score_Text\n1,a\n",
+            (),
+            "Score_Text",
+            "score_text",
+            False,
+            id="x1-control-headered-source",
+        ),
+        pytest.param(
+            {"schema": {"mode": "fixed", "fields": ["id: int", "name: str"]}},
+            "id,name\n1,a\n",
+            (
+                (
+                    "vt",
+                    "value_transform",
+                    {"operations": [{"target": "score_text", "expression": "row['name']"}], "schema": {"mode": "observed"}},
+                ),
+            ),
+            "Score_Text",
+            "score_text",
+            True,
+            id="x2-value-target-behind-a-closed-source",
+        ),
+        pytest.param(
+            {"schema": {"mode": "observed"}},
+            "id,name\n1,a\n",
+            (
+                (
+                    "vt",
+                    "value_transform",
+                    {"operations": [{"target": "score_text", "expression": "row['name']"}], "schema": {"mode": "observed"}},
+                ),
+            ),
+            "Score_Text",
+            "score_text",
+            False,
+            id="x2-control-value-target-behind-an-open-source",
+        ),
+        pytest.param(
+            {"field_mapping": {"name": "given"}, "schema": {"mode": "flexible", "fields": ["id: int", "given: str"]}},
+            "id,Name\n1,a\n",
+            (),
+            "Given",
+            "given",
+            True,
+            id="x5-source-mapping-target",
+        ),
+    )
+
+    def _source_then_read(
+        self,
+        tmp_path: Path,
+        *,
+        source_options: dict[str, Any],
+        csv_text: str,
+        middle: tuple[tuple[str, str, dict[str, Any]], ...],
+        literal: str,
+        field: str,
+        source_plugin: str = "csv",
+    ) -> tuple[CompositionState, ElspethSettings]:
+        """source -> the ``middle`` transforms -> an llm reading ``row[literal]`` under ``[field]``; the composer state and settings."""
+        path = str(self._csv(tmp_path, csv_text))
+        reader = ("llm_0", "llm", self._llm_options(f"Again {{{{ row['{literal}'] }}}}", [field], "llm_out"))
+        chain = (*middle, reader)
+        connections = [f"n{index}" for index in range(len(chain))] + ["main"]
+        state = CompositionState(
+            source=SourceSpec(
+                plugin=source_plugin, on_success="n0", options={"path": path, **source_options}, on_validation_failure="discard"
+            ),
+            nodes=tuple(
+                self._node(name, plugin, input_=connections[index], on_success=connections[index + 1], options=options)
+                for index, (name, plugin, options) in enumerate(chain)
+            ),
+            edges=(),
+            outputs=(TestComposerRuntimeFieldNameSpellingAgreement._output(tmp_path),),
+            metadata=PipelineMetadata(name="provenance"),
+            version=1,
+        )
+        settings = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin=source_plugin, on_success="n0", options={"path": path, **source_options, "on_validation_failure": "discard"}
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name=name,
+                    plugin=plugin,
+                    input=connections[index],
+                    on_success=connections[index + 1],
+                    on_error="discard",
+                    options=options,
+                )
+                for index, (name, plugin, options) in enumerate(chain)
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv", on_write_failure="discard", options={"path": str(tmp_path / "out.csv"), "schema": {"mode": "observed"}}
+                )
+            },
+        )
+        return state, settings
+
+    def test_text_source_spelling_is_refused_by_composer_and_build(self, tmp_path: Path) -> None:
+        """A text column is an identity field: no source header can spell Score_Text for score_text."""
+        state, settings = self._source_then_read(
+            tmp_path,
+            source_plugin="text",
+            source_options={"column": "score_text", "schema": {"mode": "observed"}},
+            csv_text="one line\n",
+            middle=(),
+            literal="Score_Text",
+            field="score_text",
+        )
+        result = state.validate()
+        assert [error.error_code for error in result.errors if error.error_code == "field_name_lookup_unreachable"] == [
+            "field_name_lookup_unreachable"
+        ]
+        plugins = instantiate_plugins_from_config(settings)
+        with pytest.raises(GraphValidationError, match="Unreachable header spelling"):
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=[],
+                coalesce_settings=None,
+            )
+
+    def test_text_source_canonical_lookup_is_admitted(self, tmp_path: Path) -> None:
+        state, settings = self._source_then_read(
+            tmp_path,
+            source_plugin="text",
+            source_options={"column": "score_text", "schema": {"mode": "observed"}},
+            csv_text="one line\n",
+            middle=(),
+            literal="score_text",
+            field="score_text",
+        )
+        result = state.validate()
+        assert not [error for error in result.errors if error.error_code == "field_name_lookup_unreachable"], result.errors
+        plugins = instantiate_plugins_from_config(settings)
+        ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=[],
+            coalesce_settings=None,
+        )
+
+    @pytest.mark.parametrize(("source_options", "csv_text", "middle", "literal", "field", "refused"), _NO_HEADER_SHAPES)
+    def test_both_decide_a_lookup_no_source_header_can_name_alike(
+        self,
+        tmp_path: Path,
+        source_options: dict[str, Any],
+        csv_text: str,
+        middle: tuple[tuple[str, str, dict[str, Any]], ...],
+        literal: str,
+        field: str,
+        refused: bool,
+    ) -> None:
+        state, settings = self._source_then_read(
+            tmp_path, source_options=source_options, csv_text=csv_text, middle=middle, literal=literal, field=field
+        )
+        composer = state.validate()
+        unreachable = [e for e in composer.errors if e.error_code == "field_name_lookup_unreachable"]
+        expected = f"'{literal}' reads '{field}' by a spelling no arriving row carries it under: no row arrives here with '{field}'"
+        plugins = instantiate_plugins_from_config(settings)
+
+        def build() -> ExecutionGraph:
+            return ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                gates=[],
+                coalesce_settings=None,
+            )
+
+        if refused:
+            [entry] = unreachable
+            assert expected in entry.message
+            with pytest.raises(GraphValidationError, match="Unreachable header spelling") as caught:
+                build()
+            assert expected in str(caught.value)
+        else:
+            assert not unreachable, composer.errors
+            build()
+
+    # A reductive batch output (batch_stats, as an aggregation or a collector)
+    # records every field it emits under its own name, even behind an OPEN
+    # source whose csv has a 'Mean' column (x4 / x7) and past a collector (x6):
+    # each validated green and failed every row; release refused each. A
+    # batch output that keeps its input contracts (batch_rank) is the control.
+    def _batch_then_read(self, tmp_path: Path, *, kind: str, plugin: str, batch_options: dict[str, Any]) -> CompositionState:
+        """[json source ->] a batch node -> an llm reading ``row['Mean']`` under ``[mean]``."""
+        reader = self._node(
+            "llm_0", "llm", input_="batched", on_success="main", options=self._llm_options("Again {{ row['Mean'] }}", ["mean"], "out")
+        )
+        if kind == "aggregation":
+            batch = replace(
+                self._node("agg", plugin, input_="n0", on_success="batched", options=batch_options),
+                node_type="aggregation",
+                trigger={"count": 2},
+                output_mode="transform",
+            )
+            return self._state(
+                tmp_path,
+                csv_text="id,amount,Mean\n1,2.0,x\n2,4.0,y\n",
+                source_schema={"mode": "observed", "guaranteed_fields": ["amount", "mean"]},
+                nodes=(batch, reader),
+            )
+        explode = self._node(
+            "explode",
+            "json_explode",
+            input_="n0",
+            on_success="items",
+            options={"schema": {"mode": "observed"}, "array_field": "items", "output_field": "item"},
+        )
+        lift = self._node(
+            "lift",
+            "value_transform",
+            input_="items",
+            on_success="pages",
+            options={"schema": {"mode": "observed"}, "operations": [{"target": "amount", "expression": "row['item']['v']"}]},
+        )
+        collector = replace(
+            self._node("stitch", plugin, input_="pages", on_success="batched", options=batch_options),
+            node_type="collector",
+            on_error=None,
+            scope_name="document_pages",
+            scope_opener="explode",
+            scope_policy="require_all",
+        )
+        return CompositionState(
+            source=SourceSpec(
+                plugin="json",
+                on_success="n0",
+                options={
+                    "path": str(TestComposerRuntimeBatchPlacementAgreement._json_input(tmp_path)),
+                    "format": "jsonl",
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(explode, lift, collector, reader),
+            edges=(),
+            outputs=(TestComposerRuntimeFieldNameSpellingAgreement._output(tmp_path),),
+            metadata=PipelineMetadata(name="provenance"),
+            version=1,
+        )
+
+    @pytest.mark.parametrize(
+        ("kind", "plugin", "batch_options", "refused"),
+        [
+            pytest.param(
+                "aggregation", "batch_stats", {"schema": {"mode": "observed"}, "value_field": "amount"}, True, id="x4-x7-aggregation"
+            ),
+            pytest.param("collector", "batch_stats", {"schema": {"mode": "observed"}, "value_field": "amount"}, True, id="x6-collector"),
+            pytest.param(
+                "aggregation",
+                "batch_rank",
+                {"schema": {"mode": "observed"}, "value_field": "amount"},
+                False,
+                id="control-batch-output-keeps-input-contracts",
+            ),
+        ],
+    )
+    def test_both_decide_a_lookup_past_a_batch_output_alike(
+        self, tmp_path: Path, kind: str, plugin: str, batch_options: dict[str, Any], refused: bool
+    ) -> None:
+        from elspeth.config_loading import load_settings_from_yaml_string
+
+        state = self._batch_then_read(tmp_path, kind=kind, plugin=plugin, batch_options=batch_options)
+        composer = state.validate()
+        unreachable = [e for e in composer.errors if e.error_code == "field_name_lookup_unreachable"]
+        settings = load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
+        plugins = instantiate_plugins_from_config(settings, preflight_mode=True)
+
+        def build() -> ExecutionGraph:
+            return ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+                collectors=plugins.collectors,
+                scope_settings=list(settings.scopes) if settings.scopes else None,
+            )
+
+        expected = "'Mean' reads 'mean' by a spelling no arriving row carries it under"
+        if refused:
+            [entry] = unreachable
+            assert expected in entry.message
+            with pytest.raises(GraphValidationError, match="Unreachable header spelling") as caught:
+                build()
+            assert expected in str(caught.value)
+        else:
+            assert not unreachable, composer.errors
+            build()
+
+
 class TestComposerRuntimeRagQueryTemplateAgreement:
     """Shape 32 — a RAG query template reads only what its node declares (elspeth-5887fb7928 P3, ADR-051 (f)).
 
@@ -9342,7 +9867,7 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         return {
             "rewrite": (
                 self._yaml(source=self._CSV, branch_a=self._rewrite("price", "row['price'] + 1"), branch_b=self._PASSTHROUGH),
-                "price",
+                None,
             ),
             "literal": (self._yaml(source=self._CSV, branch_a=self._rewrite("price", "'x'"), branch_b=self._PASSTHROUGH), "price"),
             "dotted": (self._yaml(source=self._JSON, branch_a=self._mapper({"meta.p": "q"}), branch_b=self._mapper({"r": "q"})), "q"),
@@ -9399,6 +9924,8 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
                 aggregations=plugins.aggregations,
                 gates=list(config.gates),
                 coalesce_settings=list(config.coalesce) or None,
+                queues=config.queues,
+                row_union_settings=list(config.row_unions) or None,
             )
         except GraphValidationError as exc:
             return None, str(exc), plugins
@@ -9433,12 +9960,101 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         [entry] = composer_entries
         assert entry.coalesce_union_type is not None
         assert entry.coalesce_union_type.field == refused_field
-        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"any", "int"}
+        expected_types = {"str", "int"} if case == "literal" else {"any", "int"}
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == expected_types
         # One predicate, one message: the composer's text is the build's text with the node label.
         assert entry.message == runtime_refusal.replace(runtime_refusal.split("'")[1], "merge_results")
 
+    def test_observed_json_unknown_input_still_refuses_certain_union_conflict(self, tmp_path: Path) -> None:
+        """A faithful unknown source type must not become a mirror-gap sentinel."""
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        source = {
+            "plugin": "json",
+            "on_success": "raw",
+            "options": {
+                "path": str(tmp_path / "input.jsonl"),
+                "format": "jsonl",
+                "on_validation_failure": "discard",
+                "schema": {"mode": "observed"},
+            },
+        }
+        pipeline_yaml = self._yaml(
+            source=source,
+            branch_a=self._rewrite("q", "row['q'] + 1", {"mode": "flexible", "fields": ["id: int"]}),
+            branch_b={"plugin": "passthrough", "options": {"schema": {"mode": "flexible", "fields": ["q: int"]}}},
+        )
+        graph, runtime_refusal, _plugins = self._runtime(pipeline_yaml, tmp_path)
+        assert graph is None
+        assert runtime_refusal is not None and "q" in runtime_refusal
+        composer = composition_state_from_runtime_yaml(pipeline_yaml).validate()
+        assert not composer.is_valid
+        [entry] = [error for error in composer.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert entry.coalesce_union_type is not None
+        assert entry.coalesce_union_type.field == "q"
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"any", "int"}
+
+    @pytest.mark.parametrize("consumer_type", ["int", "str"])
+    def test_queue_mirror_gap_abstains_after_topological_bind(self, consumer_type: str, tmp_path: Path) -> None:
+        """A queue input can type the build even when Composer's walk stops there."""
+        import yaml
+
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        document = {
+            "sources": {
+                name: {
+                    "plugin": "csv",
+                    "on_success": "inbound",
+                    "options": {
+                        "path": str(tmp_path / f"{name}.csv"),
+                        "on_validation_failure": "discard",
+                        "schema": {"mode": "fixed", "fields": ["a: int"]},
+                    },
+                }
+                for name in ("left", "right")
+            },
+            "queues": {"inbound": {}},
+            "transforms": [
+                {
+                    "name": "calculate",
+                    "plugin": "value_transform",
+                    "input": "inbound",
+                    "on_success": "calculated",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": [{"target": "x", "expression": "row['a'] + 1"}]},
+                },
+                {
+                    "name": "consume",
+                    "plugin": "passthrough",
+                    "input": "calculated",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "flexible", "fields": [f"x: {consumer_type}"]}},
+                },
+            ],
+            "sinks": {
+                "out": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {"path": str(tmp_path / "out.jsonl"), "format": "jsonl", "schema": {"mode": "observed"}},
+                }
+            },
+        }
+        pipeline_yaml = yaml.safe_dump(document, sort_keys=False)
+        graph, runtime_refusal, _plugins = self._runtime(pipeline_yaml, tmp_path)
+        composer = composition_state_from_runtime_yaml(pipeline_yaml).validate()
+        if consumer_type == "int":
+            assert graph is not None, runtime_refusal
+            assert composer.is_valid, composer.errors
+        else:
+            assert runtime_refusal is not None and "x" in runtime_refusal
+            # This is an acknowledged Composer mirror gap: it must abstain
+            # rather than invent an `any` type and over-refuse this draft.
+            assert not any(error.error_code == "edge_field_type_incompatible" for error in composer.errors)
+
     @pytest.mark.parametrize("case", ["rewrite", "dotted", "control-declared-every-branch"])
-    def test_one_table_probe_instance_equals_runtime_instance_and_node_info(self, case: str, tmp_path: Path) -> None:
+    def test_one_table_probe_instance_equals_runtime_instance_and_node_info(self, case: str, tmp_path: Path, monkeypatch) -> None:
         """T3b: the composer's probe instance, the runtime instance and NodeInfo hold the SAME stamp table and carried map."""
         from elspeth.web.composer.state import ValidationProbeCache
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
@@ -9450,6 +10066,27 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         assert graph is not None, refusal
         runtime_by_name = {wired.settings.name: wired.plugin for wired in plugins.transforms}
         transform_ids = graph.get_transform_name_id_map()
+        bound_probes = {}
+        original_transform = ValidationProbeCache.transform
+
+        def capture_transform(cache, plugin, holder):
+            probe = original_transform(cache, plugin, holder)
+            if isinstance(holder, NodeSpec):
+                bound_probes[holder.id] = probe
+            return probe
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(ValidationProbeCache, "transform", capture_transform)
+            composer = state.validate()
+        assert composer.is_valid, composer.errors
+        assert bound_probes
+        for name, probe in bound_probes.items():
+            runtime = runtime_by_name[name]
+            node_info = graph.get_node_info(transform_ids[name])
+            assert probe.output_field_declarations() == runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+            assert probe.carried_output_sources() == runtime.carried_output_sources() == dict(node_info.carried_output_sources)
+        if case == "rewrite":
+            assert bound_probes["t_a"].output_field_declarations()["price"].field_type == "int"
         with ValidationProbeCache() as probe_cache:
             for node in state.nodes:
                 if node.node_type != "transform":
@@ -9458,5 +10095,12 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
                 probe = probe_cache.transform(node.plugin, node)
                 runtime = runtime_by_name[node.id]
                 node_info = graph.get_node_info(transform_ids[node.id])
-                assert probe.output_field_declarations() == runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+                assert runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+                if node.plugin == "value_transform" and case == "rewrite":
+                    # A probe without a graph sees the local tier. Runtime and
+                    # NodeInfo see the completed upstream-bound table.
+                    assert probe.output_field_declarations()["price"].field_type == "any"
+                    assert runtime.output_field_declarations()["price"].field_type == "int"
+                else:
+                    assert probe.output_field_declarations() == runtime.output_field_declarations()
                 assert probe.carried_output_sources() == runtime.carried_output_sources() == dict(node_info.carried_output_sources)

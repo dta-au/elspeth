@@ -3415,6 +3415,16 @@ sites:
   note: forwards_input_fields / removed_input_fields are written only at builder.py:407-408 (transform),
     458-459 (aggregation), and the collector node construction block (builder.py, barrier-scopes spec
     §3) — all three node types the guard admits; add_node defaults them off (graph.py:142-143).
+- key: e6a42530e08836a6
+  path: src/elspeth/core/dag/models.py
+  qualname: NodeInfo.__post_init__
+  exception: GraphValidationError
+  message: NodeInfo.header_spelled_lookups is only meaningful for TRANSFORM nodes; node {} has type {}.
+  ordinal: 0
+  disposition: structural
+  note: header_spelled_lookups is written only on the builder's transform path (builder.py, from TransformProtocol.header_spelled_lookups);
+    add_node defaults it to an empty mapping. No composer option can place it on a non-transform node.
+    review-B2-template-residuals-r1 F1.
 - key: 4d7b97c8230791d6
   path: src/elspeth/core/dag/models.py
   qualname: NodeInfo.__post_init__
@@ -3764,6 +3774,20 @@ sites:
   disposition: mirrored
   counterpart:
   - sink_contract_violation
+- key: c0f7a990f699b126
+  path: src/elspeth/core/dag/schema_validation.py
+  qualname: validate_spelled_row_lookups_reachable
+  exception: GraphValidationError
+  message: 'Unreachable header spelling: transform ''{}'' (node ''{}'') reads fields by a spelling no
+    row arriving at it carries: {}.'
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - field_name_lookup_unreachable
+  note: review-B2-template-residuals-r1 F1. Stage 1 (_check_schema_contracts._unreachable_lookup_error)
+    calls the same predicate (field_spelling.unreachable_spelled_lookups) on the node's probe header_spelled_lookups
+    over the resolution united over every live producer of its input (_live_name_resolution, the upstream_name_resolution
+    mirror); pinned by TestComposerRuntimeSpellingProvenanceAgreement.
 - key: b4c68d796da04254
   path: src/elspeth/core/dag/schema_validation.py
   qualname: validate_transform_declared_input_fields

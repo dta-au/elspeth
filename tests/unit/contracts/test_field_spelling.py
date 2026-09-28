@@ -14,6 +14,8 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.field_spelling import (
+    ANY_HEADER_CARRIERS,
+    NO_HEADER_CARRIERS,
     NO_SOURCE_RENAMES,
     NORMALIZATION_ONLY,
     DeclaredSpellings,
@@ -31,9 +33,11 @@ from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.plugins.sources.field_normalization import normalize_field_name
 
 # The Codex shape: CSV header 'Name', source field_mapping {name: b}.
-RENAMED = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"name": "b"}, keys="normalized")])
+RENAMED = FieldNameResolution.of_source(
+    SourceFieldRenames(mapping={"name": "b"}, keys="normalized", normalizes_external_names=True), carried_out=None
+)
 # The same rename on a headerless source: columns [Name], field_mapping {Name: b}.
-RENAMED_COLUMN = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"Name": "b"}, keys="as_written")])
+RENAMED_COLUMN = FieldNameResolution.of_source(SourceFieldRenames(mapping={"Name": "b"}, keys="as_written"), carried_out=None)
 
 
 def _contract(*fields: tuple[str, str]) -> SchemaContract:
@@ -128,13 +132,14 @@ class TestUpstreamResolution:
         assert header_spelled_names(["Name"], {"id"}, RENAMED, kind="read") == ()
 
     def test_every_source_reaching_the_node_contributes_its_renames(self) -> None:
-        both = FieldNameResolution.of_source_renames(
-            [
+        both = FieldNameResolution.union(
+            FieldNameResolution.of_source(renames, carried_out=None)
+            for renames in (
                 SourceFieldRenames(mapping={"name": "b"}, keys="normalized"),
                 SourceFieldRenames(mapping={"name": "c"}, keys="normalized"),
                 SourceFieldRenames(mapping={"Name": "d"}, keys="as_written"),
                 NO_SOURCE_RENAMES,
-            ]
+            )
         )
         assert both.renames == {"name": (("b", "renamed"), ("c", "renamed"))}
         assert both.renames_as_written == {"Name": (("d", "renamed_as_written"),)}
@@ -154,7 +159,7 @@ class TestUpstreamResolution:
     def test_a_headered_rename_is_not_keyed_as_written(self) -> None:
         # The converse: under a header row the key 'Name' is never matched (keys
         # are normalized headers), so only 'name'-normalizing literals name 'b'.
-        headered = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"name": "b"}, keys="normalized")])
+        headered = FieldNameResolution.of_source(SourceFieldRenames(mapping={"name": "b"}, keys="normalized"), carried_out=None)
         assert headered.renames_as_written == {}
         assert header_spelled_names(["Name"], {"b"}, headered, kind="read")[0].leg == "renamed"
 
@@ -276,9 +281,11 @@ class TestTransformRenames:
 
     # -- only a field the lookup of a rename's source can read moves (review-C1-alias-bypass-r3 F1/F3) --
 
-    _MAPPED_TO_NAME = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={"x": "Name"}, keys="normalized")])
-    _HEADERLESS = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={}, keys="as_written")])
-    _HEADERED = FieldNameResolution.of_source_renames([SourceFieldRenames(mapping={}, keys="normalized")])
+    _MAPPED_TO_NAME = FieldNameResolution.of_source(SourceFieldRenames(mapping={"x": "Name"}, keys="normalized"), carried_out=None)
+    _HEADERLESS = FieldNameResolution.of_source(SourceFieldRenames(mapping={}, keys="as_written"), carried_out=None)
+    _HEADERED = FieldNameResolution.of_source(
+        SourceFieldRenames(mapping={}, keys="normalized", normalizes_external_names=True), carried_out=None
+    )
 
     def test_a_source_that_is_a_known_field_moves_that_field_only(self) -> None:
         # fmval-create: source {x: Name}, then {Name: c}. The lookup of 'Name' reads the
@@ -316,8 +323,8 @@ class TestTransformRenames:
         # to the second; were it to claim normalization, the second rename would move
         # the normalized 'name' onto c and creating 'name' would be falsely refused.
         once = self._HEADERLESS.then_renamed({"id": "i"})
-        assert once.normalizes_names is False
-        assert self._HEADERED.then_renamed({"id": "i"}).normalizes_names is True
+        assert once.header_carriers == NO_HEADER_CARRIERS
+        assert self._HEADERED.then_renamed({"id": "i"}).header_carriers.carries("name")
         twice = once.then_renamed({"Name": "c"})
         assert header_spelled_names(["name"], {"c"}, twice, kind="create") == ()
         assert header_spelled_names(["Name"], {"c"}, twice, kind="read") == (
@@ -343,8 +350,8 @@ class TestTransformRenames:
 
     def test_a_join_with_a_headered_branch_keeps_the_normalization_leg(self) -> None:
         merged = FieldNameResolution.union([self._HEADERLESS, self._HEADERED])
-        assert merged.normalizes_names is True
-        assert FieldNameResolution.union([self._HEADERLESS, self._HEADERLESS]).normalizes_names is False
+        assert merged.header_carriers == ANY_HEADER_CARRIERS
+        assert FieldNameResolution.union([self._HEADERLESS, self._HEADERLESS]).header_carriers == NO_HEADER_CARRIERS
         renamed = merged.then_renamed({"Name": "c"})
         assert [spelling.canonical for spelling in header_spelled_names(["name"], {"c"}, renamed, kind="create")] == ["c"]
 

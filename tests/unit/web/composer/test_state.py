@@ -4233,12 +4233,19 @@ class TestPromptTemplateUndeclaredRowFields:
         assert errors
         assert "declare as 'original_header'" in errors[0].message
 
-    def test_case_variant_reference_is_reported(self) -> None:
-        """``{{ row.Name }}`` against a declared ``name`` resolves only by accident
-        of the producer's header, which no validator can see."""
-        errors = self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+    def test_header_spelling_of_a_declared_field_is_accepted(self) -> None:
+        """``{{ row.Name }}`` under a declared ``name`` reads it by its header spelling (ADR-051 (b), S-02).
+
+        The composer shares ``undeclared_row_fields`` with the plugin layer, so
+        it admits exactly what ``LLMConfig`` admits; a row whose header is
+        spelled otherwise fails that row at render.
+        """
+        assert not self._errors(self._state("Hello {{ row.Name }}", required_input_fields=["name"]))
+
+    def test_spelling_of_an_undeclared_field_is_reported(self) -> None:
+        errors = self._errors(self._state("Hello {{ row.Title }}", required_input_fields=["name"]))
         assert errors
-        assert "'Name'" in errors[0].message
+        assert "'Title'" in errors[0].message
 
     def test_interpretation_placeholder_does_not_silence_the_rule(self) -> None:
         """Unmasked, ``{{interpretation:...}}`` is a TemplateSyntaxError that would

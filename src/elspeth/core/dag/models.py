@@ -380,8 +380,15 @@ class NodeInfo:
     # {b: c} a spelling of b names c.
     renamed_input_fields: Mapping[str, str] = field(default_factory=dict)
 
+    # A transform's header-spelled row lookups (literal -> declared field).
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.header_spelled_lookups. Consumed by
+    # validate_spelled_row_lookups_reachable, which refuses a lookup no row
+    # arriving at the node can resolve (a field created fresh upstream).
+    header_spelled_lookups: Mapping[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
-        freeze_fields(self, "renamed_input_fields")
+        freeze_fields(self, "renamed_input_fields", "header_spelled_lookups")
         component_type = self.node_type.name.lower()
         component_id = self.node_id or None
         if not self.node_id:
@@ -558,6 +565,13 @@ class NodeInfo:
         if self.renamed_input_fields and self.node_type != NodeType.TRANSFORM:
             raise GraphValidationError(
                 f"NodeInfo.renamed_input_fields is only meaningful for TRANSFORM nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # And for a transform's header-spelled lookups.
+        if self.header_spelled_lookups and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.header_spelled_lookups is only meaningful for TRANSFORM nodes; node {self.node_id!r} has type {self.node_type.name}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

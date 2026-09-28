@@ -194,7 +194,12 @@ drained and repair this release forward.
   gives `b` no longer refuses an optional `name` against a `b` another arm
   carries (a false refusal of a pipeline that runs), and the Composer no
   longer checks a sink declaration against a producer that reaches the sink
-  only through `on_error`, which the build never did. A
+  only through `on_error`, which the build never did. A rename's alias no
+  longer outlives the renamed field: once a node drops `b` (a named removal,
+  or a closed output schema without it), a later, unrelated `b` does not
+  inherit `name`'s spellings, so creating `name` after `{name: b}`, a drop of
+  `b` and `{c: b}` validates and runs (it was refused as "a header spelling of
+  the arriving field 'b'", also behind a fork and coalesce). A
   `field_mapper` rename carries the field's original header onto its new name,
   so behind `{name: c}` (or a source `{name: b}` then `{b: c}`) a declaration
   `Name` names `c` and is refused at validation ("... a transform upstream
@@ -253,7 +258,25 @@ drained and repair this release forward.
   not declare now fails the row with `template_rendering_failed` and the
   reason `Undeclared field: the template reads 'x', a field this node does not
   declare in required_input_fields` (the field is named only when the template
-  spells it). Behaviour changes: `'x' in row`, `row.get('x', default)` and
+  spells it). Configuration admits a read that spells a declared field by a
+  header spelling (`row['Name']` or `row.Name` under `required_input_fields:
+  [name]`, a query's `row.source_row['Name']` or `input_fields` value `Name`,
+  a RAG `query_template` `row['Topic']` under `[topic]`), by the field-name
+  spelling rule's own predicate; before, an identifier-shaped spelling was
+  refused at configuration while `row['Price USD']` was admitted. Validation
+  (`elspeth validate`, the composer's `field_name_lookup_unreachable`, run
+  start) refuses such a spelling when no row reaching the node can carry it:
+  on every path the field has no source header behind it — a transform or
+  value_transform creates it (an LLM's `score_text` records only its own name,
+  so `row['Score_Text']` failed every row), a statistics-style aggregation or
+  collector emits it (`row['Mean']` after `batch_stats`, even when the source
+  had a `Mean` column), it is a field emitted by an identity source (including
+  headerless CSV, text, LLM and blob rows) or a source
+  `field_mapping` target, or a closed schema upstream proves no header spelled
+  it — or the header it names was renamed away. A row whose source header is
+  spelled otherwise fails that row with the reason `... reads 'Name',
+  a spelling of a declared field that this row does not carry under that
+  spelling ...`. Behaviour changes: `'x' in row`, `row.get('x', default)` and
   `row.x is defined` on an undeclared name fail the row where configuration
   does not refuse them first; before, they answered from the whole row, so
   `'meta' in row` was `True` for a row carrying `meta` (a declared field the
@@ -550,8 +573,9 @@ drained and repair this release forward.
 - **A union coalesce whose branches certainly disagree on a field's type is
   refused at build.** When every branch merges on every row (`require_all`)
   and two branches each carry a field whose type is fixed before the first
-  row but differs — an untyped `value_transform` rewrite or `field_mapper`
-  dotted extraction (`any`) beside a source's declared `price: int`, carried
+  row but differs — a `value_transform` rewrite whose expression remains
+  untyped or `field_mapper` dotted extraction (`any`) beside a source's
+  declared `price: int`, carried
   through a passthrough or a rename — every row failed the merge with
   `contract_type_conflict`, yet `elspeth validate` and the composer admitted
   the pipeline whenever the branches were observed. `elspeth validate`, the
@@ -560,6 +584,15 @@ drained and repair this release forward.
   schema (`mode: flexible`) or write the computed value under a new name.
   A type known only from the rows (an observed upstream) still fails each row
   at the merge, and that reason now names `any` rather than `object`.
+- **Expression targets carry provable types before row 1.** A
+  `value_transform` expression over declared inputs now publishes its result
+  type and derived nullability; unknown results remain nullable `any`, and an
+  authored target type still takes precedence. An observed-mode `type_coerce`
+  also publishes each successful conversion type. Typed downstream consumers
+  can therefore build from either result, and a union coalesce accepts equal
+  branch types it previously refused. A target declaration certainly at odds
+  with its expression is refused at build; a data-dependent mismatch still
+  routes the row with a value-free reason naming the declarer.
 - **`union_collision_policy: fail` no longer ends the run on a collision.**
   A field name two arriving branches both carried raised
   `CoalesceCollisionError` out of the run at the first colliding row (exit 4,

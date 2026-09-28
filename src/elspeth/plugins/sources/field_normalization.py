@@ -25,6 +25,7 @@ from types import MappingProxyType
 from elspeth.contracts.field_spelling import (
     NORMALIZATION_ALGORITHM_VERSION,
     header_normalization_remedy,
+    header_spelling_canonical,
     normalized_field_name_or_empty,
 )
 
@@ -513,37 +514,31 @@ def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[s
     passes the concrete row fields its template reads (from
     ``extract_jinja2_field_usage``) and the names the node declared, and gets
     back the sorted shortfall it may honestly report. Shared by
-    ``LLMConfig._validate_template_variable_bindings`` and the composer's
-    ``_validate_prompt_template_variable_bindings`` so the two authoring
+    ``LLMConfig._validate_template_variable_bindings``, the multi-query column
+    check, ``RAGRetrievalConfig`` and the composer's twins so the authoring
     surfaces cannot drift (elspeth-a9ba80cb0b).
 
-    Coverage is EXACT, because render-time resolution is. ``PipelineRow``
-    resolves through ``SchemaContract.find_name``, which matches a field's
-    ``normalized_name`` or its ``original_name`` — two exact spellings, and
-    config time knows NEITHER. So the only provable coverage is a literal
-    match against a declared name, which is a ``normalized_name`` by
-    construction.
+    A read is covered when it names a declared field by EITHER spelling
+    (ADR-051 (b)): the declared name itself, or a header spelling of it by the
+    field-name spelling rule's own predicate (``header_spelling_canonical``:
+    the literal is not declared and its normalized form is). At render
+    ``TemplateRow`` resolves a declared field by its canonical name and by the
+    original name its producer recorded, so ``row['Name']`` under
+    ``required_input_fields: [name]`` reads ``name`` from a source whose header
+    is ``Name`` — the same resolution ``PipelineRow`` lookups use. A
+    declaration is the other direction: there a header spelling is REFUSED and
+    the canonical name required (``check_declared_fields_reachable``, the
+    spelling rule), which is why the canonical name is the only thing this
+    check ever asks an author to declare.
 
-    That rules out a general "canonical key" bridge, and measurement says so
-    plainly: with ``required_input_fields: ["a_b"]`` against a row whose one
-    column is ``a_b``, twelve declarable spellings (``A_B``, ``a__b``,
-    ``A_B_``, ...) render only if the producer's ``original_name`` happens to
-    match, and otherwise raise on every row. ``{{ row.a__b }}`` is a plain
-    typo of the declared name — the very class this check exists to catch.
-    Bridging by ``normalize_field_name`` would silence all twelve.
+    Config time cannot see the header a row will carry, so whether a spelling
+    other than the canonical one matches it is Tier-3 data: a row whose header
+    is spelled otherwise (``NAME``) fails that row at render, routed, like any
+    other data-dependent miss. What config CAN prove is that a read names no
+    declared field under any spelling, and that is what is reported.
 
-    The ONE sound inference is the reverse: a literal that is not a legal
-    declaration entry can never be a ``normalized_name``, so it can only be an
-    ``original_name``, and the row key it resolves to is its canonical form.
-    Those are bridged — ``{{ row["Original Header"] }}`` is covered by a
-    declared ``original_header`` — and REPORTED when that canonical name is
-    not declared. Dropping them unconditionally was the first version's bug: it
-    accepted a declaration omitting the field entirely, which then failed at
-    render, while the sibling declared-fields validator was already telling
-    authors to declare exactly the canonical name.
-
-    A literal with no declarable form at all is dropped, not reported: there is
-    nothing to ask for.
+    A literal with no declarable form at all (``"!!!"`` normalizes to nothing)
+    is dropped, not reported: there is nothing to ask for.
 
     Dynamic accesses (``row[expr]``) never reach here — callers fail closed on
     them separately, with their own opt-out.
@@ -555,9 +550,34 @@ def undeclared_row_fields(row_fields: Iterable[str], declared_fields: Iterable[s
         covering = declarable_field_name(field)
         if covering is None:
             continue
-        if covering not in declared_literals:
-            undeclared.add(field)
+        if covering in declared_literals or header_spelling_canonical(field, declared_literals) is not None:
+            continue
+        undeclared.add(field)
     return tuple(sorted(undeclared))
+
+
+def header_spelled_row_lookups(row_fields: Iterable[str], declared_fields: Iterable[str]) -> dict[str, str]:
+    """The reads ``undeclared_row_fields`` covers by a spelling other than the declared name: literal -> declared field.
+
+    Config time admits such a read because a row may carry the field under
+    that spelling (a source header). Whether one can is a fact about the
+    upstream, so the node publishes these (``TransformProtocol.header_spelled_lookups``)
+    and the build and the Web Composer refuse one no arriving row can resolve
+    (``contracts.field_spelling.unreachable_spelled_lookups``): a field a
+    transform upstream created records its own name as its original.
+    """
+    declared_literals = {name.strip() for name in declared_fields}
+    spelled: dict[str, str] = {}
+    for field in row_fields:
+        if field in declared_literals:
+            continue
+        covering = declarable_field_name(field)
+        if covering is None:
+            continue
+        canonical = covering if covering in declared_literals else header_spelling_canonical(field, declared_literals)
+        if canonical is not None:
+            spelled[field] = canonical
+    return spelled
 
 
 def describe_undeclared_row_fields(fields: Sequence[str]) -> str:

@@ -104,6 +104,7 @@ class _BranchTransform:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(
         self,
@@ -157,6 +158,7 @@ class _RequiringTransform:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, required: tuple[str, ...], *, via: str = "required_input_fields") -> None:
         self.name = "union_consumer"

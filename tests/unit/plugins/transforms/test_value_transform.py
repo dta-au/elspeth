@@ -1124,6 +1124,7 @@ class TestValueTransformPinsDeclaredTargets:
             "field": "a",
             "expected": "int",
             "actual": actual,
+            "declared_by": "operator",
             "message": (
                 f"Operation target 'a' computed a value of type {actual}, but this node's schema declares it int. "
                 "Declare the target 'any' (or the scalar type it computes) to store it."

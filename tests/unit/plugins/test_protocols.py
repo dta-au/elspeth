@@ -208,6 +208,7 @@ class TestTransformProtocol:
             preserves_input_values = False
             removed_input_fields = frozenset()
             renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+            header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
             can_drop_rows = False  # ADR-012: empty-emission governance flag
             declared_input_fields: frozenset[str] = frozenset()
             declared_string_input_fields: frozenset[str] = frozenset()  # elspeth-b19dfe41fb string-scan surface

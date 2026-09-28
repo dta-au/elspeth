@@ -695,6 +695,12 @@ def _resolve_guaranteed_field_type_uncached(
     node_info = graph.get_node_info(node_id)
     config = node_info.output_schema_config
     declares_field = config is not None and config.fields is not None and any(field_def.name == field_name for field_def in config.fields)
+    if mode == "edge" and node_info.node_type in _PLUGIN_BEARING_KINDS:
+        declaration = node_info.output_field_declarations.get(field_name)
+        if declaration is not None:
+            if declaration.field_type == "any":
+                return None
+            return ResolvedGuaranteeType(field_type=declaration.field_type, declared_by=frozenset({node_id}))
     if mode == "union_merge":
         if node_info.node_type in _PLUGIN_BEARING_KINDS:
             # Stamp arm: the table the runtime stamp rewrites the field from.

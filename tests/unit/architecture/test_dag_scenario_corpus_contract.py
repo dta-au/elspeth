@@ -954,7 +954,12 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 14a3a5cc..., captured from this file's parity failure. No oracle_freeze
 # snapshot moved (test_oracle_freeze green: the frozen surface carries no
 # scheduler_work or audit records).
-EXPECTED_CASE_REGISTRY_SHA256 = "14a3a5cc637cd12e512ce46a2b23e817a7696f5c51ba16012c9b5b130b4bc70c"
+# T1 expression typing: value_transform's three union-collision-fail
+# provenance pins changed to 1a8ad03e147600d0. The case outcome is unchanged.
+# S-02 source spelling: the csv/json plugin hashes and the reopen-resume
+# projection changed with their source bytes. This registry digest is derived
+# from the merged manifest through the canonical corpus loader.
+EXPECTED_CASE_REGISTRY_SHA256 = "1813b97297194feaad57b2368cbc3e27046ca6688b765dffabd6b971330a23be"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
