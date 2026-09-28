@@ -1808,6 +1808,79 @@ payload_store:
     assert sorted(completed) == sorted(tokens)
 
 
+def test_a_database_sink_effect_plan_carrying_an_integral_double_beyond_2_53_is_read_back_as_that_double(tmp_path: Any) -> None:
+    """review-codexfix-handoffs-r2: the durable sink-effect plan is canonical text holding the member rows.
+
+    The database sink puts each member row in its plan's ``safe_evidence``, and
+    the coordinator re-reads ``plan_json`` before it executes the prepared
+    effect. A plain ``json.loads`` read 1e17 back as an int beyond
+    ±(2**53-1), which the plan refused AFTER the rows were committed to the
+    target: the run failed with a traceback while every token was already
+    terminal. The canonical reader returns the double; the run completes.
+    """
+    from sqlalchemy import Column, Float, Integer, MetaData, Table, create_engine
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+    from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
+
+    target_url = f"sqlite:///{tmp_path / 'target.db'}"
+    engine = create_engine(target_url)
+    metadata = MetaData()
+    target = Table("t", metadata, Column("id", Integer, nullable=False), Column("x", Float))
+    database_effect_ledger_table(metadata, "_elspeth_sink_effects")
+    metadata.create_all(engine)
+    (tmp_path / "input.jsonl").write_text('{"id": 1, "x": 1.5}\n{"id": 2, "x": 1e17}\n{"id": 3, "x": 3.5}\n')
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: db
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: fixed
+        fields: ["id: int", "x: float"]
+sinks:
+  db:
+    plugin: database
+    on_write_failure: discard
+    options:
+      url: {target_url}
+      table: t
+      if_exists: append
+      schema:
+        mode: fixed
+        fields: ["id: int", "x: float"]
+      effect_ledger:
+        table: _elspeth_sink_effects
+        schema_version: 1
+        permissions: [select, insert]
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED)[1], cli.output
+    assert "Traceback" not in cli.output
+    with engine.connect() as conn:
+        written = conn.execute(select(target.c.id, target.c.x).order_by(target.c.id)).all()
+    engine.dispose()
+    assert [tuple(row) for row in written] == [(1, 1.5), (2, 1e17), (3, 3.5)]
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        completed = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars().all()
+        tokens = conn.execute(select(tokens_table.c.token_id)).scalars().all()
+    assert len(tokens) == 3
+    assert sorted(completed) == sorted(tokens)
+
+
 def test_a_source_that_skips_its_schema_ends_the_run_at_ingest_naming_the_source_row(tmp_path: Any) -> None:
     """The backstop: a VALID source row the ingest hash refuses is the source's contract breach.
 

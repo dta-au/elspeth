@@ -451,9 +451,13 @@ drained and repair this release forward.
   `1e17` was coerced for an `int` field) ended the run at the sink with no
   outcome for any row in the write, a resume or replacing-sink successor
   failed on the stored copy, and `verify` refused a recorded discard or
-  quarantine carrying one. One reader, the inverse of the canonical encoder,
-  now reads stored canonical text back to the double that was hashed: the
-  sink boundary, the replacing-sink predecessor snapshot, resume's row
+  quarantine carrying one. At a database sink the durable effect plan, which
+  carries the member rows, failed to read back after the rows were committed:
+  the run failed with every token already terminal, and a crash before the
+  write left the run unresumable. One reader, the inverse of the canonical
+  encoder, now reads stored canonical text back to the double that was hashed:
+  the sink boundary, the durable sink-effect plan (execution and
+  finalization), the replacing-sink predecessor snapshot, resume's row
   restore, row and call payload reads, and source replay all use it.
 - **`examples/batch_error_routing`** shows a failed aggregation batch end to
   end. One order's amount is a string, so its whole batch of three fails:

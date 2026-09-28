@@ -16,6 +16,7 @@ from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
@@ -543,7 +544,7 @@ class SinkEffectFinalization:
         if effect.plan_json is None or effect.plan_hash is None or effect.descriptor_mode is None:
             raise LandscapeRecordError("sink effect finalization requires one complete immutable plan")
         try:
-            plan = json.loads(effect.plan_json)
+            plan = canonical_json_loads(effect.plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("sink effect durable plan is not valid JSON") from exc
         if type(plan) is not dict:

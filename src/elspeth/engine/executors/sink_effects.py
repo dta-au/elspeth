@@ -1270,7 +1270,7 @@ class SinkEffectCoordinator:
         if effect.plan_json is None:
             raise LandscapeRecordError("prepared sink effect is missing its durable plan")
         try:
-            payload = json.loads(effect.plan_json)
+            payload = canonical_json_loads(effect.plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("prepared sink effect has invalid durable plan JSON") from exc
         if type(payload) is not dict:

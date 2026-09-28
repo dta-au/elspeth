@@ -1124,6 +1124,60 @@ def test_a_predecessor_member_carrying_an_integral_double_beyond_2_53_is_hydrate
         db.close()
 
 
+def test_a_precomputed_descriptor_carrying_a_double_beyond_2_53_finalizes_against_its_durable_plan() -> None:
+    """Finalization re-reads the durable plan from canonical text (review-codexfix-handoffs-r2).
+
+    The plan's expected descriptor is stored with ``canonical_json`` and read
+    back at finalization to compare with the descriptor the commit returned.
+    RFC 8785 stores 2**60 as ``1152921504606847000``; a plain ``json.loads``
+    read that as an int that is not the double, so the comparison refused a
+    descriptor identical to the one planned. The canonical reader returns the
+    double, and the effect finalizes.
+    """
+
+    class _MetricDescriptorSink(_CumulativeObservableSink):
+        def prepare_effect(self, request: SinkEffectPrepareRequest, ctx: RestrictedSinkEffectContext) -> SinkEffectPlan:
+            plan = super().prepare_effect(request, ctx)
+            assert plan.expected_descriptor is not None
+            descriptor = replace(plan.expected_descriptor, metadata={"mean": float(2**60)})
+            return replace(plan, expected_descriptor=descriptor)
+
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db, payload_store=MockPayloadStore())
+        run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+        sink_id = register_test_node(factory.data_flow, run.run_id, "sink", node_type=NodeType.SINK, plugin_name="sink")
+        payload = {"ordinal": 0}
+        _row, token = factory.data_flow.create_row_with_token(
+            source_node_id=source_id,
+            row_index=0,
+            data=payload,
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        )
+        factory.execution.begin_node_state(
+            token_id=token.token_id,
+            node_id=sink_id,
+            step_index=0,
+            input_data=payload,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+        )
+        members = resolve_sink_effect_members(factory, [SinkEffectMemberCandidate(token_id=token.token_id, row=payload)])
+        target = _CumulativeTarget()
+
+        result = SinkEffectCoordinator(factory=factory, worker_id="worker-a", coordination_token=leader_token_for(db, run.run_id)).execute(
+            _execution_request(run.run_id, sink_id, members), _MetricDescriptorSink(target)
+        )
+
+        assert result.effect.state.value == "finalized"
+        assert target.descriptor is not None
+        assert target.descriptor.metadata == {"mean": float(2**60)}
+    finally:
+        db.close()
+
+
 def test_append_mode_successor_preserves_pre_run_baseline(tmp_path: Path) -> None:
     db = make_landscape_db()
     try:

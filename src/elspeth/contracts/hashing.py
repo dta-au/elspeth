@@ -113,7 +113,8 @@ def canonical_json_loads(text: str | bytes) -> Any:
     """Parse text that ``canonical_json`` produced back into the value it encoded.
 
     The one inverse of the encoder, for every reader of canonical row
-    material (the sink-effect member rows, their payload-store content, a
+    material (the sink-effect member rows, their payload-store content, the
+    durable sink-effect plan whose ``safe_evidence`` can carry member rows, a
     source row's stored payload, a validation error's ``row_data_json``).
     A plain ``json.loads`` is not an inverse: RFC 8785 serializes numbers as
     IEEE 754 doubles, printing an integral double in [2**53, 1e21) in integer
