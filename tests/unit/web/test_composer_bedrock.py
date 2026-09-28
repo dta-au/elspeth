@@ -148,7 +148,8 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
     assert request["model"] == _BEDROCK_ADVISOR
     # reasoning_effort: the advisor knob rides Bedrock calls too
     # (elspeth-dc459d438e).
-    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort", "response_format"}
+    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort", "response_format", "num_retries", "max_retries"}
+    assert request["num_retries"] == request["max_retries"] == 0
     assert request["response_format"]["type"] == "json_schema"
     assert request["response_format"]["json_schema"]["strict"] is True
     assert request["reasoning_effort"] == "medium"
