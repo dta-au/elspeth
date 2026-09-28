@@ -79,12 +79,20 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
     setup = make_recorder_with_run(run_id="fork-join-count-run", source_node_id="source-0")
     register_test_node(setup.data_flow, setup.run_id, "sink-0", node_type=NodeType.SINK, plugin_name="csv_sink")
 
-    row, _initial_token = setup.data_flow.create_row_with_token(
+    row, initial_token = setup.data_flow.create_row_with_token(
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"row": 0},
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
+    )
+    # The source token is the fork parent; it carries its transient outcome
+    # because a run is never stamped successful over an outcomeless token (QR-4).
+    setup.data_flow.record_token_outcome_leader(
+        ref=TokenRef(token_id=initial_token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.TRANSIENT,
+        path=TerminalPath.FORK_PARENT,
         coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
     )
 

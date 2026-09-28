@@ -38,8 +38,6 @@ import pytest
 
 from elspeth.contracts import Checkpoint, NodeID, ResumePoint, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
-from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.group_bindings import GroupBindingRegistry
 from elspeth.core.landscape.factory import RecorderFactory
@@ -73,6 +71,8 @@ class _EarlyCompletionResume:
         _insert_failed_run(self.db, run_id)
         self.factory = MagicMock(spec=RecorderFactory)
         self.factory.scheduler.count_active_work.return_value = 0
+        # Every token is accounted for: the resume coverage check finds nothing uncovered.
+        self.factory.scheduler.leases.verify_resume_coverage.return_value = None
         self.factory.barrier_restore.pending_empty_expansion_groups.return_value = ()
         self.factory.data_flow.sweep_deferred_invariants_or_crash = MagicMock(spec=object)
         self.factory.run_lifecycle.finalize_run = MagicMock(spec=object)
@@ -89,10 +89,6 @@ class _EarlyCompletionResume:
         self.resume_state = ResumeState(
             factory=self.factory,
             run_id=run_id,
-            unprocessed_rows=(),
-            incomplete_by_row={},
-            recovery_manager=MagicMock(spec=RecoveryManager),
-            schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
             source_names_by_source={NodeID("source"): "source"},
             source_lifecycle_by_source={NodeID("source"): "loaded"},
             has_restored_barrier_work=False,

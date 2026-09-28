@@ -1834,11 +1834,8 @@ class BarrierRecoveryCoordinator:
 
         # ---- Audit derivations (no mutation yet) ---------------------------
         # Attempt offsets: max node_states attempt per journal token, + 1.
-        # Derived here with ONE focused query rather than plumbed from
-        # recovery's incomplete_by_row map: that map's exclusion set reads
-        # journal BLOCKED rows (so the resume loop does not re-drive blocked
-        # tokens), which excludes exactly the tokens this restore needs
-        # offsets for.
+        # Derived here with ONE focused query over exactly the journal tokens
+        # this restore re-drives.
         token_ids = [item.token_id for item in items]
         max_attempts = self._barrier_restore_reads.get_max_node_state_attempts(self._run_id, token_ids) if token_ids else {}
         attempt_offsets: dict[str, int] = {

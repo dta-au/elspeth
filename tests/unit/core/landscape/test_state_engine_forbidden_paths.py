@@ -772,6 +772,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "finalize",
         "heartbeat_lease",
         "ingest_row_with_initial_claim",
+        "ingest_quarantine_row_with_pending_sink",
         "mark_pending_sink_terminal",
         "mark_pending_sink_terminal_many",
         "mark_response_lost",
@@ -784,6 +785,7 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "record_source_field_resolution",
         "recover_expired_leases",
         "requeue_undecided_failed_work",
+        "verify_resume_coverage",
         "register_candidate",
         "register_verified_candidate",
         "reserve",
@@ -1019,6 +1021,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_ingest_woken_mid_ingest_atomic_rollback",
         ),
+        "ingest_quarantine_row_with_pending_sink": (
+            "tests/unit/core/landscape/test_quarantine_ingest.py",
+            "test_stale_leader_epoch_refuses_the_repository_verb_with_no_mutation",
+        ),
         "mark_pending_sink_terminal": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_mark_pending_sink_terminal_refused",
@@ -1038,6 +1044,10 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
         "requeue_undecided_failed_work": (
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_requeue_undecided_failed_work_refused",
+        ),
+        "verify_resume_coverage": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_verify_resume_coverage_refused",
         ),
         # The audit-export registry CAS (ADR-048): its stale-token evidence
         # lives beside the export-bundle derivation machinery it needs to

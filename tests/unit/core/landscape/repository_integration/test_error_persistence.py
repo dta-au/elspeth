@@ -10,10 +10,9 @@ import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
+from tests.fixtures.landscape import claim_test_work_item, ingest_quarantine_row_for_test, leader_coordination_token
 
-from elspeth.contracts.enums import NodeType
-from elspeth.contracts.results import SourceRow
+from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import sanitize_for_canonical
 from elspeth.core.landscape.database import LandscapeDB
@@ -25,7 +24,6 @@ from elspeth.core.landscape.schema import (
     transform_errors_table,
     validation_errors_table,
 )
-from elspeth.engine.tokens import TokenManager
 
 # Shared schema config for tests
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -384,21 +382,14 @@ class TestErrorEventExplainQuery:
             destination="quarantine_sink",
         )
 
-        token_manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
-        quarantine_token = token_manager.create_quarantine_token(
-            coordination_token=leader_coordination_token(factory, run_id),
+        quarantine_token = ingest_quarantine_row_for_test(
+            factory,
+            run_id=run_id,
             source_node_id=source_node.node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(
-                row=42,
-                error="Expected object row, got int",
-                destination="quarantine_sink",
-                source_row_index=0,
-            ),
+            row=42,
+            error="Expected object row, got int",
             validation_error_id=error_token.error_id,
-            source_row_index=0,
-            ingest_sequence=0,
-        )
+        ).token
 
         lineage = explain(
             query=factory.query,
@@ -443,21 +434,14 @@ class TestErrorEventExplainQuery:
             destination="quarantine_sink",
         )
 
-        token_manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
-        quarantine_token = token_manager.create_quarantine_token(
-            coordination_token=leader_coordination_token(factory, run_id),
+        quarantine_token = ingest_quarantine_row_for_test(
+            factory,
+            run_id=run_id,
             source_node_id=source_node.node_id,
-            row_index=0,
-            source_row=SourceRow.quarantined(
-                row=sanitize_for_canonical(raw_row),
-                error="Row contains NaN",
-                destination="quarantine_sink",
-                source_row_index=0,
-            ),
+            row=sanitize_for_canonical(raw_row),
+            error="Row contains NaN",
             validation_error_id=error_token.error_id,
-            source_row_index=0,
-            ingest_sequence=0,
-        )
+        ).token
 
         lineage = explain(
             query=factory.query,
@@ -491,6 +475,25 @@ class TestErrorEventExplainQuery:
             destination="quarantine_sink",
         )
 
+        # The graph exists before the injected fault (the DAG builder records
+        # it at run start), so the rollback proof covers only the ingest.
+        quarantine_sink = factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, run.run_id),
+            plugin_name="quarantine_sink",
+            node_type=NodeType.SINK,
+            plugin_version="1.0.0",
+            config={},
+            sequence=1,
+            schema_config=DYNAMIC_SCHEMA,
+        )
+        quarantine_edge_id = factory.data_flow.register_edge(
+            source_node.node_id,
+            quarantine_sink.node_id,
+            "__quarantine__",
+            RoutingMode.DIVERT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        ).edge_id
+
         def fail_validation_error_link(
             _conn: object,
             _cursor: object,
@@ -504,21 +507,15 @@ class TestErrorEventExplainQuery:
 
         sqlalchemy_event.listen(landscape_db.engine, "before_cursor_execute", fail_validation_error_link)
         try:
-            manager = TokenManager(factory.data_flow, step_resolver=lambda _node_id: 0)
             with pytest.raises(RuntimeError, match="injected validation-error linkage failure"):
-                manager.create_quarantine_token(
-                    coordination_token=leader_coordination_token(factory, run.run_id),
+                ingest_quarantine_row_for_test(
+                    factory,
+                    run_id=run.run_id,
                     source_node_id=source_node.node_id,
-                    row_index=0,
-                    source_row=SourceRow.quarantined(
-                        row={"raw": "invalid"},
-                        error="invalid source row",
-                        destination="quarantine_sink",
-                        source_row_index=0,
-                    ),
+                    row={"raw": "invalid"},
+                    error="invalid source row",
                     validation_error_id=error_id,
-                    source_row_index=0,
-                    ingest_sequence=0,
+                    quarantine_edge_id=quarantine_edge_id,
                 )
         finally:
             sqlalchemy_event.remove(landscape_db.engine, "before_cursor_execute", fail_validation_error_link)

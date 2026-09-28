@@ -13,11 +13,20 @@ from sqlalchemy.exc import IntegrityError
 from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
-from elspeth.contracts import NodeType
+from elspeth.contracts import NodeType, RoutingMode
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.types import NodeID
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import rows_table, token_parents_table, tokens_table, validation_errors_table
+from elspeth.core.landscape.schema import (
+    rows_table,
+    token_parents_table,
+    token_work_items_table,
+    tokens_table,
+    validation_errors_table,
+)
+from elspeth.engine.tokens import ingest_source_quarantine
 
 pytestmark = pytest.mark.testcontainer
 
@@ -204,7 +213,20 @@ def test_postgres_validation_error_link_is_compare_and_set(
         node_type=NodeType.SOURCE,
         plugin_name="source",
     )
+    # The source's __quarantine__ DIVERT edge to its quarantine sink, registered
+    # before the contenders start: the fenced ingest records its routing event
+    # on it, and registering it inside a thread would take the seat early.
+    sink_node_id = register_test_node(
+        first_factory.data_flow,
+        run_id,
+        "validation-link-cas-sink",
+        node_type=NodeType.SINK,
+        plugin_name="quarantine_sink",
+    )
     coordination_token = leader_coordination_token(first_factory, run_id)
+    quarantine_edge_id = first_factory.data_flow.register_edge(
+        node_id, sink_node_id, "__quarantine__", RoutingMode.DIVERT, coordination_token=coordination_token
+    ).edge_id
     error_id = first_factory.data_flow.record_validation_error(
         coordination_token=coordination_token,
         node_id=node_id,
@@ -239,17 +261,27 @@ def test_postgres_validation_error_link_is_compare_and_set(
                 raise TimeoutError("test did not release validation-link leader seat")
 
     def link(factory: RecorderFactory, index: int) -> None:
+        # The production verb that links a validation error: the ONE fenced
+        # source-quarantine ingest (row + token + link + FAILED source state +
+        # routing event + PENDING_SINK handoff in one leader transaction).
         try:
-            row, _token = factory.data_flow.create_quarantine_row_with_token(
-                source_node_id=node_id,
+            quarantined = ingest_source_quarantine(
+                scheduler=factory.scheduler,
+                data_flow=factory.data_flow,
+                execution=factory.execution,
+                coordination_token=coordination_token,
+                source_node_id=NodeID(node_id),
                 row_index=index,
                 source_row_index=index,
                 ingest_sequence=index,
-                data={"candidate": index},
+                row={"candidate": index},
                 validation_error_id=error_id,
-                coordination_token=coordination_token,
+                quarantine_sink="quarantine_sink",
+                quarantine_error="invalid row",
+                quarantine_edge_id=quarantine_edge_id,
+                terminal_step_index=1,
             )
-            result: str | BaseException = row.row_id
+            result: str | BaseException = quarantined.token.row_id
         except BaseException as exc:
             result = exc
         with lock:
@@ -294,9 +326,14 @@ def test_postgres_validation_error_link_is_compare_and_set(
             ).scalar_one()
             durable_rows = conn.execute(select(rows_table.c.row_id).where(rows_table.c.run_id == run_id)).scalars().all()
             durable_tokens = conn.execute(select(tokens_table.c.row_id).where(tokens_table.c.run_id == run_id)).scalars().all()
+            durable_items = conn.execute(
+                select(token_work_items_table.c.row_id, token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)
+            ).all()
         assert linked_row_id == winner
         assert durable_rows == [winner]
         assert durable_tokens == [winner]
+        # The loser's whole fenced ingest rolled back: exactly one parked handoff, the winner's.
+        assert [(row_id, status) for row_id, status in durable_items] == [(winner, TokenWorkStatus.PENDING_SINK.value)]
     finally:
         release_winner.set()
         for thread in threads:

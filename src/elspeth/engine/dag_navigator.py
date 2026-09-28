@@ -342,8 +342,7 @@ class DAGNavigator:
     def resolve_branch_first_node(self, branch_name: str) -> NodeID:
         """First processing node for a fork branch routed to a barrier.
 
-        Exposes the _branch_first_node lookup for fresh fork children and the
-        resume path (RowProcessor.resume_incomplete_token).
+        Exposes the _branch_first_node lookup for fresh fork children.
 
         _branch_first_node covers all coalesce- and row-union-bound branches
         (built by ExecutionGraph.get_branch_first_nodes). Calling it for a

@@ -128,17 +128,6 @@ def _row(h: _Harness, leader: CoordinationToken) -> None:
     h.factory.data_flow.create_row_with_token("source", 1, {"value": 2}, source_row_index=1, ingest_sequence=1, coordination_token=leader)
 
 
-def _quarantine(h: _Harness, leader: CoordinationToken) -> None:
-    h.factory.data_flow.create_quarantine_row_with_token(
-        "source",
-        1,
-        {"value": 2},
-        source_row_index=1,
-        ingest_sequence=1,
-        coordination_token=leader,
-    )
-
-
 def _token(h: _Harness, leader: CoordinationToken) -> None:
     h.factory.data_flow.create_token(h.token.row_id, coordination_token=leader)
 
@@ -151,7 +140,7 @@ def _leader_outcome(h: _Harness, leader: CoordinationToken) -> None:
     h.factory.data_flow.record_token_outcome_leader(h.ref, None, TerminalPath.ABANDONED, coordination_token=leader)
 
 
-_LEADER_WRITES = [_node, _edge, _row, _quarantine, _token, _validation, _leader_outcome]
+_LEADER_WRITES = [_node, _edge, _row, _token, _validation, _leader_outcome]
 
 
 @pytest.mark.parametrize("write", _LEADER_WRITES, ids=lambda write: write.__name__)

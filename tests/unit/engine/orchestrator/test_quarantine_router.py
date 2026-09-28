@@ -3,54 +3,58 @@
 
 Extracted from ``SourceIterationDriver.handle_quarantine_row``
 (elspeth-27d7bfc14b). These drive the collaborator in isolation: the reachable
-validation-error branches, the full happy-path collaboration sequence (token ->
-FAILED node_state -> DIVERT routing_event -> RowCreated telemetry ->
-PendingOutcome), and the plugin-error length bound. End-to-end audit behaviour
-stays covered by tests/integration/pipeline/orchestrator/test_quarantine_routing.py.
+plugin-bug branches (each refused BEFORE any durable write), the hand-off to
+the processor's fenced quarantine ingest, RowCreated telemetry, and the
+plugin-error length bound. The router neither moves counters nor touches the
+pending-token buckets: it returns the sink-bound result for the shared
+accumulator. The one-transaction audit record itself is pinned against a real
+Landscape in tests/unit/core/landscape/test_quarantine_ingest.py, and
+end-to-end behaviour in tests/integration/pipeline/orchestrator/test_quarantine_routing.py.
 
-Mock discipline: the Landscape recorder and ceremony are ``spec``-bound mocks
-(the collaboration is asserted through them); the source/processor/ctx/config
-inputs are plain ``SimpleNamespace`` fakes.
+Mock discipline: the ceremony is a ``spec``-bound mock; the processor is a
+recording fake of the one verb the router calls; source/ctx/config inputs are
+plain ``SimpleNamespace`` fakes.
 """
 
 from __future__ import annotations
 
 from types import MappingProxyType, SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
-from elspeth.contracts import PendingOutcome, SourceRow
-from elspeth.contracts.enums import NodeStateStatus, RoutingMode, TerminalOutcome, TerminalPath
+from elspeth.contracts import SourceRow
 from elspeth.contracts.events import RowCreated
 from elspeth.contracts.types import NodeID
-from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.orchestrator.ceremony import RunCeremony
 from elspeth.engine.orchestrator.quarantine_router import QUARANTINE_ERROR_MAX_CHARS, QuarantineRouter
 from elspeth.engine.orchestrator.run_state import LoopContext
 from elspeth.engine.orchestrator.types import ExecutionCounters, RouteValidationError
-from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 SOURCE_ID = NodeID("source-node")
+
+
+class _RecordingProcessor:
+    """Records the fenced-ingest call and returns a marker result."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.result = SimpleNamespace(token=SimpleNamespace(token_id="tok-1", row_id="row-1"))
+
+    def ingest_quarantined_row(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.result
 
 
 def _make_source(*, name: str = "quarantine_source", on_validation_failure: str = "quarantine") -> SimpleNamespace:
     return SimpleNamespace(name=name, _on_validation_failure=on_validation_failure)
 
 
-def _make_loop_ctx(*, sinks: tuple[str, ...] = ("quarantine",), validation_error_id: str | None = None) -> LoopContext:
-    token = SimpleNamespace(token_id="tok-1", row_id="row-1")
-    setup = make_recorder_with_run(run_id="run-1")
-    authority = leader_coordination_token(setup.factory, setup.run_id)
-    processor = SimpleNamespace(
-        token_manager=SimpleNamespace(create_quarantine_token=lambda **kwargs: token),
-        coordination_token=authority,
-    )
-    ctx = SimpleNamespace(
-        pop_pending_quarantine_validation_error_id=lambda row: validation_error_id,
-        require_coordination_token=lambda: authority,
-        require_member_token=lambda: authority.membership,
-    )
+def _make_loop_ctx(
+    processor: _RecordingProcessor, *, sinks: tuple[str, ...] = ("quarantine",), validation_error_id: str | None = None
+) -> LoopContext:
+    ctx = SimpleNamespace(pop_pending_quarantine_validation_error_id=lambda row: validation_error_id)
     return LoopContext(
         counters=ExecutionCounters(),
         pending_tokens={name: [] for name in sinks},
@@ -63,29 +67,21 @@ def _make_loop_ctx(*, sinks: tuple[str, ...] = ("quarantine",), validation_error
     )
 
 
-def _make_factory() -> MagicMock:
-    factory = MagicMock(spec=RecorderFactory)
-    factory.execution.begin_node_state.return_value = SimpleNamespace(state_id="state-1")
-    return factory
-
-
 def _route(
     router: QuarantineRouter,
-    factory: MagicMock,
     loop_ctx: LoopContext,
     source_item: SourceRow,
     *,
     source: SimpleNamespace,
     edge_map: dict[tuple[NodeID, str], str] | None = None,
-) -> None:
-    router.route(
-        factory,
+) -> Any:
+    return router.route(
         "run-1",
         SOURCE_ID,
         source_item,
         0,
         source_item.source_row_index,
-        0,
+        7,
         edge_map if edge_map is not None else {(SOURCE_ID, "__quarantine__"): "edge-1"},
         loop_ctx,
         active_source=source,
@@ -93,9 +89,10 @@ def _route(
 
 
 class TestQuarantineRouteValidation:
-    """The reachable plugin-bug branches raise RouteValidationError."""
+    """The reachable plugin-bug branches raise before any durable write."""
 
     def test_missing_destination_raises(self) -> None:
+        processor = _RecordingProcessor()
         router = QuarantineRouter(ceremony=MagicMock(spec=RunCeremony))
         # Empty-string destination passes SourceRow.__post_init__ (not None) but
         # is falsy at the router — the "plugin forgot the destination" case.
@@ -107,9 +104,11 @@ class TestQuarantineRouteValidation:
             source_row_index=0,
         )
         with pytest.raises(RouteValidationError, match="missing quarantine_destination"):
-            _route(router, _make_factory(), _make_loop_ctx(), item, source=_make_source())
+            _route(router, _make_loop_ctx(processor), item, source=_make_source())
+        assert processor.calls == []
 
     def test_invalid_destination_raises(self) -> None:
+        processor = _RecordingProcessor()
         router = QuarantineRouter(ceremony=MagicMock(spec=RunCeremony))
         item = SourceRow.quarantined(
             row={"bad": "data"},
@@ -118,68 +117,67 @@ class TestQuarantineRouteValidation:
             source_row_index=0,
         )
         with pytest.raises(RouteValidationError, match="invalid quarantine_destination='nonexistent_sink'"):
-            _route(router, _make_factory(), _make_loop_ctx(), item, source=_make_source(on_validation_failure="nonexistent_sink"))
+            _route(router, _make_loop_ctx(processor), item, source=_make_source(on_validation_failure="nonexistent_sink"))
+        assert processor.calls == []
 
     def test_missing_quarantine_edge_raises(self) -> None:
         from elspeth.contracts.errors import OrchestrationInvariantError
 
+        processor = _RecordingProcessor()
         router = QuarantineRouter(ceremony=MagicMock(spec=RunCeremony))
         item = SourceRow.quarantined(row={"a": 1}, error="bad", destination="quarantine", source_row_index=0)
         with pytest.raises(OrchestrationInvariantError, match="no __quarantine__"):
-            _route(router, _make_factory(), _make_loop_ctx(), item, source=_make_source(), edge_map={})
+            _route(router, _make_loop_ctx(processor), item, source=_make_source(), edge_map={})
+        assert processor.calls == []
 
 
 class TestQuarantineHappyPath:
-    """A valid quarantined row produces the full audit collaboration."""
+    """A valid quarantined row is handed to the fenced ingest and returned as a result."""
 
-    def test_full_collaboration_sequence(self) -> None:
+    def test_hands_the_row_to_the_fenced_ingest_and_returns_its_result(self) -> None:
         ceremony = MagicMock(spec=RunCeremony)
         router = QuarantineRouter(ceremony=ceremony)
-        loop_ctx = _make_loop_ctx()
-        factory = _make_factory()
-        item = SourceRow.quarantined(row={"amount": 100}, error="bad value", destination="quarantine", source_row_index=3)
+        processor = _RecordingProcessor()
+        loop_ctx = _make_loop_ctx(processor, validation_error_id="verr-1")
+        item = SourceRow.quarantined(row={"amount": float("nan")}, error="bad value", destination="quarantine", source_row_index=3)
 
-        _route(router, factory, loop_ctx, item, source=_make_source())
+        result = _route(router, loop_ctx, item, source=_make_source())
 
-        # Source node_state opened quarantined and completed FAILED.
-        begin_kwargs = factory.execution.begin_node_state.call_args.kwargs
-        assert begin_kwargs["quarantined"] is True
-        assert begin_kwargs["node_id"] == SOURCE_ID
-        assert begin_kwargs["step_index"] == 0
-        assert factory.execution.complete_node_state.call_args.kwargs["status"] is NodeStateStatus.FAILED
-        # DIVERT routing_event recorded on the __quarantine__ edge.
-        routing_kwargs = factory.execution.record_routing_event.call_args.kwargs
-        assert routing_kwargs["mode"] is RoutingMode.DIVERT
-        assert routing_kwargs["edge_id"] == "edge-1"
-        # RowCreated telemetry emitted after Landscape recording.
+        assert result is processor.result
+        (call,) = processor.calls
+        assert call == {
+            "source_node_id": SOURCE_ID,
+            "row_index": 0,
+            "source_row_index": 3,
+            "ingest_sequence": 7,
+            # Tier-3 sanitisation happened before the durable write.
+            "row": {"amount": None},
+            "validation_error_id": "verr-1",
+            "quarantine_sink": "quarantine",
+            "quarantine_error": "bad value",
+            "quarantine_edge_id": "edge-1",
+        }
+        # RowCreated telemetry names the ingested token.
         (event,), _ = ceremony.emit_telemetry.call_args
         assert isinstance(event, RowCreated)
-        # The created token reaches the destination bucket with a deferred
-        # PendingOutcome (proves the token was created and routed).
-        pending = loop_ctx.pending_tokens["quarantine"]
-        assert len(pending) == 1
-        token, outcome = pending[0]
-        assert token.token_id == "tok-1"
-        assert isinstance(outcome, PendingOutcome)
-        assert outcome.outcome is TerminalOutcome.FAILURE
-        assert outcome.path is TerminalPath.QUARANTINED_AT_SOURCE
-        # Both counters bumped (quarantine is a FAILURE lifecycle subset).
-        assert loop_ctx.counters.rows_quarantined == 1
-        assert loop_ctx.counters.rows_failed == 1
+        assert (event.row_id, event.token_id) == ("row-1", "tok-1")
+        # The router neither moves counters nor appends to pending buckets:
+        # the shared accumulator does both from the returned result.
+        assert loop_ctx.pending_tokens == {"quarantine": []}
+        assert loop_ctx.counters.rows_quarantined == 0
+        assert loop_ctx.counters.rows_failed == 0
 
-    def test_overlong_error_is_bounded_on_audit_surfaces(self) -> None:
+    def test_overlong_error_is_bounded_before_the_ingest(self) -> None:
         router = QuarantineRouter(ceremony=MagicMock(spec=RunCeremony))
-        loop_ctx = _make_loop_ctx()
-        factory = _make_factory()
+        processor = _RecordingProcessor()
         long_error = "x" * (QUARANTINE_ERROR_MAX_CHARS + 5000)
         item = SourceRow.quarantined(row={"a": 1}, error=long_error, destination="quarantine", source_row_index=0)
 
-        _route(router, factory, loop_ctx, item, source=_make_source())
+        _route(router, _make_loop_ctx(processor), item, source=_make_source())
 
-        node_error = factory.execution.complete_node_state.call_args.kwargs["error"]
-        routing_reason = factory.execution.record_routing_event.call_args.kwargs["reason"]
-        # Same bounded text feeds node_state error and DIVERT reason.
-        assert len(node_error.exception) <= QUARANTINE_ERROR_MAX_CHARS + 200
-        assert node_error.exception.endswith("chars]")
-        # SourceQuarantineReason is a TypedDict, so index the bounded text.
-        assert routing_reason["quarantine_error"] == node_error.exception
+        # ONE bounded text feeds the node_state error, the DIVERT reason, the
+        # pending-sink message and the error hash (all derived in the ingest).
+        bounded = processor.calls[0]["quarantine_error"]
+        assert len(bounded) <= QUARANTINE_ERROR_MAX_CHARS + 200
+        assert bounded.startswith("x" * QUARANTINE_ERROR_MAX_CHARS)
+        assert bounded.endswith("chars]")

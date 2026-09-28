@@ -469,7 +469,17 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #  47 → Verification verdicts page through a run/time/call index, while
 #        corrupt run bindings are found from indexed call parents. Populated
 #        epoch-46 stores require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 47
+#  48 → A source-quarantined row is handed to its sink through a durable
+#        PENDING_SINK work item written in its ingest transaction (the fifth
+#        pending_sink_bundle_clause arm), resume re-drives only scheduler work
+#        and never re-derives a row, and the run_coordination_events
+#        event_type CHECK admits ``resume_refused`` (resume refuses a run whose
+#        tokens are neither decided nor covered by scheduler work). A store
+#        written before this epoch can hold a quarantined token with no work
+#        item that the new resume refuses as corruption, so only a bump — not
+#        a fold — keeps such a store from opening. Populated epoch-47 stores
+#        require delete/recreate.
+SQLITE_SCHEMA_EPOCH = 48
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -1016,8 +1026,14 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
     ``PENDING_SINK`` is not merely a status: the dedicated redrive path must
     be able to rebuild a legal sink-bound ``RowResult`` without replaying its
     producer.  The opaque row payload and sink identity must therefore be
-    present, the persisted outcome/path pair must be one of the four
+    present, the persisted outcome/path pair must be one of the five
     sink-bound terminal pairs, and pair-specific evidence must be complete.
+    Source quarantine is the fifth: a row the source rejected is handed to its
+    quarantine sink through the same durable bundle as every other sink-bound
+    token, carrying the audited quarantine error hash and bounded message.
+    ``(FAILURE, QUARANTINED_AT_SOURCE)`` is also the sinkless discard pair;
+    a discarded token records its outcome directly and never parks, so a
+    parked item on this pair is always a source-quarantine handoff.
 
     Keep this predicate at the schema boundary so claim selection and its CAS
     UPDATE use the exact same SQL on SQLite and PostgreSQL.  Payload *shape*
@@ -1057,6 +1073,14 @@ def pending_sink_bundle_clause() -> ColumnElement[bool]:
                 token_work_items_table.c.join_group_id != "",
                 no_error_evidence,
             ),
+            and_(
+                token_work_items_table.c.pending_outcome == TerminalOutcome.FAILURE.value,
+                token_work_items_table.c.pending_path == TerminalPath.QUARANTINED_AT_SOURCE.value,
+                token_work_items_table.c.pending_error_hash.is_not(None),
+                token_work_items_table.c.pending_error_hash != "",
+                token_work_items_table.c.pending_error_message.is_not(None),
+                token_work_items_table.c.join_group_id.is_(None),
+            ),
         ),
     )
 
@@ -1075,16 +1099,33 @@ def work_item_token_decided_clause() -> ColumnElement[bool]:
     )
 
 
+def token_decided_clause() -> ColumnElement[bool]:
+    """EXISTS: the token carries a completed terminal outcome in its run.
+
+    Correlated to ``tokens``. The partial unique index
+    ``ix_token_outcomes_terminal_unique`` caps completed outcomes at one per
+    token, so NOT EXISTS of this clause is exactly "the token has no recorded
+    terminal outcome" — the fact a success stamp must never coexist with.
+    """
+    return (
+        select(token_outcomes_table.c.outcome_id)
+        .where(token_outcomes_table.c.run_id == tokens_table.c.run_id)
+        .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+        .where(token_outcomes_table.c.completed == 1)
+        .exists()
+    )
+
+
 def undecided_failed_work_clause() -> ColumnElement[bool]:
     """Predicate selecting FAILED work items whose token has no completed outcome.
 
     FAILED is a disposition, not a fate. A routed failure records the token's
     outcome before ``mark_failed``; a FAILED item whose token has none is a
     claim that died on an exception mid-row (the drain's exception arm marks
-    it FAILED and the worker exits), so the row is undecided. One predicate
-    for the two readers that must agree: ``complete_run`` refuses a success
-    stamp while such an item exists, and resume returns exactly these items
-    to READY for re-drive (``requeue_undecided_failed_work``).
+    it FAILED and the worker exits), so the row is undecided. Resume returns
+    exactly these items to READY for re-drive
+    (``requeue_undecided_failed_work``); ``complete_run``'s undecided-token
+    arm (``token_decided_clause``) refuses a success stamp over their tokens.
     """
     return and_(
         token_work_items_table.c.status == TokenWorkStatus.FAILED.value,
@@ -1099,11 +1140,10 @@ def blocked_barrier_hold_clause() -> ColumnElement[bool]:
     ``barrier_key`` (coalesce_name for coalesce, str(node_id) for
     aggregation), while ADR-028 queue-holds carry only a ``queue_key``. The
     ``barrier_key IS NOT NULL`` filter is what keeps queue-holds out of
-    barrier sweeps (restore, resume work-set exclusion, quiescence counting).
+    barrier sweeps (restore, quiescence counting).
 
     Single source of truth for the dual-use predicate — shared by
     ``TokenSchedulerRepository.list_blocked_barrier_items`` and
-    ``RecoveryManager._get_buffered_journal_token_ids`` /
     ``count_blocked_barrier_items``. The literal ``'blocked'`` MUST match
     ``TokenWorkStatus.BLOCKED.value`` (a lowercase ``StrEnum``), consistent
     with the status literals in this module's CHECK constraints.
@@ -1258,11 +1298,13 @@ run_coordination_events_table = Table(
     Column("context_json", Text, nullable=False, server_default=text("'{}'")),
     # All 10 event types from the design DDL (§A.2), including the slice-4
     # producers worker_stalled and heartbeat_degraded — pinned into the
-    # epoch-21 CHECK now so slice 4 needs no schema change.
+    # epoch-21 CHECK now so slice 4 needs no schema change — plus epoch 48's
+    # resume_refused: the resuming leader's value-free record of a run whose
+    # tokens resume cannot account for (SchedulerLeaseRepository.verify_resume_coverage).
     CheckConstraint(
         "event_type IN ('worker_register', 'worker_depart', 'worker_evict', 'worker_stalled', "
         "'leader_acquire', 'leader_release', 'leadership_lost', "
-        "'fence_refusal', 'heartbeat_degraded', 'finalize')",
+        "'fence_refusal', 'heartbeat_degraded', 'finalize', 'resume_refused')",
         name="ck_run_coordination_events_event_type",
     ),
     # Mandatory: without the table kwarg, SQLAlchemy emits a bare INTEGER

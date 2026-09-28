@@ -16,11 +16,9 @@ from sqlalchemy import insert, update
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -255,35 +253,6 @@ def _seed_scheduler_image() -> tuple[Any, TokenSchedulerRepository, dict[str, st
             id="RM-06-active-peer-lease-strict-expiry-and-dedup",
         ),
         pytest.param(
-            TokenSchedulerRepository.active_row_ids,
-            {"run_id": RUN_ID},
-            frozenset(
-                {
-                    "row-" + name
-                    for name in (
-                        "ready",
-                        "leased-self",
-                        "leased-peer-a",
-                        "leased-peer-b",
-                        "leased-peer-equality",
-                        "leased-sink-redrive",
-                        "blocked-queue",
-                        "blocked-barrier-pending-z",
-                        "blocked-barrier-adopted-a",
-                        "pending-sink-peer",
-                        "pending-sink-empty-owner",
-                    )
-                }
-            ),
-            id="RM-09-active-source-row-identities",
-        ),
-        pytest.param(
-            TokenSchedulerRepository.blocked_barrier_token_ids,
-            {"run_id": RUN_ID},
-            frozenset({"token-blocked-barrier-pending-z", "token-blocked-barrier-adopted-a"}),
-            id="RM-10-barrier-token-identities",
-        ),
-        pytest.param(
             TokenSchedulerRepository.count_blocked_barrier_items,
             {"run_id": RUN_ID},
             2,
@@ -472,52 +441,7 @@ def test_read_models_do_not_bleed_foreign_runs() -> None:
     _factory, repository, _ids = _seed_scheduler_image()
     assert repository.count_active_work(run_id=OTHER_RUN_ID) == 1
     assert repository.count_active_work(run_id=RUN_ID) == 11
-    assert repository.blocked_barrier_token_ids(run_id=OTHER_RUN_ID) == frozenset()
-
-
-@pytest.mark.parametrize("with_checkpoint", (False, True), ids=("without-checkpoint", "with-checkpoint"))
-@pytest.mark.parametrize("with_decision", (False, True), ids=("abandoned-only", "decided-plus-abandoned"))
-def test_rm14_resume_workset_refuses_abandoned_token_fates(
-    monkeypatch: pytest.MonkeyPatch,
-    with_checkpoint: bool,
-    with_decision: bool,
-) -> None:
-    factory, _repository, _ids = _seed_scheduler_image()
-    token_id = "token-failed"
-    with factory._db.engine.begin() as conn:
-        conn.execute(
-            insert(token_outcomes_table).values(
-                outcome_id="out-abandoned",
-                run_id=RUN_ID,
-                token_id=token_id,
-                outcome=None,
-                path=TerminalPath.ABANDONED.value,
-                completed=0,
-                recorded_at=NOW,
-                context_json="{}",
-            )
-        )
-        if with_decision:
-            conn.execute(
-                insert(token_outcomes_table).values(
-                    outcome_id="out-decided",
-                    run_id=RUN_ID,
-                    token_id=token_id,
-                    outcome=TerminalOutcome.SUCCESS.value,
-                    path=TerminalPath.DEFAULT_FLOW.value,
-                    completed=1,
-                    recorded_at=NOW + timedelta(seconds=1),
-                    sink_name="sink-a",
-                    context_json="{}",
-                )
-            )
-
-    recovery = RecoveryManager(factory._db, checkpoint_manager=object())  # type: ignore[arg-type]
-    # ABANDONED must refuse even when the finalized run has no checkpoint.
-    checkpoint = object() if with_checkpoint else None
-    monkeypatch.setattr(recovery, "_get_latest_checkpoint_for_resume_workset", lambda _run_id: checkpoint)
-    with pytest.raises(AuditIntegrityError, match="ABANDONED"):
-        recovery.get_resume_workset(RUN_ID)
+    assert repository.count_blocked_barrier_items(run_id=OTHER_RUN_ID) == 0
 
 
 def test_rm14_accounting_census_distinguishes_all_token_fates() -> None:

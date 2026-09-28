@@ -115,7 +115,7 @@ def test_export_transaction_refusal_reaches_cli_after_state_changes(tmp_path: Pa
     "format_version, expected",
     [(None, "checkpoint_format_missing"), (Checkpoint.CURRENT_FORMAT_VERSION + 1, "checkpoint_format_incompatible")],
 )
-def test_real_workset_format_refusal_reaches_cli(
+def test_post_preflight_format_refusal_reaches_cli(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, format_version: int | None, expected: str
 ) -> None:
     settings = _make_jsonl_settings(tmp_path)
@@ -129,28 +129,22 @@ def test_real_workset_format_refusal_reaches_cli(
         with db.engine.begin() as connection:
             run_id = connection.execute(select(runs_table.c.run_id)).scalar_one()
             connection.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status="failed"))
-        original = RecoveryManager.get_unprocessed_rows
+        original = RecoveryManager.count_active_scheduler_work
 
-        def incompatible_workset(self: RecoveryManager, observed_run_id: str) -> list[str]:
+        def format_changes_after_preflight(self: RecoveryManager, observed_run_id: str) -> int:
+            # The checkpoint changes after the CLI's advisory preflight read;
+            # the resume's own checkpoint re-verification must refuse it.
             with db.engine.begin() as connection:
                 connection.execute(
                     update(checkpoints_table).where(checkpoints_table.c.run_id == observed_run_id).values(format_version=format_version)
                 )
-            try:
-                return original(self, observed_run_id)
-            finally:
-                # Rendering must preserve the refused observation after it changes.
-                with db.engine.begin() as connection:
-                    connection.execute(
-                        update(checkpoints_table)
-                        .where(checkpoints_table.c.run_id == observed_run_id)
-                        .values(format_version=Checkpoint.CURRENT_FORMAT_VERSION)
-                    )
+            return original(self, observed_run_id)
 
-        with patch.object(RecoveryManager, "get_unprocessed_rows", autospec=True, side_effect=incompatible_workset) as workset:
+        with patch.object(
+            RecoveryManager, "count_active_scheduler_work", autospec=True, side_effect=format_changes_after_preflight
+        ) as preflight_read:
             result = runner.invoke(app, ["resume", run_id, "-s", str(settings), "--execute", "--format", "json"])
-        assert workset.call_count == 1, (result.output, result.exception)
-        workset.assert_called_once()
+        preflight_read.assert_called_once()
 
     assert result.exit_code == 1, result.output
     payload = json.loads(result.stderr)

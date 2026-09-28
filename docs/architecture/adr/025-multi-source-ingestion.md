@@ -6,6 +6,45 @@
 **Tags:** sources, config, resume, schema-contract, no-legacy-code,
           rc6, multi-source-token-scheduler
 
+## Amendment (2026-09-28): resume never re-derives a source row
+
+Decisions 3 and 4 below governed the *source-row replay* arm of resume: rows
+recovered from the audit trail were re-validated through their source's
+restored schema (`ResumedRow`, `get_unprocessed_row_data_by_source`) and
+driven down the pipeline again under a per-source contract
+(`ResumeState.schema_contracts_by_source`). That arm is deleted.
+
+Every row a run ingests is handed to the durable scheduler in the same fenced
+transaction that records it — a valid row with a claimed READY work item, a
+source-quarantined row with a born-parked PENDING_SINK item. A fork, expand or
+collect product gets its item when the work that minted it completes (or its
+barrier releases); a crash between the mint and that completion leaves the
+producing item open, and re-driving it reconciles the committed products and
+emits their items, so resume's coverage check counts such a product as covered
+by its open producer. Each item's payload carries its own row and
+its contract (`serialize_row_payload`), so resume re-drives exactly the run's
+non-terminal scheduler work and never consults a source schema. The replay arm
+was reachable only when a row had no durable work item, which the fenced
+ingest makes impossible; its one real trigger was a source-quarantined row
+(before the quarantine handoff existed), where it re-validated a row the source
+had already rejected — trapping the run under a fixed schema, and publishing
+the rejected row as SUCCESS under an observed one.
+
+Consequently:
+
+- **Decision 3** keeps its plural-by-source intent for the audit trail
+  (`run_sources` stays the single per-source contract writer, Decision 5), but
+  `ResumeState` no longer carries a contract map: the non-empty chokepoint now
+  guards `ResumeState.source_names_by_source` (one entry per `run_sources`
+  record), with `EmptyResumeStateError` unchanged as the upstream refusal.
+- **Decision 4** is withdrawn: `ResumedRow` and the whole replay work set
+  (`get_resume_workset`, `get_unprocessed_rows`, `IncompleteTokenSpec`,
+  `reconstruct_token_row`, `RowProcessor.process_existing_row` /
+  `resume_incomplete_token`) are deleted. Mixed-contract soundness is carried
+  by the scheduler payload, which records each token's contract with its row.
+
+The original text below is preserved as the dated decision.
+
 ## Context
 
 Through RC5.2 the pipeline source surface was singular by contract and by

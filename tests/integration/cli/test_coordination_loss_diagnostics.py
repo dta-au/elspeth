@@ -107,7 +107,7 @@ def test_command_preserves_observed_loss(
                 patch("elspeth.core.checkpoint.RecoveryManager.can_resume", autospec=True, return_value=ResumeCheck(can_resume=True))
             )
             stack.enter_context(patch("elspeth.core.checkpoint.RecoveryManager.get_resume_point", autospec=True, return_value=point))
-            stack.enter_context(patch("elspeth.core.checkpoint.RecoveryManager.get_unprocessed_rows", autospec=True, return_value=[]))
+            stack.enter_context(patch("elspeth.core.checkpoint.RecoveryManager.count_active_scheduler_work", autospec=True, return_value=0))
             stack.enter_context(patch("elspeth.core.checkpoint.RecoveryManager.count_blocked_barrier_items", autospec=True, return_value=0))
             stack.enter_context(patch("elspeth.cli._execute_resume_with_instances", autospec=True, side_effect=error))
         else:

@@ -197,7 +197,6 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
         "data-flow",
         (
             "create_row_with_token",
-            "create_quarantine_row_with_token",
             "insert_row_with_token_on",
             "create_token",
             "fork_token",
@@ -251,6 +250,7 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
             "enqueue_ready",
             "enqueue_ready_claimed",
             "ingest_row_with_initial_claim",
+            "ingest_quarantine_row_with_pending_sink",
             "claim_ready",
             "claim_pending_sink",
             "recover_expired_leases",
@@ -308,13 +308,16 @@ _MUTATION_APIS: tuple[MutationApi, ...] = (
 _EXPECTED_API_CATEGORY_COUNTS = {
     "run-lifecycle": 14,
     "run-start-admission": 2,
-    "data-flow": 17,
+    # QR (lane 5887): 17 -> 16, DataFlowRepository.create_quarantine_row_with_token leaves
+    # (its rows+tokens insert and error link now compose into the scheduler's fenced ingest).
+    "data-flow": 16,
     # C4 (recorded FAILED verdict, operator ruling 2026-09-23): 19 -> 20,
     # ExecutionRepository.complete_aggregation_failure, the batch's one verdict write.
     # CODEX-R2 (elspeth-5887fb7928 R4): 20 -> 21,
     # ExecutionRepository.complete_collector_failure, a collector group's one verdict write.
     "execution": 21,
-    "scheduler": 23,
+    # QR (lane 5887): 23 -> 24, TokenSchedulerRepository.ingest_quarantine_row_with_pending_sink.
+    "scheduler": 24,
     "sink-effect": 11,
     "checkpoint": 2,
     "audit-export": 3,
@@ -637,7 +640,15 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # RETURNING for sink-redrive items (no per-item binds) and one executemany of a
 # fixed-size UPDATE for transform items. Measured by scripts/fencing_inventory.py
 # --baseline against a git archive of 55dbdf290: arrived 6, departed 5, moved 0.
-_EXPECTED_DML_COUNT = 164
+# QR (lane 5887, fenced source-quarantine ingest), on its own branch 163 -> 164. Arrived:
+# NodeStateRepository.record_failed_source_quarantine_state_on insert node_states (the
+# step-0 FAILED source state, written on the ingest's one fenced connection). Measured
+# by scripts/fencing_inventory.py against a git-archive of 2d1406077.
+# QR merged with release/0.8.1 (both 164s above): 164 -> 165, write set UNCHANGED
+# (72/72). Against release a375d7f13: arrived 1 (the QR node_states insert above),
+# departed 0, moved 0. Measured by scripts/fencing_inventory.py --baseline against a
+# git archive of a375d7f13.
+_EXPECTED_DML_COUNT = 165
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -764,7 +775,11 @@ _EXPECTED_DML_COUNT = 164
 # _rotate_expired_leases split into two statements (see _EXPECTED_DML_COUNT).
 # Measured by scripts/fencing_inventory.py --baseline against a git archive of
 # 55dbdf290: arrived 6, departed 5, moved 0.
-_EXPECTED_DML_INVENTORY_SHA256 = "6a08f6514612bdcedbf2a323519f811e663f0ad92d39427bf7ee6e53abb4db40"
+# QR (on its own branch): 802297e6… -> 9d27cf24…, the one arrival named at
+# _EXPECTED_DML_COUNT.
+# QR merged with release/0.8.1: 6a08f651… (release) -> the value below, the one
+# arrival named at _EXPECTED_DML_COUNT.
+_EXPECTED_DML_INVENTORY_SHA256 = "e36c8c4358dc70992a98c6b6209b37c2d958aac25f8bd39ac615e9c2a9d16032"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -895,7 +910,25 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # Tier-1 declared-input miss closing each member's hold FAILED before the run ends.
 # Attributed by row identity from this gate's scanner on the release 63b050f39 export,
 # the lane parent ae2f320f7 export and the landing tree (lane parent == landing tree).
-_EXPECTED_CALL_COUNT = 290
+# QR (lane 5887): the base tree 2d1406077 measures 289 against the 290 pin (a drift
+# that predates QR); QR moves 289 -> 285. Departed: QuarantineRouter.route ->
+# factory.execution.begin_node_state / complete_node_state / record_routing_event and
+# TokenManager.create_quarantine_token -> self._data_flow.create_quarantine_row_with_token
+# — the four separate transactions the fenced quarantine ingest now composes into one.
+# QR commit 1 pinned an intermediate tree: the committed tree measures 286 (the arrival
+# ingest_source_quarantine -> scheduler.ingest_quarantine_row_with_pending_sink was not
+# counted). QR replay deletion: 286 -> 285. Departed: TokenManager.create_token_for_existing_row
+# -> self._data_flow.create_token (source-row replay deleted). Measured by
+# scripts/fencing_inventory.py on a git snapshot of 874fdb7c7 and on this tree.
+# QR merged with release/0.8.1: 290 (release, after G1 and R2 fix round 1 above) -> 286.
+# Against release a375d7f13: arrived 1 (ingest_source_quarantine ->
+# scheduler.ingest_quarantine_row_with_pending_sink), departed 5 (QuarantineRouter.route
+# -> begin_node_state / complete_node_state / record_routing_event,
+# TokenManager.create_quarantine_token -> create_quarantine_row_with_token,
+# TokenManager.create_token_for_existing_row -> create_token), moved 0 — the QR arrival
+# and departures named above. Measured by scripts/fencing_inventory.py --baseline
+# against a git archive of a375d7f13.
+_EXPECTED_CALL_COUNT = 286
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -908,7 +941,11 @@ _EXPECTED_CALL_COUNT = 290
 # complete_collector_failure call for a zero-arrival group.
 # G1 + G1b: 7683d3e0… -> e74265fd…, the departure and the move above.
 # R2 fix round 1: e74265fd… -> 72e3db35…, the move and the arrival above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "72e3db359610e7184f437ad8c28cb0dc70fc16a101e9483bdfc3683b1e3026b1"
+# QR (on its own branch): 7683d3e0… -> 853145e4… (commit 1's committed tree) ->
+# a00408f8… (the arrival and departures named at _EXPECTED_CALL_COUNT).
+# QR merged with release/0.8.1: 72e3db35… (release) -> the value below, the arrival
+# and departures named at _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "2be2a394f3d500e08b4af400dd259c4f56720894d7692789d9c35c4c66f76f6c"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -930,26 +967,47 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "72e3db359610e7184f437ad8c28cb0dc70fc16a101
 # Arrived: SchedulerLeaseRepository.requeue_undecided_failed_work ->
 # SchedulerEventStore.record_many (the resume_requeue_failed events, on the verb's
 # one fenced connection). Measured by scripts/fencing_inventory.py --baseline HEAD.
-# X1 fix round 2: 1e0222f8… -> the value below at count 147. Two edges keep their
+# X1 fix round 2: 1e0222f8… -> cc66a10d… at count 147. Two edges keep their
 # endpoints and move fingerprint: _terminalize_consumed_barrier_rows and
 # _transition_passthrough_pending_sink -> SchedulerEventStore.record_many
 # (ff73b28faf6e6c8f -> c9cd14d8ac48f958, 437ff52f30dcf19a -> 6a488448bf78ff07); each
 # now records an event for every candidate row after its exact-count check instead
 # of filtering on a RETURNING image. Measured by scripts/fencing_inventory.py
 # --baseline against a git archive of 4fa8e7451: moved 2, arrived 0, departed 0.
-# elspeth-5887 X2: cc66a10d… -> the value below at count 147. Two edges keep their
+# elspeth-5887 X2: cc66a10d… -> 9c79b610… at count 147. Two edges keep their
 # endpoints and move fingerprint: mark_pending_sink_terminal_many and
 # terminalize_pending_sinks_with_terminal_outcomes -> SchedulerEventStore.record_many;
 # each UPDATE is now one executemany with an exact-count check, so the events cover
 # every selected row instead of filtering on a RETURNING image. Measured by
 # scripts/fencing_inventory.py --baseline against a git archive of 55dbdf290:
 # moved 2, arrived 0, departed 0.
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 147
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "9c79b6105ca800b35388bb874da517202998b85758c77ae4ed71945799341dfe"
+# QR (lane 5887, on its own branch): 147 -> 153, 1e0222f8… -> 8bddd1d2…. Departed: the two edges of
+# DataFlowRepository.create_quarantine_row_with_token (deleted). Arrived: the fenced
+# SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink -> the data-flow
+# insert_row_with_token_on, ErrorAuditRepository.link_validation_error_to_row_on,
+# NodeStateRepository.record_failed_source_quarantine_state_on and record_routing_event_on,
+# and its own _park_source_quarantine_on; _park_source_quarantine_on -> insert_work_items
+# and SchedulerEventStore.record_many; record_failed_source_quarantine_state_on ->
+# verify_and_extend_leader_fence. Measured by scripts/fencing_inventory.py.
+# QR H2 (resume coverage check): 153 -> 154, 8bddd1d2… -> 932a286b…. Arrived:
+# SchedulerLeaseRepository.verify_resume_coverage -> record_coordination_event (the
+# value-free resume_refused event, on the verb's one leader-fenced connection, run
+# subject coordination_token.run_id). Measured by scripts/fencing_inventory.py.
+# QR merged with release/0.8.1 (X1 + X2 above): 147 -> 154, 9c79b610… (release) -> the
+# value below. Against release a375d7f13: arrived 9, departed 2, moved 0 — exactly the
+# QR arrivals and departures named above. Measured by scripts/fencing_inventory.py
+# --baseline against a git archive of a375d7f13.
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 154
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "1241860a5c22bd0a007e83bb935481d2d86e9cd680bb6db6c3f71ac4a4017667"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
-_EXPECTED_INTERNAL_EDGE_COUNT = 92
-_EXPECTED_INTERNAL_EDGE_SHA256 = "d1af3e662208f61e4514edd9cc62e5e30fb573f047d2916b108c5a7c0c392c39"
+_EXPECTED_INTERNAL_EDGE_COUNT = 93
+# QR (lane 5887): d1af3e66… -> the value below, 92 -> 93: the internal
+# insert_row_with_token_on edge moves from DataFlowRepository.create_quarantine_row_with_token
+# (deleted) to SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink, and the
+# facade edge TokenSchedulerRepository.ingest_quarantine_row_with_pending_sink -> self.queue
+# arrives (commit 1 pinned an intermediate tree without it; measured on 874fdb7c7).
+_EXPECTED_INTERNAL_EDGE_SHA256 = "e2535cc472ce543ad83042f4628377de3a003fc661e2233451fe83d4549fc4b8"
 
 
 def _repo_root() -> Path:
@@ -10707,7 +10765,7 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
         terminalized = self._terminalize_consumed_barrier_rows(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, consumed=consumed, blocked_by_token=blocked_by_token, database_now=database_now, release_context=release_context)
         record_terminal_outcomes_guarded(conn, run_id=coordination_token.run_id, outcomes=terminal_outcomes, recorded_at=database_now)
         self._transition_passthrough_pending_sink(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, blocked_rows=blocked_rows, passthrough_emissions=passthrough_emissions, emission_context=emission_context, database_now=database_now, parked_lease_owner=pending_sink_lease_owner)
-        pending = [self._prepare_fresh_pending_sink_emission(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, emission=emission, emission_context=emission_context, database_now=database_now, parked_lease_owner=pending_sink_lease_owner) for emission in fresh_emissions]
+        pending = [prepare_fresh_pending_sink_item(conn, run_id=coordination_token.run_id, emission=emission, context=emission_context, database_now=database_now, parked_lease_owner=pending_sink_lease_owner, refusal_prefix=f'Scheduler barrier completion for run_id={coordination_token.run_id!r} barrier_key={barrier_key!r}') for emission in fresh_emissions]
         ready = [self._prepare_ready_emission(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, emission=emission, emission_context=emission_context, database_now=database_now, claim_order_at=database_now - timedelta(microseconds=len(emitted_ready) - emission_index - 1)) for emission_index, emission in enumerate(emitted_ready)]
         insert_work_items(conn, values=[values for values, _event in (*pending, *ready)], operation='barrier-completion emissions')
         self._events.record_many(conn, records=[event for _values, event in (*pending, *ready)])
@@ -10715,19 +10773,29 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
     return terminalized
 """
 
-_NULL_DEADLINE_RECIPES[
-    ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._prepare_fresh_pending_sink_emission")
-] = r"""
-def _prepare_fresh_pending_sink_emission(self, conn: Connection, *, run_id: str, barrier_key: str, emission: BarrierEmission, emission_context: Mapping[str, object], database_now: datetime, parked_lease_owner: str | None=None) -> tuple[dict[str, object], SchedulerEventRecord]:
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/work_items.py", "prepare_fresh_pending_sink_item")] = r"""
+def prepare_fresh_pending_sink_item(conn: Connection, *, run_id: str, emission: BarrierEmission, context: Mapping[str, object], database_now: datetime, parked_lease_owner: str | None, refusal_prefix: str) -> tuple[dict[str, object], SchedulerEventRecord]:
     if emission.node_id is not None:
-        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received fresh pending-sink emission token_id={emission.token_id!r} with node_id={emission.node_id!r}; fresh sink-bound emissions live on the node_id-NULL terminal lane.')
+        raise AuditIntegrityError(f'{refusal_prefix} received fresh pending-sink emission token_id={emission.token_id!r} with node_id={emission.node_id!r}; fresh sink-bound emissions live on the node_id-NULL terminal lane.')
     if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
-        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} fresh pending-sink emission token_id={emission.token_id!r} requires row_id, step_index and ingest_sequence; the inserted journal row must be a complete resume cursor.')
+        raise AuditIntegrityError(f'{refusal_prefix} fresh pending-sink emission token_id={emission.token_id!r} requires row_id, step_index and ingest_sequence; the inserted journal row must be a complete resume cursor.')
     validate_work_item_references(conn, run_id=run_id, token_id=emission.token_id, row_id=emission.row_id, ingest_sequence=emission.ingest_sequence, node_id=None, coalesce_node_id=emission.coalesce_node_id)
-    work_item_id = make_work_item_id(run_id, emission.token_id, None, emission.attempt)
-    values: dict[str, object] = {'work_item_id': work_item_id, 'run_id': run_id, 'token_id': emission.token_id, 'row_id': emission.row_id, 'node_id': None, 'step_index': emission.step_index, 'ingest_sequence': emission.ingest_sequence, 'row_payload_json': emission.row_payload_json, 'status': TokenWorkStatus.PENDING_SINK.value, 'queue_key': emission.queue_key, 'barrier_key': emission.barrier_key, 'on_success_sink': emission.on_success_sink, 'pending_sink_name': emission.sink_name, 'pending_outcome': emission.outcome, 'pending_path': emission.path, 'pending_error_hash': emission.error_hash, 'pending_error_message': emission.error_message, 'join_group_id': emission.join_group_id, 'lineage_path_json': lineage_path_to_json(emission.lineage_path), 'coalesce_node_id': emission.coalesce_node_id, 'coalesce_name': emission.coalesce_name, 'row_union_name': emission.row_union_name, 'collector_name': emission.collector_name, 'attempt': emission.attempt, 'lease_owner': parked_lease_owner, 'lease_expires_at': None, 'available_at': database_now, 'created_at': database_now, 'updated_at': database_now}
-    event = SchedulerEventRecord(event_type=SchedulerEventType.MARK_PENDING_SINK, run_id=run_id, token_id=emission.token_id, work_item_id=work_item_id, node_id=None, from_status=None, to_status=TokenWorkStatus.PENDING_SINK, from_lease_owner=None, to_lease_owner=parked_lease_owner, from_attempt=None, to_attempt=emission.attempt, recorded_at=database_now, context=emission_context)
+    item_id = work_item_id(run_id, emission.token_id, None, emission.attempt)
+    values: dict[str, object] = {'work_item_id': item_id, 'run_id': run_id, 'token_id': emission.token_id, 'row_id': emission.row_id, 'node_id': None, 'step_index': emission.step_index, 'ingest_sequence': emission.ingest_sequence, 'row_payload_json': emission.row_payload_json, 'status': TokenWorkStatus.PENDING_SINK.value, 'queue_key': emission.queue_key, 'barrier_key': emission.barrier_key, 'on_success_sink': emission.on_success_sink, 'pending_sink_name': emission.sink_name, 'pending_outcome': emission.outcome, 'pending_path': emission.path, 'pending_error_hash': emission.error_hash, 'pending_error_message': emission.error_message, 'join_group_id': emission.join_group_id, 'lineage_path_json': lineage_path_to_json(emission.lineage_path), 'coalesce_node_id': emission.coalesce_node_id, 'coalesce_name': emission.coalesce_name, 'row_union_name': emission.row_union_name, 'collector_name': emission.collector_name, 'attempt': emission.attempt, 'lease_owner': parked_lease_owner, 'lease_expires_at': None, 'available_at': database_now, 'created_at': database_now, 'updated_at': database_now}
+    event = SchedulerEventRecord(event_type=SchedulerEventType.MARK_PENDING_SINK, run_id=run_id, token_id=emission.token_id, work_item_id=item_id, node_id=None, from_status=None, to_status=TokenWorkStatus.PENDING_SINK, from_lease_owner=None, to_lease_owner=parked_lease_owner, from_attempt=None, to_attempt=emission.attempt, recorded_at=database_now, context=context)
     return (values, event)
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository._park_source_quarantine_on")] = r"""
+def _park_source_quarantine_on(self, conn: Connection, *, run_id: str, emission: BarrierEmission, parked_lease_owner: str) -> RowMapping:
+    values, event = prepare_fresh_pending_sink_item(conn, run_id=run_id, emission=emission, context={'reason': 'source_quarantine_ingest'}, database_now=read_landscape_transaction_time(conn), parked_lease_owner=parked_lease_owner, refusal_prefix=f'Source-quarantine ingest for run_id={run_id!r}')
+    insert_work_items(conn, values=[values], operation='source-quarantine pending-sink handoff')
+    self._events.record_many(conn, records=[event])
+    work_item_id = values['work_item_id']
+    bundle_complete = conn.execute(select(pending_sink_bundle_clause()).where(token_work_items_table.c.work_item_id == work_item_id)).scalar_one()
+    if not bundle_complete:
+        raise AuditIntegrityError(f'Source-quarantine ingest for run_id={run_id!r} token_id={emission.token_id!r} parked an incomplete durable sink bundle; the resume drain could never claim it.')
+    return conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
 """
 
 _NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._prepare_ready_emission")] = r"""
@@ -10780,9 +10848,10 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='sqlalchemy.exc', names=[alias(name='SQLAlchemyError')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='LineageFrame'), alias(name='lineage_path_from_json'), alias(name='lineage_path_to_json')], level=0)",
-        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventRecord')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='nodes_table'), alias(name='rows_table'), alias(name='token_work_items_table'), alias(name='tokens_table')], level=0)",
     ),
     "src/elspeth/core/landscape/scheduler/queue.py": (
@@ -10791,17 +10860,18 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='sqlalchemy', names=[alias(name='select')], level=0)",
         "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
         "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken'), alias(name='WorkerMembershipToken')], level=0)",
+        "ImportFrom(module='elspeth.contracts.enums', names=[alias(name='TerminalOutcome'), alias(name='TerminalPath')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError'), alias(name='RunWorkerEvictedError')], level=0)",
         "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='LineageFrame')], level=0)",
-        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='SchedulerEventType'), alias(name='SourceIngestSpec'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='SchedulerEventType'), alias(name='SourceIngestSpec'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction'), alias(name='fenced_member_transaction')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventStore')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.leases', names=[alias(name='SchedulerLeaseRepository')], level=0)",
-        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_item_idempotent'), alias(name='item_from_mapping'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_item_idempotent'), alias(name='insert_work_items'), alias(name='item_from_mapping'), alias(name='prepare_fresh_pending_sink_item'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='work_item_id', asname='make_work_item_id')], level=0)",
-        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='active_worker_fence_clause'), alias(name='token_work_items_table')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='active_worker_fence_clause'), alias(name='pending_sink_bundle_clause'), alias(name='token_work_items_table')], level=0)",
     ),
     "src/elspeth/core/landscape/scheduler/dispositions.py": (
         "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
@@ -10834,7 +10904,6 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='sqlalchemy.exc', names=[alias(name='SQLAlchemyError')], level=0)",
         "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
-        "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='lineage_path_to_json')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='BarrierTerminalOutcomeSpec'), alias(name='BatchMembershipSpec'), alias(name='BlockedPendingSinkHandoff'), alias(name='BufferedOutcomeSpec'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.data_flow.outcomes', names=[alias(name='record_buffered_outcome_guarded'), alias(name='record_terminal_outcomes_guarded')], level=0)",
@@ -10847,8 +10916,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.core.landscape.scheduler.fencing', names=[alias(name='fenced_write'), alias(name='require_coordination_token')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.group_losses', names=[alias(name='record_group_losses')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.payload_codec', names=[alias(name='scrubbed_row_payload_json')], level=0)",
-        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_items'), alias(name='item_from_mapping'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
-        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='work_item_id', asname='make_work_item_id')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_items'), alias(name='item_from_mapping'), alias(name='prepare_fresh_pending_sink_item'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='blocked_barrier_hold_clause'), alias(name='token_outcomes_table'), alias(name='token_work_items_table'), alias(name='tokens_table')], level=0)",
     ),
 }
@@ -10877,6 +10945,7 @@ _NULL_VALUE_CALLERS = {
     "insert_work_items": frozenset(
         {
             ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.complete_barrier"),
+            ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository._park_source_quarantine_on"),
         }
     ),
 }
@@ -10955,7 +11024,7 @@ def _null_recipe_graph_is_closed(units, proof, required):
         expected = ast.parse(_NULL_DEADLINE_RECIPES[key]).body[0]
         if _null_recipe_shape(function) != _null_recipe_shape(expected) or not _null_recipe_is_visible(function, resolver, proof):
             return False
-        if function.name in {"_effect_row_values", "ready_work_item_values", "_prepare_fresh_pending_sink_emission"}:
+        if function.name in {"_effect_row_values", "ready_work_item_values", "prepare_fresh_pending_sink_item"}:
             literal_rows = [
                 part
                 for part in ast.walk(function)
@@ -11106,7 +11175,16 @@ def test_non_issuing_deadline_five_actual_insert_sites():
     [
         (_NULL_WORK_ITEMS_PATH, '"lease_expires_at": None', '"lease_expires_at": available_at'),
         (_NULL_EFFECT_PATH, '"lease_expires_at": None', '"lease_expires_at": timestamp'),
-        (_NULL_TEST_BARRIER_PATH, '"lease_expires_at": None', '"lease_expires_at": database_now'),
+        (
+            _NULL_WORK_ITEMS_PATH,
+            '"lease_owner": parked_lease_owner,\n        "lease_expires_at": None',
+            '"lease_owner": parked_lease_owner,\n        "lease_expires_at": database_now',
+        ),
+        (
+            _NULL_TEST_QUEUE_PATH,
+            'insert_work_items(conn, values=[values], operation="source-quarantine pending-sink handoff")',
+            'insert_work_items(conn, values=[{**values, "lease_expires_at": foreign}], operation="source-quarantine pending-sink handoff")',
+        ),
         (
             _NULL_TEST_QUEUE_PATH,
             'inserted = insert_work_item_idempotent(conn, values=values, operation="enqueue READY scheduler work")',
@@ -16957,6 +17035,8 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
 def test_landscape_mutation_api_inventory_is_literal_complete_and_cardinality_one() -> None:
     units = _production_units()
     # CODEX-R2 (elspeth-5887fb7928 R4): 92 -> 93, ExecutionRepository.complete_collector_failure.
+    # QR (lane 5887): 93 unchanged — DataFlowRepository.create_quarantine_row_with_token leaves,
+    # TokenSchedulerRepository.ingest_quarantine_row_with_pending_sink (the fenced quarantine ingest) arrives.
     assert len(_MUTATION_APIS) == 93
     assert Counter(api.category for api in _MUTATION_APIS) == Counter(_EXPECTED_API_CATEGORY_COUNTS)
     assert len({(api.path, api.symbol) for api in _MUTATION_APIS}) == len(_MUTATION_APIS)

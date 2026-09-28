@@ -103,6 +103,8 @@ def _make_result(
         outcome=outcome,
         path=path,
         sink_name=sink_name,
+        # A real sink-bound result always carries its durable PENDING_SINK handoff.
+        scheduler_pending_sink=sink_name is not None,
         join_group_id="join-1" if path == TerminalPath.COALESCED else None,
     )
 

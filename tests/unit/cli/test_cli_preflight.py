@@ -644,7 +644,7 @@ def test_cli_resume_rejects_legacy_sink_before_resume_mutation_or_payload_access
         recovery = recovery_cls.return_value
         recovery.can_resume.return_value = ResumeCheck(can_resume=True)
         recovery.get_resume_point.return_value = resume_point
-        recovery.get_unprocessed_rows.return_value = []
+        recovery.count_active_scheduler_work.return_value = 0
         recovery.count_blocked_barrier_items.return_value = 0
         result = runner.invoke(app, ["resume", "run-1", "-s", str(settings_path), "--execute"])
 
@@ -696,7 +696,7 @@ def test_cli_resume_reissues_admission_for_post_resume_live_mode(tmp_path: Path)
         recovery = recovery_cls.return_value
         recovery.can_resume.return_value = ResumeCheck(can_resume=True)
         recovery.get_resume_point.return_value = resume_point
-        recovery.get_unprocessed_rows.return_value = []
+        recovery.count_active_scheduler_work.return_value = 0
         recovery.count_blocked_barrier_items.return_value = 0
         result = runner.invoke(app, ["resume", "run-1", "-s", str(settings_path), "--execute"])
 
@@ -807,7 +807,7 @@ def test_cli_resume_exit_code_reflects_terminal_status(
         recovery = recovery_cls.return_value
         recovery.can_resume.return_value = ResumeCheck(can_resume=True)
         recovery.get_resume_point.return_value = resume_point
-        recovery.get_unprocessed_rows.return_value = []
+        recovery.count_active_scheduler_work.return_value = 0
         recovery.count_blocked_barrier_items.return_value = 0
         result = runner.invoke(app, ["resume", "run-1", "-s", str(settings_path), "--execute"])
 

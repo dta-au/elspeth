@@ -38,8 +38,12 @@ class TerminalPairCounterEffect:
     record. ``counts_routed_destination`` additionally tallies
     ``routed_destinations[sink_name]``. ``routes_to_sink`` marks pairs the
     processing loop routes into ``pending_tokens`` via ``_route_to_sink``
-    (quarantine is sink-reconcilable but reaches its sink on a different
-    path, so the flags are independent). ``sink_reconcilable`` marks pairs
+    for EVERY result of that pair. ``(FAILURE, QUARANTINED_AT_SOURCE)`` is a
+    shared pair and so is not flagged: its sinkless member (a discard) is
+    never routed, while its sink-carrying member (a source-quarantined row
+    with its durable PENDING_SINK handoff) is routed by the accumulator's own
+    source-quarantine arm, discriminated by the result's sink. The pair is
+    sink-reconcilable either way, so the flags are independent. ``sink_reconcilable`` marks pairs
     whose provisional counts are subtracted when a sink write reveals
     diversions. ``forbidden_in_processing_results`` marks pairs that must
     never appear in processing-loop results (their live counting belongs to

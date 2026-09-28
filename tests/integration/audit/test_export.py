@@ -16,7 +16,8 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
-from elspeth.contracts import NodeStateStatus, NodeType, RoutingMode, RunStatus
+from elspeth.contracts import NodeStateStatus, NodeType, RoutingMode, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from tests.fixtures.landscape import leader_coordination_token
 
@@ -353,6 +354,14 @@ class TestSignedExportDeterminism:
                 status=NodeStateStatus.COMPLETED,
                 output_data={"result": i * 20},
                 duration_ms=5.0,
+            )
+            # Every token of a successful run carries its outcome (QR-4).
+            factory.data_flow.record_token_outcome_leader(
+                TokenRef(token_id=token.token_id, run_id=run.run_id),
+                TerminalOutcome.SUCCESS,
+                TerminalPath.DEFAULT_FLOW,
+                coordination_token=authority,
+                sink_name="default",
             )
 
         factory.run_lifecycle.complete_run(status=RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))

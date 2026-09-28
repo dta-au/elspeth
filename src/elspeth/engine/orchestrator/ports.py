@@ -18,9 +18,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.scheduler import GroupLossSpec
-    from elspeth.contracts.schema_contract import PipelineRow
     from elspeth.contracts.types import CoalesceName, NodeID
-    from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
     from elspeth.engine.executors.collector import CollectorExecutor
     from elspeth.engine.row_union_executor import RowUnionExecutor
     from elspeth.engine.work_items import WorkItem
@@ -48,10 +46,21 @@ class RunIdentityPort(Protocol):
 
 
 class TokenCreationPort(RunIdentityPort, Protocol):
-    """Processor surface needed when source quarantine creates a token."""
+    """Processor surface needed when source quarantine records a rejected row."""
 
-    @property
-    def token_manager(self) -> Any:
+    def ingest_quarantined_row(
+        self,
+        *,
+        source_node_id: NodeID,
+        row_index: int,
+        source_row_index: int,
+        ingest_sequence: int,
+        row: object,
+        validation_error_id: str | None,
+        quarantine_sink: str,
+        quarantine_error: str,
+        quarantine_edge_id: str,
+    ) -> RowResult:
         raise NotImplementedError
 
     @property
@@ -61,15 +70,9 @@ class TokenCreationPort(RunIdentityPort, Protocol):
 
 
 class RowProcessingPort(Protocol):
-    """Processor surface for source/resume row and token execution."""
+    """Processor surface for source row execution."""
 
     def process_row(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def process_existing_row(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError
-
-    def process_token(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
 
@@ -99,10 +102,6 @@ class SchedulerDrainPort(Protocol):
 
     def has_scheduled_work(self) -> bool:
         """Return whether the durable scheduler has active non-terminal work."""
-        ...
-
-    def active_scheduled_row_ids(self) -> frozenset[str]:
-        """Return row IDs represented by active durable scheduler work."""
         ...
 
     def summarize_scheduled_work(self) -> tuple[str, ...]:
@@ -238,20 +237,6 @@ class BarrierScalarsSource(Protocol):
         ...
 
 
-class ResumeContinuationPort(Protocol):
-    """Processor surface for incomplete-token resume continuation."""
-
-    def resume_incomplete_token(
-        self,
-        spec: IncompleteTokenSpec,
-        row_data: PipelineRow,
-        ctx: PluginContext,
-        *,
-        resume_checkpoint_id: str,
-    ) -> list[RowResult]:
-        raise NotImplementedError
-
-
 class SinkStepResolver(Protocol):
     """Processor surface for sink audit step resolution."""
 
@@ -303,7 +288,6 @@ class RowProcessorHandle(
     CollectorExecutorSource,
     SinkTerminalizationPort,
     BarrierScalarsSource,
-    ResumeContinuationPort,
     SinkStepResolver,
     Protocol,
 ):

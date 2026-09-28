@@ -1219,7 +1219,7 @@ sinks:
         ):
             MockRecovery.return_value.can_resume.return_value = ResumeCheck(can_resume=True)
             MockRecovery.return_value.get_resume_point.return_value = mock_resume_point
-            MockRecovery.return_value.get_unprocessed_rows.return_value = []
+            MockRecovery.return_value.count_active_scheduler_work.return_value = 0
 
             result = runner.invoke(app, ["resume", run_id, "-s", str(settings_file), "--execute", "--format", "json"])
 
@@ -1261,7 +1261,7 @@ sinks:
         with patch("elspeth.core.checkpoint.RecoveryManager") as MockRecovery:
             MockRecovery.return_value.can_resume.return_value = mock_check
             MockRecovery.return_value.get_resume_point.return_value = mock_resume_point
-            MockRecovery.return_value.get_unprocessed_rows.return_value = ["row-1"]
+            MockRecovery.return_value.count_active_scheduler_work.return_value = 1
             result = runner.invoke(app, ["resume", "test-run-123", "-s", str(settings_file), "--execute"])
 
         assert result.exit_code == 1
@@ -1328,7 +1328,7 @@ payload_store:
         with patch("elspeth.core.checkpoint.RecoveryManager") as MockRecovery:
             MockRecovery.return_value.can_resume.return_value = mock_check
             MockRecovery.return_value.get_resume_point.return_value = mock_resume_point
-            MockRecovery.return_value.get_unprocessed_rows.return_value = ["row-1"]
+            MockRecovery.return_value.count_active_scheduler_work.return_value = 1
             result = runner.invoke(app, ["resume", "test-run-123", "-s", str(settings_file), "--execute"])
 
         assert result.exit_code == 1

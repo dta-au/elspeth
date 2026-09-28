@@ -164,6 +164,8 @@ def _make_row_result(
         path=path,
         sink_name=sink_name,
         error=error,  # type: ignore[arg-type]
+        # A real sink-bound result always carries its durable PENDING_SINK handoff.
+        scheduler_pending_sink=sink_name is not None,
         join_group_id=join_group_id,
     )
 

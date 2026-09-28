@@ -216,7 +216,7 @@ def scenario_token_holding_only_a_buffered_outcome_is_undecided(tmp_path: Path, 
             )
         )
 
-    with pytest.raises(OrchestrationInvariantError, match="FAILED scheduler work whose token has no terminal outcome"):
+    with pytest.raises(OrchestrationInvariantError, match=r"token\(s\) have no completed terminal outcome"):
         run.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=run.leader)
     assert run.factory.scheduler.leases.requeue_undecided_failed_work(coordination_token=run.leader) == 1
     assert run.work_items() == [(TokenWorkStatus.READY.value, 2, None, None)]

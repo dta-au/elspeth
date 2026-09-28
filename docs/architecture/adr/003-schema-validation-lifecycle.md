@@ -38,6 +38,12 @@ Restructure CLI to instantiate plugins BEFORE graph construction:
 - **Plugin instantiation required for validation** - Can't validate without creating plugins
 - **Resume command complexity** - Must override source with NullSource for resume operations
 
+  *Amended 2026-09-28:* NullSource still stands in for the source on resume, but
+  no longer because rows are replayed through a restored source schema. Resume
+  never re-derives a source row: it re-drives only the run's durable scheduler
+  work, whose payloads carry each row and its contract (see the ADR-025
+  amendment of the same date).
+
 ## Alternatives Considered
 
 ### Option A: Add schema fields to config models

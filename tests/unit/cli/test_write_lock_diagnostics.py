@@ -99,7 +99,7 @@ def test_execution_boundary_delivers_exact_roster(
         with (
             patch("elspeth.core.checkpoint.RecoveryManager.can_resume", autospec=True, return_value=ResumeCheck(can_resume=True)),
             patch("elspeth.core.checkpoint.RecoveryManager.get_resume_point", autospec=True, return_value=point),
-            patch("elspeth.core.checkpoint.RecoveryManager.get_unprocessed_rows", autospec=True, return_value=[]),
+            patch("elspeth.core.checkpoint.RecoveryManager.count_active_scheduler_work", autospec=True, return_value=0),
             patch("elspeth.core.checkpoint.RecoveryManager.count_blocked_barrier_items", autospec=True, return_value=0),
             patch("elspeth.cli._execute_resume_with_instances", autospec=True, side_effect=error),
         ):

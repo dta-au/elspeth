@@ -382,25 +382,3 @@ class TestTokenInfoWithUpdatedData:
         assert updated.branch_name == "my_branch"
         assert updated.fork_group_id == "fork_001"
         assert updated.expand_group_id == "expand_001"
-
-
-class TestTokenManagerCreateTokenForExistingRow:
-    """Tests for TokenManager.create_token_for_existing_row() with PipelineRow."""
-
-    def test_create_token_for_existing_row_accepts_pipeline_row(self) -> None:
-        """create_token_for_existing_row should accept PipelineRow."""
-        from elspeth.engine.tokens import TokenManager
-
-        contract = _make_contract()
-        recorder = _make_recorder()
-        recorder.create_token.return_value = _CreatedToken("new_token_001")
-        manager = TokenManager(recorder, step_resolver=_make_step_resolver())
-
-        row_data = make_row({"amount": 100}, contract=contract)
-
-        token = manager.create_token_for_existing_row(row_id="existing_row_001", row_data=row_data, coordination_token=_MOCK_COORDINATION)
-
-        assert token.row_id == "existing_row_001"
-        assert token.token_id == "new_token_001"
-        assert isinstance(token.row_data, PipelineRow)
-        assert token.row_data["amount"] == 100

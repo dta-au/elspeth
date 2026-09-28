@@ -985,13 +985,17 @@ class SchedulerDrainCoordinator:
             resume_checkpoint_id=self._resume_checkpoint_id if attempt_offset > 0 else None,
         )
         is_on_error_routed = scheduled.pending_path == TerminalPath.ON_ERROR_ROUTED.value
-        if is_on_error_routed and not scheduled.pending_error_hash:
-            # The parking disposition always persists the originating error
-            # hash for routed failures, so its absence is audit corruption —
-            # refuse to replay with a recomputed (synthetic) hash
-            # (archived issue elspeth-d74d19f901).
+        # Error-carrying handoffs: a routed transform failure and a source
+        # quarantine. Both were parked with the error hash the audit recorded
+        # when the failure happened, and both replay THAT hash — never a
+        # recomputed one (archived issue elspeth-d74d19f901). A source
+        # quarantine carries no FailureInfo, live or replayed.
+        carries_error = is_on_error_routed or scheduled.pending_path == TerminalPath.QUARANTINED_AT_SOURCE.value
+        if carries_error and not scheduled.pending_error_hash:
+            # The parking writers always persist the originating error hash
+            # for these paths, so its absence is audit corruption.
             raise AuditIntegrityError(
-                f"Scheduler pending sink work_item_id={scheduled.work_item_id!r} is ON_ERROR_ROUTED but carries no "
+                f"Scheduler pending sink work_item_id={scheduled.work_item_id!r} is {scheduled.pending_path} but carries no "
                 "pending_error_hash; the replayed outcome cannot preserve the originally-audited error hash."
             )
         return RowResult(
@@ -1004,7 +1008,7 @@ class SchedulerDrainCoordinator:
             if is_on_error_routed
             else None,
             scheduler_pending_sink=True,
-            authoritative_error_hash=scheduled.pending_error_hash if is_on_error_routed else None,
+            authoritative_error_hash=scheduled.pending_error_hash if carries_error else None,
             join_group_id=scheduled.join_group_id,
         )
 

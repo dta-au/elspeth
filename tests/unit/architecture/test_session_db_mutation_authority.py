@@ -5274,7 +5274,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e6f248b018079f85",
         1,
         None,
-        line=1163,
+        line=1281,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5375,21 +5375,26 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "288170ec1722ebc2",
         1,
         None,
-        line=125,
+        line=107,
     ),
     # Fingerprint re-pinned by elspeth-5dd23f4df9: the refuse reason this
     # function builds dropped its phantom "source-aware resume path" clause
     # (no such path exists). Same acquisition, same line, one fewer line in
     # the function body — every recovery.py entry below shifts up by one.
+    # Fingerprint re-pinned by QR (source-row replay deletion): the enclosing
+    # function's DOCSTRING was rewritten (resume never reopens a source; it
+    # re-drives durable scheduler work). Read, not mechanical: with the
+    # docstring stripped, the function's AST is byte-identical to its prior
+    # form, so no statement changed and nothing unread was admitted.
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
         "check_source_lifecycle_resumable",
         "<non-session-write-connection>",
         "write_connection",
-        "360429a1d3a62990",
+        "4a125a85b3de2efa",
         1,
         None,
-        line=234,
+        line=217,
     ),
     # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
     # same-module private callee that executes on it, which the forwarding
@@ -5402,70 +5407,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "56688d7122f39718",
         1,
         None,
-        line=429,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/checkpoint/recovery.py",
-        "RecoveryManager.get_unprocessed_row_data",
-        "<non-session-write-connection>",
-        "write_connection",
-        # Fingerprint re-pinned 2026-09-11: the acquisition's enclosing
-        # function had its DOCSTRING rewritten (a CLAUDE.md citation repointed
-        # to the data-trust guide), and the fingerprint covers the enclosing
-        # function's AST, which includes the docstring constant.  Read, not
-        # mechanical: with the docstring stripped, this function's AST is
-        # byte-identical to its pre-edit form, so no statement changed and
-        # nothing unread was admitted.
-        # Re-pinned 2026-09-28 (elspeth-5887fb7928 wave 1, H1): the persisted
-        # row payload is decoded with canonical_json_loads (it reads a stored
-        # float back to the double it encoded) instead of json.loads with a
-        # local NaN/Infinity rejector, which the canonical loader already
-        # refuses. Read, not mechanical: the acquisition, its connection and its
-        # write-connection use are unchanged; only the decode call moved.
-        "0763a378a5e6d854",
-        1,
-        None,
-        line=909,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/checkpoint/recovery.py",
-        "RecoveryManager.get_unprocessed_row_data_by_source",
-        "<non-session-write-connection>",
-        "write_connection",
-        "ccdaa74d89308bbb",
-        1,
-        None,
-        line=970,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/checkpoint/recovery.py",
-        "RecoveryManager._get_incomplete_token_work",
-        "<non-session-write-connection>",
-        "write_connection",
-        "63aa60b938d94231",
-        1,
-        None,
-        line=1037,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/checkpoint/recovery.py",
-        "RecoveryManager.get_resume_workset",
-        "<non-session-write-connection>",
-        "write_connection",
-        "18b91cab2434c597",
-        1,
-        None,
-        line=1132,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/checkpoint/recovery.py",
-        "RecoveryManager.get_resume_workset",
-        "<non-session-write-connection>",
-        "write_connection",
-        "697320a36b78fae3",
-        1,
-        None,
-        line=1174,
+        line=412,
     ),
     # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
     # ONLY -- same symbol, same fingerprint, same domain -- because the
@@ -5513,7 +5455,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c585a80de69ed5e2",
         1,
         None,
-        line=870,
+        line=871,
     ),
     # C6 stage 3 (ADR-047): the barrier journal's database-clock read for
     # hold ages; the read connection is handed to read_landscape_transaction_time.
@@ -5525,7 +5467,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "8979512df427d440",
         1,
         None,
-        line=100,
+        line=97,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5536,17 +5478,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "77752b22fc520b7b",
         1,
         None,
-        line=1124,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/landscape/scheduler/barrier.py",
-        "BarrierJournalRepository.blocked_barrier_token_ids",
-        "<non-session-write-connection>",
-        "write_connection",
-        "89c87457b3d6b1a9",
-        1,
-        None,
-        line=1143,
+        line=1035,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -5556,7 +5488,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c5310a65c3619209",
         1,
         None,
-        line=1157,
+        line=1054,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/barrier.py",
@@ -5566,7 +5498,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3053f6e3f97a64b7",
         1,
         None,
-        line=1181,
+        line=1078,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/group_losses.py",
@@ -5630,23 +5562,13 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/read_model.py",
-        "SchedulerReadModel.active_row_ids",
-        "<non-session-write-connection>",
-        "write_connection",
-        "e93c01fa22314ccf",
-        1,
-        None,
-        line=212,
-    ),
-    WriterIdentity(
-        "src/elspeth/core/landscape/scheduler/read_model.py",
         "SchedulerReadModel.count_unquiesced_work",
         "<non-session-write-connection>",
         "write_connection",
         "aabf3002d846cbce",
         1,
         None,
-        line=227,
+        line=206,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/read_model.py",
@@ -5656,7 +5578,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c511a7a388171ef4",
         1,
         None,
-        line=238,
+        line=217,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/read_model.py",
@@ -5666,7 +5588,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "435e93f0f1cf5fbc",
         1,
         None,
-        line=269,
+        line=248,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/read_model.py",
@@ -5676,7 +5598,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "dd23d5e0e835da29",
         1,
         None,
-        line=280,
+        line=259,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/read_model.py",
@@ -5686,7 +5608,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "0100307f496daf20",
         1,
         None,
-        line=317,
+        line=296,
     ),
     WriterIdentity(
         "src/elspeth/core/rate_limit/limiter.py",
@@ -18336,7 +18258,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=542,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 56
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 49
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,

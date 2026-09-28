@@ -548,12 +548,14 @@ class RowResult:
         error: For ON_ERROR_ROUTED, type-safe error details for audit
         scheduler_pending_sink: True only after the durable scheduler row for
             this exact token has been transitioned to PENDING_SINK.
-        authoritative_error_hash: For ON_ERROR_ROUTED results REBUILT from a
-            persisted pending sink (crash-recovery replay), the ORIGINAL
-            audited error hash. The outcome accumulator prefers this over
-            recomputing from the synthetic replay FailureInfo, so the replayed
-            audit record correlates with the pre-crash one
-            (archived issue elspeth-d74d19f901). None for live results.
+        authoritative_error_hash: The ORIGINAL audited error hash, which the
+            outcome accumulator uses instead of recomputing one. Set on an
+            ON_ERROR_ROUTED result REBUILT from a persisted pending sink
+            (crash-recovery replay), so the replayed audit record correlates
+            with the pre-crash one (archived issue elspeth-d74d19f901); None
+            for live ON_ERROR_ROUTED results. REQUIRED on the sink-carrying
+            source-quarantine result, live and replayed alike: the hash was
+            recorded with the quarantine at ingest and is never recomputed.
         join_group_id: For COALESCED results, the merge-event identity of the
             coalesce that produced this token. None for all other paths.
         counts_failed_barrier: True on exactly ONE result per failed
@@ -592,9 +594,10 @@ class RowResult:
         if self.authoritative_error_hash is not None:
             if type(self.authoritative_error_hash) is not str or not self.authoritative_error_hash:
                 raise OrchestrationInvariantError("RowResult.authoritative_error_hash must be a non-empty string when set")
-            if self.path != TerminalPath.ON_ERROR_ROUTED:
+            if self.path not in (TerminalPath.ON_ERROR_ROUTED, TerminalPath.QUARANTINED_AT_SOURCE):
                 raise OrchestrationInvariantError(
-                    f"RowResult.authoritative_error_hash is only valid for ON_ERROR_ROUTED results, got path={self.path!r}"
+                    "RowResult.authoritative_error_hash is only valid for ON_ERROR_ROUTED and source-quarantine "
+                    f"results, got path={self.path!r}"
                 )
         if self.outcome is not None and (self.outcome, self.path) not in _LEGAL_TERMINAL_PAIRS:
             raise OrchestrationInvariantError(f"RowResult: illegal (outcome, path) pair: ({self.outcome!r}, {self.path!r})")
@@ -620,6 +623,24 @@ class RowResult:
                 )
             if not isinstance(self.error, FailureInfo):
                 raise OrchestrationInvariantError("(FAILURE, ON_ERROR_ROUTED) outcome requires error to be a FailureInfo instance")
+        if self.path == TerminalPath.QUARANTINED_AT_SOURCE:
+            # (FAILURE, QUARANTINED_AT_SOURCE) is a SHARED pair. With a sink it
+            # is a source-quarantined row handed to its quarantine sink: the
+            # fenced ingest parked it durably and recorded its error hash, so
+            # both must travel with it. Without a sink it is a discard (a
+            # transform or batch on_error: discard, a rule-9 closer), whose
+            # outcome is already recorded — it carries neither.
+            if self.sink_name is not None:
+                if not self.scheduler_pending_sink or self.authoritative_error_hash is None:
+                    raise OrchestrationInvariantError(
+                        "A source-quarantine result bound for a sink requires its durable PENDING_SINK handoff "
+                        "(scheduler_pending_sink=True) and its audited authoritative_error_hash"
+                    )
+            elif self.scheduler_pending_sink or self.authoritative_error_hash is not None:
+                raise OrchestrationInvariantError(
+                    "A discarded (FAILURE, QUARANTINED_AT_SOURCE) result has no sink, so it carries neither a "
+                    "PENDING_SINK handoff nor an authoritative_error_hash"
+                )
         if self.path == TerminalPath.COALESCED and self.sink_name is None:
             raise OrchestrationInvariantError("(SUCCESS, COALESCED) outcome requires sink_name to be set")
         if self.path == TerminalPath.COALESCED and self.join_group_id is None:

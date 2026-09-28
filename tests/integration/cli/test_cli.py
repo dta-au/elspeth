@@ -1180,8 +1180,8 @@ class TestRunResumeEviction:
                 return_value=mock_resume_point,
             ),
             patch(
-                "elspeth.core.checkpoint.recovery.RecoveryManager.get_unprocessed_rows",
-                return_value=[],
+                "elspeth.core.checkpoint.recovery.RecoveryManager.count_active_scheduler_work",
+                return_value=0,
             ),
             patch(
                 "elspeth.core.checkpoint.recovery.RecoveryManager.count_blocked_barrier_items",

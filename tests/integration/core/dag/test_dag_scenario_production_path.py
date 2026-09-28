@@ -19,7 +19,6 @@ from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.dag import GraphValidationError
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter
 from elspeth.core.landscape.data_flow import tokens as data_flow_tokens
-from elspeth.core.landscape.scheduler import barrier as scheduler_barrier
 from elspeth.core.landscape.scheduler import dispositions as scheduler_dispositions
 from elspeth.core.landscape.scheduler import queue as scheduler_queue
 from elspeth.core.landscape.scheduler import work_items as scheduler_work_items
@@ -186,7 +185,6 @@ def _install_repeat_run_identity_order(monkeypatch: pytest.MonkeyPatch, *, rever
     monkeypatch.setattr(data_flow_tokens, "generate_id", _deterministic_token_id_factory())
     work_item_id = _ordered_work_item_id(reverse=reverse)
     monkeypatch.setattr(scheduler_queue, "make_work_item_id", work_item_id)
-    monkeypatch.setattr(scheduler_barrier, "make_work_item_id", work_item_id)
     monkeypatch.setattr(scheduler_work_items, "work_item_id", work_item_id)
 
     def ordered_ready_values(**kwargs: Any) -> dict[str, object]:

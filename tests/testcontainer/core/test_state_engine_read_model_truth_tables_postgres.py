@@ -20,11 +20,9 @@ from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
@@ -266,28 +264,7 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
     # RM-06: duplicate owners collapse and exact expiry equality is inactive.
     assert repository.peer_active_leases(run_id=RUN_ID, caller_owner=LEADER) == (PEER_A, PEER_B)
 
-    # RM-09..RM-13: active identities, barrier subtype partition, and order.
-    assert repository.active_row_ids(run_id=RUN_ID) == frozenset(
-        {
-            f"row-{name}"
-            for name in (
-                "ready",
-                "leased-self",
-                "leased-peer-a",
-                "leased-peer-b",
-                "leased-peer-equality",
-                "leased-sink-redrive",
-                "blocked-queue",
-                "blocked-barrier-pending-z",
-                "blocked-barrier-adopted-a",
-                "pending-sink-peer",
-                "pending-sink-empty-owner",
-            )
-        }
-    )
-    assert repository.blocked_barrier_token_ids(run_id=RUN_ID) == frozenset(
-        {"token-blocked-barrier-pending-z", "token-blocked-barrier-adopted-a"}
-    )
+    # RM-11..RM-13: barrier subtype partition and order.
     assert repository.count_blocked_barrier_items(run_id=RUN_ID) == 2
     assert tuple(item.barrier_key for item in repository.list_blocked_barrier_items(run_id=RUN_ID)) == (
         "a-barrier",
@@ -297,7 +274,7 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
 
     # Foreign-run rows never leak into any RM selector.
     assert repository.count_active_work(run_id=OTHER_RUN_ID) == 1
-    assert repository.blocked_barrier_token_ids(run_id=OTHER_RUN_ID) == frozenset()
+    assert repository.count_blocked_barrier_items(run_id=OTHER_RUN_ID) == 0
 
 
 def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: LandscapeDB) -> None:
@@ -442,17 +419,6 @@ def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(
     assert batch.accounting[run_ids[2]].tokens.abandoned == 1
     assert run_ids[3] not in batch.accounting
     assert "both terminally decided and marked ABANDONED" in batch.corrupt[run_ids[3]].violations[0]
-
-    recovery = RecoveryManager(postgres_db, checkpoint_manager=object())  # type: ignore[arg-type]
-    for checkpoint in (None, object()):
-        monkeypatch.setattr(
-            recovery,
-            "_get_latest_checkpoint_for_resume_workset",
-            lambda _run_id, checkpoint=checkpoint: checkpoint,
-        )
-        for run_id in (run_ids[2], run_ids[3]):
-            with pytest.raises(AuditIntegrityError, match="ABANDONED"):
-                recovery.get_resume_workset(run_id)
 
 
 def test_postgresql_token_work_status_check_rejects_unknown_state(postgres_db: LandscapeDB) -> None:

@@ -26,7 +26,8 @@ class _ProcessingResult:
     path: TerminalPath
     token: TokenInfo
     sink_name: str | None
-    scheduler_pending_sink: bool = False
+    # A real sink-bound result always carries its durable handoff (_route_to_sink refuses one without).
+    scheduler_pending_sink: bool = True
     join_group_id: str | None = None
     counts_failed_barrier: bool = False
 
