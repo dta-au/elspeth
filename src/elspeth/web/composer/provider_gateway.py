@@ -323,6 +323,10 @@ def build_composer_loop_request_kwargs(
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
+        # The Composer loop owns retries and records each provider attempt.
+        # Disable LiteLLM and SDK retries inside one audited call.
+        "num_retries": 0,
+        "max_retries": 0,
     }
     if tools:
         kwargs["tools"] = tools

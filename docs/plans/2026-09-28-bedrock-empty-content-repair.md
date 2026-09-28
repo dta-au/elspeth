@@ -1,10 +1,12 @@
 # Bedrock empty content repair implementation plan
 
-**Target:** `release/0.8.1`; prepare a separately built DTA adapter and ELSPETH change for one canary qualification. This document is a working implementation plan, not a deployment or signing record.
+**Target:** `release/0.8.1`; prepare the gateway and Composer change for canary qualification. This document is a working implementation plan, not a deployment or signing record.
+
+**Scope update (2026-09-28):** The DTA adapter lives in a secure enclave and is unavailable in this checkout. The maintainer selected gateway changes only. Gateway canonicalization now maps exact-empty assistant text with tool calls to `None` before any adapter receives it, which avoids the reported DTA adapter's `content is not None` text-block branch. Tasks concerning the DTA source, image, and canary remain qualification work in that enclave; this checkout cannot establish the adapter's introduction date or a live replay result.
 
 **Goal:** A Composer tool conversation, including a resumed tutorial session, reaches Bedrock Converse with no empty text content blocks; invalid empty text-only input fails before upstream dispatch; a Bedrock validation rejection is reported as a definite nonretryable provider failure rather than a timeout.
 
-**Architecture:** The DTA adapter owns the conversion from the gateway's canonical messages to Bedrock blocks. ELSPETH owns which persisted history rows become provider messages. The gateway's inbound contract owns rejection of canonical messages that cannot carry meaningful content. Keep stored audit rows and tool identities unchanged. Do not add a tutorial branch or server-authored pipeline structure.
+**Architecture:** The DTA adapter owns the conversion from the gateway's canonical messages to Bedrock blocks. The gateway canonicalizer represents empty assistant prose beside tool calls as `None` so adapter text-block predicates cannot emit an empty block. ELSPETH owns which persisted history rows become provider messages. The gateway's inbound contract owns rejection of messages that cannot carry meaningful content. Keep stored audit rows and tool identities unchanged. Do not add a tutorial branch or server-authored pipeline structure.
 
 **Stack:** Python, Pydantic gateway contract, DTA Bedrock adapter, LiteLLM Composer client, Bedrock Converse, Docker canary.
 

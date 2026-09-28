@@ -186,7 +186,7 @@ async def _run_production_turn(
 
     async def completion(**kwargs: Any) -> _Response:
         requests.append(kwargs)
-        if reach_the_hatch and "num_retries" in kwargs and len(kwargs["tools"]) > 1:
+        if reach_the_hatch and "max_tokens" in kwargs and len(kwargs["tools"]) > 1:
             discovery = _ToolCall(id=f"parity-discovery-{len(requests)}", function=_Function(name="list_sources", arguments="{}"))
             return _Response(choices=[_Choice(message=_Message(content=None, tool_calls=[discovery]))], usage=_usage())
         if "tools" in kwargs and any(tool["function"]["name"] == "emit_pipeline_proposal" for tool in kwargs["tools"]):
@@ -242,7 +242,7 @@ def _loop_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _planner_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
-    planner_requests = [request for request in requests if "num_retries" in request]
+    planner_requests = [request for request in requests if "max_tokens" in request]
     assert planner_requests, "the pipeline planner made no request"
     return planner_requests[0]
 
@@ -324,7 +324,7 @@ def _strict_map(tools: list[dict[str, Any]]) -> dict[str, object]:
 
 
 def _hatch_request(requests: list[dict[str, Any]]) -> dict[str, Any]:
-    hatch = [request for request in requests if "num_retries" in request and request["model"] == _ADVISOR]
+    hatch = [request for request in requests if "max_tokens" in request and request["model"] == _ADVISOR]
     assert len(hatch) == 1, "the planner took no escape-hatch turn"
     return hatch[0]
 

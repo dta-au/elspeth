@@ -3,9 +3,9 @@
 Per-role affordance (primary + advisor). Mirrors the structure of
 test_llm_sampling_config.py: same fixtures, same fake-response shape, same
 call sites (_call_llm, _call_text_llm, _call_advisor_with_audit). The
-no-regression guarantee (byte-identical kwargs when unset) is asserted, not
-assumed — every "omits" test below checks BOTH keys are absent, not just that
-the call succeeded.
+no-regression guarantee for endpoint settings is asserted, not assumed —
+every "omits" test below checks BOTH endpoint keys are absent, not just that
+the call succeeded. The freeform retry pins remain present in each request.
 """
 
 from __future__ import annotations
@@ -72,7 +72,12 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
     # Reply-only calls omit tool schemas as well as unconfigured endpoints.
     # No reasoning key either: bare OpenAI-surface aliases stay unhinted
     # (elspeth-dc459d438e / elspeth-9a46553771).
-    assert captured == {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+    assert captured == {
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "num_retries": 0,
+        "max_retries": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -133,7 +138,12 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
 
     assert "api_base" not in captured
     assert "api_key" not in captured
-    assert captured == {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
+    assert captured == {
+        "model": "gpt-5.5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "num_retries": 0,
+        "max_retries": 0,
+    }
 
 
 @pytest.mark.asyncio

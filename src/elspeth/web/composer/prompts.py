@@ -564,7 +564,8 @@ def build_messages(
         }
     )
 
-    # 3. Chat history
+    # 3. Chat history. Persisted tool turns can have no assistant prose, but
+    # history has no tool-call blocks to accompany those empty messages.
     if chat_history:
         messages.extend(
             {
@@ -573,6 +574,7 @@ def build_messages(
                 if key not in {COMPOSER_HISTORY_USER_AUTHORED_KEY, COMPOSER_HISTORY_USER_MESSAGE_ID_KEY}
             }
             for history_message in chat_history
+            if not (history_message["role"] == "assistant" and history_message["content"] == "")
         )
 
     # 4. Session-varying state context — after history so per-turn state

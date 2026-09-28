@@ -98,7 +98,8 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert all(tool["type"] == "function" and set(tool["function"]) == {"name", "description", "parameters"} for tool in request["tools"])
     # reasoning_effort: Bedrock models carry the discovery knob
     # (elspeth-dc459d438e); LiteLLM maps it to an Anthropic thinking budget.
-    assert set(request) == {"model", "messages", "tools", "reasoning_effort"}
+    assert set(request) == {"model", "messages", "tools", "reasoning_effort", "num_retries", "max_retries"}
+    assert request["num_retries"] == request["max_retries"] == 0
     assert request["reasoning_effort"] == "low"
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
 

@@ -240,6 +240,25 @@ class TestBuildMessages:
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"] == "new question"
 
+    def test_empty_assistant_history_is_omitted_from_provider_messages(self) -> None:
+        history = [
+            {"role": "user", "content": "first request"},
+            {"role": "assistant", "content": ""},
+            {"role": "assistant", "content": "a real answer"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "later request"},
+        ]
+
+        messages = build_messages(history, _empty_state(), "continue", _stub_catalog())
+
+        assert messages[2:-2] == [
+            {"role": "user", "content": "first request"},
+            {"role": "assistant", "content": "a real answer"},
+            {"role": "user", "content": "later request"},
+        ]
+        assert messages[-1] == {"role": "user", "content": "continue"}
+        assert history[1] == {"role": "assistant", "content": ""}
+
     def test_internal_history_authorship_marker_never_reaches_provider_messages(self) -> None:
         state = _empty_state()
         catalog = _stub_catalog()
