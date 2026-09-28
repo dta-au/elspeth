@@ -20,6 +20,7 @@ cannot disagree about what the template may see.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -303,6 +304,27 @@ def test_the_opt_out_holds_the_whole_row() -> None:
     rendered = _outcome("{{ query }} {{ row | dictsort }}", ALL_FIELDS)
     assert _VALUE_SENTINEL in rendered
     assert _KEY_SENTINEL in rendered
+
+
+@pytest.mark.parametrize(
+    ("projection", "expected"),
+    [
+        pytest.param(
+            ALL_FIELDS,
+            {"question": "how do plants eat", "topic": "biology", "secret": _VALUE_SENTINEL, _KEY_SENTINEL: _VALUE_SENTINEL},
+            id="opt-out",
+        ),
+        pytest.param(_QUESTION_AND_TOPIC, {"question": "how do plants eat", "topic": "biology"}, id="declared"),
+    ],
+)
+def test_row_tojson_serializes_the_projected_row(projection: RowProjection, expected: dict[str, object]) -> None:
+    """``{{ row | tojson }}`` renders the row the query sees as JSON (Codex final review C2).
+
+    Under ``[]`` it failed every row once the row became a ``TemplateRow``
+    (not JSON-serialisable) while release had delivered it; the sandbox's
+    ``json.dumps_function`` policy serializes the mapping the row holds.
+    """
+    assert json.loads(_outcome("{{ row | tojson }}", projection)) == expected
 
 
 def test_a_declared_field_reads_by_either_spelling() -> None:
