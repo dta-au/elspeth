@@ -35,6 +35,7 @@ from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError, EmptyResumeStateError
 from elspeth.contracts.freeze import deep_freeze, freeze_fields
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import NodeID
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
@@ -71,10 +72,6 @@ _RESUMABLE_RUN_STATUSES = frozenset({RunStatus.FAILED, RunStatus.INTERRUPTED})
 # (checkpoint_id, barrier_scalars_json) — keyed by payload so a re-read of the
 # same checkpoint row with mutated JSON cannot serve a stale deserialization.
 _CheckpointStateCacheKey = tuple[str, str | None]
-
-
-def _reject_source_row_json_constant(constant: str) -> Any:
-    raise AuditIntegrityError(f"non-finite JSON constant {constant!r} - NaN/Infinity are not valid audit values")
 
 
 __all__ = [
@@ -676,11 +673,8 @@ class RecoveryManager:
             raise ValueError(f"Row {row_id} payload has been purged (hash={exc.content_hash}) - cannot resume") from exc
 
         try:
-            degraded_data = json.loads(
-                payload_bytes.decode("utf-8"),
-                parse_constant=_reject_source_row_json_constant,
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError, AuditIntegrityError) as exc:
+            degraded_data = canonical_json_loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AuditIntegrityError(
                 f"Corrupt payload for row {row_id} (ref={source_data_ref}) — "
                 f"cannot decode persisted row data (Tier 1 violation). "
@@ -874,7 +868,7 @@ class RecoveryManager:
         - Decimal → string ("42.50")
         - pandas/numpy scalars → primitives
 
-        On resume, json.loads() returns degraded types (all strings). To restore
+        On resume, canonical_json_loads() returns degraded types (all strings). To restore
         type fidelity, this method REQUIRES source_schema_class to re-validate rows
         through the source's Pydantic schema, which re-coerces strings back to typed values.
 

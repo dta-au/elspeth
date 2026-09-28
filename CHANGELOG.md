@@ -610,6 +610,42 @@ drained and repair this release forward.
   the same way and the run stays `FAILED`. The re-run is at-least-once, as a
   lease takeover already is: an external call the failed attempt made may be
   made again.
+- **A source row carrying an integer beyond ±(2**53-1) is quarantined, not
+  fatal.** The audit trail hashes each row as canonical JSON, which refuses
+  such an integer, so a source that read one (a JSON number, a CSV or text
+  value under an `int` field, an LLM source's integer output field, a cloud
+  blob or Dataverse record) passed it as a valid row and the run ended at
+  ingest with that row's token left without an outcome. The source-boundary
+  schema check that already quarantined `NaN`/`Infinity` now applies the
+  canonicalizer's own number rule to every field (declared, `any`, extras and
+  nested values, after coercion), so the row takes the source's
+  `on_validation_failure` route with the value-free reason
+  `<root>: [non_canonical_number]`, and the rows around it deliver. A row
+  quarantined for another reason that also carries such an integer now reaches
+  its quarantine sink (the value is nulled there, as `NaN` already was) instead
+  of ending the run. A transform that computes such a number (a
+  `value_transform` product, a collector's sum) fails its output validation
+  under the same rule, routed and value-free, and the recorded reason names the
+  rule (`[non_canonical_number]`) and the canonical-JSON guidance rather than a
+  transform schema bug. `blob_rows` refuses a configured `size_bytes` above 2**53-1 at
+  validation. A source that bypasses its schema still ends the run at ingest,
+  and the error now names the offending row by its source row index.
+- **A row carrying a float in [2**53, 1e21) no longer ends the run.** Canonical
+  JSON (RFC 8785) prints such a double in integer notation (`1e17` as
+  `100000000000000000`), and every reader of stored canonical row text parsed
+  it back as an integer the canonicalizer itself refuses. A valid row holding
+  one (a JSON or CSV float, a transform's float result, a quarantined row whose
+  `1e17` was coerced for an `int` field) ended the run at the sink with no
+  outcome for any row in the write, a resume or replacing-sink successor
+  failed on the stored copy, and `verify` refused a recorded discard or
+  quarantine carrying one. At a database sink the durable effect plan, which
+  carries the member rows, failed to read back after the rows were committed:
+  the run failed with every token already terminal, and a crash before the
+  write left the run unresumable. One reader, the inverse of the canonical
+  encoder, now reads stored canonical text back to the double that was hashed:
+  the sink boundary, the durable sink-effect plan (execution and
+  finalization), the replacing-sink predecessor snapshot, resume's row
+  restore, row and call payload reads, and source replay all use it.
 - **`examples/batch_error_routing`** shows a failed aggregation batch end to
   end. One order's amount is a string, so its whole batch of three fails:
   `settings.yaml` routes all three rows, with their original values, to the
@@ -825,11 +861,12 @@ drained and repair this release forward.
   returns an unconfigured route label or a value that is not a bool or string
   no longer records a preview or a hash of that value (a short value printed
   whole); the failure names its type, a string's length and the condition.
-  A source that passes an integer beyond the JSON safe range as a valid row
-  still ends the run at ingest, but the failure (the source operation's error
-  and the printed traceback) no longer is that integer: it names the row
-  index, a declared field and the error type, as the transform, aggregation
-  and collector seams already did. Sinks follow the same rule: `dataverse`
+  A source row carrying an integer beyond the JSON safe range is quarantined
+  (see the bullet above); a source that bypasses its schema and passes one as
+  a valid row still ends the run at ingest, but the failure (the source
+  operation's error and the printed traceback) no longer is that integer: it
+  names the source row index, a declared field and the error type, as the
+  transform, aggregation and collector seams already did. Sinks follow the same rule: `dataverse`
   no longer prints the row's alternate-key or lookup value when it refuses a
   duplicate, blank or non-string key or an unsafe `@odata.bind` reference
   (it names the field, the failure and, for a duplicate, the two member
@@ -837,6 +874,15 @@ drained and repair this release forward.
   serialization diversion reasons carry the exception class instead of the
   codec's text, which quoted the character it could not encode (`CSV
   encoding (ascii) failed: UnicodeEncodeError`) or the non-finite float.
+  The `database` sink's constraint diversion reason no longer carries the
+  driver's message, which on PostgreSQL quotes the row (`Key (email)=(…)
+  already exists`, `Failing row contains (…)`, `invalid input syntax for type
+  integer: "…"`, and with psycopg2 the statement with its parameters) and
+  reached `node_states.error_json`: it names a stable kind and the driver's
+  condition and, on PostgreSQL, the violated constraint from the driver's
+  structured diagnostics, e.g. `Constraint violation: unique_violation
+  (UniqueViolation) on constraint orders_email_key` or, on SQLite,
+  `(SQLITE_CONSTRAINT_UNIQUE)`.
 
 ### Newly refused configurations
 

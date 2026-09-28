@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
@@ -45,7 +44,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.field_spelling import DeclaredSpellings
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import canonical_json_loads, stable_hash
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract import SchemaContract
@@ -779,7 +778,7 @@ class SinkExecutor:
         }
         canonical_rows: list[dict[str, object]] = []
         for row in rows:
-            normalized = json.loads(pipeline_canonical_json(row))
+            normalized = canonical_json_loads(pipeline_canonical_json(row))
             if type(normalized) is not dict:  # pragma: no cover - rows are dictionaries by construction
                 raise OrchestrationInvariantError("sink-effect row canonicalization did not produce a mapping")
             canonical_rows.append(normalized)

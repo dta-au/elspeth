@@ -26,7 +26,9 @@ built only from parts that cannot carry row content:
   model fields, list indexes and a row's own dict keys (str or int) in the same
   positions, so none is rendered.
 - the error ``type`` code, only when it is one of pydantic-core's own error
-  types; anything else renders as ``custom``.
+  types or one of ELSPETH's own closed codes (``ELSPETH_ERROR_TYPES``: a
+  fixed string an ELSPETH validator raises, e.g. ``non_canonical_number``);
+  anything else renders as ``custom``.
 - ``msg`` is never rendered. The type code carries the meaning.
 
 The engine's own contract checks validate ROW data against a plugin's declared
@@ -37,7 +39,7 @@ both layers call this one function (the engine may not import ``plugins``).
 
 from __future__ import annotations
 
-from typing import get_args
+from typing import Final, get_args
 
 from pydantic import AliasChoices, AliasPath, ValidationError
 from pydantic_core.core_schema import ErrorType
@@ -45,6 +47,14 @@ from pydantic_core.core_schema import ErrorType
 from elspeth.contracts.data import PluginSchema
 
 _BUILTIN_ERROR_TYPES: frozenset[str] = frozenset(get_args(ErrorType))
+
+# The source-boundary schema's rule: a number canonical JSON refuses by value
+# (NaN/Infinity, an integer beyond ±(2**53-1)). Raised as this fixed
+# PydanticCustomError type so the rendered reason names the rule.
+NON_CANONICAL_NUMBER_ERROR_TYPE: Final = "non_canonical_number"
+# ELSPETH's own closed error codes: fixed strings, never built from data, so
+# printing one cannot carry row content.
+ELSPETH_ERROR_TYPES: frozenset[str] = frozenset({NON_CANONICAL_NUMBER_ERROR_TYPE})
 _UNDECLARED_FIELD = "[undeclared]"
 _NESTED = "[item]"
 _CUSTOM_TYPE = "custom"
@@ -96,7 +106,7 @@ def safe_validation_error_text(exc: ValidationError, schema: type[PluginSchema])
     parts = []
     for detail in details:
         error_type = detail["type"]
-        rendered_type = error_type if error_type in _BUILTIN_ERROR_TYPES else _CUSTOM_TYPE
+        rendered_type = error_type if error_type in _BUILTIN_ERROR_TYPES or error_type in ELSPETH_ERROR_TYPES else _CUSTOM_TYPE
         parts.append(f"{_render_location(detail['loc'], declared)}: [{rendered_type}]")
     noun = "error" if len(details) == 1 else "errors"
     return f"{len(details)} validation {noun}: " + "; ".join(parts)

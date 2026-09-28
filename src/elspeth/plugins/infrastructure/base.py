@@ -153,7 +153,7 @@ def _demote_required_model_fields(
     pydantic hoists that constraint OUT of the annotation into the FieldInfo.
     Rebuilding a field from ``.annotation`` alone therefore silently accepts
     NaN and Infinity — in a codebase that maintains a dedicated
-    ``_find_non_finite_value_path`` walker to reject exactly those.
+    ``_find_non_canonical_number_path`` walker to reject exactly those.
 
     The field is deliberately KEPT in the model rather than removed: ``mode:
     fixed`` builds ``extra="forbid"``, so dropping it would reject rows that

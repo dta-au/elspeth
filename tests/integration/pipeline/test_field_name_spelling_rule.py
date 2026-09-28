@@ -1078,6 +1078,31 @@ def test_creating_the_normalized_name_of_a_renamed_field_that_never_carried_it_d
     assert [(row["c"], row["name"]) for row in rows] == [(SENTINEL, f"{SENTINEL}!"), ("Bob", "Bob!")]
 
 
+def test_behind_two_renames_of_a_headerless_source_creating_the_normalized_name_delivers(tmp_path: Path) -> None:
+    """hl-create-2ren (review-C1C3-residuals-r1 F1): columns [id, Name], {id: i}, {Name: c}, create 'name'.
+
+    The first rename must carry the headerless flag to the second. If it claimed
+    the upstream normalizes names, the second rename would move the normalized
+    'name' onto c and the build would falsely refuse creating 'name' — the r3 F1
+    shape, one rename further from the source. One rename straight off the source
+    (hl-create above) does not exercise the carry.
+    """
+    source = _headerless_source(tmp_path, columns=["id", "Name"], field_mapping={}, schema=_OBSERVED)
+    first = {**_transform("field_mapper", {"mapping": {"id": "i"}, "schema": _OBSERVED}), "name": "ren_id", "on_success": "mid1"}
+    second = {
+        **_transform("field_mapper", {"mapping": {"Name": "c"}, "schema": _OBSERVED}),
+        "name": "ren_name",
+        "input": "mid1",
+        "on_success": "mid",
+    }
+    result = _run(_settings(tmp_path, source=source, transforms=[first, second, {**_CREATE_NAME, "input": "mid"}]))
+
+    assert result.exit_code == 0, result.output
+    assert _terminal_outcomes(tmp_path) == {"success/default_flow": 2}
+    rows = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert [(row["i"], row["c"], row["name"]) for row in rows] == [("1", SENTINEL, f"{SENTINEL}!"), ("2", "Bob", "Bob!")]
+
+
 def test_a_renamed_headerless_column_is_still_read_by_its_own_spelling(tmp_path: Path) -> None:
     """columns [Name], {Name: c}: c records 'Name' as its original, so a declared 'Name' names c and is refused."""
     source = _headerless_source(

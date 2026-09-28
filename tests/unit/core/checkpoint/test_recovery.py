@@ -1591,6 +1591,42 @@ def test_get_unprocessed_row_data_by_source_rejects_non_finite_json_constant(
         )
 
 
+def test_get_unprocessed_row_data_restores_an_integral_double_beyond_2_53_as_that_double(
+    db: LandscapeDB,
+    recovery_manager: RecoveryManager,
+    payload_store: PayloadStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored source row is read back as the value that was stored (review-codexfix-handoffs-r1 F1).
+
+    Ingest stores the row as canonical JSON, where RFC 8785 writes 1e17 as
+    ``100000000000000000``. A plain ``json.loads`` restored it as an int
+    beyond ±(2**53-1): the observed source schema refuses that int, so resume
+    rejected a row the live run had admitted.
+    """
+    from elspeth.contracts.hashing import canonical_json
+    from elspeth.contracts.schema import SchemaConfig
+    from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+    observed_schema = create_schema_from_config(SchemaConfig(mode="observed", fields=None), "ObservedResumeSchema", allow_coercion=True)
+    stored = canonical_json({"id": 1, "x": 1e17, "nested": [-9.99e20]})
+    assert stored == '{"id":1,"nested":[-999000000000000000000],"x":100000000000000000}'
+    payload_ref = payload_store.store(stored.encode())
+    with db.write_connection() as conn:
+        _insert_run(conn, "run-integral-double", status=RunStatus.FAILED)
+        _insert_node(conn, "run-integral-double", "source-node", node_type=NodeType.SOURCE)
+        _insert_row(conn, "run-integral-double", "row-1", row_index=0, source_data_ref=payload_ref)
+
+    monkeypatch.setattr(recovery_manager, "get_unprocessed_rows", lambda _run_id: ["row-1"])
+    [resumed] = recovery_manager.get_unprocessed_row_data("run-integral-double", payload_store, source_schema_class=observed_schema)
+
+    assert resumed.row_id == "row-1"
+    assert resumed.row_data["x"] == 1e17
+    assert type(resumed.row_data["x"]) is float
+    assert list(resumed.row_data["nested"]) == [-9.99e20]
+    assert type(resumed.row_data["nested"][0]) is float
+
+
 def test_get_resume_point_reads_latest_checkpoint_after_can_resume(
     db: LandscapeDB,
     checkpoint_manager: CheckpointManager,

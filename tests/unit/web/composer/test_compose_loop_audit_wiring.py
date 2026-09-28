@@ -1252,12 +1252,12 @@ async def test_canonicalization_sentinel_omits_detail_for_non_rfc8785_errors() -
 
 
 def test_canonicalization_sentinel_captures_detail_for_rfc8785_errors() -> None:
-    """rfc8785 errors are message-safe by spec — capture full detail.
+    """The base rfc8785 error's messages are type/rule strings — capture them.
 
-    :class:`rfc8785.CanonicalizationError` messages are bounded type
-    or rule strings (``"unsupported type: <class 'X'>"``,
-    ``"<value> is not representable in JCS"``) that never echo
-    arbitrary payload bytes. Capturing them in
+    The base :class:`rfc8785.CanonicalizationError` messages are bounded
+    type or rule strings (``"unsupported type: <class 'X'>"``) that never
+    echo payload bytes (its value-echoing subclasses are pinned below).
+    Capturing them in
     ``_canonicalization_detail`` gives auditors the offending Python
     type name without correlating to operational logs — exactly the
     forensic value the diagnostic upgrade is for.
@@ -1273,6 +1273,30 @@ def test_canonicalization_sentinel_captures_detail_for_rfc8785_errors() -> None:
     assert "PluginSummary" in detail
     assert "unsupported type" in detail
     assert sentinel["_payload_keys"] == ["data", "success", "validation"]
+
+
+@pytest.mark.parametrize(
+    ("value", "echo"),
+    [(9_007_199_254_740_993, "9007199254740993"), (float("inf"), "inf")],
+    ids=["IntegerDomainError", "FloatDomainError"],
+)
+def test_canonicalization_sentinel_omits_detail_for_rfc8785_domain_errors(value: object, echo: str) -> None:
+    """rfc8785's domain errors echo the value, so they get no detail (H3, lane 5887).
+
+    Measured: ``IntegerDomainError`` renders ``"<the integer> exceeds safe
+    integer domain for JSON floats"`` and ``FloatDomainError`` ``"<the float>
+    is not representable in JCS"``. The planner's tool arguments can carry a
+    value copied from a user's data, and the sentinel is persisted, so only
+    the class name is kept.
+    """
+    with pytest.raises(rfc8785.CanonicalizationError) as exc_info:
+        rfc8785.dumps({"n": value})
+    assert echo in str(exc_info.value)  # the echo the sentinel must not carry
+
+    sentinel = build_canonicalization_sentinel(exc_info.value, {"n": value})
+
+    assert sentinel == {"_canonicalization_error": type(exc_info.value).__name__, "_payload_keys": ["n"]}
+    assert echo not in json.dumps(sentinel)
 
 
 def test_canonicalization_sentinel_caps_detail_at_512_chars() -> None:
