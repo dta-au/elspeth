@@ -1786,7 +1786,7 @@ class _SessionPendingInterpretationPlanner:
         suppresses=("R1", "R5"),
         invariant="Malformed non-null interpretation requirements raise InterpretationPlaceholderConsumedError before a review decision is produced.",
         test_ref="tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_pending_interpretation_plan_rejects_malformed_requirements",
-        test_fingerprint="89f255fca82efd59b4ea5c646c231fd468fe88873e8e094b0f34944d645a33ac",
+        test_fingerprint="587d212c8d829339aa25f3272c58f0e9d45cd95b80a44c0b1f724bc41ae81885",
     )
     def plan(
         command: SessionPendingInterpretationCommand,

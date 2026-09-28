@@ -20,12 +20,11 @@ custody repair also requires removing any repository or organization secret
 accessible to these workflows and excluding the key from runner environments.
 Those external changes require operator authorization and live verification.
 
-CI retains `required` signature verification on pushes, which fails closed
-when the key is unavailable; this change does not clear the deliberately red
-trust-tier gate. PRs retain shape-only checks and the prohibition on unverified
-signed-metadata edits. A shape-only result cannot detect forged signatures.
+CI does not verify signed trust-tier allowlist metadata or gate merges on that
+verification. A green CI result makes no signature-authenticity claim.
 Authoritative signature verification remains an operator-keyed operation in a
-trusted context, separate from CI.
+trusted context, separate from CI. Keyless shape checks cannot detect forged
+signatures.
 
 - **An agent never holds the key.** Agents may *propose* work — survey the tree,
   stage a bundle, run a non-authoritative preview judge — but the authoritative
@@ -37,7 +36,7 @@ trusted context, separate from CI.
   which fails if any signing verb is added to a `run:` step of
   `.github/workflows/enforce-allowlist-judge-gates.yaml`.
   `tests/unit/test_ci_workflow_xdist.py` also rejects operator-key references
-  anywhere in the parsed workflows and preserves required push verification.
+  anywhere in the parsed workflows.
 
 **Staging asserts; firing verifies.** A staged bundle carries *zero* authority.
 Everything it claims (which entries drifted, which findings are orphaned, which

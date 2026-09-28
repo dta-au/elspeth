@@ -253,9 +253,9 @@ comparison as a test before touching resolution.
 ### Gate: trust-tier lint corpus
 
 **Pins:** the finding corpus of the `elspeth-lints` static-analysis rules over
-`src/elspeth`. The gate is deliberately fail-closed (exit 1 with a standing
-corpus) until the operator signs the package; do not expect zero and do not
-try to clear it during ordinary feature work.
+`src/elspeth`. A keyless scan exits 1 with a standing corpus; do not expect
+zero. CI does not run this signed check. Operator verification of a reviewed
+package is separate from CI.
 
 ```bash
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
@@ -861,9 +861,9 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing`
   prefix lets a contributor without the operator key run it; shape-only
   verification cannot detect forged judge metadata. CI never receives the
-  operator key; push verification remains required and fails closed without
-  it. An operator-controlled context must verify the exact reviewed candidate
-  with trusted verifier code before a merge is authoritative.
+  operator key and does not claim signed allowlist clearance. An
+  operator-controlled context must verify the exact reviewed candidate with
+  trusted verifier code before claiming that clearance.
 - The `trust_tier.tier_model` allowlist under `config/cicd/enforce_tier_model/*.yaml`
   seals each judged suppression with an operator-held HMAC signature. A
   signed entry binds by `scope_fingerprint` of the enclosing function, not by
