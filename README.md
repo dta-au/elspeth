@@ -4,6 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+![Status: 0.8.1](https://img.shields.io/badge/status-0.8.1-green.svg)
 
 ELSPETH builds, validates, runs, and audits data and LLM workflows whose
 outputs need to be reviewed and explained. You can author a pipeline in
@@ -86,6 +87,32 @@ ELSPETH supports audit export and optional signing. The
 [export settings and limits](docs/reference/configuration.md#export-settings)
 describe what is exported and how to configure it.
 
+## What changed in 0.8.1
+
+This release changes recovery and audit storage. For SQLite installations,
+the cutover is from session epoch 53 to 71 and Landscape epoch 38 to 48;
+archive or export evidence you need, stop the old service, recreate both stale
+databases in the same service-stop window, and install 0.8.1. See the
+[release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
+before upgrading.
+
+## Recovery and deployment
+
+To resume an interrupted run, replace the ID in
+`elspeth resume <run_id> --execute` with the run you intend to resume, for
+example `elspeth resume abc123 --execute`. Without `--execute`,
+`elspeth resume <run_id>` checks whether the run can be resumed without
+changing it. See the [recovery runbook](docs/runbooks/resume-failed-run.md)
+for the eligibility checks and operator procedure.
+
+Set `IMAGE_TAG` only after confirming that the intended container tag was
+published; the [Docker guide](docs/guides/docker.md) shows how to inspect it.
+The [AWS ECS cold-install runbook](docs/runbooks/aws-ecs-cold-install.md)
+describes the tracked Terraform package. Azure Container Apps has
+Single/sticky desktop acceptance; live cloud acceptance is a separate gate.
+See the [deployment platform reference](docs/reference/deployment-platforms.md)
+for the precise support limits.
+
 ## Documentation
 
 | Start here | For |
@@ -105,7 +132,9 @@ for certain provider integrations. It deploys independently from the engine.
 ## Contributing and support
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development checks and pull request
-guidance, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and
+guidance, [GOVERNANCE.md](GOVERNANCE.md) and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for project participation,
+[SECURITY.md](SECURITY.md) for private vulnerability reporting, and
 [SUPPORT.md](SUPPORT.md) for help channels and current support limits.
 
 ELSPETH is available under the [MIT License](LICENSE).
