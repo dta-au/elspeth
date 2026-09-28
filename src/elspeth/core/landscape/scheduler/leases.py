@@ -51,6 +51,7 @@ from elspeth.core.landscape.schema import (
     pending_sink_bundle_clause,
     run_workers_table,
     token_outcomes_table,
+    token_parents_table,
     token_work_items_table,
     tokens_table,
     undecided_failed_work_clause,
@@ -941,7 +942,18 @@ class SchedulerLeaseRepository:
 
         Resume re-drives only durable scheduler work and never re-derives a
         row, so a resumable run must account for every token: a completed
-        outcome, or a READY / LEASED / BLOCKED / PENDING_SINK work item. Run
+        outcome, a READY / LEASED / BLOCKED / PENDING_SINK work item of its
+        own, or a parent (``token_parents``) whose READY / LEASED / BLOCKED
+        item has not completed. The last arm is the mint window: fork, expand
+        and collect commit their product tokens before the producing
+        work completes, and that completion (or barrier release) emits the
+        products' items atomically; a crash between the two commits leaves
+        products with no item of their own while their producer is still open
+        work, and re-driving it reconciles the committed products
+        (``_reconcile_*_replay``) and emits their items. A parent whose item
+        is PENDING_SINK, TERMINAL or FAILED has finished processing, so it
+        covers nothing. One level suffices: no product is processed before it
+        holds an item of its own. Run
         under the resuming leader's seat after ``requeue_undecided_failed_work``
         (a FAILED item left after it belongs to a decided token) and after the
         barrier-journal restore (which mints the work of committed barrier
@@ -985,7 +997,30 @@ class SchedulerLeaseRepository:
             )
             .exists()
         )
-        uncovered = select(tokens.c.token_id).where(tokens.c.run_id == run_id).where(~decided_or_abandoned).where(~covered)
+        producer_open = (
+            select(token_parents_table.c.parent_token_id)
+            .where(token_parents_table.c.run_id == tokens.c.run_id)
+            .where(token_parents_table.c.token_id == tokens.c.token_id)
+            .where(
+                select(token_work_items_table.c.work_item_id)
+                .where(token_work_items_table.c.run_id == token_parents_table.c.run_id)
+                .where(token_work_items_table.c.token_id == token_parents_table.c.parent_token_id)
+                .where(
+                    token_work_items_table.c.status.in_(
+                        (
+                            TokenWorkStatus.READY.value,
+                            TokenWorkStatus.LEASED.value,
+                            TokenWorkStatus.BLOCKED.value,
+                        )
+                    )
+                )
+                .exists()
+            )
+            .exists()
+        )
+        uncovered = (
+            select(tokens.c.token_id).where(tokens.c.run_id == run_id).where(~decided_or_abandoned).where(~covered).where(~producer_open)
+        )
         with fenced_write(self._engine, coordination_token=coordination_token, verb="verify_resume_coverage") as conn:
             token_count = conn.execute(select(func.count()).select_from(uncovered.subquery())).scalar_one()
             if token_count == 0:

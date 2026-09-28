@@ -16,8 +16,12 @@ driven down the pipeline again under a per-source contract
 
 Every row a run ingests is handed to the durable scheduler in the same fenced
 transaction that records it — a valid row with a claimed READY work item, a
-source-quarantined row with a born-parked PENDING_SINK item — and every child
-token is minted with its own item. Each item's payload carries its own row and
+source-quarantined row with a born-parked PENDING_SINK item. A fork, expand or
+collect product gets its item when the work that minted it completes (or its
+barrier releases); a crash between the mint and that completion leaves the
+producing item open, and re-driving it reconciles the committed products and
+emits their items, so resume's coverage check counts such a product as covered
+by its open producer. Each item's payload carries its own row and
 its contract (`serialize_row_payload`), so resume re-drives exactly the run's
 non-terminal scheduler work and never consults a source schema. The replay arm
 was reachable only when a row had no durable work item, which the fenced

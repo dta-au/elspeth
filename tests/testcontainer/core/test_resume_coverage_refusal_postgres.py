@@ -22,6 +22,7 @@ from tests.helpers.postgres_target import postgres_test_target
 from tests.integration.pipeline.test_resume_coverage_refusal import (
     scenario_abandoned_token_is_refused_before_any_redrive,
     scenario_coverage_is_evaluated_under_the_won_seat,
+    scenario_product_of_a_finished_producer_is_refused,
     scenario_run_with_no_work_left_is_refused_not_finalized,
     scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check,
     scenario_token_without_work_item_or_outcome_is_refused_and_recorded,
@@ -74,3 +75,7 @@ def test_success_stamp_refuses_an_undecided_token_past_the_coverage_check_on_pos
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, postgres_url: str
 ) -> None:
     scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check(tmp_path, monkeypatch, db_url=postgres_url)
+
+
+def test_product_of_a_finished_producer_is_refused_on_postgres(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, postgres_url: str) -> None:
+    scenario_product_of_a_finished_producer_is_refused(tmp_path, monkeypatch, db_url=postgres_url)

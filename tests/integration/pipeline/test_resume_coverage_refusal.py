@@ -1,13 +1,16 @@
 """Resume's coverage check refuses a run whose tokens it cannot account for.
 
 Resume re-drives only durable scheduler work and never re-derives a row, so a
-resumable run must account for every token: a completed outcome, or a READY /
-LEASED / BLOCKED / PENDING_SINK work item. These are CORRUPTION-DETECTOR tests:
+resumable run must account for every token: a completed outcome, a READY /
+LEASED / BLOCKED / PENDING_SINK work item, or an open producer (a parent whose
+READY / LEASED / BLOCKED item re-drives it — the mint window, proved by real
+crashes in ``test_resume_mint_window_crash.py``). These are CORRUPTION-DETECTOR tests:
 the base state is a REAL crashed run (a crash injected at the first sink
 reservation, so all four tokens — three valid rows and the quarantined one —
 park PENDING_SINK), and each test then corrupts the store directly into a state
 the fenced ingest cannot produce — a token with no work item, an ABANDONED
-token, a decided-and-ABANDONED token. The real-crash resume
+token, a decided-and-ABANDONED token, a product of a finished (PENDING_SINK)
+producer. The real-crash resume
 tests (no corruption) live elsewhere and never share this module.
 
 The coverage refusal must be recorded value-free in Landscape (one
@@ -38,6 +41,7 @@ from elspeth.core.landscape.schema import (
     run_coordination_events_table,
     runs_table,
     token_outcomes_table,
+    token_parents_table,
     token_work_items_table,
     tokens_table,
 )
@@ -333,6 +337,38 @@ def scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check(
         db.close()
 
 
+def scenario_product_of_a_finished_producer_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, db_url: str) -> None:
+    """Only an OPEN producer covers a product: a parent parked PENDING_SINK has finished and covers nothing.
+
+    The mint-window arm counts a token with no item as covered while a parent
+    (``token_parents``) holds a READY / LEASED / BLOCKED item, because
+    re-driving that producer emits the product's item. A producer parked for
+    its sink already completed, and its completion would have emitted the
+    product's item. Corrupt the crash image into exactly that state — one
+    token's handoff deleted, the token linked as the product of another
+    token that is parked PENDING_SINK — and the check must still refuse it.
+    """
+    settings, db, run_id = _crashed_run(tmp_path, monkeypatch, db_url)
+    try:
+        with db.connection() as conn:
+            parked = sorted(
+                conn.execute(select(token_work_items_table.c.token_id).where(token_work_items_table.c.run_id == run_id)).scalars().all()
+            )
+        producer, victim = parked[0], parked[1]
+        with db.engine.begin() as conn:
+            conn.execute(delete(token_work_items_table).where(token_work_items_table.c.token_id == victim))
+            conn.execute(insert(token_parents_table).values(token_id=victim, parent_token_id=producer, run_id=run_id, ordinal=0))
+        outcomes_before = _outcome_rows(db, run_id)
+
+        result = _resume(settings, run_id)
+        assert result.exit_code == 4, result.output
+        assert _refusal_events(db, run_id) == [{"cause": _CAUSE, "first_token_ids": [victim], "token_count": 1}]
+        assert _outcome_rows(db, run_id) == outcomes_before
+        assert not (tmp_path / "out" / "out.jsonl").exists()
+    finally:
+        db.close()
+
+
 # SQLite runs of the scenarios; tests/testcontainer/core/test_resume_coverage_refusal_postgres.py
 # runs the same scenarios against PostgreSQL.
 
@@ -360,3 +396,7 @@ def test_run_with_no_work_left_is_refused_not_finalized(tmp_path: Path, monkeypa
 
 def test_success_stamp_refuses_an_undecided_token_past_the_coverage_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     scenario_success_stamp_refuses_an_undecided_token_past_the_coverage_check(tmp_path, monkeypatch, db_url=_sqlite_url(tmp_path))
+
+
+def test_product_of_a_finished_producer_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    scenario_product_of_a_finished_producer_is_refused(tmp_path, monkeypatch, db_url=_sqlite_url(tmp_path))

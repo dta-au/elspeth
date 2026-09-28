@@ -489,7 +489,8 @@ drained and repair this release forward.
   never reads a source row again: after the same crash the quarantined row
   reaches its quarantine sink, the valid rows reach theirs, nothing is
   published twice, and the run ends `completed_with_failures`. Resume refuses
-  a run in which a row has neither an outcome nor a work item and records the
+  a run in which a row has neither an outcome nor a work item (its own, or the
+  still-open work that forked, expanded or collected it) and records the
   refusal in the audit trail as a `resume_refused` event naming the token ids
   (never row values). A run can no longer be stamped successful while any row
   lacks a recorded outcome. `elspeth resume`'s preview reports "Scheduler work

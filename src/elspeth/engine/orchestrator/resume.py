@@ -185,11 +185,14 @@ def run_resume_processing_loop(
     Resume never re-derives a source row. Every row the run ingested was
     handed to the scheduler in the same fenced transaction that recorded it
     (valid ingest: a claimed READY item; source quarantine: a born-parked
-    PENDING_SINK item), and every child token is minted with its own item.
-    The recovered work is therefore exactly the run's non-terminal scheduler
-    items (READY / LEASED / BLOCKED / PENDING_SINK) plus the barrier buffers
-    restored from the journal at processor construction; each item's payload
-    carries its own row and contract, so no source schema is consulted.
+    PENDING_SINK item). A fork, expand or collect product gets
+    its item when its producing work completes; a crash between the child's
+    mint and that completion leaves the producer open, and re-driving it
+    reconciles the committed children and emits their items. The recovered
+    work is therefore exactly the run's non-terminal scheduler items (READY /
+    LEASED / BLOCKED / PENDING_SINK) plus the barrier buffers restored from
+    the journal at processor construction; each item's payload carries its
+    own row and contract, so no source schema is consulted.
 
     End-of-input barrier flushes run only when the resume is not interrupted:
     on graceful shutdown buffered state stays pending rather than being forced
@@ -286,7 +289,8 @@ def refuse_unaccounted_resume(factory: RecorderFactory, coordination_token: Coor
         return
     raise AuditIntegrityError(
         f"Resume of run {coordination_token.run_id!r} refused: {refusal.token_count} token(s) have no completed "
-        "outcome and no durable scheduler work item; resume re-drives only scheduler work and never re-derives a "
+        "outcome, no durable scheduler work item and no open producing item; resume re-drives only scheduler work "
+        "and never re-derives a "
         f"row, so it cannot account for them. First token id(s): {', '.join(refusal.first_token_ids)}. "
         "Recorded as a resume_refused coordination event; nothing was re-driven."
     )
