@@ -21,6 +21,7 @@ name: composer-redaction-gate
 on:
   pull_request:
     branches: [main, master, "RC*", "release/**"]
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
 jobs:
   redaction-gate:
