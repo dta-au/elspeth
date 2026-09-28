@@ -1241,8 +1241,8 @@ Within that:
 `row` has fields and one method, `get`. Every other attribute or item lookup
 on `row` reads a field of that name: `row.keys` and `row.items` are fields,
 not methods, so `row.keys()` calls the value of a field named `keys`. For the
-field names use `row | list`, for name and value pairs `row | items` or
-`row | dictsort`, and for a mapping `dict(row)`. `row.contract`, `row.to_dict`
+field names use `row | list`, for name and value pairs `row | items | list`
+or `row | dictsort`, and for a mapping `dict(row)`. `row.contract`, `row.to_dict`
 and `row.to_checkpoint_format` are reserved names, not fields: read a column
 with one of those names as `row['contract']`. The row object, its schema
 contract and their methods are not reachable from a template. A lookup of a

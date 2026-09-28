@@ -183,6 +183,9 @@ def test_the_row_used_as_an_object_is_refused_under_every_declaration(
     # No declaration makes these forms work, so the refusal never suggests one.
     assert "required_input_fields: []" not in message
     assert "'row | list'" in message
+    # `row | items` printed bare sends a generator address to the provider; the named pairs form ends in `| list`.
+    assert "'row | items | list'" in message
+    assert "'row | items'" not in message
     assert "dict(row)" in message
 
 

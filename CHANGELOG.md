@@ -293,7 +293,7 @@ drained and repair this release forward.
   `template_rendering_failed` and the `Undeclared field` reason. Behaviour
   changes: under every declaration `row` is the template row rather than a
   plain dict, so `row.items()`, `row.keys()` and `row.values()` are refused at
-  configuration (they were dict methods; `row | items`, `row | list` and
+  configuration (they were dict methods; `row | items | list`, `row | list` and
   `dict(row)` replace them), and `{{ row }}` prints the declared fields. No
   shipped example sets `query_template`.
 - **One template row API, refused at configuration under every declaration
@@ -314,7 +314,7 @@ drained and repair this release forward.
   bound-method or object repr with a memory address to the provider
   (`{{ row.get }}`, `{{ row }}`, `row | pprint`); `row.contract` under `[]`
   read a column named `contract` while the same text was refused under a
-  list. The refusal names the replacement (`row | list`, `row | items`,
+  list. The refusal names the replacement (`row | list`, `row | items | list`,
   `row | dictsort`, `dict(row)`, `row['contract']`) and never suggests `[]`.
   A method on a value built from the whole row is that value's own, not a row
   call: `dict(row).items()`, `(row | list).count('note')`,
@@ -964,7 +964,7 @@ These ran and delivered rows before:
   `row.contract` / `row.to_dict()` / `row.to_checkpoint_format()` (also through
   `row | attr(...)`) are refused at configuration in an LLM prompt, a query's
   `row.source_row` and a RAG `query_template`, `required_input_fields: []`
-  included; replace them with `row | list`, `row | items`, `row | dictsort`,
+  included; replace them with `row | list`, `row | items | list`, `row | dictsort`,
   `dict(row)` or `row['contract']`. Before, `row.keys()` under `[]` (single-
   and multi-query) and RAG `row.keys()` / `row.items()` / `row.values()`
   under any declaration delivered, and the rest failed each row or sent an

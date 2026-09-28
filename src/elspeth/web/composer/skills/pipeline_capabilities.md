@@ -309,7 +309,7 @@ value (`row.keys()`, `row.items()`, `row['keys']()`, `row.get('note')()`,
 and the reserved names `row.contract`, `row.to_dict` and
 `row.to_checkpoint_format` are refused
 under every declaration, `[]` included. For the field names use `row | list`,
-for name and value pairs `row | items` or `row | dictsort`, for a mapping
+for name and value pairs `row | items | list` or `row | dictsort`, for a mapping
 `dict(row)` or `row | tojson`; read a column named like a method or a reserved
 name as `row['contract']`. A method on a field's value (`row.note.upper()`)
 is fine. With `required_input_fields` omitted, a model prompt may not use

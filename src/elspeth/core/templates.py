@@ -166,7 +166,7 @@ def describe_row_api_misuse(misuses: Iterable[str]) -> str:
         "row holds fields and one method, get: row.name, row['name'] and row.get('name', default) read a field, "
         "so row.keys() calls the value of a field named 'keys', and row.contract, row.to_dict and "
         "row.to_checkpoint_format are reserved names, not fields. For the field names use 'row | list', for "
-        "name and value pairs 'row | items' or 'row | dictsort', for a mapping 'dict(row)'; read a column whose "
+        "name and value pairs 'row | items | list' or 'row | dictsort', for a mapping 'dict(row)'; read a column whose "
         "name is reserved or matches a method as row['contract'] or row['keys']."
     )
 
