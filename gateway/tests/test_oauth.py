@@ -215,6 +215,25 @@ async def test_scope_sent_space_joined_when_configured(client):
     assert form["scope"] == "read write"
 
 
+@respx.mock
+async def test_token_fetch_uses_oauth_timeout_independent_of_inference_timeout(client):
+    route = respx.post(TOKEN_URL).mock(return_value=_ok_response())
+    config = _config(
+        ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_TIMEOUT_SECONDS="12.5",
+        ELSPETH_LLM_GATEWAY_REQUEST_TIMEOUT_SECONDS="300",
+    )
+    manager = TokenManager(config, client)
+
+    await manager.get_token()
+
+    assert route.calls[0].request.extensions["timeout"] == {
+        "connect": 12.5,
+        "read": 12.5,
+        "write": 12.5,
+        "pool": 12.5,
+    }
+
+
 # --- caching / single-flight ----------------------------------------------------
 
 

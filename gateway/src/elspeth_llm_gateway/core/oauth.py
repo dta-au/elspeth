@@ -148,7 +148,7 @@ class TokenManager:
                 self._config.oauth_token_url,
                 data=data,
                 headers=headers,
-                timeout=self._config.request_timeout_seconds,
+                timeout=self._config.oauth_token_timeout_seconds,
                 follow_redirects=False,
             )
         except httpx.HTTPError:
