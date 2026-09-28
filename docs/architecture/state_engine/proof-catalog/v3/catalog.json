@@ -6679,7 +6679,7 @@
       "id": "PB-01",
       "family": "production_boundary",
       "title": "Source ingress",
-      "contract": "Accepted rows enter TS-02 with source completion; before plugin execution resume repairs only an exact pre-fix missing-witness image and fails closed on ambiguity, while pre-row failures and quarantine exclusions create no scheduler work.",
+      "contract": "Accepted rows enter TS-02 with source completion; before plugin execution resume repairs only an exact pre-fix missing-witness image and fails closed on ambiguity. Pre-row source failures create no scheduler work; a quarantined source row atomically records its row, token, failed source state, DIVERT routing event, and durable PENDING_SINK work item.",
       "required_cases": [
         {
           "case_id": "leg-contract",
@@ -29755,8 +29755,8 @@
     {
       "id": "RM-09",
       "family": "read_model",
-      "title": "Active source-row scheduler identities",
-      "contract": "Returns the exact row identities with non-final scheduler work that drive mixed scheduler/source resume refusal.",
+      "title": "Retired: active source-row scheduler identities",
+      "contract": "Retired after QR: resume re-drives durable scheduler work; no active source-row identity read model or mixed scheduler/source refusal remains.",
       "required_cases": [
         {
           "case_id": "leg-contract",
@@ -29765,170 +29765,170 @@
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-same-host-leader-plus-claim-only-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "postgresql-16-aws-single-leader-landscape": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             }
           }
@@ -29938,8 +29938,8 @@
     {
       "id": "RM-10",
       "family": "read_model",
-      "title": "Blocked barrier token identities",
-      "contract": "Returns the exact distinct token identities represented by barrier-backed BLOCKED work so buffered tokens are excluded from redrive.",
+      "title": "Retired: blocked barrier token identities",
+      "contract": "Retired after QR: barrier journal restoration and durable scheduler work own buffered-token recovery; no blocked-barrier token identity read model remains.",
       "required_cases": [
         {
           "case_id": "leg-contract",
@@ -29948,170 +29948,170 @@
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-same-host-leader-plus-claim-only-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             },
             "postgresql-16-aws-single-leader-landscape": {
               "production_entry": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "precondition_image": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "success_effects": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "guard_refusal": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "zero_mutation_rollback": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "concurrency": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "crash_restart": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "boundary_composition": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "read_model_truth_table": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               },
               "maintenance": {
-                "status": "required",
-                "reason": null
+                "status": "not_applicable",
+                "reason": "Retired by QR: this read model was deleted and is no longer a runtime proof obligation."
               }
             }
           }
