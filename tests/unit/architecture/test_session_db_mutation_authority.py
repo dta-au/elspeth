@@ -5769,7 +5769,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c585a80de69ed5e2",
         1,
         None,
-        line=870,
+        line=871,
     ),
     # C6 stage 3 (ADR-047): the barrier journal's database-clock read for
     # hold ages; the read connection is handed to read_landscape_transaction_time.

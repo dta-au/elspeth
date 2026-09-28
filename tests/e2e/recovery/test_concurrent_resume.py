@@ -56,7 +56,8 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import insert, select, update
 
-from elspeth.contracts import PipelineRow, RunStatus
+from elspeth.contracts import PipelineRow, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.scheduler import SchedulerEventType, SourceIngestSpec, TokenWorkStatus
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -105,6 +106,22 @@ from tests.fixtures.landscape import await_database_time, expire_leader_seat, ex
 # so "live" holds under both clock domains; the expired-seat companion arm
 # stamps an explicit past expiry instead.
 _GUARD_LIVE_SEAT_WINDOW_SECONDS = 10**9
+
+
+def _decide_claimed_token(crashed: Any, claimed: Any, worker_id: str) -> None:
+    """Record the claimed row's outcome before its item closes, as the engine does.
+
+    These tests drive the scheduler verbs by hand in place of a transform; a
+    run is never stamped successful while a token lacks a recorded outcome
+    (QR-4), so the hand-driven row reaches one here.
+    """
+    crashed.factory.data_flow.record_token_outcome(
+        TokenRef(token_id=claimed.token_id, run_id=crashed.run_id),
+        TerminalOutcome.SUCCESS,
+        TerminalPath.FILTER_DROPPED,
+        member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=worker_id),
+        work_item=claimed,
+    )
 
 
 @pytest.mark.timeout(120)
@@ -679,6 +696,7 @@ class TestTwoResumesSameRunId:
             member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=winner_id),
         )
         assert claimed is not None and claimed.token_id == crashed_token and claimed.attempt == 2
+        _decide_claimed_token(crashed, claimed, winner_id)
         crashed.repo.mark_terminal(
             work_item_id=claimed.work_item_id,
             expected_lease_owner=winner_id,
@@ -1209,6 +1227,7 @@ class TestTwoResumesSameRunId:
         assert items_mid[crashed_token]["lease_owner"] == "crashed-worker-1"
 
         # Mark the fresh token terminal (follower completed it).
+        _decide_claimed_token(crashed, follower_claimed, follower_id)
         crashed.repo.mark_terminal(
             work_item_id=follower_claimed.work_item_id,
             expected_lease_owner=follower_id,
@@ -1247,6 +1266,7 @@ class TestTwoResumesSameRunId:
             member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=leader_id),
         )
         assert recovered_claim is not None and recovered_claim.token_id == crashed_token
+        _decide_claimed_token(crashed, recovered_claim, leader_id)
         crashed.repo.mark_terminal(
             work_item_id=recovered_claim.work_item_id,
             expected_lease_owner=leader_id,

@@ -505,7 +505,7 @@ class SchedulerQueueRepository:
             raise TypeError("quarantine ingest requires an exact DataFlowRepository")
         if type(execution) is not ExecutionRepository:
             raise TypeError("quarantine ingest requires an exact ExecutionRepository")
-        if not isinstance(coordination_token, CoordinationToken):
+        if type(coordination_token) is not CoordinationToken:
             raise TypeError("quarantine ingest requires a CoordinationToken")
         if type(pending_sink) is not BarrierEmission:
             raise TypeError("quarantine ingest requires a BarrierEmission pending-sink image")

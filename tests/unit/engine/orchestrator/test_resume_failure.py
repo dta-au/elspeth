@@ -92,6 +92,18 @@ def _make_orchestrator(db: LandscapeDB | None = None) -> Orchestrator:
     return Orchestrator(db)
 
 
+def _covered_factory() -> MagicMock:
+    """A RecorderFactory mock whose resume coverage check accounts for every token.
+
+    A bare mock's ``verify_resume_coverage()`` returns a truthy mock, which the
+    resume reads as a refusal; tests of other resume behaviour pin "nothing
+    uncovered" explicitly.
+    """
+    factory = MagicMock(spec=RecorderFactory)
+    factory.scheduler.leases.verify_resume_coverage.return_value = None
+    return factory
+
+
 def _mock_processor() -> MagicMock:
     """Create a RowProcessor mock with optional runtime collaborators absent."""
     processor = MagicMock(spec=RowProcessor)
@@ -810,7 +822,7 @@ class TestResumeFinalizesAsFailed:
             pytest.raises(Exception, match="left non-terminal scheduler work after end-of-source flush") as exc_info,
         ):
             orch._resume_coordinator.process_resumed_rows(
-                MagicMock(spec=RecorderFactory),
+                _covered_factory(),
                 "run-with-blocked-work",
                 config,
                 MagicMock(spec=ExecutionGraph),
@@ -865,7 +877,7 @@ class TestResumeFinalizesAsFailed:
             pytest.raises(RuntimeError, match="resume runtime preflight exploded"),
         ):
             orch._resume_coordinator.process_resumed_rows(
-                MagicMock(spec=RecorderFactory),
+                _covered_factory(),
                 "run-resume-runtime-preflight-fails",
                 config,
                 graph,
@@ -925,7 +937,7 @@ class TestResumeFinalizesAsFailed:
             except LookupError:
                 with pytest.raises(RuntimeError, match="Plugin cleanup failed"):
                     orch._resume_coordinator.process_resumed_rows(
-                        MagicMock(spec=RecorderFactory),
+                        _covered_factory(),
                         "run-resume-clean-boundary",
                         config,
                         MagicMock(spec=ExecutionGraph),
@@ -1590,7 +1602,7 @@ class TestResumeFinalizesAsFailed:
         orch = _make_orchestrator(db)
         run_id = "run-empty-journal"
         _insert_failed_run(db, run_id)
-        mock_factory = MagicMock(spec=RecorderFactory)
+        mock_factory = _covered_factory()
         mock_factory.scheduler.count_active_work.return_value = 0
         mock_factory.barrier_restore.pending_empty_expansion_groups.return_value = ()
         mock_factory.data_flow.sweep_deferred_invariants_or_crash = MagicMock(spec=object)
@@ -1746,7 +1758,7 @@ class TestResumeFinalizesAsFailed:
         orch = _make_orchestrator(db)
         run_id = "run-structural-counter-resume"
         _insert_failed_run(db, run_id)
-        mock_factory = MagicMock(spec=RecorderFactory)
+        mock_factory = _covered_factory()
         mock_factory.scheduler.count_active_work.return_value = 0
         mock_factory.barrier_restore.pending_empty_expansion_groups.return_value = ()
         mock_factory.data_flow.sweep_deferred_invariants_or_crash = MagicMock(spec=DataFlowRepository.sweep_deferred_invariants_or_crash)

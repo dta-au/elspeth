@@ -42,6 +42,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.data_flow.serialization import canonical_or_recorded_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
 from elspeth.core.landscape.item_fencing import fenced_item_transaction
@@ -336,10 +337,7 @@ class NodeStateRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="record_failed_source_quarantine_state_on",
         )
-        try:
-            input_hash = stable_hash(input_data)
-        except (ValueError, TypeError):
-            input_hash = repr_hash(input_data)
+        input_hash = canonical_or_recorded_hash(input_data)
         timestamp = now()
         try:
             result = conn.execute(

@@ -518,6 +518,8 @@ def make_row_result(
 
     Defaults to the ADR-019 happy path pair: (SUCCESS, DEFAULT_FLOW).
     Sink-targeting paths default sink_name to "default" for test convenience.
+    A sink-bound result carries its durable PENDING_SINK handoff, as every
+    real one does: the orchestrator refuses one without it.
     """
     from elspeth.contracts.results import RowResult
 
@@ -553,6 +555,7 @@ def make_row_result(
         path=resolved_path,
         sink_name=resolved_sink_name,
         error=error,
+        scheduler_pending_sink=resolved_sink_name is not None,
     )
 
 
