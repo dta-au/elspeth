@@ -14,8 +14,8 @@ This census is the ratchet. It builds every registered transform from its
 does), plus the variant configs that switch on further created fields, reads
 the declaration stamp table, and requires every ``any`` field to match a
 reason in ``_REASONS``: a row-carried value whose type is the data's, a
-list/mapping the schema DSL cannot type, the value_transform expression target
-(B7 ruling), or a probe config's own ``any`` declaration. An unaccounted
+list/mapping the schema DSL cannot type, or a probe config's own ``any``
+declaration. An unaccounted
 ``any`` field fails, and so does a stale reason that no longer matches any
 field, so the table cannot drift from the code in either direction.
 """
@@ -34,7 +34,6 @@ from tests.invariants.test_pass_through_invariants import _registered_transform_
 
 _CARRIED = "carried from the rows: the value is a row value, its type is the data's"
 _LIST_OR_MAPPING = "list/mapping: the schema DSL has no type for it"
-_EXPRESSION = "value_transform expression target: its type depends on the expression and the data (B7 ruling)"
 _PROBE_AUTHORED = "the probe config's own schema declares the field 'any'"
 
 # (plugin name, field-name glob) -> why the field stays ``any``.
@@ -79,7 +78,6 @@ _REASONS: dict[tuple[str, str], str] = {
     ("azure_document_intelligence", "di_result"): _LIST_OR_MAPPING,
     ("azure_document_intelligence", "di_tables"): _LIST_OR_MAPPING,
     ("azure_document_intelligence", "di_kv"): _LIST_OR_MAPPING,
-    ("value_transform", "*"): _EXPRESSION,
 }
 
 _OBSERVED: dict[str, Any] = {"schema": {"mode": "observed"}}

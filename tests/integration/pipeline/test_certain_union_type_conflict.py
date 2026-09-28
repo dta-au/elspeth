@@ -1,7 +1,7 @@
 """A union coalesce whose every row would fail the runtime merge is refused at build (ADR-050 D8).
 
 Two branches that each guarantee a field and certainly type it differently —
-a declared-``any`` rewrite (value_transform, a field_mapper dotted extraction)
+a derived-``str`` literal or an untyped field_mapper dotted extraction
 against a carried concrete type — fail EVERY row with ``contract_type_conflict``
 at the runtime merge. Both types are fixed before row 1 (the stamp table on
 one side, a source declaration on the other), so the conflict is certain from
@@ -14,10 +14,9 @@ newly refused shape really does fail every row at runtime (no false refusal).
 The residual — a type knowable only at row 1 (an observed upstream) — keeps
 routing per row (``test_coalesce_group_failure_accounting``).
 
-Expression typing (the 2026-09-27 arbiter verdict) will type ``row['price'] +
-1`` as ``int`` and so make the ``rewrite`` shape DELIVER; the ``literal`` and
-``dotted`` shapes stay certain conflicts under it (``str`` vs ``int``; a dotted
-extraction is untyped), so the soundness pins do not depend on that change.
+Expression typing makes ``row['price'] + 1`` an ``int`` rewrite that delivers;
+the ``literal`` and ``dotted`` shapes remain certain conflicts (``str`` vs
+``int`` and ``any`` vs ``int``, respectively).
 """
 
 from __future__ import annotations
@@ -135,16 +134,11 @@ def _dotted_vs_carried_rename(tmp_path: Path) -> dict[str, Any]:
 
 
 _CERTAIN_SHAPES = {
-    # The r3 F-1 shape; expression typing (round 10b) makes it deliver.
-    "rewrite": (
-        lambda tmp_path: _rewrite_vs_carried(tmp_path, expression="row['price'] + 1"),
-        "price",
-        "transform 'vt_a' (value_transform)",
-    ),
     "literal": (lambda tmp_path: _rewrite_vs_carried(tmp_path, expression="'x'"), "price", "transform 'vt_a' (value_transform)"),
     "dotted": (_dotted_vs_carried_rename, "q", "transform 'fm_a' (field_mapper)"),
 }
-_CARRIED_DECLARERS = {"rewrite": "source 'src' (csv)", "literal": "source 'src' (csv)", "dotted": "source 'src' (json)"}
+_CARRIED_DECLARERS = {"literal": "source 'src' (csv)", "dotted": "source 'src' (json)"}
+_CONFLICTING_TYPES = {"literal": ("str", "int"), "dotted": ("any", "int")}
 
 
 def _write(tmp_path: Path, settings: dict[str, Any]) -> Path:
@@ -210,9 +204,21 @@ def test_every_refused_shape_fails_every_row_with_the_refusal_disabled(tmp_path:
     assert non_terminal == 0
     assert "success" not in outcomes
     assert outcomes["failure"] == 4  # 2 rows x 2 branch tokens
-    assert reasons == {f"contract_type_conflict: Cannot merge contracts: field '{field_name}' has conflicting types 'any' and 'int'"}, (
-        reasons
-    )
+    first_type, second_type = _CONFLICTING_TYPES[shape]
+    assert reasons == {
+        f"contract_type_conflict: Cannot merge contracts: field '{field_name}' has conflicting types '{first_type}' and '{second_type}'"
+    }, reasons
+
+
+def test_derived_int_rewrite_builds_and_delivers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """co2: the derived int rewrite is compatible with the carried int branch."""
+    settings = _rewrite_vs_carried(tmp_path, expression="row['price'] + 1")
+    settings_path = _write(tmp_path, settings)
+    validate_exit, validate_output = _cli(monkeypatch, "validate", "--settings", str(settings_path))
+    assert validate_exit == 0, validate_output
+    run_exit, run_output = _cli(monkeypatch, "run", "--settings", str(settings_path), "--execute")
+    assert run_exit == 0, run_output
+    assert (tmp_path / "out.jsonl").read_bytes() == b'{"id": 1, "price": 10}\n{"id": 2, "price": 20}\n'
 
 
 @pytest.mark.parametrize(

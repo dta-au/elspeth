@@ -1872,26 +1872,30 @@ class TestInvisibleRetypeThroughPassThrough:
 
     type_coerce converts id int->str mid-chain while the final producer
     under-declares id back into the guarantee channel. Two closure halves,
-    each pinned in both directions: with declared fields, type_coerce now
-    DECLARES its conversion targets (nearest declaration correct); in
-    observed mode the walk ABSTAINS at an undeclared pass-through rather
-    than resolving through it (silence is not type-preservation).
+    each pinned in both directions: type_coerce declares its conversion
+    targets in every schema mode (nearest declaration correct), while the
+    walk abstains at a genuinely undeclared observed pass-through.
     """
 
     def test_observed_coercer_with_matching_sink_builds(self) -> None:
         """The false-reject regression pin: rows genuinely carry str after the
         coercion, so the sink demanding str must build even though the only
-        ancestor DECLARATION says int. The walk abstains at the observed
-        type_coerce instead of resolving the stale source type."""
+        ancestor DECLARATION says int. The conversion target publishes str."""
         _build_invisible_retype_graph(coerce_schema=_COERCE_OBSERVED, sink_id_type="str")
 
-    def test_observed_coercer_with_conflicting_sink_keeps_per_row_posture(self) -> None:
-        """Rows carry str and the sink demands int — doomed at runtime, but an
-        observed coercer states nothing the build can prove either way, so the
-        historical per-row preflight posture stands (green build). Pinned so a
-        later 'improvement' that resolves through observed pass-throughs
-        cannot silently reintroduce the stale-type claim."""
-        _build_invisible_retype_graph(coerce_schema=_COERCE_OBSERVED, sink_id_type="int")
+    def test_observed_coercer_with_conflicting_sink_is_rejected(self) -> None:
+        """The observed coercer publishes str for its conversion target, so
+        the sink's int demand is a certain build-time mismatch."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_invisible_retype_graph(coerce_schema=_COERCE_OBSERVED, sink_id_type="int")
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+        assert exc_info.value.to_node_id is not None and exc_info.value.to_node_id.startswith("sink_output")
+        assert "declared by: transform_coerce_id" in str(exc_info.value)
 
     def test_declaring_coercer_with_matching_sink_builds(self) -> None:
         """With declared fields, the appended conversion-target declaration
@@ -1899,9 +1903,8 @@ class TestInvisibleRetypeThroughPassThrough:
         _build_invisible_retype_graph(coerce_schema=_COERCE_FLEX_WITHOUT_TARGET, sink_id_type="str")
 
     def test_declaring_coercer_with_conflicting_sink_is_rejected(self) -> None:
-        """The improvement direction: the same doomed pipeline the observed
-        arm must tolerate is CAUGHT when the coercer declares fields, because
-        the appended target declaration is graph-visible."""
+        """The same doomed pipeline is caught with flexible schema because
+        the appended conversion-target declaration is graph-visible."""
         from elspeth.core.dag.models import EdgeContractError
 
         with pytest.raises(EdgeContractError) as exc_info:

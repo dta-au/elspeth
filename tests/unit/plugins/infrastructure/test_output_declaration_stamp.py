@@ -151,17 +151,23 @@ class TestStampPrecedence:
 
 
 class TestValueTransformDeclaration:
-    def test_every_target_is_declared_any_by_the_plugin(self) -> None:
+    def test_literal_targets_are_declared_int_by_the_plugin(self) -> None:
         from elspeth.plugins.transforms.value_transform import ValueTransform
 
         transform = ValueTransform(
             {"schema": DYNAMIC_SCHEMA, "operations": [{"target": "b", "expression": "1"}, {"target": "a", "expression": "2"}]}
         )
         assert transform.created_output_fields() == (
-            FieldDefinition(name="a", field_type="any", required=True, nullable=True),
-            FieldDefinition(name="b", field_type="any", required=True, nullable=True),
+            FieldDefinition(name="a", field_type="int", required=True, nullable=False),
+            FieldDefinition(name="b", field_type="int", required=True, nullable=False),
         )
         assert transform.declared_output_fields == frozenset()
+
+    def test_an_unresolved_expression_target_is_declared_any_by_the_plugin(self) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform({"schema": DYNAMIC_SCHEMA, "operations": [{"target": "copies", "expression": "row['meta']['copies']"}]})
+        assert transform.created_output_fields() == (FieldDefinition(name="copies", field_type="any", required=True, nullable=True),)
 
     def test_an_explicit_any_target_stores_a_str_where_a_prior_row_stored_an_int(self) -> None:
         """B7 (panel ``vt_str_explicit_any``): both emissions carry the same declared contract."""

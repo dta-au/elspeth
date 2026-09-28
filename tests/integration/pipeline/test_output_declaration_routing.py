@@ -19,8 +19,9 @@ ones the elspeth-5887fb7928 R2 unit and the S1 specialist panel measured
 - T5: value_transform as a TYPED CONSUMER of a carried field passes a valid
   row and routes the wrong-typed one (before: Tier-1
   ``SchemaConfigModeViolation`` on a VALID row).
-- T6: nulls — ``int?`` accepts, ``int`` routes, json_explode records
-  ``nullable`` truthfully, null-first and null-later under ``any`` both pass.
+- T6: nulls — ``int?`` accepts, a certain null against ``int`` is refused at
+  build, an uncertain null routes, json_explode records ``nullable``
+  truthfully, and null-first and null-later under ``any`` both pass.
 - T8: two arrival orders and ``max_workers > 1`` record byte-identical
   contracts.
 - T10: the SOURCE seam is unchanged (infer-and-lock, value-validated).
@@ -115,6 +116,14 @@ def _run(settings_path: Path) -> Any:
     result = runner.invoke(app, ["run", "-s", str(settings_path), "--execute"])
     assert "Traceback" not in result.output, result.output
     return result
+
+
+def _validate(settings_path: Path) -> Any:
+    from typer.testing import CliRunner
+
+    from elspeth.cli import app
+
+    return CliRunner().invoke(app, ["validate", "-s", str(settings_path)])
 
 
 def _transform_node_contracts(tmp_path: Path) -> dict[str, str]:
@@ -806,9 +815,20 @@ class TestNulls:
         assert result.exit_code == 0, result.output
         assert [row["a"] for row in _read_jsonl(tmp_path / "out.jsonl")] == [None, None]
 
-    def test_a_non_nullable_declaration_routes_null(self, tmp_path: Path) -> None:
+    def test_a_non_nullable_declaration_refuses_a_certain_null_at_build(self, tmp_path: Path) -> None:
         _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 10}, {"id": 2, "a": 11}])
         transform = _vt(schema={"mode": "flexible", "fields": ["id: int", "a: int"]}, operations=[{"target": "a", "expression": "None"}])
+        result = _validate(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 1, result.output
+        assert "target 'a' declares int" in result.output
+        assert "computes null" in result.output
+
+    def test_a_non_nullable_declaration_routes_an_uncertain_null(self, tmp_path: Path) -> None:
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 10}, {"id": 2, "a": 11}])
+        transform = _vt(
+            schema={"mode": "flexible", "fields": ["id: int", "a: int"]},
+            operations=[{"target": "a", "expression": "row.get('missing')"}],
+        )
         result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
         assert result.exit_code == 2, result.output
         assert _read_jsonl(tmp_path / "out.jsonl") == []
@@ -904,10 +924,20 @@ class TestAnIntSatisfiesAFloatDeclaration:
         [y] = [field for field in json.loads(recorded)["fields"] if field["normalized_name"] == "y"]
         assert (y["python_type"], y["source"]) == ("float", "declared")
 
-    def test_a_typed_float_value_transform_target_routes_a_computed_bool(self, tmp_path: Path) -> None:
+    def test_a_typed_float_value_transform_target_refuses_a_certain_bool_at_build(self, tmp_path: Path) -> None:
         _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": 3}, {"id": 2, "a": 4}])
         transform = _vt(
             schema={"mode": "flexible", "fields": ["id: int", "y: float"]}, operations=[{"target": "y", "expression": "row['a'] > 3"}]
+        )
+        result = _validate(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
+        assert result.exit_code == 1, result.output
+        assert "target 'y' declares float" in result.output
+        assert "computes bool" in result.output
+
+    def test_a_typed_float_value_transform_target_routes_an_uncertain_bool(self, tmp_path: Path) -> None:
+        _write_jsonl(tmp_path / "in.jsonl", [{"id": 1, "a": True}, {"id": 2, "a": False}])
+        transform = _vt(
+            schema={"mode": "flexible", "fields": ["id: int", "y: float"]}, operations=[{"target": "y", "expression": "row.get('a')"}]
         )
         result = _run(_settings(tmp_path, sources={"src": _json_source(tmp_path / "in.jsonl")}, transforms=[transform]))
         assert result.exit_code == 2, result.output
