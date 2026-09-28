@@ -66,6 +66,12 @@
       "amount"
     ]
   },
+  "examples/batch_rank_passthrough/settings.yaml": {
+    "aggregation:rank_per_prompt": []
+  },
+  "examples/batch_rank_passthrough/settings_transform.yaml": {
+    "aggregation:rank_per_prompt": []
+  },
   "examples/blob_transforms/settings_expand_csv_blobs.yaml": {
     "transform:expand_csv_blob": [
       "blob_ref"
