@@ -820,6 +820,19 @@ class SchemaConfig:
         """Whether extra fields beyond schema are allowed."""
         return self.is_observed or self.mode == "flexible"
 
+    def closed_field_names(self) -> frozenset[str] | None:
+        """Every name a row this schema admits can carry, or None when it admits undeclared fields.
+
+        An UPPER bound: the declared fields, optional ones included (unlike
+        ``get_effective_guaranteed_fields``, a lower bound), under an extras
+        firewall (``allows_extra_fields`` False). Read by the field-name
+        spelling rule's build-time resolution to tell a field a node drops
+        (``FieldNameResolution.past_node``).
+        """
+        if self.allows_extra_fields or self.fields is None:
+            return None
+        return frozenset(field_definition.name for field_definition in self.fields) | self.get_effective_guaranteed_fields()
+
     def get_effective_guaranteed_fields(self) -> frozenset[str]:
         """Get all fields this schema guarantees will exist.
 

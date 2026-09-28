@@ -440,6 +440,39 @@ def test_an_undeclared_key_computed_from_the_row_is_not_quoted() -> None:
         )
 
 
+_SPELLING_OF_DECLARED = (
+    "TemplateError: Undeclared field: the template reads 'NOTE', a spelling of a declared field that this row does not "
+    "carry under that spelling (its producer recorded another original name, or the field is absent); read the field "
+    "by its declared name"
+)
+
+
+@pytest.mark.parametrize("source", ["{{ row['Note'] }}", "{{ row.Note }}", "{{ row.get('Note') }}", "{{ 'Note' in row }}"])
+def test_a_declared_field_reads_by_its_recorded_header_spelling(source: str) -> None:
+    """``row['Note']`` under ``[note]`` reads ``note`` when its producer recorded the header ``Note`` (ADR-051 (b), S-02)."""
+    assert _outcome(source, row=TemplateRow.project(_row(), _NOTE_ONLY)) in {"first", "True"}
+
+
+@pytest.mark.parametrize("source", ["{{ row['NOTE'] }}", "{{ row.NOTE }}", "{{ row.get('NOTE', 'd') }}", "{{ 'NOTE' in row }}"])
+def test_a_spelling_of_a_declared_field_the_row_does_not_carry_says_so(source: str) -> None:
+    """Configuration admits any header spelling of a declared field; a row whose header is spelled otherwise fails, saying which.
+
+    ``NOTE`` normalizes to the declared ``note`` (the spelling rule's
+    predicate), but this row's producer recorded the header ``Note``. Reporting
+    it as a field the node does not declare would send the author to declare
+    ``NOTE``, which the spelling rule refuses.
+    """
+    assert _outcome(source, row=TemplateRow.project(_row(), _NOTE_ONLY)) == _SPELLING_OF_DECLARED
+
+
+def test_a_computed_key_that_spells_a_declared_field_is_not_quoted_or_classified() -> None:
+    """Whether a computed key spells a declared field is a fact about row data: the text stays the unspelled one."""
+    row = TemplateRow.project(_row(note="NOTE"), _NOTE_ONLY)
+    assert _outcome("{{ row[row.note] }}", row=row) == (
+        f"TemplateError: Undeclared field: the template reads {_UNSPELLED}, a field this node does not declare in required_input_fields"
+    )
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [

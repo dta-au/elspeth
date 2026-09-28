@@ -567,6 +567,7 @@ def build_execution_graph(
             forwards_input_fields=transform.forwards_input_fields,
             removed_input_fields=transform.removed_input_fields,
             renamed_input_fields=transform.renamed_input_fields,
+            header_spelled_lookups=transform.header_spelled_lookups,
             preserves_input_values=transform.preserves_input_values,
             output_field_declarations=published.output_field_declarations,
             carried_output_sources=published.carried_output_sources,

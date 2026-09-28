@@ -462,21 +462,25 @@ class TestUndeclaredRowFields:
     def test_reports_only_the_shortfall_sorted(self) -> None:
         assert self._u({"zeta", "alpha", "a"}, ["a"]) == ("alpha", "zeta")
 
-    def test_a_declarable_variant_is_reported_not_bridged(self) -> None:
-        """Coverage is EXACT, because render-time resolution is.
+    def test_a_header_spelling_of_a_declared_field_is_covered(self) -> None:
+        """A read names a declared field by either spelling (ADR-051 (b), S-02).
 
-        ``SchemaContract.find_name`` matches a field's ``normalized_name`` OR
-        its ``original_name`` — two exact spellings, neither knowable at config
-        time. So ``{{ row.Name }}`` against a declared ``name`` resolves only if
-        the producer's original header happened to be ``Name``; measured
-        against a row whose one column is ``a_b``, twelve declarable spellings
-        (``A_B``, ``a__b``, ``A_B_``, ...) raise on every row and one renders.
-        An earlier version bridged these through ``normalize_field_name`` and
-        silenced all twelve, including plain typos of the declared name.
+        ``TemplateRow`` resolves a declared field by its canonical name and by
+        the original name its producer recorded, so ``row['Name']`` under
+        ``[name]`` reads ``name`` from a source whose header is ``Name``. The
+        predicate is the spelling rule's own (``header_spelling_canonical``);
+        a row whose header is spelled otherwise fails that row at render,
+        routed. Refusing the read here contradicted that ruling.
         """
-        assert self._u({"Name"}, ["name"]) == ("Name",)
-        assert self._u({"a__b"}, ["a_b"]) == ("a__b",)
-        assert self._u({"A_B_"}, ["a_b"]) == ("A_B_",)
+        assert self._u({"Name"}, ["name"]) == ()
+        assert self._u({"a__b"}, ["a_b"]) == ()
+        assert self._u({"A_B_"}, ["a_b"]) == ()
+
+    def test_a_spelling_of_no_declared_field_is_still_reported(self) -> None:
+        """Only a spelling of a DECLARED field is covered: a typo that normalizes elsewhere, or a spelling of an undeclared field, is not."""
+        assert self._u({"Nmae"}, ["name"]) == ("Nmae",)
+        assert self._u({"Name"}, ["title"]) == ("Name",)
+        assert self._u({"Name", "Title"}, ["name"]) == ("Title",)
 
     def test_undeclarable_literal_is_bridged_to_its_canonical_key(self) -> None:
         """The one sound inference, and it runs the OTHER way.

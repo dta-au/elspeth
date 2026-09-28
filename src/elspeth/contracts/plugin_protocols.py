@@ -212,7 +212,7 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # ``mapping.get(k, k)`` (``resolve_field_names``), so a declaration whose
     # ``k`` this source renames names the rename TARGET. Read by the field-name
     # spelling rule's build-time resolution
-    # (``contracts.field_spelling.FieldNameResolution.of_source_renames``) on
+    # (``contracts.field_spelling.FieldNameResolution.of_source``) on
     # both the DAG builder and the Web Composer's source probe.
     @property
     def field_renames(self) -> "SourceFieldRenames": ...
@@ -450,6 +450,17 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # (``FieldNameResolution.then_renamed``) in the DAG validator and the Web
     # Composer's mirror; empty for a transform that renames nothing.
     renamed_input_fields: Mapping[str, str]
+
+    # Header-spelled row lookups (field-name spelling rule): literal ->
+    # declared field for every row lookup the node makes by a spelling other
+    # than the field it declares (a template's row['Name'] under
+    # required_input_fields [name], a multi-query input_fields column).
+    # Configuration admits such a lookup because a row may carry the field
+    # under that spelling; the build and the Web Composer refuse one no
+    # arriving row can resolve (``field_spelling.unreachable_spelled_lookups``:
+    # a field a transform upstream created fresh records only its own name).
+    # Empty for a node that looks every field up by its declared name.
+    header_spelled_lookups: Mapping[str, str]
 
     # Value-preservation declaration (elspeth-e6e552ce34). The presence flags
     # above say which fields survive; this one says the plugin never CHANGES a
@@ -726,6 +737,11 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # TransformProtocol above for the contract; every batch-aware conformer
     # inherits BaseTransform's empty default (none renames a field).
     renamed_input_fields: Mapping[str, str]
+
+    # Header-spelled row lookups (field-name spelling rule). See
+    # TransformProtocol above for the contract; every batch-aware conformer
+    # inherits BaseTransform's empty default (none renders a row template).
+    header_spelled_lookups: Mapping[str, str]
 
     # Value-preservation declaration (elspeth-e6e552ce34). See
     # TransformProtocol above for the contract. The two protocols must not

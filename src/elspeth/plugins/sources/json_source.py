@@ -173,10 +173,11 @@ class JSONSource(BaseSource):
         - Flexible: {"mode": "flexible", "fields": ["id: int"]} - at least these fields
     """
 
+    _normalizes_external_names = True
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9773d7d4da8358a9"
+    source_file_hash: str | None = "sha256:3594f36338bc9898"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str

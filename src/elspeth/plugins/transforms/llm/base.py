@@ -56,9 +56,8 @@ _MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({_MULTI_QUERY_SOURCE
 # used to be accepted and then fail every row at run time. Leading with it
 # would still hand the planner a repair that trades this error for another.
 _UNDECLARED_ROW_FIELDS_REMEDY: Final[str] = (
-    "Rewrite each reference to a field the node already declares — that always applies, and a "
-    "spelling the declaration does not carry works at best by accident of the producer's original "
-    "header. Add a name to options.required_input_fields ONLY if the upstream producer guarantees "
+    "Rewrite each reference to a field the node already declares, by its declared name — that always "
+    "applies. Add a name to options.required_input_fields ONLY if the upstream producer guarantees "
     "that exact name (declare the parenthesised form where one is shown; the bracket literal itself "
     "is not a legal declaration entry). Declaring a name the producer does not guarantee is refused "
     "when the pipeline is validated. Do not empty required_input_fields to silence this: "
@@ -977,6 +976,36 @@ class LLMConfig(TransformDataConfig):
             name for spec in self.image_inputs if spec.required for name in (spec.field, spec.format_field) if name is not None
         }
         return super().declared_input_fields | frozenset(required_image_fields)
+
+    def header_spelled_row_lookups(self) -> dict[str, str]:
+        """Every row lookup the node makes by a spelling other than the field it declares: literal -> declared field.
+
+        The reads ``_validate_template_variable_bindings`` admits as a header
+        spelling of a declared field (``header_spelled_row_lookups``): a
+        single-query prompt's row reads against ``required_input_fields``,
+        and per query its ``input_fields`` columns against the declared input
+        fields and its ``row.source_row`` columns against
+        ``required_input_fields``. None under the ``[]`` opt-out or an absent
+        declaration, where nothing is checked against a declaration. The
+        transform publishes them (``TransformProtocol.header_spelled_lookups``)
+        for the build to prove each can resolve on an arriving row.
+        """
+        from elspeth.core.templates import extract_jinja2_field_usage
+        from elspeth.plugins.sources.field_normalization import header_spelled_row_lookups
+
+        if not self.required_input_fields:
+            return {}
+        if self.queries is None:
+            return header_spelled_row_lookups(extract_jinja2_field_usage(self.effective_template()).fields, self.required_input_fields)
+        lookups: dict[str, str] = {}
+        for spec in resolve_queries(self.queries):
+            lookups.update(header_spelled_row_lookups(spec.input_fields.values(), self.declared_input_fields))
+            lookups.update(
+                header_spelled_row_lookups(
+                    multi_query_source_row_columns(self.effective_template(spec.template)), self.required_input_fields
+                )
+            )
+        return lookups
 
     @property
     def image_input_fields(self) -> frozenset[str]:

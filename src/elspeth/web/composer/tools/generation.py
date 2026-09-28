@@ -1612,6 +1612,19 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "to an arriving field. Never add a field_mapper to restore the header spelling to satisfy this — declare the "
         "normalized name instead.",
     ),
+    DirectValidationGuidance(
+        "field_name_lookup_unreachable",
+        "A template reads a declared field by a spelling other than its declared name (row['Score_Text'] under "
+        "required_input_fields [score_text], a multi-query input_fields column, a RAG query_template read). Such a "
+        "lookup resolves only when the arriving row records that spelling as the field's original source header, and "
+        "no row reaching this node can: on every path the field comes from a headerless source (columns recorded as "
+        "written), a source field_mapping or a rename (the target records the name it was renamed from), a node that "
+        "creates it, or a statistics-style aggregation or collector (every field it emits records its own name), or a "
+        "transform renames the field that header names away. The template fails every row.",
+        "Rewrite the lookup to the declared name the message names (row['score_text'] or row.score_text) with "
+        "patch_node_options on the rejected node. Do not rename the field back or add a field_mapper to recreate the "
+        "header spelling.",
+    ),
     *_direct_plugin_policy_guidance(),
 )
 

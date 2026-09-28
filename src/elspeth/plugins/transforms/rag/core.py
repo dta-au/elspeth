@@ -20,6 +20,7 @@ import re
 from abc import abstractmethod
 from collections.abc import Callable
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Self
 
 import structlog
@@ -176,6 +177,26 @@ class RetrievalOutputConfig(TransformDataConfig):
         """
         return declared_row_projection(self.required_input_fields, always_declared=frozenset({self.query_field}))
 
+    def header_spelled_row_lookups(self) -> dict[str, str]:
+        """The query template's row reads by a spelling other than the field it declares: literal -> declared field.
+
+        The reads ``_validate_query_template_row_reads`` admits as a header
+        spelling of a declared field (``header_spelled_row_lookups``); none
+        without a template or under the ``[]`` opt-out. The transform
+        publishes them (``TransformProtocol.header_spelled_lookups``) for the
+        build to prove each can resolve on an arriving row.
+        """
+        if self.query_template is None:
+            return {}
+        from elspeth.core.templates import extract_jinja2_field_usage
+        from elspeth.plugins.sources.field_normalization import header_spelled_row_lookups
+
+        match self.query_template_row_projection():
+            case AllFields():
+                return {}
+            case DeclaredFields(names=declared):
+                return header_spelled_row_lookups(extract_jinja2_field_usage(self.query_template).fields, declared)
+
     @model_validator(mode="after")
     def _validate_query_template_row_reads(self) -> Self:
         """Refuse a query template whose reads configuration can prove fail or go unused.
@@ -311,6 +332,7 @@ class RetrievalTransformBase(BaseTransform):
 
         self._retrieval_config = retrieval_config
         self._initialize_declared_input_fields(self._retrieval_config)
+        self.header_spelled_lookups = MappingProxyType(self._retrieval_config.header_spelled_row_lookups())
         prefix = self._retrieval_config.output_prefix
 
         # Output field names

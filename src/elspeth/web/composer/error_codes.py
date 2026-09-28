@@ -133,6 +133,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "prompt_template_parts_required",
         "prompt_template_unbound_variables",
         "field_name_header_spelling",
+        "field_name_lookup_unreachable",
         "prompt_template_undeclared_row_fields",
         "proof_repair_exhausted",
         "quarantine_unknown_output",

@@ -86,6 +86,7 @@ class _Transform:
     forwards_input_fields = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str = "mock_transform") -> None:
         self.name = name

@@ -424,7 +424,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:719563e76907222d"
+    source_file_hash: str | None = "sha256:187311dbfdf3a7d6"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (
@@ -486,6 +486,7 @@ class AzureBlobSource(BaseSource):
         self._field_mapping = cfg.field_mapping
         # Headerless CSV (columns, or the schema's field names): field_mapping keys are matched as written.
         self._field_mapping_keys = "as_written" if cfg.format == "csv" and not cfg.csv_options.has_header else "normalized"
+        self._normalizes_external_names = self._field_mapping_keys == "normalized"
         self._field_resolution: FieldResolution | None = None
         self._contract_builder: ContractBuilder | None = None
 

@@ -956,7 +956,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # scheduler_work or audit records).
 # T1 expression typing: value_transform's three union-collision-fail
 # provenance pins changed to 1a8ad03e147600d0. The case outcome is unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "95cff05d16d8f8c515b5eb4f44c7865151ded21798c513ff7baee4c824879246"
+# S-02 source spelling: the csv/json plugin hashes and the reopen-resume
+# projection changed with their source bytes. This registry digest is derived
+# from the merged manifest through the canonical corpus loader.
+EXPECTED_CASE_REGISTRY_SHA256 = "1813b97297194feaad57b2368cbc3e27046ca6688b765dffabd6b971330a23be"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -1074,6 +1074,7 @@ class _TransformWithTypedSchema:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, schema: SchemaConfig) -> None:
         self.name = name
@@ -2615,6 +2616,7 @@ class _PassThroughBranchTransform:
     forwards_input_fields: bool = False
     removed_input_fields: frozenset[str] = frozenset()
     renamed_input_fields: Mapping[str, str] = MappingProxyType({})
+    header_spelled_lookups: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, name: str, added_field: str) -> None:
         self.name = name

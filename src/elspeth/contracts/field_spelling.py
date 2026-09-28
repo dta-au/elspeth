@@ -53,6 +53,7 @@ from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.freeze import freeze_fields
 
 if TYPE_CHECKING:
@@ -136,7 +137,7 @@ def normalized_field_name_or_empty(raw: str) -> str:
     return normalized
 
 
-SpellingLeg = Literal["recorded", "renamed_as_written", "renamed", "normalized", "carried"]
+SpellingLeg = Literal["recorded", "renamed_as_written", "renamed", "normalized", "carried", "own_name"]
 """Which leg of the upstream's resolution named the canonical field (``FieldNameResolution.resolve``).
 
 ``recorded``: the arriving row's contract resolves the literal (it is the
@@ -145,11 +146,20 @@ original name recorded for that field — a lookup ``row[literal]`` reads it).
 literal itself, a column name the source keys as written.
 ``renamed``: a headered source's ``field_mapping`` renames the literal's
 normalized form.
-``normalized``: the literal's normalized form is the field itself.
+``normalized``: the literal's normalized form is the field itself, and a row
+arriving here may carry that field under a source header's spelling
+(``HeaderCarriers``), so a lookup of the literal may read it.
 ``carried``: a transform upstream renamed the field one of the legs above
 names, carrying its identity onto the new name
 (``TransformProtocol.renamed_input_fields``) — so a lookup of the literal
 reads the renamed field.
+``own_name``: the literal's normalized form is the field itself, but no row
+arriving here carries that field under a source header's spelling (it is not
+among the ``HeaderCarriers``: an identity source's column, a source
+``field_mapping`` target, a rename target, a field a node creates), so rows
+record it under its own name only: it is what the literal names as a
+DECLARATION (a header spelling of it is still refused), but a LOOKUP of any
+other spelling of it reads nothing (``unreachable_spelled_lookups``).
 """
 
 FieldMappingKeys = Literal["normalized", "as_written"]
@@ -166,7 +176,10 @@ class SourceFieldRenames:
     """The renames a source applies (``SourceProtocol.field_renames``), keyed the way the source keys them.
 
     ``mapping`` is the source's validated ``field_mapping`` (key -> row key),
-    ``keys`` what those keys are matched against. A source keys a row by
+    ``keys`` what those keys are matched against. ``normalizes_external_names``
+    states whether the source actually derives row keys from external headers;
+    identity sources can match no field_mapping keys yet still record every
+    field under its own name. A source keys a row by
     ``mapping.get(k, k)`` where ``k`` is ``normalize(h)`` for a header ``h``
     under ``normalized`` and the column name itself under ``as_written``, so a
     declared literal names a rename target exactly when its ``k`` is a key.
@@ -174,13 +187,18 @@ class SourceFieldRenames:
 
     mapping: Mapping[str, str]
     keys: FieldMappingKeys
+    normalizes_external_names: bool = False
 
     def __post_init__(self) -> None:
         freeze_fields(self, "mapping")
 
 
-NO_SOURCE_RENAMES = SourceFieldRenames(mapping={}, keys="normalized")
-"""A source that renames nothing: every name it emits resolves by normalization alone."""
+NO_SOURCE_RENAMES = SourceFieldRenames(mapping={}, keys="normalized", normalizes_external_names=True)
+"""The graph default for a normalizing source with no field mapping.
+
+Production graph construction always reads each source instance's explicit
+``field_renames``; this value is the default for manually assembled graphs.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +237,97 @@ def _ordered(entries: Iterable[ResolvedName]) -> tuple[ResolvedName, ...]:
         if name not in first:
             first[name] = leg
     return tuple(sorted(first.items(), key=lambda entry: (entry[1] != "carried", entry[0])))
+
+
+@dataclass(frozen=True, slots=True)
+class HeaderCarriers:
+    """The fields a row arriving here can carry under a source header's spelling — the normalization leg's premise.
+
+    A lookup ``row[literal]`` reads a field whose recorded original name is
+    ``literal`` (``SchemaContract.find_name``). Only a source that keys a row
+    by the NORMALIZED form of each external header records a spelling other
+    than the field's name as its original, and a field keeps that original
+    only while every node on the way hands the input's field contract on
+    (``propagate_contract`` / ``narrow_contract_to_output``: a name that
+    existed upstream keeps its contract, a name new to a node's output records
+    its own name). So the normalization leg (``normalize(literal)`` is the
+    field) can make a lookup read the field only when the field is one of
+    these carriers; every other field is recorded under its own name only.
+
+    Either ONLY ``names`` can (``all_but`` False: a finite upper bound, e.g.
+    a normalizing source whose schema admits no undeclared field), or every
+    name BUT ``names`` can (``all_but`` True: an open normalizing source,
+    minus what is provably recorded under its own name). What is not a
+    carrier, each a fact of configuration:
+
+    - every field of a source that does not normalize external names: it
+      records each field as written;
+    - a source ``field_mapping`` target: it records the header the mapping
+      read, reached by the ``renamed`` leg, never by its own normalization;
+    - a transform rename target (``then_renamed``): it carries the renamed
+      field's original, reached by the ``carried`` leg;
+    - a field a transform creates fresh (``freshly_created_fields``);
+    - every field past a reductive batch output, which keeps none of its
+      input's field contracts (``keeps_input_field_contracts``);
+    - a name outside a node's closed output schema (``within``): gone, so a
+      later writer of that name records its own; and, behind a BOUNDED
+      upstream, a name that closed output adds, new to its output. Behind an
+      open upstream the closed output itself becomes the bound: a name it
+      adds may be an input field it hands on.
+
+    Over-approximates, never under: a carrier may still arrive recorded under
+    its own name (an open source that emits it unspelled), so a lookup the
+    leg admits is decided per row, and one it refuses no row could resolve.
+    """
+
+    names: frozenset[str]
+    all_but: bool
+
+    def carries(self, name: str) -> bool:
+        return (name in self.names) != self.all_but
+
+    @classmethod
+    def of_source(cls, renames: SourceFieldRenames, carried_out: Collection[str] | None) -> HeaderCarriers:
+        """A source's carriers: only names derived from external headers, minus its mapping targets."""
+        if not renames.normalizes_external_names:
+            return NO_HEADER_CARRIERS
+        targets = frozenset(renames.mapping.values())
+        if carried_out is None:
+            return cls(names=targets, all_but=True)
+        return cls(names=frozenset(carried_out) - targets, all_but=False)
+
+    @classmethod
+    def union(cls, parts: Iterable[HeaderCarriers]) -> HeaderCarriers:
+        """Where paths meet: a name any path can carry (no paths: every name, the normalization rule alone)."""
+        collected = tuple(parts)
+        if not collected:
+            return ANY_HEADER_CARRIERS
+        bounded = frozenset().union(*(part.names for part in collected if not part.all_but))
+        open_parts = tuple(part.names for part in collected if part.all_but)
+        if not open_parts:
+            return cls(names=bounded, all_but=False)
+        return cls(names=frozenset.intersection(*open_parts) - bounded, all_but=True)
+
+    def without(self, names: Collection[str]) -> HeaderCarriers:
+        """These carriers less ``names``, which rows past here record under their own names only."""
+        if self.all_but:
+            return HeaderCarriers(names=self.names | frozenset(names), all_but=True)
+        return HeaderCarriers(names=self.names - frozenset(names), all_but=False)
+
+    def within(self, carried_out: Collection[str] | None) -> HeaderCarriers:
+        """These carriers past a node whose output carries at most ``carried_out`` (None: open, unchanged)."""
+        if carried_out is None:
+            return self
+        if self.all_but:
+            return HeaderCarriers(names=frozenset(carried_out) - self.names, all_but=False)
+        return HeaderCarriers(names=self.names & frozenset(carried_out), all_but=False)
+
+
+ANY_HEADER_CARRIERS = HeaderCarriers(names=frozenset(), all_but=True)
+"""Every field may carry a source header's spelling: an open normalizing source, or no upstream known."""
+
+NO_HEADER_CARRIERS = HeaderCarriers(names=frozenset(), all_but=False)
+"""No field carries a source header's spelling: behind identity sources only."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,12 +370,23 @@ class FieldNameResolution:
       rename read that is no normalization fixed point (a headerless column
       ``Name``) is carried on the as-written leg, which a lookup matches as
       written.
-      ``normalizes_names`` says whether any upstream source keys an unmapped
-      external name by its normalized form (``SourceFieldRenames.keys`` is
-      ``normalized``). Behind only headerless sources it is False: they emit
-      every unmapped column as written and record it as its own original
-      name, so no lookup of a literal ever reads the field ``normalize``
-      makes of it, and a rename moves no such field (``then_renamed``).
+      ``header_carriers`` (``HeaderCarriers``) is the fields a row arriving
+      here can carry under a source header's spelling. The normalization
+      leg names a field with the ``normalized`` leg only when it is one;
+      any other field is recorded under its own name only (``own_name``):
+      behind only identity sources no field is (they emit every unmapped
+      column as written and record it as its own original name), so no
+      lookup of a literal ever reads the field ``normalize`` makes of it,
+      and a rename moves no such field (``then_renamed``).
+
+    - what each node between the sources and the resolving node does to
+      the names its rows carry (build time, ``past_node``): a field a
+      transform CREATES carries its own name as its recorded original, and
+      so does a name a node's closed output adds, so neither is a header
+      carrier past it; a field a node provably drops (a named removal, or a
+      name outside its closed output schema) takes every leg naming it with
+      it, so a later, unrelated field of that name never inherits the
+      dropped field's spellings.
 
     The run time does not re-derive a source's renames: its contract already
     records every identity the renames carried, which ``recorded`` reads.
@@ -276,36 +396,33 @@ class FieldNameResolution:
     renames: Mapping[str, tuple[ResolvedName, ...]]
     normalized_moves: Mapping[str, tuple[ResolvedName, ...]]
     recorded: SchemaContract | None
-    normalizes_names: bool
+    header_carriers: HeaderCarriers
 
     def __post_init__(self) -> None:
         freeze_fields(self, "renames_as_written", "renames", "normalized_moves")
 
     @classmethod
-    def of_source_renames(cls, sources: Iterable[SourceFieldRenames]) -> FieldNameResolution:
-        """The build-time resolution over the ``field_renames`` of the given sources, at the sources themselves."""
-        targets: dict[FieldMappingKeys, dict[str, list[ResolvedName]]] = {"as_written": {}, "normalized": {}}
-        legs: dict[FieldMappingKeys, SpellingLeg] = {"as_written": "renamed_as_written", "normalized": "renamed"}
-        normalizes_names = False
-        for source in sources:
-            normalizes_names = normalizes_names or source.keys == "normalized"
-            keyed = targets[source.keys]
-            for key, target in source.mapping.items():
-                if key not in keyed:
-                    keyed[key] = []
-                keyed[key].append((target, legs[source.keys]))
+    def of_source(cls, renames: SourceFieldRenames, *, carried_out: Collection[str] | None) -> FieldNameResolution:
+        """The build-time resolution at one source: its ``field_renames`` and the closed bound of its schema.
+
+        ``carried_out`` is every name the source's rows can carry
+        (``SchemaConfig.closed_field_names`` of its output schema; None when
+        it admits undeclared fields), which bounds its ``HeaderCarriers``.
+        """
+        leg: SpellingLeg = "renamed_as_written" if renames.keys == "as_written" else "renamed"
+        keyed = {key: ((target, leg),) for key, target in sorted(renames.mapping.items())}
         return cls(
-            renames_as_written={key: _ordered(found) for key, found in targets["as_written"].items()},
-            renames={key: _ordered(found) for key, found in targets["normalized"].items()},
+            renames_as_written=keyed if renames.keys == "as_written" else {},
+            renames=keyed if renames.keys == "normalized" else {},
             normalized_moves={},
             recorded=None,
-            normalizes_names=normalizes_names,
+            header_carriers=HeaderCarriers.of_source(renames, carried_out),
         )
 
     @classmethod
     def of_contract(cls, contract: SchemaContract) -> FieldNameResolution:
         """The run-time resolution: the arriving row's own contract (``then_renamed`` is build-time only)."""
-        return cls(renames_as_written={}, renames={}, normalized_moves={}, recorded=contract, normalizes_names=True)
+        return cls(renames_as_written={}, renames={}, normalized_moves={}, recorded=contract, header_carriers=ANY_HEADER_CARRIERS)
 
     @classmethod
     def union(cls, resolutions: Iterable[FieldNameResolution]) -> FieldNameResolution:
@@ -328,7 +445,9 @@ class FieldNameResolution:
             name: _ordered(
                 entry
                 for resolution in parts
-                for entry in (resolution.normalized_moves[name] if name in resolution.normalized_moves else ((name, "normalized"),))
+                for entry in (
+                    resolution.normalized_moves[name] if name in resolution.normalized_moves else (resolution._normalization_leg(name),)
+                )
             )
             for name in moved_names
         }
@@ -337,9 +456,15 @@ class FieldNameResolution:
             renames={key: _ordered(entries) for key, entries in merged[1].items()},
             normalized_moves=moves,
             recorded=None,
-            # No predecessor known: the normalization rule alone, as NORMALIZATION_ONLY.
-            normalizes_names=not parts or any(resolution.normalizes_names for resolution in parts),
+            # A carrier on ANY path: rows from a path that carries a source
+            # header of the name resolve it. No predecessor known: every name,
+            # the normalization rule alone, as NORMALIZATION_ONLY.
+            header_carriers=HeaderCarriers.union(resolution.header_carriers for resolution in parts),
         )
+
+    def _normalization_leg(self, name: str) -> ResolvedName:
+        """The normalization leg's entry for the field ``name`` itself: ``own_name`` unless a row may carry it under a header's spelling."""
+        return (name, "normalized") if self.header_carriers.carries(name) else (name, "own_name")
 
     def then_renamed(self, renamed: Mapping[str, str]) -> FieldNameResolution:
         """This resolution on the far side of a transform that renames ``renamed`` (source spelling -> new name).
@@ -354,17 +479,22 @@ class FieldNameResolution:
           ``field_mapping`` target, an earlier rename's) reads exactly that
           field, and nothing its normalized form might name;
         - any other source reads the literal, what the renames make of it,
-          and — only when an upstream source keys headers by their
-          normalized form (``normalizes_names``) — the field ``normalize``
-          makes of a header spelled like it. Behind headerless sources alone
-          no lookup of a literal reads that field, so it does not move.
+          and — only when a row may carry that field under a source header's
+          spelling (``HeaderCarriers``) — the field ``normalize`` makes of a
+          header spelled like it. Behind headerless sources alone no lookup
+          of a literal reads that field, so it does not move.
 
         Only a field the lookup can read moves: renaming a field away never
         makes a later declaration stricter than keeping it would. Every leg
         naming a renamed field now names the new one. So does the
         normalization leg of the renamed name itself, unless that name is a
         field some other leg already names: its identity is that other
-        spelling, and the old name no longer reaches it.
+        spelling, and the old name no longer reaches it. A lookup of another
+        spelling of a field rows record under its own name only (``own_name``)
+        reads nothing, so only that name itself moves it. A rename target is
+        no header carrier past the rename: it carries the renamed field's
+        recorded original, which the ``carried`` leg reaches, and never a
+        header spelling of its own name.
         """
         named_elsewhere = {
             name
@@ -380,7 +510,12 @@ class FieldNameResolution:
                 if source in named_elsewhere
                 else {
                     source,
-                    *(found for found, leg in self.resolve(DeclaredName.of(source)) if leg != "normalized" or self.normalizes_names),
+                    *(
+                        found
+                        for found, leg in self.resolve(DeclaredName.of(source))
+                        # A field recorded under its own name only: no other spelling's lookup reads it.
+                        if leg != "own_name"
+                    ),
                 }
             )
             for field_name in reads:
@@ -417,7 +552,7 @@ class FieldNameResolution:
             renames={key: moved(entries) for key, entries in self.renames.items()},
             normalized_moves=moves,
             recorded=None,
-            normalizes_names=self.normalizes_names,
+            header_carriers=self.header_carriers.without({target for targets in moved_to.values() for target in targets}),
         )
 
     def resolve(self, name: DeclaredName) -> Iterator[ResolvedName]:
@@ -434,14 +569,176 @@ class FieldNameResolution:
             if name.normalized in self.normalized_moves:
                 yield from self.normalized_moves[name.normalized]
             else:
-                yield name.normalized, "normalized"
+                yield self._normalization_leg(name.normalized)
+
+    def past_node(
+        self,
+        *,
+        renamed: Mapping[str, str],
+        created: Collection[str],
+        removed: Collection[str],
+        carried_out: Collection[str] | None,
+        keeps_input_contracts: bool,
+    ) -> FieldNameResolution:
+        """This resolution on the far side of one node, from what the node provably does to the names its rows carry.
+
+        ``keeps_input_contracts`` (``keeps_input_field_contracts``) False: the
+        node records every field it emits under its own name, whatever its
+        input carried, so past it only a field's own name reaches it
+        (``OWN_NAMES_ONLY``) and the other facts do not matter.
+
+        ``renamed`` is the node's identity-carrying renames (``then_renamed``).
+        ``created`` is the fields it creates FRESH (``freshly_created_fields``):
+        each records its own name as its original, so any leg that named an
+        earlier field of that name is stale, and the name is no header
+        carrier past the node. ``removed`` is the node's named removal set
+        and ``carried_out`` the closed upper bound of the names its rows carry
+        (``SchemaConfig.closed_field_names``; None when its output is open):
+        a field outside them is gone, so every leg naming it goes too — a
+        later, unrelated field of that name must not inherit the dropped
+        field's spellings. A name the node itself writes is never gone.
+        A key left with no leg is dropped, so its literal falls back to the
+        normalization leg: the resolution over-approximates, never under.
+        The closed bound also bounds the header carriers (``within``); the
+        removal set does not, since over-stating it is allowed
+        (``TransformProtocol.removed_input_fields``) and taking a carrier away
+        refuses a lookup.
+        """
+        if not keeps_input_contracts:
+            return OWN_NAMES_ONLY
+        after = self.then_renamed(renamed)
+        written = frozenset(created) | frozenset(renamed.values())
+        fresh = frozenset(created) - frozenset(renamed.values())
+
+        def gone(name: str) -> bool:
+            if name in fresh:
+                return True
+            if name in written:
+                return False
+            return name in removed or (carried_out is not None and name not in carried_out)
+
+        def kept(legs: Mapping[str, tuple[ResolvedName, ...]]) -> dict[str, tuple[ResolvedName, ...]]:
+            pruned = {key: tuple(entry for entry in entries if not gone(entry[0])) for key, entries in legs.items()}
+            return {key: entries for key, entries in pruned.items() if entries}
+
+        return FieldNameResolution(
+            renames_as_written=kept(after.renames_as_written),
+            renames=kept(after.renames),
+            normalized_moves=kept(after.normalized_moves),
+            recorded=None,
+            header_carriers=after.header_carriers.without(fresh).within(carried_out),
+        )
 
 
-NORMALIZATION_ONLY = FieldNameResolution(renames_as_written={}, renames={}, normalized_moves={}, recorded=None, normalizes_names=True)
+def freshly_created_fields(
+    *,
+    declared_output_fields: Collection[str],
+    renamed_input_fields: Mapping[str, str],
+    passes_through_input: bool,
+    forwards_input_fields: bool,
+) -> frozenset[str]:
+    """The fields a TRANSFORM creates fresh: every row it emits records each under its own name as its original.
+
+    A transform whose write path keeps the input row
+    (``can_overwrite_input_fields``) is refused, per row, any input that
+    already carries one of its ``declared_output_fields`` (the executor's
+    field-collision preflight), so each such field is new to its output
+    contract, which records a new field's own name as its original
+    (``propagate_contract`` / ``narrow_contract_to_output``: a name the input
+    contract lacks enters as ``FieldContract.inferred(name, name, ...)``). A
+    rename target is not fresh: it carries the renamed field's identity
+    (``renamed_input_fields``). A transform that builds a fresh row runs no
+    collision preflight — an output field of an input's name keeps that
+    input's contract — so it creates nothing fresh here; its closed output
+    schema, where it has one, bounds the header carriers instead
+    (``HeaderCarriers.within``).
+    """
+    if not can_overwrite_input_fields(passes_through_input=passes_through_input, forwards_input_fields=forwards_input_fields):
+        return frozenset()
+    return frozenset(declared_output_fields) - frozenset(renamed_input_fields.values())
+
+
+def keeps_input_field_contracts(*, batch_output: bool, passes_through_input: bool, forwards_input_fields: bool) -> bool:
+    """Whether the rows a node emits keep the field contracts of the rows it read (``FieldNameResolution.past_node``).
+
+    A row-to-row transform always does: its output contract is its input's,
+    narrowed or extended (``propagate_contract`` /
+    ``narrow_contract_to_output``), so a field of an input's name keeps that
+    input's recorded original. A BATCH output (``batch_output``: an
+    aggregation or collector flush) keeps them only when the plugin passes
+    its buffered rows through or forwards their fields
+    (``can_overwrite_input_fields``: batch_replicate, batch_rank,
+    batch_outlier_annotator merge their input contracts); a reductive one —
+    a statistics row, a comparison, an assembled report — builds a contract
+    of its own in which every key is the plugin's, recorded under its own
+    name (``BaseTransform._batch_output_contract``), even a key named like
+    an input field.
+    """
+    return not batch_output or can_overwrite_input_fields(
+        passes_through_input=passes_through_input, forwards_input_fields=forwards_input_fields
+    )
+
+
+def unreachable_spelled_lookups(lookups: Mapping[str, str], resolution: FieldNameResolution) -> tuple[HeaderSpelling, ...]:
+    """The row lookups by a spelling that no row arriving here can resolve to the field it names.
+
+    ``lookups`` maps a literal a node looks a declared field up by to that
+    declared field (``TransformProtocol.header_spelled_lookups``: a template's
+    ``row['Name']`` under ``required_input_fields: [name]``). At run time the
+    lookup resolves only when the arriving row records the literal as the
+    field's original name, which only a header carrier's can
+    (``HeaderCarriers``). ``resolution`` is the union over every live path to
+    the node, so the lookup is refused only when NO path can deliver the
+    field under that spelling — never a runnable pipeline. Both names are
+    configuration (value-free).
+    """
+    unreachable = []
+    for literal, canonical in sorted(lookups.items()):
+        reachable = {found for found, leg in resolution.resolve(DeclaredName.of(literal)) if leg != "own_name"}
+        if canonical not in reachable:
+            # Why: no path delivers the field under a source header's
+            # spelling, or the field a header of that spelling names was
+            # renamed away upstream.
+            leg: SpellingLeg = "carried" if resolution.header_carriers.carries(canonical) else "own_name"
+            unreachable.append(HeaderSpelling(literal=literal, canonical=canonical, kind="read", leg=leg))
+    return tuple(unreachable)
+
+
+def describe_unreachable_spelled_lookups(lookups: Iterable[HeaderSpelling]) -> str:
+    """Render refused lookups for an error message: config literals and declared names only (value-free)."""
+    return "; ".join(
+        f"'{lookup.literal}' reads '{lookup.canonical}' by a spelling no arriving row carries it under: "
+        + (
+            f"no row arrives here with '{lookup.canonical}' recorded under a source header's spelling (a headerless "
+            f"source records each column as written, a field_mapping or rename target the name it was renamed from, "
+            f"and a field a node creates, or any field a statistics-style aggregation or collector emits, its own "
+            f"name), so a lookup of '{lookup.literal}' reads nothing"
+            if lookup.leg == "own_name"
+            else f"a transform upstream renames the field a header spelled '{lookup.literal}' names away from '{lookup.canonical}'"
+        )
+        + f". Read it as row['{lookup.canonical}']"
+        for lookup in lookups
+    )
+
+
+NORMALIZATION_ONLY = FieldNameResolution(
+    renames_as_written={}, renames={}, normalized_moves={}, recorded=None, header_carriers=ANY_HEADER_CARRIERS
+)
 """The resolution with no upstream rename and no row contract: ``normalize(T)`` alone.
 
 For names checked against names the SAME node creates (value_transform's targets
 against one another), where no upstream resolution is involved.
+"""
+
+OWN_NAMES_ONLY = FieldNameResolution(
+    renames_as_written={}, renames={}, normalized_moves={}, recorded=None, header_carriers=NO_HEADER_CARRIERS
+)
+"""The resolution of rows that record every field under its own name only: no rename leg, no header carrier.
+
+Past a node that keeps none of its input's field contracts
+(``keeps_input_field_contracts``): every spelling of a field but its name
+names it only by the ``own_name`` leg, which a declaration still refuses and
+a lookup never reads.
 """
 
 
@@ -486,10 +783,12 @@ def _spelled(
 def header_spelling_canonical(name: str, present: Collection[str]) -> str | None:
     """The canonical field ``name`` is a header spelling of among names one node creates itself, or None.
 
-    Normalization only (``NORMALIZATION_ONLY``): the names in ``present`` are
-    this node's own, so no upstream resolution applies. A name that is present
-    is never a header spelling (a row can carry ``B`` and ``b`` as two fields:
-    a source ``field_mapping`` value bypasses normalization).
+    Normalization only (``NORMALIZATION_ONLY``): ``present`` is the names one
+    node creates, or the names a template node declares it may read. A header
+    spelling of a declared field is covered at plugin config time; upstream
+    resolution later decides whether that spelling is reachable from a source.
+    A name already present is never a header spelling (a row can carry ``B``
+    and ``b`` as two distinct fields).
     """
     spelled = _spelled(_declared((name,)), present, NORMALIZATION_ONLY, kind="create")
     return spelled[0].canonical if spelled else None
@@ -664,7 +963,7 @@ def describe_header_spelling(spelling: HeaderSpelling) -> str:
 
 HEADER_SPELLING_RULE = (
     "Row lookups (an expression's row['<header>'], a field_mapper source, an option that only locates a field) resolve "
-    "either spelling; a declaration — a schema field, required_input_fields, an input option the plugin declares, a "
+    "either spelling of a source header; a declaration — a schema field, required_input_fields, an input option the plugin declares, a "
     "created name — must name the field as rows carry it."
 )
 """The closing sentence every refusal of the rule carries, build and run time alike."""

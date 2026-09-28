@@ -287,9 +287,10 @@ class DataverseSource(BaseSource):
     validated at the Tier 3 boundary (JSON parse, NaN/Infinity rejection).
     """
 
+    _normalizes_external_names = True
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f97eb2c8e80ef0b1"
+    source_file_hash: str | None = "sha256:fe84ee1118943bf9"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 

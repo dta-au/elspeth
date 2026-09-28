@@ -28,9 +28,12 @@ from elspeth.contracts.field_spelling import (
     NO_SOURCE_RENAMES,
     DeclaredSpellings,
     FieldNameResolution,
-    SourceFieldRenames,
     describe_header_spellings,
+    describe_unreachable_spelled_lookups,
+    freshly_created_fields,
     header_spelled_declarations,
+    keeps_input_field_contracts,
+    unreachable_spelled_lookups,
 )
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
@@ -1987,9 +1990,9 @@ _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION: Final[str] = (
 # raises ``DeclaredRequiredInputFieldsViolation`` on EVERY row. Leading with it
 # would hand the planner a repair that clears this error and breaks the run.
 _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX: Final[str] = (
-    "Change ONLY that node. Rewrite each reference to a field the node already declares — that always applies, and a "
-    "spelling the declaration does not carry works at best by accident of the producer's original header, so "
-    "'correcting' the declaration to match a template typo moves the failure rather than clearing it. Add a name to "
+    "Change ONLY that node. Rewrite each reference to a field the node already declares, by its declared name — that "
+    "always applies, and 'correcting' the declaration to match a template typo moves the failure rather than "
+    "clearing it. Add a name to "
     "options.required_input_fields ONLY if the upstream producer guarantees that exact name: declaring one it does "
     "not guarantee is refused when the pipeline is validated. "
     'Where the rejection shows a parenthesised form, declare THAT — a bracket literal such as row["Original Header"] '
@@ -4312,12 +4315,15 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
     the context can be built from a contracted row — the ``input_fields``
     values need no template at all. The message is the plugin layer's
     (``multi_query_undeclared_columns_message``), so both surfaces read one
-    text. Coverage is ``undeclared_row_fields``'s exact comparison: an
+    text. Coverage is ``undeclared_row_fields``'s comparison (a declared
+    name, or a header spelling of one, ADR-051 (b)): an
     ``input_fields`` value against the declaration plus ``image_inputs``
     columns (``LLMConfig.declared_input_fields``: it is read in the parent,
     from the full row), a ``row.source_row.<column>`` read against the
     declaration alone (the template's ``source_row`` holds only the declared
-    fields, ADR-051).
+    fields, ADR-051). Whether an arriving row can carry a header spelling is
+    the upstream's fact, checked in ``_check_schema_contracts``
+    (``field_name_lookup_unreachable``).
     """
     queries = node.options.get("queries")
     if queries is None:
@@ -7591,38 +7597,46 @@ def _check_schema_contracts(
     # a probe instance's ``field_renames`` exactly as the builder reads the real
     # source's, followed through every transform's ``renamed_input_fields`` on
     # the way (``upstream_name_resolution`` in core/dag/schema_validation.py).
-    source_renames_memo: dict[str, SourceFieldRenames] = {}
+    source_resolution_memo: dict[str, FieldNameResolution] = {}
 
-    def _source_field_renames(producer: ProducerEntry) -> SourceFieldRenames:
-        """A source producer's ``field_renames``; none when its draft config does not construct.
+    def _source_name_resolution(producer: ProducerEntry) -> FieldNameResolution:
+        """A source producer's resolution (``FieldNameResolution.of_source``), read off a probe as the builder reads the source.
 
-        A source that does not build is refused by its own validation, and the
-        build that would read its renames never runs, so it contributes none.
+        Its ``field_renames``, and the closed bound of the output schema the
+        builder assigns the source node: the probe's computed
+        ``_output_schema_config``, else its declared schema. A source that
+        does not build is refused by its own validation, and the build that
+        would read it never runs, so it contributes no rename and no bound.
         """
         source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
-        if source_name in source_renames_memo:
-            return source_renames_memo[source_name]
+        if source_name in source_resolution_memo:
+            return source_resolution_memo[source_name]
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
         from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 
         source_spec = source_map[source_name]
         probe: SourceProtocol | None = None
-        renames: SourceFieldRenames
+        resolution: FieldNameResolution
         try:
             probe_options = prepare_validation_probe_options(source_spec.options, plugin=source_spec.plugin)
             probe_options["on_validation_failure"] = source_spec.on_validation_failure
             with plugin_preflight_mode(True):
                 probe = get_shared_plugin_manager().create_source(source_spec.plugin, probe_options)
-            renames = probe.field_renames
+            schema_config = probe._output_schema_config
+            if schema_config is None:
+                schema_config, _ = _parse_producer_raw_schema(producer)
+            resolution = FieldNameResolution.of_source(
+                probe.field_renames, carried_out=None if schema_config is None else schema_config.closed_field_names()
+            )
         except Exception as exc:
             if not _is_source_config_probe_exception(exc):
                 raise
-            renames = NO_SOURCE_RENAMES
+            resolution = FieldNameResolution.of_source(NO_SOURCE_RENAMES, carried_out=None)
         finally:
             if probe is not None:
                 probe.close()
-        source_renames_memo[source_name] = renames
-        return renames
+        source_resolution_memo[source_name] = resolution
+        return resolution
 
     def _node_input_connections(node: NodeSpec) -> tuple[str, ...]:
         return _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
@@ -7656,32 +7670,60 @@ def _check_schema_contracts(
     live_reach_memo: dict[tuple[str, ...], FieldNameResolution] = {}
     producer_resolution_memo: dict[str, FieldNameResolution] = {}
 
-    def _transform_renamed_input_fields(node: NodeSpec) -> Mapping[str, str]:
-        """A transform node's ``renamed_input_fields``, read off its shared probe; none for any other kind.
+    def _past_producer_node(node: NodeSpec, resolution: FieldNameResolution, producer: ProducerEntry) -> FieldNameResolution:
+        """``resolution`` on the far side of ``node``: the facts the builder threads onto its ``NodeInfo``, read off its shared probe.
 
-        Exactly what the builder threads onto a TRANSFORM ``NodeInfo``. A node
-        whose draft options do not construct is refused by its own validation
-        and the build that would follow its renames never runs, so it renames
-        nothing here (as ``_source_field_renames`` abstains).
+        Mirrors ``_output_name_resolution``: renames and freshly created fields
+        at a TRANSFORM, the named removal set at a transform, aggregation or
+        collector, the closed upper bound of their output schema (the one
+        ``_known_producer_schema_config`` proves, as the builder assigns it),
+        and whether a batch output keeps its input's field contracts at all
+        (``keeps_input_field_contracts``). Any other node kind, and a node
+        whose draft options do not construct (refused by its own validation,
+        so the build that would follow it never runs), passes every name
+        through, as ``_source_name_resolution`` abstains.
         """
-        if node.node_type != "transform" or node.plugin is None:
-            return {}
+        if node.node_type not in ("transform", "aggregation", "collector") or node.plugin is None:
+            return resolution.past_node(renamed={}, created=(), removed=(), carried_out=None, keeps_input_contracts=True)
         try:
-            return probe_cache.transform(node.plugin, node).renamed_input_fields
+            transform = probe_cache.transform(node.plugin, node)
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
-            return {}
+            return resolution.past_node(renamed={}, created=(), removed=(), carried_out=None, keeps_input_contracts=True)
+        is_transform = node.node_type == "transform"
+        renamed = transform.renamed_input_fields if is_transform else {}
+        output_config = _known_producer_schema_config(producer)
+        return resolution.past_node(
+            renamed=renamed,
+            created=(
+                freshly_created_fields(
+                    declared_output_fields=transform.declared_output_fields,
+                    renamed_input_fields=renamed,
+                    passes_through_input=transform.passes_through_input,
+                    forwards_input_fields=transform.forwards_input_fields,
+                )
+                if is_transform
+                else ()
+            ),
+            removed=transform.removed_input_fields,
+            carried_out=None if output_config is None else output_config.closed_field_names(),
+            keeps_input_contracts=keeps_input_field_contracts(
+                batch_output=not is_transform,
+                passes_through_input=transform.passes_through_input,
+                forwards_input_fields=transform.forwards_input_fields,
+            ),
+        )
 
     def _producer_name_resolution(producer: ProducerEntry) -> FieldNameResolution:
         """The name resolution of the rows ``producer`` emits (``_output_name_resolution`` in the builder's validator)."""
         if producer.producer_id in producer_resolution_memo:
             return producer_resolution_memo[producer.producer_id]
         if is_source_producer_id(producer.producer_id):
-            resolution = FieldNameResolution.of_source_renames((_source_field_renames(producer),))
+            resolution = _source_name_resolution(producer)
         else:
             node = node_by_id[producer.producer_id]
-            resolution = _live_name_resolution(_node_input_connections(node)).then_renamed(_transform_renamed_input_fields(node))
+            resolution = _past_producer_node(node, _live_name_resolution(_node_input_connections(node)), producer)
         producer_resolution_memo[producer.producer_id] = resolution
         return resolution
 
@@ -7751,6 +7793,35 @@ def _check_schema_contracts(
             ),
         )
 
+    def _unreachable_lookup_error(node: NodeSpec) -> ValidationEntry | None:
+        """The builder's ``validate_spelled_row_lookups_reachable`` for one transform node, or None.
+
+        The node's ``header_spelled_lookups`` (read off its shared probe; a
+        node whose options do not construct is refused by its own validation)
+        against the resolution united over every live producer of its input,
+        through the one predicate ``unreachable_spelled_lookups``.
+        """
+        if node.plugin is None:
+            return None
+        try:
+            lookups = probe_cache.transform(node.plugin, node).header_spelled_lookups
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return None
+        if not lookups:
+            return None
+        unreachable = unreachable_spelled_lookups(lookups, _live_name_resolution(_node_input_connections(node)))
+        if not unreachable:
+            return None
+        return _err(
+            f"node:{node.id}",
+            f"Unreachable header spelling: Transform '{node.id}' ({node.plugin}) reads fields by a spelling no row "
+            f"arriving at it carries: {describe_unreachable_spelled_lookups(unreachable)}.",
+            "high",
+            "field_name_lookup_unreachable",
+        )
+
     class _SpellingSurfaces(NamedTuple):
         declared: DeclaredSpellings
         removed: frozenset[str]
@@ -7794,6 +7865,9 @@ def _check_schema_contracts(
             continue
         if node.id in parse_failed_producers:
             continue
+        lookup_error = _unreachable_lookup_error(node)
+        if lookup_error is not None:
+            errors.append(lookup_error)
         surfaces = _probe_transform_spelling_surfaces(node.plugin, node)
         # A node that declares nothing has nothing any upstream could make a
         # header spelling, so no producer is walked for it.

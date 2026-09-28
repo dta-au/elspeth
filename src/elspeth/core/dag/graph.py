@@ -80,8 +80,8 @@ if TYPE_CHECKING:
 # if the type were ever changed to a mutable container.
 _EMPTY_DECLARED_REQUIRED_FIELDS: frozenset[str] = frozenset()
 
-# The empty renamed_input_fields default: a read-only mapping, so the shared
-# default instance cannot be mutated through one node's NodeInfo.
+# The empty renamed_input_fields / header_spelled_lookups default: a read-only
+# mapping, so the shared default instance cannot be mutated through one node's NodeInfo.
 _NO_RENAMED_INPUT_FIELDS: Mapping[str, str] = MappingProxyType({})
 
 
@@ -183,6 +183,7 @@ class ExecutionGraph:
         carried_output_sources: Mapping[str, str] | None = None,
         field_renames: SourceFieldRenames = NO_SOURCE_RENAMES,
         renamed_input_fields: Mapping[str, str] = _NO_RENAMED_INPUT_FIELDS,
+        header_spelled_lookups: Mapping[str, str] = _NO_RENAMED_INPUT_FIELDS,
     ) -> None:
         """Add a node to the execution graph.
 
@@ -284,6 +285,10 @@ class ExecutionGraph:
             renamed_input_fields: For TRANSFORM nodes only — the transform's
                 identity-carrying renames (TransformProtocol.renamed_input_fields),
                 followed by the same resolution. NodeInfo guards against misuse.
+            header_spelled_lookups: For TRANSFORM nodes only — the transform's
+                row lookups by a spelling other than the field it declares
+                (TransformProtocol.header_spelled_lookups), each proved
+                resolvable on an arriving row. NodeInfo guards against misuse.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -329,6 +334,7 @@ class ExecutionGraph:
             carried_output_sources=carried_output_sources if carried_output_sources is not None else {},
             field_renames=field_renames,
             renamed_input_fields=renamed_input_fields,
+            header_spelled_lookups=header_spelled_lookups,
             passes_through_input=passes_through_input,
             forwards_input_fields=forwards_input_fields,
             removed_input_fields=removed_input_fields,
