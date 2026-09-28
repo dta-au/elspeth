@@ -129,7 +129,7 @@ class GatewayConfig(BaseModel):
     oauth_scopes: tuple[str, ...] = ()
     oauth_fixed_lifetime_seconds: int | None = None
     refresh_skew_seconds: int = 60
-    request_timeout_seconds: float = 60.0
+    request_timeout_seconds: float = 300.0
     max_body_bytes: int = 1_048_576
     max_response_bytes: int = 4_194_304
     bounds: Bounds
@@ -357,7 +357,7 @@ def load_config(environ: Mapping[str, str]) -> GatewayConfig:
             refresh_skew_seconds = parsed_skew
 
     request_timeout_raw = _read(environ, _REQUEST_TIMEOUT_SECONDS)
-    request_timeout_seconds = 60.0
+    request_timeout_seconds = 300.0
     if request_timeout_raw is not None:
         parsed_timeout = _parse_float(request_timeout_raw, env_key=_REQUEST_TIMEOUT_SECONDS, errors=errors)
         if parsed_timeout is not None:
