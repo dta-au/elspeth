@@ -408,3 +408,15 @@ class TestCanonicalJsonLoadsIsTheEncodersInverse:
     def test_a_non_finite_constant_is_a_decode_error(self, constant: str) -> None:
         with pytest.raises(json.JSONDecodeError, match="non-finite JSON constant"):
             canonical_json_loads('{"x": ' + constant + "}")
+
+    @pytest.mark.parametrize("literal", ["1" + "0" * 400, "-1" + "0" * 400, "1e400", "-1e400"])
+    def test_numeric_literal_that_overflows_to_infinity_is_a_decode_error(self, literal: str) -> None:
+        with pytest.raises(json.JSONDecodeError, match="non-finite JSON number"):
+            canonical_json_loads('{"x": ' + literal + "}")
+
+    def test_integer_literal_over_python_digit_limit_is_a_decode_error(self) -> None:
+        with pytest.raises(json.JSONDecodeError, match="JSON integer"):
+            canonical_json_loads('{"x": ' + "9" * 5000 + "}")
+
+    def test_large_finite_exponent_still_decodes(self) -> None:
+        assert canonical_json_loads('{"x": 1e308}') == {"x": 1e308}

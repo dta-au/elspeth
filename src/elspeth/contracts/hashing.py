@@ -93,7 +93,13 @@ _CANONICAL_SAFE_INTEGER_MAX = 2**53 - 1
 
 
 def _parse_canonical_integer_literal(literal: str) -> int | float:
-    value = int(literal)
+    try:
+        value = int(literal)
+    except ValueError as exc:
+        # CPython raises ValueError for an integer token beyond its decimal
+        # conversion digit limit. Persisted JSON corruption must retain the
+        # same decode-error class as every other invalid numeric literal.
+        raise json.JSONDecodeError("JSON integer literal exceeds decoder limit", literal, 0) from exc
     if -_CANONICAL_SAFE_INTEGER_MAX <= value <= _CANONICAL_SAFE_INTEGER_MAX:
         return value
     # Beyond the safe range only a double can have produced this literal:
@@ -101,7 +107,17 @@ def _parse_canonical_integer_literal(literal: str) -> int | float:
     # (1e17 -> 100000000000000000), and the encoder refuses such ints.
     # The literal is that double's shortest round-trip form, so float() of
     # it is exactly the value that was encoded.
-    return float(literal)
+    double = float(literal)
+    if not math.isfinite(double):
+        raise json.JSONDecodeError("non-finite JSON number", literal, 0)
+    return double
+
+
+def _parse_canonical_float_literal(literal: str) -> float:
+    value = float(literal)
+    if not math.isfinite(value):
+        raise json.JSONDecodeError("non-finite JSON number", literal, 0)
+    return value
 
 
 def _refuse_non_finite_literal(literal: str) -> Any:
@@ -126,9 +142,15 @@ def canonical_json_loads(text: str | bytes) -> Any:
     ``5``), and ``int`` is the established reading of that text. Outside the
     safe range the literal can only have come from a double, so it is read
     back as that double. NaN / Infinity never appear in canonical JSON and
-    are refused as a decode error.
+    are refused as a decode error, including numeric literals that overflow
+    to infinity during Python's float conversion.
     """
-    return json.loads(text, parse_int=_parse_canonical_integer_literal, parse_constant=_refuse_non_finite_literal)
+    return json.loads(
+        text,
+        parse_int=_parse_canonical_integer_literal,
+        parse_float=_parse_canonical_float_literal,
+        parse_constant=_refuse_non_finite_literal,
+    )
 
 
 def stable_hash(obj: Any) -> str:
