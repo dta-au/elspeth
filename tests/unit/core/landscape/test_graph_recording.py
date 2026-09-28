@@ -1988,7 +1988,9 @@ class TestResumeAcrossTheDeclarationChange:
             ),
             locked=True,
         )
-        with pytest.raises(FrameworkBugError, match="'copies' has conflicting types 'int' and 'object'"):
+        # A declared ``any`` field's contract type is ``object``; the conflict
+        # names it ``any``, the schema vocabulary (G2, 4bb77fbd5).
+        with pytest.raises(FrameworkBugError, match="'copies' has conflicting types 'int' and 'any'"):
             factory.data_flow.update_node_output_contract(
                 "xfm", post_change, member_token=leader_coordination_token(factory, "run-1").membership
             )
