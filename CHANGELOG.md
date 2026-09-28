@@ -643,6 +643,33 @@ drained and repair this release forward.
   runs, approvals, attestations and authentication events for the identities in
   their scope. With governance off — the default — none of this is enforced and
   runs are admitted without an approval, as before.
+- **People & access in one place.** Authorized administrators can find a person
+  and manage access, roles, approvers, usage limits and local sign-in from one
+  searchable panel. Live local administrators can manage local accounts, and
+  neither the web UI nor the operator CLI can remove the last administrator
+  who can still sign in.
+- **Freeform is the Composer default.** New users open in Freeform, and the
+  tutorial hands off to it. Composer puts
+  blocking readiness decisions and their next actions beside the conversation,
+  including the controls for requesting an approval.
+- **Review follows the content that will run.** Composer requires the complete
+  live prompt for approval and binds the approved artifact to the effective
+  system and query prompts. Advisor evidence and injection checks include the
+  shared system prompt and up to eight query templates, with further queries
+  marked as withheld. Stale review actions are rejected after the source or
+  prompt changes.
+- **Composer validation honors authored contracts.** It evaluates every
+  declared semantic requirement and accepts the documented string form of
+  explicit schema fields for authored LLM nodes.
+- **Advisor blocks preserve the conversation.** A blocked turn keeps the
+  Composer reply and shows the reviewer's bounded finding and repair action.
+  Structured verdicts distinguish a rejected graph from a transient review
+  failure: transient failures can be retried, while an unchanged rejected
+  graph is not reviewed repeatedly.
+- **Uploaded material is validated against its contents.** Composer can use
+  uploaded CSV or JSON reference tables in `reference_join` and uploaded text
+  in an LLM prompt. Readiness validation reads the authorized, pinned bytes;
+  missing, changed or invalid content is refused before execution.
 - **The "Save for review" gesture is renamed "Share inspect link".** The old
   name read as a request addressed to someone, which is what the new send-for-
   review verb actually does; this one mints a link that anyone holding it can
@@ -693,7 +720,22 @@ drained and repair this release forward.
   validation check is removed with it. See the
   [environment reference](docs/reference/environment-variables.md#azure-ai-search)
   and the [Container Apps runbook](docs/runbooks/azure-container-apps-cold-install.md).
+- **LLM costs use an explicit billing identity.** Operator profiles can name a
+  `pricing_model` separately from the model used for routing; accounting keeps
+  provider usage and price provenance, and reports an unknown price as
+  unavailable. Azure reasoning deployments now receive the required completion
+  token parameter. Set `temperature: null` on LLM nodes using those deployments
+  so Azure does not reject their row calls.
+- **Web run limits are operator configurable.**
+  `ELSPETH_WEB__EXECUTION_RATE_LIMIT` controls the external-call rate for
+  web-executed pipelines; the default remains 60 calls per minute per service.
 
+- **Web progress survives interrupted connections.** PostgreSQL-backed
+  replicas share Composer progress, run events, WebSocket tickets and rate
+  budgets, and an admitted run can recover after a replica is lost. The Run
+  view also recovers progress after a stream ends while the tab is closed;
+  temporary backend failures reconnect, and stale Composer poll responses
+  cannot roll progress backward.
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a
   clock sampled before it, and sink-effect clocks are sampled after their lease
@@ -707,7 +749,17 @@ drained and repair this release forward.
   error reaches the audit trail instead of the rollback's own error.
 - **Blob custody stays fenced across durable effects and recovery.** Collector
   blob custody and fatal archive failures are preserved, and custody walkers
-  reject null canonical sections rather than treating them as empty.
+  reject null canonical sections rather than treating them as empty. Cleanup
+  metrics no longer expose session or blob identifiers as labels.
+- **Document and storage boundaries fail closed.** Azure safety scans reject
+  rows with no scannable text; Azure Blob reads and CSV writes enforce byte
+  limits, and replayed sink effects bind to the storage account. PDF
+  rasterization rejects missing or duplicate worker pages before emitting
+  results.
+- **Release signing stays under operator custody.** CI workflows no longer
+  bind the judge-metadata signing key. Push checks still require verification
+  and fail closed without it; authoritative verification requires an
+  operator-controlled context.
 - **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
   refresh, database work is offloaded off the request path, and response
   streams carry size caps.
