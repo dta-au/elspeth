@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFenceLost
@@ -130,12 +130,8 @@ async def test_create_pipeline_proposal_accepts_live_compose_context() -> None:
     proposal = PipelineProposal.create(
         pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     plan = PipelinePlanResult(
         proposal=proposal,

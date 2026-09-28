@@ -8,7 +8,6 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
-from elspeth.web.composer.guided.state_machine import GUIDED_SESSION_SCHEMA_VERSION
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -45,7 +44,6 @@ def test_changelog_describes_release_boundaries_precisely() -> None:
     assert "before external publication" in release
     assert "before I/O" not in release
     assert "shared proposal and validation contract" in release
-    assert "guided-staged" in release
     assert "elspeth export-resume <run-id> --execute" in release
     assert "sink-effect-v1" not in release
 
@@ -60,6 +58,7 @@ def test_changelog_preserves_historical_epochs_and_assigns_live_epochs_to_curren
 
     assert f"SESSION_SCHEMA_EPOCH` advances from 53\nto {SESSION_SCHEMA_EPOCH}" in current_release
     assert f"SQLITE_SCHEMA_EPOCH` advances from 38 to {SQLITE_SCHEMA_EPOCH}" in current_release
+    assert f"Session epoch {SESSION_SCHEMA_EPOCH} removes mode-specific operation state" in current_release
     assert f"install {CURRENT_VERSION}" in " ".join(current_release.split())
 
     assert "SESSION_SCHEMA_EPOCH` advances from 35\nto 53" in release_080
@@ -109,13 +108,13 @@ def test_home_surfaces_current_and_predecessor_releases_without_invented_counts(
 def test_authoring_describes_current_staged_and_structural_capabilities() -> None:
     html = _text(WEBSITE / "authoring.html")
 
-    assert "source → sink → transforms → wiring" in html
+    assert "Freeform — one open conversation to build and revise the pipeline" in html
     assert "source → transforms → sink → wire" not in html
     assert "LLM-primary" in html
     assert "candidate remains separate" in html.lower()
-    assert "cross-sink write-failure fallback" in html
-    assert "require-all coalesce" in html
-    assert "freeform and guided-full" in html
+    assert "structural queues, fork, and coalesce nodes" in html
+    assert "require_all" in html
+    assert "The freeform Web Composer uses an LLM" in html
     assert "In the bundled" not in html
     assert "38ac0f55" not in html and "098ec06d" not in html
     for capability in ("structural queue", "fork", "coalesce", "text source", "text sink"):
@@ -164,14 +163,14 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert len(current) == 1
     current_text = current[0].get_text(" ", strip=True)
     assert f"From 0.8.0 to {CURRENT_VERSION}" in current_text
-    assert "SESSION_SCHEMA_EPOCH" in current_text and f"53 → {SESSION_SCHEMA_EPOCH}" in current_text
-    assert f"guided schema remains at {GUIDED_SESSION_SCHEMA_VERSION}" in current_text
-    assert "SQLITE_SCHEMA_EPOCH" in current_text and f"38 → {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert f"Sessions epoch {SESSION_SCHEMA_EPOCH}" in current_text
+    assert f"Landscape epoch {SQLITE_SCHEMA_EPOCH}" in current_text
+    assert "ordinary freeform composition" in current_text
     historical = soup.select('[data-release="0.8.0"]')
     assert len(historical) == 1
     historical_text = historical[0].get_text(" ", strip=True)
     assert "from 0.7.1 to 0.8.0" in historical_text
-    assert "35 → 53" in historical_text and "29 → 38" in historical_text
+    assert "both database schemas" in historical_text and "coordinated recreation" in historical_text
     assert f"before installing {CURRENT_VERSION}" in html
     assert "aws-ecs-deployment.md" in html
 

@@ -7,12 +7,12 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 70 for durable Composer progress, request lifecycle leases, identity owner
+to 71 for durable Composer progress, request lifecycle leases, identity owner
 foreign keys, approval revocation provenance, run admission decisions, sparse
 proposal arguments, structured validation errors, approved prompt artifact provenance,
 64-bit quota policy limits, nullable token-ledger prompt/completion measures
 (unknown usage is NULL, never zero), and timestamp-leading indexes for
-container-wide quota scans, durable guided fork failure diagnostics, the
+container-wide quota scans, durable fork failure diagnostics, the
 freeform default preference with removal of the retired mode banner field, and
 ordered coalesce branches and source order in composer authority hashes.
 Session epoch 62 requires nullable backend suggestions in durable advisor
@@ -25,9 +25,6 @@ It also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
-Session epoch 64 adds the distinct `cost_unavailable` guided-operation failure
-classification so missing model pricing directs administrators to repair pricing
-instead of asking users to retry an invalid provider response.
 Session epoch 65 makes `completion_gates.advisor_signoff.note` a required key in
 the persisted composer-meta envelope, so a blocked turn can show the advisory
 reviewer's own bounded words beside the block; the strict parser refuses an
@@ -49,9 +46,12 @@ Session epoch 69 adds immutable freeform message ingress receipts that bind
 each accepted client request UUID to one user message and its originally
 requested nullable state. Exact transport retries can recover that acceptance
 without inserting another user message.
-Session epoch 70 replaces the persisted tutorial stage `guided` with `build`.
-The first-run tutorial now composes through the ordinary freeform planner while
-retaining explicit Run, Audit and Graduation steps.
+Session epoch 70 stores the first-run tutorial Build stage. The tutorial
+composes through the ordinary freeform planner while retaining explicit Run,
+Audit and Graduation steps.
+Session epoch 71 removes mode-specific operation state and adds mode-neutral
+durable receipts for session fork and state revert. Earlier Sessions stores
+must be recreated; there is no compatibility reader or in-place migration.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 46 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
@@ -77,10 +77,10 @@ separate deployment requirement.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 70 (including epoch 69) and Landscape databases below epoch 46 must be
+epoch 71 (including epoch 70) and Landscape databases below epoch 46 must be
 recreated together.
 Startup accepts an empty database or an existing database matching the exact
-current schema epoch (session 70, Landscape 46); these are not minimum versions.
+current schema epoch (session 71, Landscape 46); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service
