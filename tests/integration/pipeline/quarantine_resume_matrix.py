@@ -320,7 +320,7 @@ def assert_crash_image(tmp_path: Path, db: LandscapeDB, window: Window) -> Crash
     )
 
 
-def _lapse_crashed_leases(db: LandscapeDB, run_id: str, *, seat: bool) -> None:
+def lapse_crashed_leases(db: LandscapeDB, run_id: str, *, seat: bool) -> None:
     """Write the crashed run's still-held windows into the database's past.
 
     A crashed run keeps its unfinalized sink effect's lease (5 min default)
@@ -405,7 +405,7 @@ def scenario_crash_then_resume(
     db = LandscapeDB.from_url(db_url, create_tables=False)
     try:
         image = assert_crash_image(tmp_path, db, window)
-        _lapse_crashed_leases(db, image.run_id, seat=process_death)
+        lapse_crashed_leases(db, image.run_id, seat=process_death)
         result = resume(settings, image.run_id)
         assert_resumed_correctly(tmp_path, db, kind, image, result)
     finally:
