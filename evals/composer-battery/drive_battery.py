@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -381,7 +382,13 @@ class Battery:
         if preferences != dict(PINNED_PREFERENCES):
             instrument["http_unrecovered"] = instrument["http_unrecovered"] or f"preferences not pinned: read back {preferences!r}"
         # 3. compose
-        r = step("post_message", "POST", f"/api/sessions/{sid}/messages", json={"content": prompt}, timeout=CLIENT_TIMEOUT_S)
+        r = step(
+            "post_message",
+            "POST",
+            f"/api/sessions/{sid}/messages",
+            json={"content": prompt, "client_request_id": str(uuid4())},
+            timeout=CLIENT_TIMEOUT_S,
+        )
         if r is None:
             pr = step("composer_progress", "GET", f"/api/sessions/{sid}/composer-progress", timeout=30)
             reason = pr.body.get("reason") if pr is not None and isinstance(pr.body, dict) else None

@@ -70,7 +70,13 @@ export async function driveFreeformTutorial(page, options = {}) {
   while (Date.now() < deadline) {
     const continueToRun = page.getByRole("button", { name: FREEFORM_BUILD_ACTION_NAMES[1] });
     if (await isEnabled(continueToRun)) {
-      await continueToRun.click();
+      try {
+        await continueToRun.click({ timeout: 2_000 });
+      } catch (error) {
+        // A new review can disable this button between the enabled check and click.
+        if (!(await isEnabled(continueToRun))) continue;
+        throw error;
+      }
       await page.getByRole("heading", { name: /Ready to run/i }).waitFor({ state: "visible", timeout: 60_000 });
       await page.getByRole("button", { name: FREEFORM_BUILD_ACTION_NAMES[2], exact: true }).click();
       await page.getByRole("button", { name: "Continue", exact: true })

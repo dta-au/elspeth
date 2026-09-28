@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   FREEFORM_BUILD_ACTION_NAMES,
+  driveFreeformTutorial,
   finishTutorialAndVerifyGraduation,
   isAuditRequest,
   isComposeRequest,
@@ -13,6 +14,30 @@ describe("standalone staging tutorial driver contract", () => {
 
   it("drives the ordinary freeform Build and explicit Run gestures", () => {
     expect(FREEFORM_BUILD_ACTION_NAMES).toEqual(["Send tutorial brief", "Continue to Run", "Run"]);
+  });
+
+  it("rechecks reviews when Continue to Run becomes disabled before the click", async () => {
+    const waitFor = vi.fn(async () => undefined);
+    const continueClick = vi.fn()
+      .mockRejectedValueOnce(new Error("button became disabled"))
+      .mockResolvedValueOnce(undefined);
+    const continueEnabled = vi.fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const page = {
+      getByRole: vi.fn((role: string, options: { name: string | RegExp }) => {
+        if (role === "button" && options.name === "Continue to Run") {
+          return { isEnabled: continueEnabled, click: continueClick };
+        }
+        return { waitFor, click: vi.fn(async () => undefined) };
+      }),
+    };
+
+    await driveFreeformTutorial(page, { timeoutMs: 5_000 });
+
+    expect(continueClick).toHaveBeenCalledTimes(2);
+    expect(page.getByRole).toHaveBeenCalledWith("button", { name: "Run", exact: true });
   });
 
   it("treats composer messages, not a removed guided route, as the compose step", () => {
