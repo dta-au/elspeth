@@ -722,6 +722,11 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     forwards_input_fields: bool
     removed_input_fields: frozenset[str]
 
+    # Identity-carrying renames (field-name spelling rule). See
+    # TransformProtocol above for the contract; every batch-aware conformer
+    # inherits BaseTransform's empty default (none renames a field).
+    renamed_input_fields: Mapping[str, str]
+
     # Value-preservation declaration (elspeth-e6e552ce34). See
     # TransformProtocol above for the contract. The two protocols must not
     # diverge on data members (elspeth-8783933d99): every conformer is a
