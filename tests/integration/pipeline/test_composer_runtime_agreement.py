@@ -9965,6 +9965,35 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         # One predicate, one message: the composer's text is the build's text with the node label.
         assert entry.message == runtime_refusal.replace(runtime_refusal.split("'")[1], "merge_results")
 
+    def test_observed_json_unknown_input_still_refuses_certain_union_conflict(self, tmp_path: Path) -> None:
+        """A faithful unknown source type must not become a mirror-gap sentinel."""
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        source = {
+            "plugin": "json",
+            "on_success": "raw",
+            "options": {
+                "path": str(tmp_path / "input.jsonl"),
+                "format": "jsonl",
+                "on_validation_failure": "discard",
+                "schema": {"mode": "observed"},
+            },
+        }
+        pipeline_yaml = self._yaml(
+            source=source,
+            branch_a=self._rewrite("q", "row['q'] + 1", {"mode": "flexible", "fields": ["id: int"]}),
+            branch_b={"plugin": "passthrough", "options": {"schema": {"mode": "flexible", "fields": ["q: int"]}}},
+        )
+        graph, runtime_refusal, _plugins = self._runtime(pipeline_yaml, tmp_path)
+        assert graph is None
+        assert runtime_refusal is not None and "q" in runtime_refusal
+        composer = composition_state_from_runtime_yaml(pipeline_yaml).validate()
+        assert not composer.is_valid
+        [entry] = [error for error in composer.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert entry.coalesce_union_type is not None
+        assert entry.coalesce_union_type.field == "q"
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"any", "int"}
+
     @pytest.mark.parametrize("consumer_type", ["int", "str"])
     def test_queue_mirror_gap_abstains_after_topological_bind(self, consumer_type: str, tmp_path: Path) -> None:
         """A queue input can type the build even when Composer's walk stops there."""
@@ -10017,7 +10046,7 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         composer = composition_state_from_runtime_yaml(pipeline_yaml).validate()
         if consumer_type == "int":
             assert graph is not None, runtime_refusal
-            assert not any(error.error_code == "edge_field_type_incompatible" for error in composer.errors), composer.errors
+            assert composer.is_valid, composer.errors
         else:
             assert runtime_refusal is not None and "x" in runtime_refusal
             # This is an acknowledged Composer mirror gap: it must abstain
@@ -10025,7 +10054,7 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
             assert not any(error.error_code == "edge_field_type_incompatible" for error in composer.errors)
 
     @pytest.mark.parametrize("case", ["rewrite", "dotted", "control-declared-every-branch"])
-    def test_one_table_probe_instance_equals_runtime_instance_and_node_info(self, case: str, tmp_path: Path) -> None:
+    def test_one_table_probe_instance_equals_runtime_instance_and_node_info(self, case: str, tmp_path: Path, monkeypatch) -> None:
         """T3b: the composer's probe instance, the runtime instance and NodeInfo hold the SAME stamp table and carried map."""
         from elspeth.web.composer.state import ValidationProbeCache
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
@@ -10037,6 +10066,27 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         assert graph is not None, refusal
         runtime_by_name = {wired.settings.name: wired.plugin for wired in plugins.transforms}
         transform_ids = graph.get_transform_name_id_map()
+        bound_probes = {}
+        original_transform = ValidationProbeCache.transform
+
+        def capture_transform(cache, plugin, holder):
+            probe = original_transform(cache, plugin, holder)
+            if isinstance(holder, NodeSpec):
+                bound_probes[holder.id] = probe
+            return probe
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(ValidationProbeCache, "transform", capture_transform)
+            composer = state.validate()
+        assert composer.is_valid, composer.errors
+        assert bound_probes
+        for name, probe in bound_probes.items():
+            runtime = runtime_by_name[name]
+            node_info = graph.get_node_info(transform_ids[name])
+            assert probe.output_field_declarations() == runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+            assert probe.carried_output_sources() == runtime.carried_output_sources() == dict(node_info.carried_output_sources)
+        if case == "rewrite":
+            assert bound_probes["t_a"].output_field_declarations()["price"].field_type == "int"
         with ValidationProbeCache() as probe_cache:
             for node in state.nodes:
                 if node.node_type != "transform":
