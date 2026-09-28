@@ -28,6 +28,7 @@ class _ProcessingResult:
     sink_name: str | None
     scheduler_pending_sink: bool = False
     join_group_id: str | None = None
+    counts_failed_barrier: bool = False
 
 
 def _make_result(
