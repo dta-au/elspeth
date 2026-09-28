@@ -17,7 +17,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus
+from elspeth.contracts import CallStatus, CallType, Determinism, NodeStateStatus, NodeType, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
 from elspeth.contracts.schema import SchemaConfig
@@ -358,6 +359,14 @@ class TestUpdateGradeAfterPurge:
         db, factory = _setup()
         _create_nondeterministic_call(db, factory, response_ref=None, response_hash=fake_sha256("resp_hash"))
         leader = leader_coordination_token(factory, "run-1")
+        # The call's row reaches its outcome before the success stamp (QR-4).
+        factory.data_flow.record_token_outcome_leader(
+            TokenRef(token_id="tok-nd-node", run_id="run-1"),
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            coordination_token=leader,
+            sink_name="default",
+        )
         factory.run_lifecycle.finalize_run(
             status=RunStatus.COMPLETED,
             coordination_token=leader,

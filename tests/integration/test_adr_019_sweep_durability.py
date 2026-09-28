@@ -15,7 +15,7 @@ from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError
 from elspeth.contracts.run_start import RunStartPermitBinding
 from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -401,6 +401,20 @@ def _setup_adr019_failed_resume_run(
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="default",
+        )
+
+    # An unprocessed row is durable READY work at the transform, the image real
+    # ingest leaves: resume re-drives scheduler work and never re-derives a
+    # source row (QR), so a bare outcomeless token would be refused instead.
+    for i in range(processed_count, num_rows):
+        factory.scheduler.enqueue_ready(
+            token_id=f"t{i}",
+            row_id=f"r{i}",
+            node_id=xform_nid,
+            step_index=graph.get_node_step_map()[xform_nid],
+            ingest_sequence=i,
+            row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow({"value": i}, contract)),
+            member_token=authority.membership,
         )
 
     if processed_count > 0:

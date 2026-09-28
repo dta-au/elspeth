@@ -13,11 +13,12 @@ from typing import Any
 
 import pytest
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.landscape import claim_test_work_item, make_factory
@@ -82,14 +83,26 @@ def _run_pipeline(
                     item = claim_test_work_item(
                         factory, member_token=authority.membership, token_id=token.token_id, node_id=transform_node.node_id
                     )
+                    error_details = {"reason": "test_error", "message": "boom"}
                     factory.data_flow.record_transform_error(
                         ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                         member_token=authority.membership,
                         work_item=item,
                         transform_id=transform_node.node_id,
                         row_data={"id": "bad_transform_row"},
-                        error_details={"reason": "test_error", "message": "boom"},
+                        error_details=error_details,
                         destination="discard",
+                    )
+                    # A discarded transform error terminalizes its token, as the
+                    # engine does, before the item closes: a run is never
+                    # stamped successful over a token with no outcome (QR-4).
+                    factory.data_flow.record_token_outcome(
+                        TokenRef(token_id=token.token_id, run_id=run.run_id),
+                        TerminalOutcome.FAILURE,
+                        TerminalPath.QUARANTINED_AT_SOURCE,
+                        member_token=authority.membership,
+                        work_item=item,
+                        error_hash=compute_error_hash(str(error_details)),
                     )
                     factory.scheduler.mark_terminal(
                         member_token=authority.membership, work_item_id=item.work_item_id, expected_lease_owner=authority.worker_id

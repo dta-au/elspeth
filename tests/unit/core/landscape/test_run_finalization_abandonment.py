@@ -26,7 +26,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.checkpoint import CheckpointDraft
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.sink_effects import SinkEffectMemberCandidate
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.landscape.execution.sink_effect_identity import resolve_sink_effect_members
@@ -358,10 +358,15 @@ class TestAbandonmentSweepStaysSilent:
         assert _abandoned_rows(setup) == []
 
     def test_success_finalize_never_sweeps(self) -> None:
-        """A COMPLETED stamp with undecided tokens is a closure violation for
-        accounting to surface — sweeping it under ABANDONED would hide it."""
+        """A COMPLETED stamp with undecided tokens is a closure violation to
+        surface — sweeping it under ABANDONED would hide it. The success stamp
+        refuses it (QR-4), and the refusal still writes no abandonment."""
         setup, _token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=False)
 
-        setup.factory.run_lifecycle.finalize_run(RunStatus.COMPLETED, coordination_token=_leader_token(setup))
+        with pytest.raises(OrchestrationInvariantError, match="no completed terminal outcome"):
+            setup.factory.run_lifecycle.finalize_run(RunStatus.COMPLETED, coordination_token=_leader_token(setup))
 
         assert _abandoned_rows(setup) == []
+        run = setup.factory.run_lifecycle.get_run(setup.run_id)
+        assert run is not None
+        assert run.status is not RunStatus.COMPLETED

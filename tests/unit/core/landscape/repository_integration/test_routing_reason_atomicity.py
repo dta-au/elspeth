@@ -16,7 +16,9 @@ from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
 from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, leader_token_for
 
-from elspeth.contracts import NodeType, RoutingMode, RoutingSpec, RunStatus
+from elspeth.contracts import NodeType, RoutingMode, RoutingSpec, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ConfigGateReason
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.schema import SchemaConfig
@@ -41,6 +43,24 @@ EDGE_B_ID = "edge-1"
 SHARED_GROUP_ID = "caller-shared-cross-state-group"
 REASON: ConfigGateReason = {"condition": "row['route'] == 'accepted'", "result": "true"}
 SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
+
+
+def _close_routed_token(factory: RecorderFactory, member: WorkerMembershipToken) -> None:
+    """Claim the gate's item, record the routed row's outcome, then close the item.
+
+    The engine records a token's outcome before its item closes, and a run is
+    never stamped successful while a token lacks one (QR-4).
+    """
+    claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
+    factory.data_flow.record_token_outcome(
+        TokenRef(token_id=TOKEN_ID, run_id=RUN_ID),
+        TerminalOutcome.SUCCESS,
+        TerminalPath.GATE_ROUTED,
+        member_token=member,
+        work_item=claim,
+        sink_name=SINK_ID,
+    )
+    factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
 
 
 def _seed_routing_state(db_url: str) -> None:
@@ -367,9 +387,7 @@ def test_spawned_identical_writers_converge_and_export_exact_reason(tmp_path: Pa
         assert store.retrieve(rows[0].reason_ref) == b'{"condition":"row[\'route\'] == \'accepted\'","result":"true"}'
 
         factory = RecorderFactory(db)
-        member = leader_coordination_token(factory, RUN_ID).membership
-        claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
-        factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
+        _close_routed_token(factory, leader_coordination_token(factory, RUN_ID).membership)
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID))
         routing_exports = [
             record
@@ -874,9 +892,7 @@ def test_sqlite_backup_restore_preserves_exported_reason_and_retry_identity(tmp_
             member_token=leader_token_for(db, RUN_ID).membership,
         )
         factory = RecorderFactory(db)
-        member = leader_coordination_token(factory, RUN_ID).membership
-        claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
-        factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
+        _close_routed_token(factory, leader_coordination_token(factory, RUN_ID).membership)
         factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID))
         source_export = [
             record
