@@ -386,6 +386,7 @@ class TestCsvClassifierScenario:
                                     "provider": "openrouter",
                                     "model": "anthropic/claude-3.5-sonnet",
                                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                                    "system_prompt": "You classify support tickets by urgency. Return only the urgency label.",
                                     "prompt_template": "Classify {{ row['subject'] }}",
                                     "response_field": "urgency",
                                     "schema": {"mode": "observed"},
@@ -415,14 +416,22 @@ class TestCsvClassifierScenario:
         )
         # Turn 2: claim completion → proof gate fires
         turn2 = _llm_response(content="All set.", tool_calls=None)
-        # Turn 3: repair — switch source schema to observed mode
+        # Turn 3: repair — switch to observed mode while preserving the complete
+        # field guarantee verified from the seeded CSV's only row.
         turn3 = _llm_response(
             content=None,
             tool_calls=[
                 {
                     "id": "call_repair",
                     "name": "patch_source_options",
-                    "arguments": {"patch": {"schema": {"mode": "observed"}}},
+                    "arguments": {
+                        "patch": {
+                            "schema": {
+                                "mode": "observed",
+                                "guaranteed_fields": ["ticket_id", "customer_name", "subject", "body", "received_at"],
+                            }
+                        }
+                    },
                 },
             ],
         )

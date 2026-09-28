@@ -33,7 +33,7 @@ from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import TransformErrorCategory, TransformErrorReason
 from elspeth.core.landscape.data_flow import errors as data_flow_errors
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import node_states_table, transform_errors_table
+from elspeth.core.landscape.schema import node_states_table, rows_table, token_outcomes_table, tokens_table, transform_errors_table
 from elspeth.core.landscape.terminal_transform_failures import deciding_transform_errors
 from elspeth.mcp.analyzers.reports import get_error_analysis, get_run_summary
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
@@ -393,12 +393,12 @@ def test_the_latest_attempt_is_ranked_in_one_pass_whatever_order_the_indexes_wer
 
 
 def _collector_member_plans(created_last: str) -> tuple[list[str], list[list[str]]]:
-    """Run the member arm over a run with a collector node, and EXPLAIN every statement it sent.
+    """Run the member arm over a run with a collector node, and EXPLAIN its state lookup.
 
     Returns ``(trap, plans)``: the plan of a node-driven read (the control),
     and the plan of each statement the arm executed that reads ``node_states``.
-    The statements are captured as the arm sent them, so a rewrite of the arm
-    is measured, not a copy of its query.
+    The state statements are captured as sent, so a rewrite of the arm is
+    measured, not a copy of its query.
     """
     from sqlalchemy import event
 
@@ -411,6 +411,8 @@ def _collector_member_plans(created_last: str) -> tuple[list[str], list[list[str
     with db.write_connection() as conn:
         conn.exec_driver_sql(f"DROP INDEX {created_last}")
         conn.exec_driver_sql(f"CREATE INDEX {created_last} ON node_states ({column}_id)")
+    token_id = _token(setup, 0)
+    _terminal(setup, token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
     sent: list[tuple[str, Any]] = []
 
     def capture(_conn: Any, _cursor: Any, statement: str, parameters: Any, _context: Any, _executemany: bool) -> None:
@@ -430,14 +432,12 @@ def _collector_member_plans(created_last: str) -> tuple[list[str], list[list[str
 
 @pytest.mark.parametrize("created_last", ["ix_node_states_node", "ix_node_states_token"])
 def test_the_collector_member_arm_reaches_node_states_by_token_whatever_order_the_indexes_were_created_in(created_last: str) -> None:
-    """Pin the PLAN: collector member holds are found from the runs' terminal outcomes, never by the collector node id.
+    """Pin the state plan: collector member holds use token probes, never node or run scans.
 
-    Node ids are stable across runs of one pipeline, and ``node_states`` has
-    no index leading with ``run_id``. A read driven by the collector node id
-    searches ``ix_node_states_node``: every state that node ever recorded, in
-    every run the database holds (the control). The member arm must search
-    ``node_states`` by ``token_id`` for each failed token of the runs, under
-    both index creation orders.
+    Node ids are stable across runs; a node-driven read searches every state
+    that node ever recorded (the control). A run-only index also offers a
+    run-wide scan. The member arm must search states by ``token_id`` for its
+    selected failed outcomes under both node/token index creation orders.
     """
     trap, plans = _collector_member_plans(created_last)
 
@@ -448,4 +448,168 @@ def test_the_collector_member_arm_reaches_node_states_by_token_whatever_order_th
     assert node_state_steps, plan
     assert all(step.startswith("SEARCH node_states USING INDEX") and "token_id=?" in step for step in node_state_steps), plan
     assert not any("ix_node_states_node" in step for step in plan), plan
-    assert any(step.startswith("SEARCH token_outcomes") and "run_id=?" in step for step in plan), plan
+    assert not any("token_outcomes" in step for step in plan), plan
+
+
+def _seed_collector_plan_run(setup: RecorderSetup, *, count: int, failed_count: int) -> None:
+    """Write a valid run with sparse or dense failed outcomes for member-plan tests."""
+    run_id = setup.run_id
+    register_test_node(setup.data_flow, run_id, "collector_x", node_type=NodeType.COLLECTOR, plugin_name="batch_stats")
+    db = setup.db
+    now = datetime.now(UTC)
+    with db.write_connection() as conn:
+        conn.execute(
+            rows_table.insert(),
+            [
+                {
+                    "row_id": f"{run_id}-row-{index}",
+                    "run_id": run_id,
+                    "source_node_id": "src",
+                    "source_row_index": index,
+                    "ingest_sequence": index,
+                    "source_data_hash": "a" * 64,
+                    "created_at": now,
+                }
+                for index in range(count)
+            ],
+        )
+        conn.execute(
+            tokens_table.insert(),
+            [
+                {
+                    "token_id": f"{run_id}-token-{index}",
+                    "row_id": f"{run_id}-row-{index}",
+                    "run_id": run_id,
+                    "created_at": now,
+                }
+                for index in range(count)
+            ],
+        )
+        conn.execute(
+            node_states_table.insert(),
+            [
+                {
+                    "state_id": f"{run_id}-state-{index}",
+                    "token_id": f"{run_id}-token-{index}",
+                    "run_id": run_id,
+                    "node_id": "collector_x",
+                    "step_index": 0,
+                    "attempt": 0,
+                    "status": NodeStateStatus.FAILED.value if index < failed_count else NodeStateStatus.COMPLETED.value,
+                    "input_hash": "a" * 64,
+                    "started_at": now,
+                    "error_json": '{"type":"PluginContractViolation"}' if index < failed_count else None,
+                }
+                for index in range(count)
+            ],
+        )
+        conn.execute(
+            token_outcomes_table.insert(),
+            [
+                {
+                    "outcome_id": f"{run_id}-outcome-{index}",
+                    "run_id": run_id,
+                    "token_id": f"{run_id}-token-{index}",
+                    "outcome": TerminalOutcome.FAILURE.value if index < failed_count else TerminalOutcome.SUCCESS.value,
+                    "path": TerminalPath.UNROUTED.value if index < failed_count else TerminalPath.DEFAULT_FLOW.value,
+                    "completed": 1,
+                    "recorded_at": now,
+                }
+                for index in range(count)
+            ],
+        )
+        conn.exec_driver_sql("ANALYZE")
+
+
+def test_collector_member_state_lookup_stays_token_bound_after_analyze() -> None:
+    """A run-wide state index must not turn five failed tokens into a scan of every state in the run."""
+    from sqlalchemy import event
+
+    from elspeth.core.landscape.terminal_transform_failures import deciding_collector_group_failures
+
+    setup = _setup("run-1")
+    _seed_collector_plan_run(setup, count=2_000, failed_count=5)
+    db = setup.db
+    sent: list[tuple[str, Any]] = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, parameters: Any, _context: Any, _executemany: bool) -> None:
+        if statement.startswith("SELECT"):
+            sent.append((statement, parameters))
+
+    with db.read_only_connection() as conn:
+        event.listen(db.engine, "before_cursor_execute", capture)
+        try:
+            assert deciding_collector_group_failures(conn, ("run-1",)) == ()
+        finally:
+            event.remove(db.engine, "before_cursor_execute", capture)
+        assert len(conn.execute(select(token_outcomes_table.c.outcome_id).where(token_outcomes_table.c.outcome == "failure")).all()) == 5
+        negative = [
+            row[3]
+            for row in conn.exec_driver_sql(
+                "EXPLAIN QUERY PLAN SELECT node_states.state_id FROM node_states INDEXED BY ix_node_states_run "
+                "JOIN token_outcomes ON token_outcomes.run_id = node_states.run_id AND token_outcomes.token_id = node_states.token_id "
+                "WHERE token_outcomes.run_id = 'run-1' AND token_outcomes.outcome = 'failure'"
+            )
+        ]
+        state_statements = [(statement, parameters) for statement, parameters in sent if "node_states" in statement]
+        assert len(state_statements) == 1, sent
+        statement, parameters = state_statements[0]
+        plan = [row[3] for row in conn.exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)]
+    db.close()
+
+    assert any("SEARCH node_states USING INDEX ix_node_states_run (run_id=?)" in step for step in negative), negative
+    assert "FROM node_states" in statement and "JOIN" not in statement, statement
+    assert "node_states.run_id =" not in statement, statement
+    assert any("SEARCH node_states USING INDEX ix_node_states_token (token_id=?)" in step for step in plan), plan
+
+
+def test_collector_member_state_batches_keep_all_failed_states_and_run_pairs() -> None:
+    """Large failure sets stay within SQL parameter bounds and retain repeated FAILED states for one token."""
+    from sqlalchemy import event
+
+    from elspeth.core.landscape.terminal_transform_failures import deciding_collector_group_failures
+
+    first = _setup("run-1")
+    _seed_collector_plan_run(first, count=1_001, failed_count=1_001)
+    second = _setup("run-2", db=first.db)
+    _seed_collector_plan_run(second, count=2, failed_count=1)
+    with first.db.write_connection() as conn:
+        conn.execute(
+            node_states_table.insert().values(
+                state_id="run-1-second-failed-state",
+                token_id="run-1-token-0",
+                run_id="run-1",
+                node_id="collector_x",
+                step_index=0,
+                attempt=1,
+                status=NodeStateStatus.FAILED.value,
+                input_hash="a" * 64,
+                started_at=datetime.now(UTC),
+                error_json='{"type":"PluginContractViolation"}',
+            )
+        )
+        conn.exec_driver_sql("ANALYZE")
+
+    sent: list[tuple[str, Any]] = []
+
+    def capture(_conn: Any, _cursor: Any, statement: str, parameters: Any, _context: Any, _executemany: bool) -> None:
+        if statement.startswith("SELECT") and "FROM node_states" in statement:
+            sent.append((statement, parameters))
+
+    with first.db.read_only_connection() as conn:
+        event.listen(first.db.engine, "before_cursor_execute", capture)
+        try:
+            assert deciding_collector_group_failures(conn, ("run-1", "run-2")) == ()
+        finally:
+            event.remove(first.db.engine, "before_cursor_execute", capture)
+        assert len(sent) == 3, sent
+        assert all(len(parameters) <= 501 for _statement, parameters in sent), sent
+        state_rows = [row for statement, parameters in sent for row in conn.exec_driver_sql(statement, parameters)]
+    first.db.close()
+
+    assert len(state_rows) == 1_003
+    assert {(row.run_id, row.token_id) for row in state_rows} == {
+        *(("run-1", f"run-1-token-{index}") for index in range(1_001)),
+        ("run-2", "run-2-token-0"),
+    }
+    assert sum(row.token_id == "run-1-token-0" for row in state_rows) == 2

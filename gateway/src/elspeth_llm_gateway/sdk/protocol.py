@@ -38,9 +38,11 @@ CLASSIFIABLE_CODES: frozenset[str] = frozenset(
         "upstream_rate_limited",
         "upstream_timeout",
         "upstream_unavailable",
+        "upstream_request_rejected",
         "upstream_response_invalid",
     }
 )
+_RETRYABLE_CLASSIFIABLE_CODES = frozenset({"upstream_rate_limited", "upstream_timeout", "upstream_unavailable"})
 
 _ADAPTER_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 
@@ -133,7 +135,9 @@ class ErrorClassification(BaseModel):
 
     ``code`` must be one of ``CLASSIFIABLE_CODES`` — the closed set of
     outcomes an adapter is permitted to report. Anything else (e.g. an
-    internal-error code) is not adapter-classifiable and is rejected.
+    internal-error code) is not adapter-classifiable and is rejected. The
+    ``retryable`` value must agree with the code; the gateway's error code
+    table remains authoritative for the rendered response.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -145,6 +149,8 @@ class ErrorClassification(BaseModel):
     def _check_code(self) -> Self:
         if self.code not in CLASSIFIABLE_CODES:
             raise ValueError(f"code must be one of {sorted(CLASSIFIABLE_CODES)}")
+        if self.retryable != (self.code in _RETRYABLE_CLASSIFIABLE_CODES):
+            raise ValueError("retryable must match the classified code")
         return self
 
 

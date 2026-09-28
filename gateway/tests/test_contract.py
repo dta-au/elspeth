@@ -59,9 +59,66 @@ def test_chat_request_rejects_empty_messages():
         ChatRequest(model="m", messages=[])
 
 
+def _call(call_id: str, name: str = "lookup") -> dict:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": "{}"}}
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "user", "content": "hi"}, {"role": "tool", "content": "result", "tool_call_id": "c1"}],
+        [{"role": "user", "content": "hi"}, {"role": "assistant", "tool_calls": [_call("c1")]}],
+        [{"role": "assistant", "tool_calls": [_call("c1"), _call("c1")]}, {"role": "tool", "content": "result", "tool_call_id": "c1"}],
+        [{"role": "assistant", "tool_calls": [_call("c1")]}, {"role": "user", "content": "next"}],
+        [
+            {"role": "assistant", "tool_calls": [_call("c1")]},
+            {"role": "tool", "content": "result", "tool_call_id": "c1"},
+            {"role": "tool", "content": "result", "tool_call_id": "c1"},
+        ],
+    ],
+)
+def test_chat_request_rejects_incoherent_tool_conversation(messages: list[dict]) -> None:
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=messages)
+
+
+def test_chat_request_accepts_completed_multi_tool_batch() -> None:
+    request = ChatRequest(
+        model="m",
+        messages=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "checking", "tool_calls": [_call("c1"), _call("c2")]},
+            {"role": "tool", "content": "second", "tool_call_id": "c2"},
+            {"role": "tool", "content": "first", "tool_call_id": "c1"},
+            {"role": "user", "content": "next"},
+        ],
+    )
+    assert request.messages[-1].content == "next"
+
+
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "assistant", "tool_calls": [_call("")]}],
+        [{"role": "assistant", "tool_calls": [_call("  ")]}],
+        [{"role": "assistant", "tool_calls": [_call("c1", " ")]}],
+        [{"role": "tool", "content": "result", "tool_call_id": " "}],
+    ],
+)
+def test_chat_request_rejects_blank_tool_identity(messages: list[dict]) -> None:
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=messages)
+
+
+def test_chat_request_rejects_required_tool_choice_without_tools() -> None:
+    with pytest.raises(ValidationError):
+        ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], tool_choice="required")
+
+
 @pytest.mark.parametrize("value", ["auto", "none", "required"])
 def test_chat_request_accepts_valid_string_tool_choice(value):
-    request = ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], tool_choice=value)
+    tools = [{"type": "function", "function": {"name": "lookup"}}] if value == "required" else None
+    request = ChatRequest(model="m", messages=[{"role": "user", "content": "hi"}], tool_choice=value, tools=tools)
     assert request.tool_choice == value
 
 
@@ -356,6 +413,17 @@ def test_build_completion_response_tool_call():
         ],
     }
     assert response["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_build_completion_response_preserves_mixed_prose_and_tool_call():
+    call = CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}")
+    canonical = CanonicalResponse(text="I will check", tool_calls=(call,), finish_reason=FinishReason.TOOL_CALLS)
+
+    response = build_completion_response(response_id="resp_mixed", created=1234, model_alias="m", canonical=canonical)
+
+    message = response["choices"][0]["message"]
+    assert message["content"] == "I will check"
+    assert message["tool_calls"][0]["id"] == "c1"
     assert "usage" not in response
 
 

@@ -22,6 +22,7 @@ ALL_CODES = {
     "upstream_rate_limited",
     "upstream_timeout",
     "upstream_unavailable",
+    "upstream_request_rejected",
     "upstream_response_invalid",
     "internal_error",
 }
@@ -46,20 +47,21 @@ EXPECTED_STATUS = {
     "upstream_rate_limited": 429,
     "upstream_timeout": 504,
     "upstream_unavailable": 503,
+    "upstream_request_rejected": 400,
     "upstream_response_invalid": 502,
     "internal_error": 500,
 }
 
 
-# --- GatewayErrorCode: exactly 14 codes, no extras --------------------------
+# --- GatewayErrorCode: exact vocabulary -------------------------------------
 
 
-def test_exactly_fourteen_codes_no_extras():
+def test_exact_gateway_error_codes_no_extras():
     assert {member.value for member in GatewayErrorCode} == ALL_CODES
 
 
-def test_code_count_is_fourteen():
-    assert len(GatewayErrorCode) == 14
+def test_code_count_is_fifteen():
+    assert len(GatewayErrorCode) == 15
 
 
 # --- HTTP_STATUS -------------------------------------------------------------

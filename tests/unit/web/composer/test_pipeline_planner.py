@@ -3806,6 +3806,19 @@ def test_planner_rejects_invalid_provider_tool_call_ids(call_id: str) -> None:
     assert caught.value.code == "MALFORMED_RESPONSE"
 
 
+@pytest.mark.parametrize("name", ["", " ", "\u2003"])
+def test_planner_rejects_blank_provider_tool_names(name: str) -> None:
+    response = _Response(
+        choices=[_Choice(message=_Message(content=None, tool_calls=[_ToolCall(id="call-1", function=_Function(name, "{}"))]))],
+        usage=_planner_usage(),
+    )
+
+    with pytest.raises(PipelinePlannerError, match="tool call metadata") as caught:
+        _parse_response_tool_calls(response, max_tool_calls=3, dialect=ToolContractDialect.NONE, sent_tool_names=frozenset())
+
+    assert caught.value.code == "MALFORMED_RESPONSE"
+
+
 def test_planner_preserves_valid_distinct_provider_tool_call_order() -> None:
     signed_call_id = "call_1__thought__" + "eA" * 150
     response = _Response(

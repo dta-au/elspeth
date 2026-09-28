@@ -7897,7 +7897,9 @@ _REVIEWED_REGISTRY_MODULES = {
     # constant) so a database error's text never carries bound row values;
     # the diff is that keyword and the constant, so construction order, guard
     # installation and clock issuance are unchanged.
-    "src/elspeth/core/landscape/database.py": "a27f58772ba30c96454a9605b47b7fb127e20987b067121e1f769c7397f3cacd",
+    # 964378989 added ix_node_states_run to _REQUIRED_INDEXES; the deadline
+    # guard, journal installation, and database clock path remain unchanged.
+    "src/elspeth/core/landscape/database.py": "2f6b0183b95b876071f1a89238754ae73bd40e43f63b6f3fc4ab4c9706ee3756",
 }
 
 

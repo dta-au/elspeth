@@ -90,6 +90,7 @@ Arms characterised here (all in ``tool_batch.py``):
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -323,6 +324,34 @@ async def test_arm_json_decode_failure_records_arg_error(
         "The JSON-decode ARG_ERROR arm may have been rerouted — inspect "
         "tool_batch.py (ARG_ERROR pre-dispatch site 1/3)."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_pipeline_state", "set_pipeline"])
+async def test_invalid_json_arg_error_sends_replayable_tool_call_history(
+    fake_composer_service: ComposerServiceImpl,
+    result_session_id: str,
+    tool_name: str,
+) -> None:
+    class CapturingLLM(_FakeComposeLLM):
+        def __init__(self) -> None:
+            first = _raw_tool_call_llm(name=tool_name, raw_arguments="{not valid json")._responses[0]
+            super().__init__((first, _fake_llm_response(content="Done.")))
+            self.requests: list[list[dict[str, Any]]] = []
+
+        async def __call__(self, messages: Any, tools: Any) -> Any:
+            self.requests.append(deepcopy(messages))
+            return await super().__call__(messages, tools)
+
+    llm = CapturingLLM()
+    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+
+    assert result.tool_outcomes[0].error_class == "JSONDecodeError"
+    assert len(llm.requests) >= 2
+    assistant = next(message for message in llm.requests[1] if message["role"] == "assistant" and message.get("tool_calls"))
+    arguments = assistant["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(json.loads(arguments), dict)
+    assert arguments != "{not valid json"
 
 
 @pytest.mark.asyncio

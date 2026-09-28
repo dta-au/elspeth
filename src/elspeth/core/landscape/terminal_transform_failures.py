@@ -107,22 +107,25 @@ database with the other order. It is the trap ``ix_token_outcomes_run_token``
 records in ``schema.py`` (elspeth-c675c8c2d9). The window reads the run's
 errors once, whichever order the indexes were created in.
 
-The collector member arm has the same kind of trap. ``node_states`` has no
-index that leads with ``run_id``, and node ids are stable across runs of the
-same pipeline (a hash of the node's configuration), so a collector node id
-matches that node's states in EVERY run the database holds. A query that puts
-the collector node id in SQL lets SQLite drive ``node_states`` through
-``ix_node_states_node`` and scan the node's whole history. So the member query
-drives from the runs' ``(FAILURE, UNROUTED)`` terminal outcomes and reaches
-``node_states`` by ``token_id`` only; the collector nodes are applied to the
-fetched rows. A failed token has a handful of FAILED states, so the rows read
-are bounded by the runs' failed tokens, never by history.
+The collector member arm has the same kind of trap. Node ids are stable across
+runs of the same pipeline (a hash of the node's configuration), so a collector
+node id matches that node's states in EVERY run the database holds. A query
+that puts the collector node id in SQL lets SQLite drive ``node_states``
+through ``ix_node_states_node`` and scan the node's whole history. A joined
+query can also drive through ``ix_node_states_run`` and scan every state in the
+run. So the member reader first selects the runs' ``(FAILURE, UNROUTED)``
+terminal outcomes, then fetches FAILED states in bounded ``token_id`` batches
+without a run predicate on ``node_states``. The collector nodes and exact
+run/token pairs are applied to the fetched rows. A failed token has a handful
+of FAILED states, so the state reads are bounded by failed tokens, never by
+the run's whole history.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import islice
 
 from sqlalchemy import Select, and_, exists, func, select
 from sqlalchemy.engine import Connection
@@ -206,6 +209,8 @@ def deciding_transform_errors(run_ids: Sequence[str]) -> Select[tuple[str, str, 
 COLLECTOR_GROUP_MEMBER_TERMINAL_PATH = TerminalPath.UNROUTED
 """The terminal path every member of a failed collector group ends on (with ``TerminalOutcome.FAILURE``)."""
 
+_MEMBER_STATE_BATCH_SIZE = 500
+
 
 @dataclass(frozen=True, slots=True)
 class CollectorGroupMemberFailure:
@@ -279,49 +284,47 @@ def deciding_collector_group_failures(conn: Connection, run_ids: Sequence[str]) 
         # Exactly what the loop below would return: it keeps only states at
         # a collector node.
         return ()
-    failed_states = (
-        select(token_outcomes_table.c.run_id, token_outcomes_table.c.token_id, node_states_table.c.node_id, node_states_table.c.error_json)
-        .select_from(
-            token_outcomes_table.join(
-                node_states_table,
-                and_(
-                    node_states_table.c.token_id == token_outcomes_table.c.token_id,
-                    node_states_table.c.run_id == token_outcomes_table.c.run_id,
-                ),
-            )
-        )
+    failed_outcomes = (
+        select(token_outcomes_table.c.run_id, token_outcomes_table.c.token_id)
         .where(token_outcomes_table.c.run_id.in_(run_ids))
         .where(token_outcomes_table.c.completed == 1)
         .where(token_outcomes_table.c.outcome == TerminalOutcome.FAILURE.value)
         .where(token_outcomes_table.c.path == COLLECTOR_GROUP_MEMBER_TERMINAL_PATH.value)
-        .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
     )
     members: dict[tuple[str, str], CollectorGroupMemberFailure] = {}
-    for row in conn.execute(failed_states):
-        run_id, token_id, node_id = str(row.run_id), str(row.token_id), str(row.node_id)
-        if (run_id, node_id) not in collector_nodes:
-            continue
-        hold = parse_collector_group_failure_hold(token_id, node_id, row.error_json)
-        if hold is None:
-            continue
-        if (run_id, token_id) in members:
-            raise AuditIntegrityError(f"Token {token_id!r} (run {run_id!r}) holds more than one collector group-failure verdict")
-        if (run_id, hold.group_id) not in groups:
-            raise AuditIntegrityError(
-                f"Collector group-failure hold of token {token_id!r} at {node_id!r} names group {hold.group_id!r}, "
-                f"which has no collector_group_failures row in run {run_id!r}"
-            )
-        recorded_node, recorded_reason = groups[(run_id, hold.group_id)]
-        if (recorded_node, recorded_reason) != (node_id, hold.failure_reason):
-            raise AuditIntegrityError(
-                f"Collector group-failure hold of token {token_id!r} at {node_id!r} records {hold.failure_reason.value!r} "
-                f"for group {hold.group_id!r}, whose verdict records {recorded_reason.value!r} at {recorded_node!r}"
-            )
-        members[(run_id, token_id)] = CollectorGroupMemberFailure(
-            run_id=run_id,
-            token_id=token_id,
-            collector_node_id=node_id,
-            group_id=hold.group_id,
-            failure_reason=hold.failure_reason,
+    outcome_rows = iter(conn.execute(failed_outcomes))
+    while batch := tuple(islice(outcome_rows, _MEMBER_STATE_BATCH_SIZE)):
+        selected = {(str(row.run_id), str(row.token_id)) for row in batch}
+        failed_states = (
+            select(node_states_table.c.run_id, node_states_table.c.token_id, node_states_table.c.node_id, node_states_table.c.error_json)
+            .where(node_states_table.c.token_id.in_([token_id for _run_id, token_id in selected]))
+            .where(node_states_table.c.status == NodeStateStatus.FAILED.value)
         )
+        for row in conn.execute(failed_states):
+            run_id, token_id, node_id = str(row.run_id), str(row.token_id), str(row.node_id)
+            if (run_id, token_id) not in selected or (run_id, node_id) not in collector_nodes:
+                continue
+            hold = parse_collector_group_failure_hold(token_id, node_id, row.error_json)
+            if hold is None:
+                continue
+            if (run_id, token_id) in members:
+                raise AuditIntegrityError(f"Token {token_id!r} (run {run_id!r}) holds more than one collector group-failure verdict")
+            if (run_id, hold.group_id) not in groups:
+                raise AuditIntegrityError(
+                    f"Collector group-failure hold of token {token_id!r} at {node_id!r} names group {hold.group_id!r}, "
+                    f"which has no collector_group_failures row in run {run_id!r}"
+                )
+            recorded_node, recorded_reason = groups[(run_id, hold.group_id)]
+            if (recorded_node, recorded_reason) != (node_id, hold.failure_reason):
+                raise AuditIntegrityError(
+                    f"Collector group-failure hold of token {token_id!r} at {node_id!r} records {hold.failure_reason.value!r} "
+                    f"for group {hold.group_id!r}, whose verdict records {recorded_reason.value!r} at {recorded_node!r}"
+                )
+            members[(run_id, token_id)] = CollectorGroupMemberFailure(
+                run_id=run_id,
+                token_id=token_id,
+                collector_node_id=node_id,
+                group_id=hold.group_id,
+                failure_reason=hold.failure_reason,
+            )
     return tuple(members.values())

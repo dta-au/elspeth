@@ -282,6 +282,8 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
         function_arguments = getattr(function, "arguments", _MISSING_TOOL_CALL_FIELD)
         if type(function_name) is not str or type(function_arguments) is not str:
             raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+        if not function_name.strip():
+            raise AuditIntegrityError("Composer tool batch contains blank provider function name")
 
         call_ids.add(call_id)
         admitted_calls.append(
@@ -964,19 +966,25 @@ async def run_tool_batch(
             audit_arguments: Mapping[str, Any] | str = (
                 unknown_audit_arguments if unknown_audit_arguments is not None else tool_call.function.arguments
             )
-            if isinstance(exc, JsonBoundaryError) and unknown_audit_arguments is None:
-                audit_arguments = {
+            if unknown_audit_arguments is None:
+                replay_arguments = {
                     "_redaction_status": INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
                     "error_class": type(exc).__name__,
                 }
-                decoded_args_by_call_id[tool_call.id] = dict(audit_arguments)
+                # Keep the original malformed wire bytes in the audit record
+                # for ordinary JSON decode failures, but send a valid JSON
+                # placeholder in the next provider request. The gateway's
+                # tool-call contract cannot replay malformed JSON arguments.
                 _replace_llm_tool_call_arguments(
                     llm_messages,
                     tool_call_id=tool_call.id,
-                    arguments=audit_arguments,
+                    arguments=replay_arguments,
                     dialect=ctx.tool_contract_dialect,
                     semantic=False,
                 )
+                if isinstance(exc, JsonBoundaryError):
+                    audit_arguments = replay_arguments
+                    decoded_args_by_call_id[tool_call.id] = dict(replay_arguments)
             # No arguments were decoded, so wire_conformant stays None.
             audit = begin_dispatch(
                 tool_call.id,

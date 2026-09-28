@@ -7,6 +7,22 @@ import pytest
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 
 
+@pytest.mark.parametrize("structured_output", [False, True])
+def test_checkpoint_options_disable_inner_provider_retries(structured_output: bool) -> None:
+    options = build_advisor_request_options(
+        model="openai/gpt-4o",
+        temperature=None,
+        seed=None,
+        max_tokens=128,
+        reasoning_effort=None,
+        api_base="https://gateway.example.test/v1",
+        api_key="test-token",
+        structured_output=structured_output,
+    )
+    assert options["num_retries"] == 0
+    assert options["max_retries"] == 0
+
+
 @pytest.mark.parametrize(
     ("model", "api_base", "requires_parameters"),
     [
@@ -64,6 +80,8 @@ def test_hint_options_preserve_prose_request() -> None:
     assert options == {
         "model": "openrouter/anthropic/claude-sonnet-5",
         "max_tokens": 4096,
+        "num_retries": 0,
+        "max_retries": 0,
         "reasoning": {"effort": "low"},
     }
 

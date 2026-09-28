@@ -481,6 +481,7 @@ class TestErrorCodeMapping:
             ("upstream_unavailable", ServerError, True),
             ("oauth_token_unavailable", ServerError, True),
             ("upstream_unauthorized", LLMClientError, False),
+            ("upstream_request_rejected", LLMClientError, False),
             ("upstream_response_invalid", LLMClientError, False),
             ("internal_error", LLMClientError, False),
             # ELSPETH's own bearer was rejected by the gateway's inbound

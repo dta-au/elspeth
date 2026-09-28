@@ -224,7 +224,8 @@ def _tool_call_body(arguments: str) -> dict:
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": arguments}}],
-            }
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "call_1"},
         ],
     }
 
@@ -324,6 +325,16 @@ async def test_capability_unsupported_returns_422_with_both_headers():
 
 
 # --- happy path ------------------------------------------------------------------
+
+
+@respx.mock
+async def test_oversized_integer_literal_is_invalid_request_not_internal_error():
+    raw = b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"n":' + b"9" * 5000 + b"}"
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", content=raw, headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 @respx.mock

@@ -131,9 +131,9 @@ class CanonicalResponse(BaseModel):
     usage: CanonicalUsage | None = None
 
     @model_validator(mode="after")
-    def _check_content_xor(self) -> Self:
+    def _check_content_present(self) -> Self:
         has_text = self.text is not None
         has_tool_calls = len(self.tool_calls) > 0
-        if has_text == has_tool_calls:
-            raise ValueError("exactly one of text or tool_calls must be set")
+        if not (has_text or has_tool_calls):
+            raise ValueError("text or tool_calls must be set")
         return self

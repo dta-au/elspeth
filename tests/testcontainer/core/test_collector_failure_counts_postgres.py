@@ -3,9 +3,9 @@
 The SQLite cases (``tests/integration/pipeline/test_collector_failure_counts.py``)
 prove the semantics. These send the arm's SQL to PostgreSQL:
 
-- the token-driven member query (terminal outcomes joined to ``node_states``
-  by ``token_id``) and the verdict-row reads, over a database that holds a
-  prior run of the same pipeline, so the collector node id is shared;
+- the terminal-outcome selection and its bounded ``node_states`` token probes,
+  plus verdict-row reads, over a database that holds a prior run of the same
+  pipeline, so the collector node id is shared;
 - the ``failure_reason`` CHECK folded into epoch 45, reflected by name at
   startup (``LandscapeDB.from_url`` validates it) and enforced on insert;
 - the plan: with sequential scans disabled, the member query still reaches
@@ -151,8 +151,8 @@ def test_the_member_query_reaches_node_states_by_token_on_postgres(
         )
 
     assert "ix_node_states_node" in control, f"control: a node-driven read uses the node index:\n{control}"
-    assert "ix_node_states_node" not in plan, plan
-    node_state_lines = [line for line in plan.splitlines() if " on node_states" in line]
-    assert node_state_lines, plan
-    assert all("Index" in line for line in node_state_lines), plan
-    assert "token_id" in plan, plan
+    assert "FROM node_states" in statement and "JOIN" not in statement, statement
+    assert "node_states.run_id =" not in statement, statement
+    assert "ix_node_states_node" not in plan and "ix_node_states_run" not in plan, plan
+    assert "Seq Scan on node_states" not in plan, plan
+    assert "ix_node_states_token" in plan and "token_id" in plan, plan
