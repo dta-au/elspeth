@@ -887,7 +887,15 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # held / late-arrival / release). G1b moved, not added: the row_union sweep's
 # processor.mark_blocked_barrier_terminal#1 now sits in _handle_failed_row_union_outcome
 # (the deleted _mark_barrier_tokens_terminal re-checked what the repository enforces).
-_EXPECTED_CALL_COUNT = 289
+# R2 fix round 1 (0365b84eb): 289 -> 290. Moved: RowProcessor._record_flush_violation ->
+# self._data_flow.record_token_outcome_leader#1 is now
+# batch_violation_outcomes.record_batch_violation_failures -> data_flow.record_token_outcome_leader#1,
+# the one per-token recorder both batch seams call. Arrived:
+# CollectorExecutor._execute_flush -> self._execution.complete_node_state#3, the collector's
+# Tier-1 declared-input miss closing each member's hold FAILED before the run ends.
+# Attributed by row identity from this gate's scanner on the release 63b050f39 export,
+# the lane parent ae2f320f7 export and the landing tree (lane parent == landing tree).
+_EXPECTED_CALL_COUNT = 290
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -899,7 +907,8 @@ _EXPECTED_CALL_COUNT = 289
 # K063 run accounting adds CollectorExecutor.notify_empty_group's direct
 # complete_collector_failure call for a zero-arrival group.
 # G1 + G1b: 7683d3e0… -> e74265fd…, the departure and the move above.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "e74265fd4839681642a89d26a1fc41a6860b59ae53a785d5804a22766d21868c"
+# R2 fix round 1: e74265fd… -> 72e3db35…, the move and the arrival above.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "72e3db359610e7184f437ad8c28cb0dc70fc16a101e9483bdfc3683b1e3026b1"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
