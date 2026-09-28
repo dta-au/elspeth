@@ -12,11 +12,13 @@ version-controlled YAML or through the authenticated Web Composer. Both paths
 use the same plugin contracts, graph validation, execution engine, and
 Landscape audit trail.
 
-> **Status:** ELSPETH is pre-release software. Its interfaces and storage
-> schemas can change between releases. Evaluate its behaviour and controls for
-> your use case before relying on it. The project is developed with substantial
-> AI assistance and has had limited user testing. See the
-> [release notes](CHANGELOG.md) and [support policy](SUPPORT.md).
+> **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
+> use-case-specific applications, but it is not yet ready for general production use.
+> Before relying on it, validate ELSPETH against your requirements and risk controls.
+>
+> **AI-generated code:** ELSPETH is a rapid prototype, generated and reviewed by AI,
+> that is in active development with major systems subject to change. Limited user
+> testing has been conducted on a small set of use cases.
 
 ## What it does
 
