@@ -1273,7 +1273,12 @@ opts out of these checks, and the template then sees the whole row.
 Configuration also refuses a template that uses its row as an object, under
 every declaration, `[]` included, because no declaration makes it work: a
 call on a row field (`row.keys()`, `row.items()`, `row['keys']()`,
-`row.note()`, calling an element of the row, `(row | first)()`, and calling
+`row.note()`, calling an element of the row, `(row | first)()`, calling row
+data — a field's value, an item or element of it, what a builtin filter or a
+method builds from it, an operator over it, or a name every binding of which
+is row data (`row.tags[0]()`, `(row.tags | select | first)()`,
+`(row.note | upper)()`, `row.note.upper()()`,
+`{% set m = row.tags %}{{ m[0]() }}`) — and calling
 what `row.get('note')` returns, `row.get('note')()`, also when its default is
 a row field, `row.get('note', row.id)()`),
 `row.get` without a call (`{{ row.get }}`,

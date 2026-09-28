@@ -97,6 +97,7 @@ PipelineRow names (`RETIRED_ROW_API_NAMES`: `contract`, `to_dict`,
 `to_checkpoint_format`) are reserved in attribute form; their columns are read
 by item. Configuration refuses the row used as an object — a reserved name, a
 call on a row field (including calling an element of the row, `(row | first)()`,
+row data — a field's value or anything built only from row data and literals —
 or what `row.get(...)` returns), `row.get`
 without a call — under **every** declaration,
 `[]` included, on the prompt's `row`, a query's `row` and `row.source_row`,

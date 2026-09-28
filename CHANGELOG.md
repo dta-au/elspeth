@@ -304,9 +304,15 @@ drained and repair this release forward.
   `row.source_row` and a RAG `query_template`, and under `required_input_fields:
   []` too, a call on a row field (`row.keys()`, `row.items()`,
   `row['keys']()`, `row.note()`, `dict(row).note()`, calling an element of
-  the row such as `(row | first)()` or part of a field's value such as
-  `row.tags[0]()` or `(row.tags | first)()`, and calling what `row.get('note')`
-  returns, also when its default is a row field, `row.get('note', row.id)()`),
+  the row such as `(row | first)()`, calling row data — a field's value,
+  an item or element of it (`row.tags[0]()`, `(row.tags | select | first)()`,
+  `(row.tags | batch(1) | first | first)()`), what a builtin filter or a
+  method builds from it (`(row.note | upper)()`, `row.note.upper()()`,
+  `(row | tojson)()`), an operator over it (`(row.note ~ 'x')()`), or a name
+  every binding of which is row data (`{% set m = row.tags %}{{ m[0]() }}`,
+  `{% for c in row.tags %}{{ c() }}{% endfor %}`) — and calling what
+  `row.get('note')` returns, also when its default is a row field,
+  `row.get('note', row.id)()`),
   `row.get` without a call, and the reserved
   names `row.contract`, `row.to_dict` and `row.to_checkpoint_format` (also
   through `row | attr('contract')`). Before, under `[]` these validated and
@@ -331,7 +337,12 @@ drained and repair this release forward.
   fields, and `row | tojson` (also over a nested value such as
   `row.meta | tojson`), `row | last`, `row | urlencode` and `row | pprint`
   work, where each failed every row or printed an object repr;
-  `row | reverse` is still the list of field names in reverse order. With the
+  `row | reverse` is still the list of field names in reverse order, and
+  `row | random` (also over a mapping value, `row.meta | random`) picks one
+  of the field names, as `row | list | random` does, where Jinja's builtin
+  indexed the mapping by position and failed every row. An attribute of a
+  value is the value's own and is not refused when called
+  (`row.note.upper()`, `(row.note | attr('upper'))()`). With the
   declaration omitted, a single-query prompt that uses `row` as a whole
   (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: it rendered an
   empty row. A multi-query `input_fields` variable named `source_row` or like
@@ -1041,13 +1052,14 @@ the batch's rows left without an outcome); a `value_transform` or
 row without an outcome); a `union_collision_policy: fail` coalesce whose
 branches all guarantee a shared field (ended the run with exit 4 at the first
 row). Each of these failed every row: a template number literal that
-overflows to infinity; a `truncate` length shorter than its ending; a
-call on part of a field's value in an LLM prompt, a query or a RAG
-`query_template` (`row.tags[0]()`, `(row.tags | first)()`,
-`(row.get('tags') | list | last)()`), under every declaration; a
-`<response>_usage` schema type other than `any`; a header-spelled scan field
-over a non-string column; and in a RAG `query_template`, a dynamic `row[...]`
-key or a top-level name other than `query` or `row`. A header-spelled `web_scrape`
+overflows to infinity; a `truncate` length shorter than its ending; a call on
+row data in an LLM prompt, a query or a RAG `query_template`
+(`row.tags[0]()`, `(row.tags | first)()`, `(row.get('tags') | list | last)()`,
+`(row.note | upper)()`, `{% set m = row.tags %}{{ m[0]() }}`),
+under every declaration; a `<response>_usage` schema type other than `any`; a
+header-spelled scan field over a non-string column; and in a RAG
+`query_template`, a dynamic `row[...]` key or a top-level name other than
+`query` or `row`. A header-spelled `web_scrape`
 `url_field` or `blob_ref_field` now routes each row instead of ending the
 run. The composer now refuses an optional declared field whose upstream type
 the build already refused (`edge_field_type_incompatible`).

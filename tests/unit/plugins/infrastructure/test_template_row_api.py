@@ -29,7 +29,7 @@ from jinja2.filters import FILTERS
 from pydantic import ValidationError
 
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
-from elspeth.core.templates import RETIRED_ROW_API_NAMES, TEMPLATE_ROW_METHODS
+from elspeth.core.templates import _ELEMENT_FILTERS, _VALUE_BUILDING_FILTERS, RETIRED_ROW_API_NAMES, TEMPLATE_ROW_METHODS
 from elspeth.plugins.infrastructure.templates import (
     ALL_FIELDS,
     DeclaredFields,
@@ -156,9 +156,58 @@ _MISUSES = (
     pytest.param("{{ (R.F | list | first)() }}", "a call on a row field", id="element-of-a-listed-field-value-called"),
     pytest.param("{{ (R.F | sort | last)() }}", "a call on a row field", id="element-of-a-sorted-field-value-called"),
     pytest.param("{{ (R.F | list)() }}", "a call on a row field", id="a-listed-field-value-called"),
+    # Row data is never callable, whatever carries it there (review-B2-template-residuals-r1 F2 + F3).
+    pytest.param("{{ (R.F | unique | first)() }}", "a call on a row field", id="element-of-a-deduplicated-field-value-called"),
+    pytest.param("{{ (R.F | reverse | last)() }}", "a call on a row field", id="element-of-a-reversed-field-value-called"),
+    pytest.param("{{ (R.F | select | first)() }}", "a call on a row field", id="element-of-a-selected-field-value-called"),
+    pytest.param("{{ (R.F | batch(1) | first | first)() }}", "a call on a row field", id="element-of-a-batched-field-value-called"),
+    pytest.param("{{ (R.F | map('upper') | first)() }}", "a call on a row field", id="element-of-a-mapped-field-value-called"),
+    pytest.param("{{ (R.F | upper)() }}", "a call on a row field", id="a-filtered-field-value-called"),
+    pytest.param("{{ (R | tojson)() }}", "a call on a row field", id="the-row-as-json-called"),
+    pytest.param("{{ (R.F.split(',') | first)() }}", "a call on a row field", id="element-of-a-method-result-called"),
+    pytest.param("{{ R.F.upper()() }}", "a call on a row field", id="a-method-result-called"),
+    pytest.param("{{ (R.F ~ 'x')() }}", "a call on a row field", id="a-concatenation-called"),
+    pytest.param("{{ (R.F * 2)() }}", "a call on a row field", id="arithmetic-on-a-field-value-called"),
+    pytest.param("{{ (-R.F)() }}", "a call on a row field", id="a-negated-field-value-called"),
+    pytest.param("{{ (R.F == 'x')() }}", "a call on a row field", id="a-comparison-called"),
+    pytest.param("{{ (R.F if R.F else 'x')() }}", "a call on a row field", id="a-conditional-field-value-called"),
+    pytest.param("{% set m = R.F %}{{ m[0]() }}", "a call on a row field", id="part-of-an-aliased-field-value-called"),
+    pytest.param("{% set m = R.F %}{{ (m | first)() }}", "a call on a row field", id="element-of-an-aliased-field-value-called"),
+    pytest.param("{% for c in R.F %}{{ c() }}{% endfor %}", "a call on a row field", id="a-loop-over-a-field-value-called"),
+    pytest.param("{% for k, v in R | items %}{{ v() }}{% endfor %}", "a call on a row field", id="a-looped-field-value-called"),
+    pytest.param("{% for k in R %}{{ k() }}{% endfor %}", "a call on a row field", id="a-looped-field-name-called"),
     pytest.param("{{ R.get }}", "row.get without a call", id="uncalled-get"),
     pytest.param("{{ R | attr('get') }}", "row.get without a call", id="uncalled-get-through-attr"),
 )
+
+# One call per builtin filter whose result over row data is row data, so each
+# member of the two sets is pinned on its own (review-B2-template-residuals-r1
+# F2: deleting ``unique`` or ``reverse`` from the old set failed no test).
+_ROW_DATA_FILTER_CALLS: dict[str, str] = {
+    **{name: f"{{{{ (R.F | {name})() }}}}" for name in ("first", "last", "random", "min", "max")},
+    **{name: f"{{{{ (R.F | {name}(1) | first | first)() }}}}" for name in ("batch", "slice")},
+    **{name: f"{{{{ (R.F | {name}('x') | first)() }}}}" for name in ("selectattr", "rejectattr")},
+    **{
+        name: f"{{{{ (R.F | {name} | first)() }}}}"
+        for name in ("dictsort", "items", "list", "reject", "reverse", "select", "sort", "unique")
+    },
+    **{name: f"{{{{ (R.F | {name})() }}}}" for name in sorted(_VALUE_BUILDING_FILTERS)},
+}
+
+
+def test_every_row_data_filter_has_a_refused_call() -> None:
+    """The parametrization below covers exactly the filters the analysis treats as keeping row data."""
+    assert frozenset(_ROW_DATA_FILTER_CALLS) == _ELEMENT_FILTERS | _VALUE_BUILDING_FILTERS
+
+
+@pytest.mark.parametrize(("build", "receiver", "field", "declared"), _SURFACES)
+@pytest.mark.parametrize("form", [pytest.param(form, id=name) for name, form in sorted(_ROW_DATA_FILTER_CALLS.items())])
+def test_a_call_on_every_row_data_filter_result_is_refused(build: Any, receiver: str, field: str, declared: list[str], form: str) -> None:
+    with pytest.raises(ValidationError) as caught:
+        build(form.replace("R", receiver).replace("F", field), declared)
+    assert _ROW_AS_OBJECT in str(caught.value)
+    assert "a call on a row field" in str(caught.value)
+
 
 _DECLARATIONS = (
     pytest.param("list", id="list"),
@@ -299,6 +348,47 @@ def test_a_callable_the_template_supplies_is_not_a_row_call(receiver: str, form:
 @pytest.mark.parametrize("build", [pytest.param(_single, id="single-query-row"), pytest.param(_rag, id="rag-row")])
 @pytest.mark.parametrize(("form", "rendered"), _SUPPLIED_CALLABLES)
 def test_a_callable_the_template_supplies_is_admitted_by_the_opt_out_and_renders(build: Any, form: str, rendered: str) -> None:
+    template = form.replace("R", "row")
+    build(template, [])
+    assert _render(template, ALL_FIELDS) == rendered
+
+
+# What is not row data is not refused: a value's own method, bound to a name or
+# mapped out of it, and a name that is bound to a callable anywhere. Each renders.
+_VALUE_METHODS_CALLED = (
+    pytest.param("{% set f = R.note.upper %}{{ f() }}", "FIRST", id="a-value-method-bound-to-a-name"),
+    pytest.param("{{ (R.note | map(attribute='upper') | first)() }}", "F", id="a-mapped-value-method"),
+    pytest.param("{% set m = R.note %}{% set m = range %}{{ m(2) | list }}", "[0, 1]", id="a-name-also-bound-to-a-callable"),
+    pytest.param("{% macro c(v) %}{{ v(2) | list }}{% endmacro %}{{ c(range) }}{{ c(R.note) if false }}", "[0, 1]", id="a-macro-parameter"),
+    # A global read before its binding, or past a binding in a branch not taken, is still the global.
+    pytest.param("{{ range(2) | list }}{% set range = R.note %}", "[0, 1]", id="a-global-called-before-it-is-bound"),
+    pytest.param(
+        "{% if false %}{% set range = R.note %}{% endif %}{{ range(2) | list }}", "[0, 1]", id="a-global-bound-in-a-branch-not-taken"
+    ),
+)
+
+
+@pytest.mark.parametrize("receiver", [pytest.param("row", id="row"), pytest.param("row.source_row", id="source-row")])
+@pytest.mark.parametrize(("form", "rendered"), _VALUE_METHODS_CALLED)
+def test_a_value_method_or_a_callable_name_is_not_a_row_call(receiver: str, form: str, rendered: str) -> None:
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    row_attribute = "source_row" if receiver == "row.source_row" else None
+    assert extract_jinja2_field_usage(form.replace("R", receiver), row_attribute=row_attribute).row_api_misuses == ()
+
+
+def test_a_name_read_from_the_context_before_its_binding_is_not_row_data() -> None:
+    """``{{ f(1) }}{% set f = row.note %}``: the call reads the context's ``f``, not the row data bound after it."""
+    from elspeth.core.templates import extract_jinja2_field_usage
+
+    assert extract_jinja2_field_usage("{{ f(1) }}{% set f = row.note %}").row_api_misuses == ()
+    # Control: bound first, the call is on row data.
+    assert extract_jinja2_field_usage("{% set f = row.note %}{{ f(1) }}").row_api_misuses != ()
+
+
+@pytest.mark.parametrize("build", [pytest.param(_single, id="single-query-row"), pytest.param(_rag, id="rag-row")])
+@pytest.mark.parametrize(("form", "rendered"), _VALUE_METHODS_CALLED)
+def test_a_value_method_or_a_callable_name_is_admitted_and_renders(build: Any, form: str, rendered: str) -> None:
     template = form.replace("R", "row")
     build(template, [])
     assert _render(template, ALL_FIELDS) == rendered
@@ -482,5 +572,22 @@ def test_every_builtin_filter_sees_the_row_as_the_mapping_it_holds(name: str, pr
     """
     row = TemplateRow.project(_row(_SCALAR_ROW), projection)
     plain = dict(row)
-    source = "{{ row | reverse | list }}" if name == "reverse" else f"{{{{ row | {name} }}}}"
+    if name == "random":
+        # A random key of each: compared by the set it is drawn from.
+        source = "{{ (row | random) in (row | list) }}"
+    elif name == "reverse":
+        source = "{{ row | reverse | list }}"
+    else:
+        source = f"{{{{ row | {name} }}}}"
     assert _outcome(source, row) == _outcome(source, plain)
+
+
+@pytest.mark.parametrize("projection", _PROJECTIONS)
+def test_random_picks_one_of_the_row_field_names(projection: RowProjection) -> None:
+    """``row | random`` is a field name, as ``row | list | random`` is; the builtin indexed the mapping by position and failed."""
+    names = set(TemplateRow.project(_row(), projection))
+    assert {_render("{{ row | random }}", projection) for _ in range(40)} <= names
+    # A multi-query's variables and a mapping field value are mappings too.
+    assert SandboxedTemplate("{{ row | random }}").render(row={"text": "alpha"}) == "text"
+    # Any other value keeps the builtin.
+    assert SandboxedTemplate("{{ [7] | random }}").render(row={}) == "7"
