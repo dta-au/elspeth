@@ -12,11 +12,9 @@ from collections.abc import Iterable, Sequence
 from typing import Any, Final, Literal
 
 from jinja2 import TemplateSyntaxError
-from jinja2 import nodes as jinja_nodes
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.schema_contract import declared_type_name_admits
-from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
@@ -38,7 +36,8 @@ _PROMPT_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().
 # The one name build_template_context injects beside the query's own
 # input_fields variables (multi_query.py): the full source row, reachable as
 # row.source_row.<column> inside a query template.
-_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
+_MULTI_QUERY_SOURCE_ROW: Final[str] = "source_row"
+_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({_MULTI_QUERY_SOURCE_ROW})
 
 
 # Single-owned by the plugin layer and imported by the composer rule, so the
@@ -83,62 +82,42 @@ MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY: Final[str] = (
 )
 
 
-@observation_boundary(
-    tier=3,
-    source="a multi-query prompt template (YAML- or web-authored Jinja2 text) parsed into its AST",
-    source_param="template",
-    suppresses=("R5",),
-    invariant=(
-        "returns only literal column names read as row.source_row.<name>, row.source_row['<name>'], "
-        "row['source_row']['<name>'] or row.source_row.get('<name>'); the get method itself, dotted "
-        "underscore names, bare "
-        "row.source_row, aliases and computed keys contribute nothing; raises only TemplateSyntaxError "
-        "for text that does not parse"
-    ),
-)
 def multi_query_source_row_columns(template: str) -> frozenset[str]:
-    """Row columns a multi-query template reads directly through ``row.source_row``.
+    """Row columns a multi-query template reads through ``row.source_row``.
 
-    Literal reads only. A computed key (``row.source_row[k]``), an alias
-    (``{% set s = row.source_row %}``) or the bare row object carries no
-    config-time column name, so it contributes nothing rather than a guess.
+    The single-query field analysis pointed at the nested row
+    (``extract_jinja2_field_usage(..., row_attribute="source_row")``), so a
+    query's column reads are found exactly as a single-query template's field
+    reads are: attribute and item syntax, ``get('<name>')``, the
+    attribute-resolving filters (``attr('x')``, ``map(attribute='x')``,
+    ``selectattr('x')``, ``sort``/``join``/``sum(attribute='x')``,
+    ``groupby('x')``) and names bound to the row. A second, narrower walk here
+    once missed the filters, so a query reading an undeclared column through
+    ``row.source_row | attr('x')`` validated and then failed every row
+    (review-G3-template-api-r2 F2). A computed key names no column and
+    contributes nothing here; ``_validate_template_row_access`` refuses it.
+    Raises ``TemplateSyntaxError`` for text that does not parse.
     """
+    from elspeth.core.templates import extract_jinja2_field_usage
 
-    def is_source_row(node: jinja_nodes.Node) -> bool:
-        if isinstance(node, jinja_nodes.Getattr):
-            return isinstance(node.node, jinja_nodes.Name) and node.node.name == "row" and node.attr == "source_row"
-        if isinstance(node, jinja_nodes.Getitem):
-            return (
-                isinstance(node.node, jinja_nodes.Name)
-                and node.node.name == "row"
-                and isinstance(node.arg, jinja_nodes.Const)
-                and node.arg.value == "source_row"
-            )
-        return False
+    return extract_jinja2_field_usage(template, row_attribute=_MULTI_QUERY_SOURCE_ROW).fields
 
-    ast = create_sandboxed_environment().parse(template)
-    columns: set[str] = set()
-    for attr in ast.find_all(jinja_nodes.Getattr):
-        # ``row.source_row`` renders as a field-only TemplateRow: a dotted name
-        # is a column, except ``get`` (its one method, read by the Call loop)
-        # and an underscore name (the sandbox refuses it).
-        if is_source_row(attr.node) and attr.attr != "get" and not attr.attr.startswith("_"):
-            columns.add(attr.attr)
-    for item in ast.find_all(jinja_nodes.Getitem):
-        if is_source_row(item.node) and isinstance(item.arg, jinja_nodes.Const) and isinstance(item.arg.value, str):
-            columns.add(item.arg.value)
-    for call in ast.find_all(jinja_nodes.Call):
-        callee = call.node
-        if (
-            isinstance(callee, jinja_nodes.Getattr)
-            and callee.attr == "get"
-            and is_source_row(callee.node)
-            and call.args
-            and isinstance(call.args[0], jinja_nodes.Const)
-            and isinstance(call.args[0].value, str)
-        ):
-            columns.add(call.args[0].value)
-    return frozenset(columns)
+
+def multi_query_context_names(template: str) -> frozenset[str]:
+    """The query variables a multi-query template reads as ``row.<variable>``, its ``row.source_row`` reads excluded.
+
+    A query renders with ``row`` bound to its input_fields variables plus
+    ``source_row``; a read through ``row.source_row`` is a column read
+    (``multi_query_source_row_columns``), so a method on a column's value
+    (``row.source_row.get('meta', '').upper()``) names no variable. Shared by
+    ``LLMConfig._validate_template_variable_bindings`` and the composer's
+    twin so the two surfaces judge one query binding the same way
+    (review-G3-template-api-r3 F4). Raises ``TemplateSyntaxError`` for text
+    that does not parse.
+    """
+    from elspeth.core.templates import extract_jinja2_context_fields
+
+    return extract_jinja2_context_fields(template, row_attribute=_MULTI_QUERY_SOURCE_ROW) - _MULTI_QUERY_IMPLICIT_ROW_NAMES
 
 
 def multi_query_undeclared_columns_message(query_name: str, undeclared: Sequence[str], declared: Iterable[str]) -> str:
@@ -641,7 +620,7 @@ class LLMConfig(TransformDataConfig):
             if self.queries is not None:
                 # A query renders with the row at row.source_row; the same reads
                 # through it are refused the same way as through row.
-                extractions.append(extract_jinja2_field_usage(template, row_attribute="source_row"))
+                extractions.append(extract_jinja2_field_usage(template, row_attribute=_MULTI_QUERY_SOURCE_ROW))
             for extraction in extractions:
                 misuses.extend(extraction.row_api_misuses)
                 computed_keys.extend(extraction.computed_key_accesses)
@@ -919,7 +898,7 @@ class LLMConfig(TransformDataConfig):
                 node_template_specs.append(spec.name)
 
             bound = frozenset(spec.input_fields)
-            unbound_fields = sorted(extract_jinja2_field_usage(template).fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+            unbound_fields = sorted(multi_query_context_names(template) - bound)
             if unbound_fields:
                 fields = ", ".join(f"'{name}'" for name in unbound_fields)
                 bound_names = ", ".join(f"'{name}'" for name in sorted(bound))

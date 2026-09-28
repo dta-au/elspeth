@@ -40,7 +40,7 @@ _EXPECTED_SANDBOXED_TEMPLATE_SITES = Counter(
 _EXPECTED_MESSAGE_QUOTING_ENVIRONMENTS = Counter(
     {
         "plugins/sinks/azure_blob_sink.py": 2,
-        "plugins/transforms/llm/base.py": 3,
+        "plugins/transforms/llm/base.py": 2,
         # RetrievalOutputConfig parses the query template for its unbound names: config text only.
         "plugins/transforms/rag/core.py": 1,
         "plugins/sources/llm/config.py": 2,

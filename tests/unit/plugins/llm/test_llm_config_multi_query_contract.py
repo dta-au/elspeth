@@ -217,10 +217,78 @@ class TestSourceRowColumnExtraction:
         )
         assert multi_query_source_row_columns(template) == frozenset()
 
-    def test_a_name_that_was_row_api_is_a_column_read(self) -> None:
-        """``row.source_row`` renders as a field-only TemplateRow, so these names read columns and must be declared."""
+    def test_a_method_name_is_a_column_read_and_a_reserved_name_is_not(self) -> None:
+        """``row.source_row`` holds fields and one method, as a single-query ``row`` does (G3).
+
+        ``keys`` reads a column; ``to_dict`` and ``contract`` are reserved names,
+        which ``_validate_template_row_access`` refuses on every surface before any
+        column check, so they are never columns to declare.
+        """
         template = "{{ row.source_row.to_dict() }} {{ row['source_row'].contract }} {{ row.source_row.keys }}"
-        assert multi_query_source_row_columns(template) == frozenset({"to_dict", "contract", "keys"})
+        assert multi_query_source_row_columns(template) == frozenset({"keys"})
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            pytest.param("{{ row.source_row | attr('x') }}", id="attr"),
+            pytest.param("{{ [row.source_row] | map(attribute='x') | list }}", id="map-attribute"),
+            pytest.param("{{ [row.source_row] | map('attr', 'x') | list }}", id="map-attr"),
+            pytest.param("{{ [row.source_row] | selectattr('x') | list }}", id="selectattr"),
+            pytest.param("{{ [row.source_row] | sort(attribute='x') | list }}", id="sort-attribute"),
+            pytest.param("{{ [row.source_row] | join(',', attribute='x') }}", id="join-attribute"),
+            pytest.param("{{ [row.source_row] | groupby('x') | list }}", id="groupby"),
+            pytest.param("{{ [row.source_row] | sum(attribute='x') }}", id="sum-attribute"),
+            pytest.param("{% set s = row.source_row %}{{ s.x }}", id="an-alias-of-the-row"),
+        ],
+    )
+    def test_an_attribute_resolving_filter_reads_a_column(self, template: str) -> None:
+        """The column analysis is the single-query field analysis pointed at ``row.source_row``.
+
+        A narrower walk of its own once missed these forms, so an undeclared
+        column read through them validated and failed every row
+        (review-G3-template-api-r2 F2).
+        """
+        assert multi_query_source_row_columns(template) == frozenset({"x"})
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            pytest.param("{{ row.source_row | attr('note') }}", id="attr"),
+            pytest.param("{{ [row.source_row] | map(attribute='note') | list }}", id="map-attribute"),
+            pytest.param("{{ [row.source_row] | selectattr('note') | list }}", id="selectattr"),
+            pytest.param("{{ [row.source_row] | sum(attribute='note') }}", id="sum-attribute"),
+        ],
+    )
+    def test_an_undeclared_column_read_through_a_filter_is_refused(self, form: str) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            _multi({"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }} " + form}}, required=["body"])
+        assert "Query 'classify' reads row column 'note' through its input_fields values or 'row.source_row'" in str(exc_info.value)
+
+
+class TestQueryVariablesExcludeSourceRowReads:
+    """A method on a column's value is not a query variable (review-G3-template-api-r3 F4).
+
+    The binding check judges ``row.<variable>`` against the query's input_fields;
+    a read through ``row.source_row`` is a column read and names no variable.
+    """
+
+    @pytest.mark.parametrize(
+        "form",
+        [
+            pytest.param("{{ row.source_row.get('body', '').upper() }}", id="get-with-default"),
+            pytest.param("{{ row.source_row.get('body').upper() }}", id="get"),
+            pytest.param("{{ row.source_row.body.upper() }}", id="attribute"),
+            pytest.param("{{ row['source_row']['body'].upper() }}", id="item"),
+        ],
+    )
+    def test_a_method_on_a_column_value_is_admitted(self, form: str) -> None:
+        config = _multi({"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }} " + form}}, required=["body"])
+        assert config.required_input_fields == ["body"]
+
+    def test_an_unbound_variable_is_still_refused(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            _multi({"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }} {{ row.other }}"}}, required=["body"])
+        assert "references 'other' under 'row', but this query's input_fields binds only 'text'" in str(exc_info.value)
 
 
 class TestUndeclaredMultiQuerySuggestionNamesColumnsOnly:

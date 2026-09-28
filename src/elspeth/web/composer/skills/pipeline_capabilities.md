@@ -291,8 +291,9 @@ field declares `float`.
 A row template — an LLM prompt or query template, or a retrieval
 `query_template` — sees only the fields its node declares in
 `required_input_fields` (a retrieval template also sees its query field).
-Declare every field the template reads or tests, and read each one by a fixed
-name (`row.field`, `row['field']`, a query's `row.source_row.field`): a key
+Declare every field the template reads or tests, an attribute filter's
+(`attr('field')`, `map(attribute='field')`) included, and read each one by a
+fixed name (`row.field`, `row['field']`, a query's `row.source_row.field`): a key
 computed at render (`row[k]`, `row.get(expr)`, or either through
 `row.source_row`) is refused. Reading or testing any other
 field fails every row, including `'x' in row`, a row carried through a `set`
@@ -302,12 +303,14 @@ declare the fields. A single-query prompt or retrieval template that never
 reads `row` declares none: the query field reaches a retrieval template as
 `query` without a declaration, and a declaration the template cannot use is
 refused. `row` has fields and one method, `get`: `row.items` and `row.keys`
-read columns of those names, so a call on a row field (`row.keys()`,
-`row.items()`, `row['keys']()`, `row.get('note')()`), `row.get` without a call
+read columns of those names, so a call on a row field or on row data
+(`row.keys()`, `row.items()`, `row['keys']()`, `row.get('note')()`,
+`row.tags[0]()`, `(row.tags | first)()`, `(row.note | upper)()`,
+`row.note.upper()()`, `{% set m = row.tags %}{{ m[0]() }}`), `row.get` without a call
 and the reserved names `row.contract`, `row.to_dict` and
 `row.to_checkpoint_format` are refused
 under every declaration, `[]` included. For the field names use `row | list`,
-for name and value pairs `row | items` or `row | dictsort`, for a mapping
+for name and value pairs `row | items | list` or `row | dictsort`, for a mapping
 `dict(row)` or `row | tojson`; read a column named like a method or a reserved
 name as `row['contract']`. A method on a field's value (`row.note.upper()`)
 is fine. With `required_input_fields` omitted, a model prompt may not use

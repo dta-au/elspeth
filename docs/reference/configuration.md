@@ -1241,8 +1241,8 @@ Within that:
 `row` has fields and one method, `get`. Every other attribute or item lookup
 on `row` reads a field of that name: `row.keys` and `row.items` are fields,
 not methods, so `row.keys()` calls the value of a field named `keys`. For the
-field names use `row | list`, for name and value pairs `row | items` or
-`row | dictsort`, and for a mapping `dict(row)`. `row.contract`, `row.to_dict`
+field names use `row | list`, for name and value pairs `row | items | list`
+or `row | dictsort`, and for a mapping `dict(row)`. `row.contract`, `row.to_dict`
 and `row.to_checkpoint_format` are reserved names, not fields: read a column
 with one of those names as `row['contract']`. The row object, its schema
 contract and their methods are not reachable from a template. A lookup of a
@@ -1273,7 +1273,12 @@ opts out of these checks, and the template then sees the whole row.
 Configuration also refuses a template that uses its row as an object, under
 every declaration, `[]` included, because no declaration makes it work: a
 call on a row field (`row.keys()`, `row.items()`, `row['keys']()`,
-`row.note()`, calling an element of the row, `(row | first)()`, and calling
+`row.note()`, calling an element of the row, `(row | first)()`, calling row
+data — a field's value, an item or element of it, what a builtin filter or a
+method builds from it, an operator over it, or a name every binding of which
+is row data (`row.tags[0]()`, `(row.tags | select | first)()`,
+`(row.note | upper)()`, `row.note.upper()()`,
+`{% set m = row.tags %}{{ m[0]() }}`) — and calling
 what `row.get('note')` returns, `row.get('note')()`, also when its default is
 a row field, `row.get('note', row.id)()`),
 `row.get` without a call (`{{ row.get }}`,

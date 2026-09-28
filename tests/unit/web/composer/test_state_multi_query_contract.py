@@ -110,6 +110,39 @@ def test_list_form_queries_and_node_level_fallback_template_are_read() -> None:
     assert "reads row column 'title'" in entry.message
 
 
+@pytest.mark.parametrize(
+    "form",
+    [
+        pytest.param("{{ row.source_row | attr('title') }}", id="attr"),
+        pytest.param("{{ [row.source_row] | map(attribute='title') | list }}", id="map-attribute"),
+        pytest.param("{{ [row.source_row] | selectattr('title') | list }}", id="selectattr"),
+        pytest.param("{{ [row.source_row] | groupby('title') | list }}", id="groupby"),
+    ],
+)
+def test_a_source_row_column_read_through_a_filter_is_reported(form: str) -> None:
+    """The column analysis is the shared ``multi_query_source_row_columns`` (review-G3-template-api-r2 F2)."""
+    options = _options(["body"], {"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }} " + form}})
+    (entry,) = _coded(_state(options))
+    assert "reads row column 'title'" in entry.message
+    assert entry.message in _plugin_message(options)
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        pytest.param("{{ row.source_row.get('body', '').upper() }}", id="get-with-default"),
+        pytest.param("{{ row.source_row.get('body').upper() }}", id="get"),
+    ],
+)
+def test_a_method_on_a_source_row_value_is_not_an_unbound_query_variable(form: str) -> None:
+    """The binding twin reads the shared ``multi_query_context_names`` (review-G3-template-api-r3 F4)."""
+    options = _options(["body"], {"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }} " + form}})
+    result = _state(options).validate()
+    assert [entry for entry in result.errors if entry.error_code == "query_template_unbound_row_fields"] == []
+    kwargs = {key: value for key, value in options.items() if key != "schema"}
+    LLMConfig(schema_config=SchemaConfig.from_dict({"mode": "observed"}), **kwargs)
+
+
 def test_subscripted_source_row_column_outside_declaration_is_reported() -> None:
     options = _options(
         ["body"], {"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }} {{ row['source_row']['title'] }}"}}

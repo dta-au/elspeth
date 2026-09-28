@@ -252,8 +252,9 @@ class TemplateRow(Mapping[str, Any]):
     Used as a value, the row is the mapping it holds: ``{{ row }}`` and every
     string conversion render its field values as a plain mapping (a nested
     value as its data, not ELSPETH's frozen carrier), ``tojson`` serializes it,
-    ``last`` reads the last field name (``__reversed__``) and ``reverse`` is
-    the list of field names in reverse order (``_reverse_row_names``).
+    ``last`` reads the last field name (``__reversed__``), ``reverse`` is
+    the list of field names in reverse order (``_reverse_row_names``) and
+    ``random`` picks one of them (``_random_mapping_key``).
     ``repr`` names the fields and never a value, because a repr can reach an
     exception message.
 
@@ -390,6 +391,7 @@ class _LocalSandboxedEnvironment(ImmutableSandboxedEnvironment):
         for name in _MAPPING_TYPED_FILTERS:
             self.filters[name] = _row_as_mapping(self.filters[name])
         self.filters["reverse"] = _reverse_row_names(self.filters["reverse"])
+        self.filters["random"] = _random_mapping_key(self.filters["random"])
 
     def getattr(self, obj: Any, attribute: str) -> Any:
         if type(obj) is TemplateRow:
@@ -450,6 +452,27 @@ def _reverse_row_names(filter_function: Callable[[Any], Any]) -> Callable[[Any],
         return filter_function(value)
 
     return reverse_row_names
+
+
+def _random_mapping_key(filter_function: Callable[..., Any]) -> Callable[..., Any]:
+    """``row | random`` is one of the row's field names, chosen at random, as ``row | list | random`` is: a mapping's random key.
+
+    The builtin picks ``seq[randrange(len(seq))]``: it indexes its argument
+    by position, which a mapping does not support (a template row, a
+    multi-query's variables and a mapping field value are keyed by name), so
+    over any of them it failed every row. A mapping used as a collection is
+    its keys (``first``, ``last``, ``list``; a row's ``reverse``), so
+    ``random`` picks among them. ``wraps`` keeps the builtin's
+    context-passing marker, so Jinja still hands it the context.
+    """
+
+    @wraps(filter_function)
+    def random_mapping_key(context: Any, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return filter_function(context, list(value))
+        return filter_function(context, value)
+
+    return random_mapping_key
 
 
 def _template_json_default(value: object) -> object:
