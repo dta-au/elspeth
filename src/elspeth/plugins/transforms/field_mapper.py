@@ -328,7 +328,7 @@ class FieldMapper(BaseTransform):
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8e1f5e5488b29ee1"
+    source_file_hash: str | None = "sha256:1b322bc8e2f94c9e"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -924,7 +924,8 @@ class FieldMapper(BaseTransform):
                 issue_code=None,
                 summary="Rename, drop, or reorder row fields. Stateless and shape-changing — declares new field names in output_schema.",
                 composer_hints=(
-                    "Config keys are 'mapping' (dict of source->target), 'select_only' (bool, default false), plus 'schema'. Every mapping source is required: a row missing one routes to on_error as missing_field. Rename with {old: new}; keep a field with {x: x}; drop a field by omitting it under select_only: true.",
+                    "Config keys are 'mapping' (dict of source->target), 'select_only' (bool, default false), plus 'schema'. Rename with {old: new}; keep a field with {x: x}; drop a field by omitting it under select_only: true.",
+                    "Every mapping source is required: a row missing one routes to on_error as missing_field.",
                     "field_mapper has no 'drop'/'include'/'rename_only' keys — dropping is done by omitting the field under select_only: true.",
                     "Use select_only: true when cleanup means 'save only these fields'; with select_only true, mapping should whitelist exactly the saved output fields.",
                     "A select_only whitelist must preserve every field required by the downstream sink; include each required field as a mapping target before routing the mapper to that sink.",
