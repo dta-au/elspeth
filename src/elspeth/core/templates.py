@@ -686,7 +686,8 @@ def _called_nodes(ast: Node) -> frozenset[int]:
         "field (any name but the row's one method or a reserved name on the row object; a name that is not a "
         "dict attribute on a dict built from the row), an item lookup or element filter on anything carrying the "
         "row's fields or on row data by this same test, a value-building builtin filter over either, a map of one "
-        "of those filters, a name every binding of which is row data, a method call on row data, a concatenation, "
+        "of those filters, a name every binding of which is row data, a method call on row data (a value's own get "
+        "included), a list or tuple literal of row data and literals, a concatenation, "
         "arithmetic, comparison, negation, conditional or boolean expression over row data and literals, or a "
         "row.get(...) or default filter whose fallback is absent, a literal or itself row data by this same "
         "test, each filter or method counting only when every argument is a literal or row data; every other "
@@ -735,7 +736,10 @@ def _is_row_field_call(
     - a name every binding of which is row data (``_RowReceiverNames.data``:
       ``{% set m = row.tags %}``, ``{% for c in row.tags %}``);
     - what a method on row data returns (``row.note.upper()``,
-      ``row.note.split(',')``);
+      ``row.note.split(',')``, a mapping value's own ``row.meta.get('x')``);
+    - a list or tuple written only of row data and literals
+      (``[row.note, 'x']``), so an item or element of it and a name a loop
+      over it binds (``{% for c in [row.note] %}``) are row data too;
     - a concatenation with row data (``row.note ~ 'x'``, always a string), a
       comparison or ``not`` of it (a boolean), and arithmetic, a negation, a
       conditional or ``and``/``or`` whose operands are row data or literals.
@@ -743,11 +747,18 @@ def _is_row_field_call(
     A filter or a method counts only when every argument is a literal or row
     data: ``int(default)``, ``sum(start)``, ``batch(n, fill_with)`` and
     ``dict.get(key, default)`` can return an argument, which may be callable.
-    What is NOT row data: an attribute of row data, which is the value's own
-    (``row.tags[0].upper`` is a method, so ``row.tags[0].upper()`` is a call
-    that works, and ``(row.note | attr('upper'))()`` too); an element of
-    ``groupby`` (its grouper is an attribute) or of ``map(attribute=...)``;
-    and a name bound anywhere to anything else, a macro parameter included.
+    What this test does NOT take for row data, so a call on it is admitted:
+    an attribute of row data, which configuration cannot resolve without the
+    value's type — on a string it is the value's own method
+    (``row.tags[0].upper()`` and ``(row.note | attr('upper'))()`` work), on
+    a mapping Jinja reads the item (``row.meta.x()``, and an element of
+    ``map(attribute=...)``, calls row data and fails the row at render); an
+    element of ``groupby`` (its grouper is an attribute); a name bound
+    anywhere to anything else; and a name this flow-insensitive test does
+    not follow into a binding: a macro parameter, whatever its call sites
+    pass (``{{ f(row.note) }}``), and an attribute of a ``namespace()``. A
+    call the test admits that does call row data fails that row at render,
+    routed with a value-free reason like any render failure.
     So is calling what ``get`` returns, a field value, when ``get`` cannot
     return its default or the default is a literal or is itself row data by
     this same test (``row.get('x', row.y)()``): any other default
@@ -795,7 +806,13 @@ def _is_row_field_call(
                 or _is_row_field_call(fallback, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
             )
         )
-    if isinstance(callee, Call) and isinstance(callee.node, Getattr) and callee.node.attr in TEMPLATE_ROW_METHODS:
+    if (
+        isinstance(callee, Call)
+        and isinstance(callee.node, Getattr)
+        and callee.node.attr in TEMPLATE_ROW_METHODS
+        and _node_is_row_object_expression(callee.node.node, namespaces, row_collection_aliases, row_container_aliases)
+    ):
+        # The row's own ``get``; a ``get`` on a field's value is a method on row data (below).
         if _has_unknown_star_values(callee.dyn_args) or _has_unknown_kwarg_values(callee.dyn_kwargs):
             return False
         default = _call_positional_or_keyword_value(callee, 1, "default")
@@ -803,7 +820,7 @@ def _is_row_field_call(
             default is None
             or isinstance(default, _LITERAL_NODES)
             or _is_row_field_call(default, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
-        ) and _node_is_row_object_expression(callee.node.node, namespaces, row_collection_aliases, row_container_aliases)
+        )
     return _is_row_data_expression(callee, namespaces, row_receivers, row_collection_aliases, row_container_aliases)
 
 
@@ -879,6 +896,9 @@ def _is_row_data_expression(
         return is_data(node.node.node) and _arguments_are_row_data_or_literals(
             node, namespaces, row_receivers, row_collection_aliases, row_container_aliases
         )
+    if isinstance(node, (List, Tuple)):
+        # A list or tuple written only of row data and literals holds plain data.
+        return any(is_data(item) for item in node.items) and all(is_data_or_literal(item) for item in node.items)
     if isinstance(node, Concat):
         # ``~`` always builds a string.
         return any(

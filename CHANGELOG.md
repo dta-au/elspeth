@@ -308,8 +308,10 @@ drained and repair this release forward.
   an item or element of it (`row.tags[0]()`, `(row.tags | select | first)()`,
   `(row.tags | batch(1) | first | first)()`), what a builtin filter or a
   method builds from it (`(row.note | upper)()`, `row.note.upper()()`,
-  `(row | tojson)()`), an operator over it (`(row.note ~ 'x')()`), or a name
-  every binding of which is row data (`{% set m = row.tags %}{{ m[0]() }}`,
+  `row.meta.get('x')()`, `(row | tojson)()`), an operator over it
+  (`(row.note ~ 'x')()`), a list or tuple written of it
+  (`{% for c in [row.note] %}{{ c() }}{% endfor %}`), or a name every
+  binding of which is row data (`{% set m = row.tags %}{{ m[0]() }}`,
   `{% for c in row.tags %}{{ c() }}{% endfor %}`) — and calling what
   `row.get('note')` returns, also when its default is a row field,
   `row.get('note', row.id)()`),
@@ -340,9 +342,15 @@ drained and repair this release forward.
   `row | reverse` is still the list of field names in reverse order, and
   `row | random` (also over a mapping value, `row.meta | random`) picks one
   of the field names, as `row | list | random` does, where Jinja's builtin
-  indexed the mapping by position and failed every row. An attribute of a
-  value is the value's own and is not refused when called
-  (`row.note.upper()`, `(row.note | attr('upper'))()`). With the
+  indexed the mapping by position and failed every row. Configuration does
+  not resolve an attribute of a value, so calling one is admitted: on a
+  string it is the value's method (`row.note.upper()`,
+  `(row.note | attr('upper'))()` work), while on a mapping Jinja reads the
+  item (`row.meta.x()`, `(row.recs | map(attribute='y') | first)()`), which
+  fails the row at render. Nor does it follow row data into a macro
+  parameter (`{{ f(row.note) }}` calling `v()`) or a `namespace()`
+  attribute; such a call also fails the row at render, routed with a
+  value-free reason. With the
   declaration omitted, a single-query prompt that uses `row` as a whole
   (`{{ row }}`, `row | dictsort`, `dict(row)`) is refused: it rendered an
   empty row. A multi-query `input_fields` variable named `source_row` or like

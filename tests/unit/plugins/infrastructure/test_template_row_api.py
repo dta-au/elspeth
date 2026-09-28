@@ -176,6 +176,12 @@ _MISUSES = (
     pytest.param("{% for c in R.F %}{{ c() }}{% endfor %}", "a call on a row field", id="a-loop-over-a-field-value-called"),
     pytest.param("{% for k, v in R | items %}{{ v() }}{% endfor %}", "a call on a row field", id="a-looped-field-value-called"),
     pytest.param("{% for k in R %}{{ k() }}{% endfor %}", "a call on a row field", id="a-looped-field-name-called"),
+    # review-B2-fix-r1 m1: a value's own ``get`` returns row data too, and so
+    # does an element of a list or tuple written only of row data and literals.
+    pytest.param("{{ R.F.get('x')() }}", "a call on a row field", id="get-on-a-field-value-result-called"),
+    pytest.param("{% for c in [R.F] %}{{ c() }}{% endfor %}", "a call on a row field", id="a-loop-over-a-listed-field-value-called"),
+    pytest.param("{{ [R.F, 'x'][0]() }}", "a call on a row field", id="item-of-a-list-of-row-data-called"),
+    pytest.param("{{ ((R.F, R.F) | first)() }}", "a call on a row field", id="element-of-a-tuple-of-row-data-called"),
     pytest.param("{{ R.get }}", "row.get without a call", id="uncalled-get"),
     pytest.param("{{ R | attr('get') }}", "row.get without a call", id="uncalled-get-through-attr"),
 )
@@ -357,6 +363,8 @@ def test_a_callable_the_template_supplies_is_admitted_by_the_opt_out_and_renders
 # mapped out of it, and a name that is bound to a callable anywhere. Each renders.
 _VALUE_METHODS_CALLED = (
     pytest.param("{% set f = R.note.upper %}{{ f() }}", "FIRST", id="a-value-method-bound-to-a-name"),
+    pytest.param("{% for f in [R.note.upper] %}{{ f() }}{% endfor %}", "FIRST", id="a-listed-value-method"),
+    pytest.param("{% for f in [R.note, range] %}{{ f(2) | list if loop.last }}{% endfor %}", "[0, 1]", id="a-list-holding-a-callable"),
     pytest.param("{{ (R.note | map(attribute='upper') | first)() }}", "F", id="a-mapped-value-method"),
     pytest.param("{% set m = R.note %}{% set m = range %}{{ m(2) | list }}", "[0, 1]", id="a-name-also-bound-to-a-callable"),
     pytest.param("{% macro c(v) %}{{ v(2) | list }}{% endmacro %}{{ c(range) }}{{ c(R.note) if false }}", "[0, 1]", id="a-macro-parameter"),
