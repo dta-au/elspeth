@@ -2353,6 +2353,16 @@ sites:
   note: FrameworkBugError at builder.py:144 — declared_output_fields must be a subset of the plugin's
     own effective guaranteed_fields. Both sides come from the transform class, not from NodeSpec.options,
     so authored state cannot reach it.
+- key: e1681e16a410f544
+  path: src/elspeth/core/dag/builder.py
+  qualname: build_execution_graph
+  exception: FrameworkBugError
+  message: Bound value_transform has no output schema
+  ordinal: 0
+  disposition: structural
+  note: The builder calls bind_upstream_input_types immediately before this check. A successful bind constructs
+    both _output_schema_config and output_schema before returning (value_transform.py:496-500); failures
+    raise instead. Composer-authored state cannot produce a successful bind with either missing.
 - key: 185547a3819dee51
   path: src/elspeth/core/dag/builder.py
   qualname: build_execution_graph
