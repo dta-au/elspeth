@@ -72,6 +72,7 @@ from elspeth.contracts.export_records import (
     WebPluginPolicyExportRecord,
 )
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.database import LandscapeDB
@@ -431,9 +432,16 @@ class LandscapeExporter:
 
     @staticmethod
     def _parse_tier1_json(raw_json: str, field_name: str, context: str) -> Any:
-        """Parse JSON from Tier 1 audit data, crashing with context on corruption."""
+        """Parse stored canonical JSON from Tier 1 audit data, crashing with context on corruption.
+
+        ``settings_json`` and ``config_json`` are written by ``canonical_json``,
+        so they are read with its inverse: a plain ``json.loads`` reads an
+        integral double beyond 2**53 (printed in integer notation) back as an
+        ``int`` -- not the value that was hashed, and one the canonical encoder
+        refuses when the export record is serialized.
+        """
         try:
-            return json.loads(raw_json)
+            return canonical_json_loads(raw_json)
         except json.JSONDecodeError as exc:
             raise AuditIntegrityError(
                 f"Corrupt {field_name} for {context}: database corruption (Tier 1 violation). Parse error: {exc}"

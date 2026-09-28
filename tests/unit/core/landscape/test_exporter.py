@@ -2574,3 +2574,65 @@ class TestFullPipelineExport:
         for batch_size in (1, 2, 3):
             records = list(_make_exporter(**kwargs, row_batch_size=batch_size).export_run("run-1"))
             assert records == baseline, f"row_batch_size={batch_size} changed the export stream"
+
+
+# ===========================================================================
+# Stored canonical settings/config read back to the hashed value
+# ===========================================================================
+
+
+class TestExportReadsStoredCanonicalJson:
+    """The exported settings/config are the values that were hashed.
+
+    RFC 8785 prints an integral double in [2**53, 1e21) in integer notation
+    (``1e17`` -> ``100000000000000000``). A plain ``json.loads`` reads that
+    back as an ``int`` -- a different value from the hashed double, and one
+    the canonical encoder itself refuses when the record is signed.
+    """
+
+    _BIG = 1e17
+
+    def _export(self, *, sign: bool) -> list[dict[str, Any]]:
+        from elspeth.contracts.schema import SchemaConfig
+        from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
+
+        db = make_landscape_db()
+        factory = make_factory(db)
+        factory.run_lifecycle.begin_run(
+            config={"threshold": self._BIG},
+            canonical_version="v1",
+            run_id="run-1",
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        factory.data_flow.register_node(
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            plugin_name="csv",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0.0",
+            config={"path": "in.csv", "limit": self._BIG},
+            schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+        )
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-key" if sign else None,
+            signer_key_id="test-signer-v1" if sign else None,
+            compartment_id="test-compartment",
+        )
+        return list(exporter.export_run("run-1", sign=sign))
+
+    def test_settings_and_node_config_float_beyond_2_53_read_back_as_the_same_double(self) -> None:
+        records = self._export(sign=False)
+        threshold = records[0]["settings"]["threshold"]
+        node_config = next(r for r in records if r["record_type"] == "node")["config"]
+        assert type(threshold) is float
+        assert threshold == self._BIG
+        assert type(node_config["limit"]) is float
+        assert node_config["limit"] == self._BIG
+
+    def test_signed_export_of_float_beyond_2_53_settings_completes(self) -> None:
+        records = self._export(sign=True)
+        assert records[-1]["record_type"] == "manifest"
+        assert all("signature" in record for record in records)
+        assert records[0]["settings"]["threshold"] == self._BIG
