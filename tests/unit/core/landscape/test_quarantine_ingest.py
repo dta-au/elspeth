@@ -22,8 +22,8 @@ from sqlalchemy import select, update
 from elspeth.contracts import NodeType, RoutingMode
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import RunLeadershipLostError
-from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.errors import ExecutionError, RunLeadershipLostError, SourceQuarantineReason
+from elspeth.contracts.scheduler import BarrierEmission, SchedulerEventType, SourceIngestSpec, TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import sanitize_for_canonical
@@ -176,6 +176,64 @@ def test_stale_leader_epoch_refuses_the_whole_ingest_with_no_mutation(harness: _
     with pytest.raises(RunLeadershipLostError):
         _ingest(harness, {"id": "abc"}, leader=replace(harness.leader, leader_epoch=harness.leader.leader_epoch + 1))
     assert _snapshot(harness) == before
+
+
+def _ingest_through_the_repository_verb(h: _Harness, *, leader: CoordinationToken) -> None:
+    """Call the fenced repository verb itself with the arguments the composition builds."""
+    row = quarantine_pipeline_row({"id": "abc"})
+    state_id = "state-direct"
+    divert_event = h.factory.execution.node_states.prepare_routing_event_for_new_state(
+        state_id,
+        h.edge_id,
+        RoutingMode.DIVERT,
+        SourceQuarantineReason(quarantine_error=_ERROR),
+        run_id=leader.run_id,
+        owner="test_quarantine_ingest",
+    )
+    h.factory.scheduler.ingest_quarantine_row_with_pending_sink(
+        coordination_token=leader,
+        source=SourceIngestSpec(
+            source_node_id="source",
+            row_index=0,
+            data=row.to_dict(),
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row-direct",
+            token_id="token-direct",
+        ),
+        data_flow=h.factory.data_flow,
+        execution=h.factory.execution,
+        validation_error_id=None,
+        source_state_id=state_id,
+        failure=ExecutionError(exception=_ERROR, exception_type="ValidationError"),
+        divert_event=divert_event,
+        pending_sink=BarrierEmission(
+            token_id="token-direct",
+            row_payload_json=h.factory.scheduler.serialize_row_payload(row),
+            sink_name="bad",
+            outcome=TerminalOutcome.FAILURE.value,
+            path=TerminalPath.QUARANTINED_AT_SOURCE.value,
+            error_hash=compute_error_hash(_ERROR),
+            error_message=_ERROR,
+            row_id="row-direct",
+            node_id=None,
+            step_index=2,
+            ingest_sequence=0,
+        ),
+    )
+
+
+def test_stale_leader_epoch_refuses_the_repository_verb_with_no_mutation(harness: _Harness) -> None:
+    """F-10 retained evidence for ``ingest_quarantine_row_with_pending_sink``: the verb itself is fenced."""
+    before = _snapshot(harness)
+    with pytest.raises(RunLeadershipLostError):
+        _ingest_through_the_repository_verb(harness, leader=replace(harness.leader, leader_epoch=harness.leader.leader_epoch + 1))
+    assert _snapshot(harness) == before
+    # Control: the same arguments under the current leader ingest the row, so
+    # the refusal above is the fence and not a malformed call.
+    _ingest_through_the_repository_verb(harness, leader=harness.leader)
+    with harness.db.read_only_connection() as conn:
+        assert conn.execute(select(tokens_table.c.token_id)).scalars().all() == ["token-direct"]
 
 
 @pytest.mark.parametrize(

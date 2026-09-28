@@ -944,7 +944,17 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 040ed5b1c21f4dae with the new code reproduces cab4aab8... exactly, so the
 # move is plugin provenance, not runtime semantics; (3) this digest, captured
 # from this file's parity failure. No oracle_freeze snapshot moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "7d9bebc6bdb3ca946d71a64d420b03b1c4bda1bb5f6f5dd11211a3e0ab8962af"
+# Rotated 2026-09-29 (elspeth-5887fb7928, QR source-quarantine resume): an
+# AUDIT SHAPE rotation. A source-quarantined row is ingested with a born-parked
+# PENDING_SINK work item (QR-1), so source-quarantine-routed's exact projection
+# gains one scheduler_work entry (mark_pending_sink -> mark_pending_sink_terminal)
+# and its export gains the 2 scheduler_event records (manifest record_count
+# 27 -> 29). Order: (1) that case's expected block, captured from the harness's
+# own run evidence (durable == portable); (2) this digest 7d9bebc6... ->
+# 14a3a5cc..., captured from this file's parity failure. No oracle_freeze
+# snapshot moved (test_oracle_freeze green: the frozen surface carries no
+# scheduler_work or audit records).
+EXPECTED_CASE_REGISTRY_SHA256 = "14a3a5cc637cd12e512ce46a2b23e817a7696f5c51ba16012c9b5b130b4bc70c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
