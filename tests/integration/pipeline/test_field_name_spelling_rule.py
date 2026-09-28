@@ -396,7 +396,7 @@ class TestStringScanFields:
 
 
 class TestTypeCoerceConversionField:
-    """S7(b): the conversion field is a declared input (Q4 amendment), so the rule governs it."""
+    """S7(b): a conversion reads its declared input and writes a published output."""
 
     def _coerce(self, field: str, schema: dict[str, Any]) -> dict[str, Any]:
         return _transform("type_coerce", {"conversions": [{"field": field, "to": "int"}], "schema": schema})
@@ -407,7 +407,7 @@ class TestTypeCoerceConversionField:
         coerce = self._coerce("Price", {"mode": "flexible", "fields": ["price: str"]})
         result = _run(_settings(tmp_path, source=source, transforms=[coerce]))
 
-        _assert_routed(tmp_path, result, reason=_READ, literal="Price", canonical="price")
+        _assert_routed(tmp_path, result, reason=_CREATE, literal="Price", canonical="price")
 
     def test_the_observed_mode_lookup_is_refused_too(self, tmp_path: Path) -> None:
         """Behaviour change (CHANGELOG): an observed-mode ``field: Price`` worked as a lookup; it now routes."""
@@ -415,7 +415,7 @@ class TestTypeCoerceConversionField:
             _settings(tmp_path, source=_csv_source(tmp_path, "ID,Price\n1,5\n2,6\n"), transforms=[self._coerce("Price", _OBSERVED)])
         )
 
-        _assert_routed(tmp_path, result, reason=_READ, literal="Price", canonical="price")
+        _assert_routed(tmp_path, result, reason=_CREATE, literal="Price", canonical="price")
 
     def test_the_canonical_conversion_delivers(self, tmp_path: Path) -> None:
         result = _run(
@@ -662,7 +662,7 @@ def _mapped_surfaces(*, runtime: bool) -> list[Any]:
         ),
         pytest.param(
             _transform("type_coerce", {"conversions": [{"field": "Name", "to": "int"}], "schema": _OBSERVED}),
-            _READ,
+            _CREATE,
             id="type_coerce-conversion-field",
         ),
         pytest.param(_web_scrape("Name"), _READ, id="web_scrape-url_field"),
@@ -698,6 +698,7 @@ def test_a_renamed_header_declaration_is_refused_at_build_behind_a_closed_upstre
         assert "the source's field_mapping renames 'name' to 'b'. Declare 'b'" in output
     else:
         assert "'Name' is a header spelling of the arriving field 'b'" in output
+        assert "name it 'b' to overwrite that field" in output
 
 
 def test_a_renamed_header_required_input_field_names_the_rename_target(tmp_path: Path) -> None:
@@ -822,6 +823,7 @@ def test_a_renamed_headerless_column_declaration_is_refused_at_build_behind_a_cl
         assert "headers are normalized" not in output
     else:
         assert "'Name' is a header spelling of the arriving field 'b'" in output
+        assert "name it 'b' to overwrite that field" in output
 
 
 @pytest.mark.parametrize(("transform", "reason"), _mapped_surfaces(runtime=True))

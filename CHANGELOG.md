@@ -208,9 +208,11 @@ drained and repair this release forward.
   `given: int` with exit 0. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
   Price}]` over header `Price` worked as a lookup and now routes every row
-  with `declared_field_is_header_spelling` — write `field: price`; and a
-  conversion field is now a declared input, so one no
-  row carries is refused at build against a `fixed` upstream and otherwise
+  with `target_is_header_spelling` — write `field: price`. A conversion
+  reads and writes its field; its now-published output type makes the
+  created-name reason the stronger spelling claim. The conversion field is
+  also a declared input, so one no row carries is refused at build against
+  a `fixed` upstream and otherwise
   routes each row lacking it as `missing_field`, as before (see the
   declared-input bullet below). The same holds for `json_explode`'s
   `array_field`, now a declared input: `array_field: Name` over header `Name`
