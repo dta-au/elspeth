@@ -5249,7 +5249,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ffdb0616b1c68213",
         1,
         None,
-        line=539,
+        line=542,
         connection_escape=True,
     ),
     # open_export_read_transaction acquires twice: engine.connect()
@@ -5262,7 +5262,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9d39978e72854dca",
         1,
         None,
-        line=544,
+        line=547,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/leases.py",
@@ -5285,7 +5285,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=426,
+        line=500,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5296,7 +5296,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=839,
+        line=913,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5307,7 +5307,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "a1ed0f32c96a6da4",
         1,
         None,
-        line=859,
+        line=933,
         connection_escape=True,
     ),
     # ``with LandscapeDB.from_url(...) as database`` then ``database.engine
@@ -5375,7 +5375,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "288170ec1722ebc2",
         1,
         None,
-        line=128,
+        line=125,
     ),
     # Fingerprint re-pinned by elspeth-5dd23f4df9: the refuse reason this
     # function builds dropped its phantom "source-aware resume path" clause
@@ -5389,7 +5389,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "360429a1d3a62990",
         1,
         None,
-        line=237,
+        line=234,
     ),
     # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
     # same-module private callee that executes on it, which the forwarding
@@ -5402,7 +5402,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "56688d7122f39718",
         1,
         None,
-        line=432,
+        line=429,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -5416,10 +5416,16 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         # mechanical: with the docstring stripped, this function's AST is
         # byte-identical to its pre-edit form, so no statement changed and
         # nothing unread was admitted.
-        "220df19797033d2b",
+        # Re-pinned 2026-09-28 (elspeth-5887fb7928 wave 1, H1): the persisted
+        # row payload is decoded with canonical_json_loads (it reads a stored
+        # float back to the double it encoded) instead of json.loads with a
+        # local NaN/Infinity rejector, which the canonical loader already
+        # refuses. Read, not mechanical: the acquisition, its connection and its
+        # write-connection use are unchanged; only the decode call moved.
+        "0763a378a5e6d854",
         1,
         None,
-        line=915,
+        line=909,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -5429,7 +5435,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ccdaa74d89308bbb",
         1,
         None,
-        line=976,
+        line=970,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -5439,7 +5445,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "63aa60b938d94231",
         1,
         None,
-        line=1043,
+        line=1037,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -5449,7 +5455,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "18b91cab2434c597",
         1,
         None,
-        line=1138,
+        line=1132,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -5459,7 +5465,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "697320a36b78fae3",
         1,
         None,
-        line=1180,
+        line=1174,
     ),
     # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
     # ONLY -- same symbol, same fingerprint, same domain -- because the
@@ -18327,7 +18333,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         "ffdb0616b1c68213",
         1,
         None,
-        line=539,
+        line=542,
         connection_escape=True,
     )
     assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 56
