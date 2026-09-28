@@ -20,7 +20,9 @@ published stamp tables.
 
 A THIRD, separate operation lives here too: ``join_batch_contracts``, the
 DESCRIPTION join (J1) used only where several PRODUCERS' rows meet — the sink
-batch merge and display headers (ADR-050). It never raises on a type
+batch merge, display headers (ADR-050), and the carried fields of a batch
+plugin that emits one row per buffered row (``batch_rank``), whose buffered
+rows can come from several producers. It never raises on a type
 difference: two producers that type one field differently are both telling
 the truth about their own rows, and the batch description is ``object``. It
 is the wrong tool for a coalesce (a union coalesce PROMISES one type to its

@@ -10,7 +10,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.transforms.batch_rank import BatchRank
@@ -208,6 +208,90 @@ class TestShape:
             if ranked:
                 assert 1 <= out["rank_rank"] <= ranked_count
                 assert 0.0 <= out["rank_percentile"] < 100.0
+
+
+def _row_with(data: dict[str, Any], *fields: FieldContract) -> PipelineRow:
+    """A PipelineRow whose contract is exactly ``fields`` (one producer's truthful description of its row)."""
+    return make_row(data, contract=SchemaContract(mode="OBSERVED", fields=fields, locked=True))
+
+
+class TestCarriedFieldContracts:
+    """Every emitted row's contract describes that row's own carried values.
+
+    Buffered rows can come from different producers (two sources on one queue,
+    row_union branches), each typing a carried field truthfully for its own
+    rows. The one shared output contract must describe all of them: an
+    emitted row's contract never rejects the value it carries.
+    """
+
+    @staticmethod
+    def _violations(result: TransformResult) -> list[list[str]]:
+        assert result.status == "success"
+        assert result.rows is not None
+        return [[type(violation).__name__ for violation in row.contract.validate(row.to_dict())] for row in result.rows]
+
+    def test_int_then_float_rank_field(self, ctx: PluginContext) -> None:
+        transform = BatchRank({"schema": OBSERVED, "value_field": "score"})
+        rows = [_row_with({"score": 7}, make_field("score", int)), _row_with({"score": 2.5}, make_field("score", float))]
+
+        result = transform.process(rows, ctx)
+
+        assert _column(result, "rank_rank") == [1, 2]
+        assert self._violations(result) == [[], []]
+
+    def test_carried_non_rank_field_typed_differently(self, ctx: PluginContext) -> None:
+        transform = BatchRank({"schema": OBSERVED, "value_field": "score"})
+        rows = [
+            _row_with({"score": 1, "note": "kept"}, make_field("score", int), make_field("note", str)),
+            _row_with({"score": 2, "note": 3}, make_field("score", int), make_field("note", int)),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert self._violations(result) == [[], []]
+        assert result.rows is not None
+        # Two producers typing one field differently are described as 'any', never as either one's type.
+        assert result.rows[0].contract.get_field("note").python_type is object
+
+    def test_carried_field_nullable_on_one_producer_only(self, ctx: PluginContext) -> None:
+        transform = BatchRank({"schema": OBSERVED, "value_field": "score"})
+        rows = [
+            _row_with({"score": 1, "note": "kept"}, make_field("score", int), make_field("note", str, required=True)),
+            _row_with({"score": 2, "note": None}, make_field("score", int), make_field("note", str, required=True, nullable=True)),
+        ]
+
+        assert self._violations(transform.process(rows, ctx)) == [[], []]
+
+    def test_carried_field_absent_from_one_producer(self, ctx: PluginContext) -> None:
+        transform = BatchRank({"schema": OBSERVED, "value_field": "score"})
+        rows = [
+            _row_with({"score": 1, "note": "kept"}, make_field("score", int), make_field("note", str, required=True)),
+            _row_with({"score": 2}, make_field("score", int)),
+        ]
+
+        result = transform.process(rows, ctx)
+
+        assert self._violations(result) == [[], []]
+        assert result.rows is not None
+        assert "note" not in result.rows[1]
+        # A field some buffered row lacks is never claimed required on the rows that share the contract.
+        assert result.rows[1].contract.get_field("note").required is False
+
+    def test_one_producer_batch_keeps_its_exact_carried_types(self, ctx: PluginContext) -> None:
+        """Negative control: describing several producers never widens a batch from ONE producer."""
+        transform = BatchRank({"schema": OBSERVED, "value_field": "score"})
+        contract = SchemaContract(
+            mode="OBSERVED", fields=(make_field("score", int, required=True), make_field("note", str, nullable=True)), locked=True
+        )
+        rows = [make_row({"score": 7, "note": "a"}, contract=contract), make_row({"score": 3, "note": None}, contract=contract)]
+
+        result = transform.process(rows, ctx)
+
+        assert result.rows is not None
+        emitted = result.rows[0].contract
+        assert (emitted.get_field("score").python_type, emitted.get_field("score").required) == (int, True)
+        assert (emitted.get_field("note").python_type, emitted.get_field("note").nullable) == (str, True)
+        assert self._violations(result) == [[], []]
 
 
 class TestBatchFailures:

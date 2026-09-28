@@ -44,6 +44,7 @@ from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
+from elspeth.contracts.union_merge import join_batch_contracts
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError, TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -126,7 +127,7 @@ class BatchRank(BaseTransform):
     name = "batch_rank"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9dbd060cd8223249"
+    source_file_hash: str | None = "sha256:227225a4dc42b7f9"
     config_model = BatchRankConfig
     is_batch_aware = True
     # Passthrough-capable: every successful flush is a success_multi of exactly
@@ -319,12 +320,20 @@ class BatchRank(BaseTransform):
         return ranks
 
     def _output_contract_for(self, rows: list[PipelineRow]) -> SchemaContract:
-        """One output contract for every emitted row: the buffered rows' fields plus the annotations."""
-        merged_fields: dict[str, FieldContract] = {}
-        for row in rows:
-            for field in row.contract.fields:
-                if field.normalized_name not in merged_fields:
-                    merged_fields[field.normalized_name] = field
+        """One output contract for every emitted row: the buffered rows' fields plus the annotations.
+
+        ``success_multi`` requires one shared contract instance, so the carried
+        fields are the J1 description join of the buffered rows' own contracts
+        (``join_batch_contracts``): buffered rows can come from several
+        producers (two sources on one queue, row_union branches), and a field
+        they type differently is ``object``, nullable is OR and a field some
+        row lacks is optional. Every emitted row's contract therefore admits
+        the carried values it holds, which ``preserves_input_values`` keeps
+        exactly as they arrived. Rows sharing one contract join to that
+        contract unchanged, so a single-producer batch keeps its exact types.
+        """
+        joined = join_batch_contracts(list({id(row.contract): row.contract for row in rows}.values()))
+        merged_fields: dict[str, FieldContract] = {field.normalized_name: field for field in joined.fields}
 
         # Each annotation enters as a placeholder; the ONE stamp rewrites it to
         # the plugin's declaration (ADR-050) and the batch postflight checks
@@ -339,7 +348,7 @@ class BatchRank(BaseTransform):
             )
 
         output_contract = SchemaContract(
-            mode=rows[0].contract.mode,
+            mode=joined.mode,
             fields=tuple(merged_fields.values()),
             locked=True,
         )
