@@ -429,6 +429,18 @@ def test_parse_success_screened_without_result_yields_empty_string():
     assert response.text == ""
 
 
+def test_parse_success_operations_preserves_text_when_present():
+    adapter = ReferenceV1InvokeAdapter()
+    response = adapter.parse_success(
+        {
+            "halt": "operations",
+            "result": {"text": "I will check", "invocations": [{"ref": "c1", "operation": "lookup", "payload": {}}]},
+        }
+    )
+    assert response.text == "I will check"
+    assert response.tool_calls == (CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}"),)
+
+
 def test_parse_success_unknown_halt_raises_value_error():
     adapter = ReferenceV1InvokeAdapter()
     with pytest.raises(ValueError):
@@ -535,6 +547,13 @@ def test_classify_error_too_long():
     adapter = ReferenceV1InvokeAdapter()
     classification = adapter.classify_error(UpstreamFailure(status=400, body={"fault": {"kind": "too_long"}}))
     assert classification.code == "context_length_exceeded"
+    assert classification.retryable is False
+
+
+def test_classify_error_unknown_upstream_400_is_request_rejection():
+    adapter = ReferenceV1InvokeAdapter()
+    classification = adapter.classify_error(UpstreamFailure(status=400, body={"fault": {"kind": "validation"}}))
+    assert classification.code == "upstream_request_rejected"
     assert classification.retryable is False
 
 

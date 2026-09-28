@@ -32,7 +32,7 @@ from elspeth_llm_gateway.core.contract import (
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode
 from elspeth_llm_gateway.core.events import canonical_hash, log_event
 from elspeth_llm_gateway.core.transport import UpstreamClient
-from elspeth_llm_gateway.sdk.protocol import AdapterDescriptor, AdapterProtocol, UpstreamFailure
+from elspeth_llm_gateway.sdk.protocol import AdapterDescriptor, AdapterProtocol, ErrorClassification, UpstreamFailure
 from elspeth_llm_gateway.sdk.types import (
     CanonicalMessage,
     CanonicalRequest,
@@ -225,8 +225,13 @@ class CompletionService:
         failure = UpstreamFailure(status=result.status, body=result.body)
         try:
             classification = self._adapter.classify_error(failure)
+            if type(classification) is not ErrorClassification:
+                raise TypeError("adapter classification must be ErrorClassification")
+            classification = ErrorClassification.model_validate(classification.model_dump())
         except Exception:
             raise GatewayError(GatewayErrorCode.INTERNAL_ERROR) from None
+        if result.status in (400, 422) and classification.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID.value:
+            raise GatewayError(GatewayErrorCode.UPSTREAM_REQUEST_REJECTED)
         raise GatewayError(GatewayErrorCode(classification.code))
 
     def _log_completion(

@@ -181,6 +181,7 @@ async def test_assistant_tool_turn_reaches_adapter_without_empty_text(client, as
                     {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'}},
                 ],
             },
+            {"role": "tool", "content": "found", "tool_call_id": "call-1"},
         ]
     )
 
@@ -383,6 +384,22 @@ async def test_non_2xx_classified_error_raises_matching_gateway_error(client):
 
 
 @respx.mock
+async def test_unknown_upstream_400_is_nonretryable_request_rejection(client):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(400, json={"fault": {"kind": "validation", "detail": "secret"}}))
+    adapter = FakeAdapter(classify_result=ErrorClassification(code="upstream_response_invalid", retryable=False))
+    service = _service(_config(), adapter, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(), "req-rejected")
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_REQUEST_REJECTED
+    assert exc_info.value.status == 400
+    assert exc_info.value.retryable is False
+    assert "secret" not in exc_info.value.safe_message
+
+
+@respx.mock
 async def test_classify_error_exception_raises_internal_error(client):
     _mock_token()
     respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(500, json={"fault": {"kind": "overloaded"}}))
@@ -392,6 +409,20 @@ async def test_classify_error_exception_raises_internal_error(client):
 
     with pytest.raises(GatewayError) as exc_info:
         await service.complete(_chat_request(), "req-classify-exc")
+
+    assert exc_info.value.code == GatewayErrorCode.INTERNAL_ERROR
+
+
+@respx.mock
+async def test_adapter_cannot_bypass_classification_retryability_validation(client):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(500, json={"fault": {"kind": "unknown"}}))
+    invalid = ErrorClassification.model_construct(code="upstream_response_invalid", retryable=True)
+    adapter = FakeAdapter(classify_result=invalid)
+    service = _service(_config(), adapter, client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await service.complete(_chat_request(), "req-invalid-classification")
 
     assert exc_info.value.code == GatewayErrorCode.INTERNAL_ERROR
 

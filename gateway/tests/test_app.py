@@ -224,7 +224,8 @@ def _tool_call_body(arguments: str) -> dict:
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": arguments}}],
-            }
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "call_1"},
         ],
     }
 

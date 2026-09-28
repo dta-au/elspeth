@@ -276,7 +276,7 @@ def test_canonical_response_empty_text_counts_as_text_present():
     # Empty string is the adapter-mapping convention for a "successful" finish
     # (e.g. content_filter or length truncation) that salvaged no text: it is
     # never represented as None. text="" satisfies the has_text side of the
-    # XOR validator.
+    # content-present validator.
     resp = CanonicalResponse(text="", finish_reason=FinishReason.CONTENT_FILTER)
     assert resp.text == ""
     assert resp.tool_calls == ()
@@ -293,14 +293,11 @@ def test_canonical_response_forbids_extra():
         CanonicalResponse(text="hello", finish_reason=FinishReason.STOP, extra_field=1)
 
 
-def test_canonical_response_rejects_both_text_and_tool_calls():
+def test_canonical_response_preserves_both_text_and_tool_calls():
     call = CanonicalToolCall(call_id="c1", name="lookup", arguments_json="{}")
-    with pytest.raises(ValidationError):
-        CanonicalResponse(
-            text="hello",
-            tool_calls=(call,),
-            finish_reason=FinishReason.STOP,
-        )
+    response = CanonicalResponse(text="hello", tool_calls=(call,), finish_reason=FinishReason.TOOL_CALLS)
+    assert response.text == "hello"
+    assert response.tool_calls == (call,)
 
 
 def test_canonical_response_rejects_neither_text_nor_tool_calls():

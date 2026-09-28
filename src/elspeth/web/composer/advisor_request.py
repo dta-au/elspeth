@@ -26,7 +26,9 @@ def build_advisor_request_options(
     parameter. Recognize both its LiteLLM prefix and its public custom endpoint;
     arbitrary gateway capabilities remain observable only by probing.
     """
-    kwargs: dict[str, object] = {"model": model, "max_tokens": max_tokens}
+    # The checkpoint loop owns its two audited attempts. Keep LiteLLM and the
+    # underlying SDK from retrying inside one admitted provider call.
+    kwargs: dict[str, object] = {"model": model, "max_tokens": max_tokens, "num_retries": 0, "max_retries": 0}
     if temperature is not None:
         kwargs["temperature"] = temperature
     if seed is not None:
