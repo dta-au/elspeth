@@ -3,15 +3,14 @@
 Two things are pinned here.
 
 **The consolidation.** ``content`` for an LLM-call audit row used to be
-hand-built byte-identically at three drain sites
+hand-built byte-identically at two remaining drain sites
 (``sessions/routes/_helpers._persist_llm_calls``,
-``composer/planning_application._persist_pipeline_planner_audit``,
-``sessions/guided_audit.prepare_guided_audit_rows``). They now share one
+``composer/planning_application._persist_pipeline_planner_audit``). They now share one
 projection, :func:`llm_call_audit_summary`. The no-regression proof compares
 the helper against a JSON string written out literally in this file — not
 re-derived from the helper, which would pass vacuously — and the
-three-sites-agree property is asserted by driving the three real drain
-sites, not by calling the helper three times.
+two-sites-agree property is asserted by driving both real drain
+sites, not by calling the helper twice.
 
 **The behaviour.** The envelope (``chat_messages.tool_calls``) already
 carries ``finish_reason`` for every call; that is the forensic record, and
@@ -56,7 +55,6 @@ from elspeth.web.composer.audit import llm_call_audit_summary
 from elspeth.web.composer.planning_application import PlanningApplication
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
-from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _persist_llm_calls
 
@@ -382,43 +380,35 @@ class TestAllThreeDrainSitesShareOneProjection:
         message = service.messages[0]
         return message.content
 
-    @staticmethod
-    def _guided_audit_site_content(call: ComposerLLMCall) -> str:
-        (row,) = prepare_guided_audit_rows(invocations=(), llm_calls=(call,), chat_turns=())
-
-        assert row.kind == "llm"
-        return row.content
-
-    async def _all_three(self, call: ComposerLLMCall) -> tuple[str, str, str]:
+    async def _both_sites(self, call: ComposerLLMCall) -> tuple[str, str]:
         return (
             await self._helpers_site_content(call),
             await self._composer_service_site_content(call),
-            self._guided_audit_site_content(call),
         )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("finish_reason", (None, *ROUTINE, *ABNORMAL, "provider_specific_halt"))
-    async def test_the_three_sites_emit_the_same_summary(self, finish_reason: str | None) -> None:
+    async def test_both_sites_emit_the_same_summary(self, finish_reason: str | None) -> None:
         call = _call(finish_reason=finish_reason)
 
-        helpers, composer_service, guided = await self._all_three(call)
+        helpers, composer_service = await self._both_sites(call)
 
-        assert helpers == composer_service == guided
+        assert helpers == composer_service
 
     @pytest.mark.asyncio
-    async def test_the_three_sites_all_surface_an_abnormal_reason(self) -> None:
+    async def test_both_sites_surface_an_abnormal_reason(self) -> None:
         """Not just equal to each other — equal to the right thing."""
-        helpers, composer_service, guided = await self._all_three(_call(finish_reason="length"))
+        helpers, composer_service = await self._both_sites(_call(finish_reason="length"))
 
-        for content in (helpers, composer_service, guided):
+        for content in (helpers, composer_service):
             assert json.loads(content)["finish_reason"] == "length"
 
     @pytest.mark.asyncio
-    async def test_the_three_sites_are_unchanged_for_a_routine_call(self) -> None:
+    async def test_both_sites_are_unchanged_for_a_routine_call(self) -> None:
         """Byte-identical to the pre-consolidation output at every site."""
-        helpers, composer_service, guided = await self._all_three(_call(finish_reason="stop"))
+        helpers, composer_service = await self._both_sites(_call(finish_reason="stop"))
 
-        for content in (helpers, composer_service, guided):
+        for content in (helpers, composer_service):
             assert content == _LEGACY_SUMMARY_JSON
 
 

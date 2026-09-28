@@ -1109,8 +1109,7 @@ def test_state_options_reference_blob_recognises_blob_id_vocabulary(options: Map
 
     Regression for elspeth-4f3cd4155b: the retention guard recognised only
     ``blob_ref``/``path``/``file``. A blob bound through the ``blob_id`` /
-    ``*_blob_id`` custody vocabulary, which
-    ``guided/stage_transitions._option_blob_ids`` honours, read as unbound
+    ``*_blob_id`` custody vocabulary read as unbound
     here and became updatable/deletable under an accepted composition.
     Negative rows pin that the vocabulary is exact: a near-miss key is not
     a binding, and neither is the id as a bare list element.

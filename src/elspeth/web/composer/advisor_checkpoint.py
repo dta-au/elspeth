@@ -45,7 +45,7 @@ from elspeth.web.composer.advisor_output import parse_advisor_checkpoint_respons
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
     admit_llm_provider_metadata,
     attach_llm_calls,

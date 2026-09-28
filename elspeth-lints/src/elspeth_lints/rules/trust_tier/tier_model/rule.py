@@ -522,7 +522,6 @@ class TierModelVisitor(ast.NodeVisitor):
                 "canonicalize_pydantic_cause",
             }
         ),
-        "web/composer/guided/protocol.py": frozenset({"validate_payload"}),
         # The Tier-3 LiteLLM/provider response parsers were extracted from
         # service.py into a dedicated module (llm_response_parsing.py) and
         # the cross-module public names had their underscore prefix removed

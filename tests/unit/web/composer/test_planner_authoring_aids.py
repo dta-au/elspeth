@@ -188,8 +188,7 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
     """Live-deployment posture: one OpenRouter LLM operator profile.
 
     Mirrors ``_operator_profile_view`` in ``test_set_pipeline_candidate.py`` —
-    the posture every failing planner surface (tutorial, guided, freeform web)
-    actually runs under, where llm nodes are authored via a profile alias.
+    the planner posture where llm nodes are authored via a profile alias.
     """
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
@@ -2122,8 +2121,7 @@ class TestPromptShieldRules:
         assert "aws_bedrock_prompt_shield" in rendered
 
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
-        # The failing surface is the tutorial/guided walk under the operator-
-        # profile posture — pin that the section actually reaches it (web_scrape
+        # Pin that the section reaches the operator-profile posture (web_scrape
         # and llm are policy-visible there), not just the trained fixture.
         from elspeth.web.interpretation_state import PROMPT_SHIELD_USER_TERM
 
@@ -2748,7 +2746,6 @@ class TestSession891b7b1eLiveReviewEdits:
     def test_proposal_planner_custody_rule_names_no_unadvertised_tool(self) -> None:
         """Shared aids must not teach proposal planners calls absent from their palette."""
         from elspeth.web.composer.pipeline_planner import PlannerDiscoveryPolicy, planner_tool_definitions
-        from elspeth.web.composer.pipeline_proposal import PlannerSurface
         from elspeth.web.composer.tools import get_tool_definitions
 
         view, _snapshot = _trained_view()
@@ -2757,12 +2754,11 @@ class TestSession891b7b1eLiveReviewEdits:
         registered_names = {definition["name"] for definition in get_tool_definitions()}
         named_tools = {name for name in registered_names if name in proposal_rule}
 
-        for surface in PlannerSurface:
-            policy = PlannerDiscoveryPolicy.initial(surface)
-            advertised_names = {
-                definition["function"]["name"] for definition in planner_tool_definitions(policy, dialect=ToolContractDialect.NONE)
-            }
-            assert named_tools <= advertised_names
+        policy = PlannerDiscoveryPolicy.initial()
+        advertised_names = {
+            definition["function"]["name"] for definition in planner_tool_definitions(policy, dialect=ToolContractDialect.NONE)
+        }
+        assert named_tools <= advertised_names
 
         assert "get_pipeline_state" not in proposal_rule
         assert "patch_source_options" not in proposal_rule

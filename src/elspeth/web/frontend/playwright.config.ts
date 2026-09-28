@@ -137,7 +137,7 @@ export default defineConfig({
   ],
   // The suite uses one authenticated account and verifies account-scoped
   // composer preferences. Running specs in parallel lets tests race through the
-  // same preference row and makes first-session mode assertions nondeterministic.
+  // same preference row and makes first-session preference assertions nondeterministic.
   fullyParallel: false,
   forbidOnly: isCI,
   retries: isCI ? 2 : 0,

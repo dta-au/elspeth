@@ -2,8 +2,6 @@
 import {
   Fragment,
   useEffect,
-  useId,
-  useLayoutEffect,
   useMemo,
   useRef,
   useCallback,
@@ -21,14 +19,11 @@ import {
 } from "@/stores/interpretationEventsStore";
 import type { InterpretationEvent } from "@/types/interpretation";
 import type { ValidationEntryDTO } from "@/types/index";
-import { useBlobStore } from "@/stores/blobStore";
 import {
-  deriveInlineSourceRowCount,
   projectInlineSourceSummary,
   useInlineSourceStore,
 } from "@/stores/inlineSourceStore";
 import { useComposer } from "@/hooks/useComposer";
-import { FOCUSABLE_SELECTOR } from "@/hooks/useFocusTrap";
 import {
   getBlobMetadata,
   previewBlobContent,
@@ -36,59 +31,22 @@ import {
 } from "@/api/client";
 import { MessageBubble } from "./MessageBubble";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
-import { dedupeGuidedUserMessages } from "./guidedReplay";
-import type { ChatTurn as GuidedWireChatTurn } from "@/types/guided";
 import { ComposingIndicator } from "./ComposingIndicator";
 import { AuthorityChip } from "./AuthorityChip";
 import {
   ChatInput,
   uploadedBlobPromptSentence,
-  uploadedSourcePromptSentence,
 } from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
-import { CompletionSummary } from "./guided/CompletionSummary";
-import { ModeSwitchButton } from "./guided/ModeSwitchButton";
 import { actionableProposals } from "./actionableProposals";
-import { GuidedChatHistory } from "./guided/GuidedChatHistory";
-import { GuidedDecisionSheet } from "./guided/GuidedDecisionSheet";
-import {
-  guidedDecisionRecord,
-  guidedDecisionRows,
-  guidedDecisionTurns,
-  reviewedGuidedStages,
-} from "./guided/guidedDecisionStages";
-import { GuidedPendingStrip } from "./guided/GuidedPendingStrip";
-import {
-  GUIDED_EXPLAIN_MESSAGE,
-  GUIDED_EXPLAIN_PIPELINE_MESSAGE,
-} from "./guided/explainPrompt";
-import { GUIDED_STEP_LABELS } from "./guided/stepLabels";
-import {
-  afterConfirmationChatToken,
-  completedGuidedChatToken,
-} from "./guided/completedChatToken";
-import {
-  useCompletionOutcome,
-  type CompletionOutcome,
-} from "./completionOutcome";
-import { GuidedDecisionPendingIndicator } from "./guided/GuidedDecisionPendingIndicator";
-import { GuidedTurn } from "./guided/GuidedTurn";
-import { isGuidedBuildActive } from "./guided/guidedBuildActive";
-import { latestAssistantRationale } from "./guided/guidedRationale";
-import { clientWireBlockerMessages, humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import { useCompletionOutcome } from "./completionOutcome";
+import { makePhraseFor } from "@/lib/validationHumaniser";
 import {
   AcknowledgementStack,
-  isPendingAcknowledgement,
-  useHasPendingGuidedInterpretations,
   usePendingAcknowledgements,
 } from "./AcknowledgementStack";
-import { acknowledgementCardTitle } from "./AcknowledgementCard";
-import {
-  humaniseStepLabel,
-  humaniseStepTitle,
-  stepLabelForNodeId,
-} from "./interpretationStepLabel";
+import { stepLabelForNodeId } from "./interpretationStepLabel";
 import { ApprovalReadinessRow } from "@/components/workflow/ApprovalReadinessRow";
 import { DecisionPanel, DecisionPanelLiveRegion } from "./DecisionPanel";
 import { projectDecisionRows } from "./decisionPanelRows";
@@ -98,11 +56,7 @@ import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import {
   COMPOSE_CONNECTING_MESSAGE,
   COMPOSE_UNAVAILABLE_MESSAGE,
-  COMPOSE_USER_CANCEL_ABORT_REASON,
-  runComposeWithTimeout,
 } from "@/config/composer";
-import type { WireBlockerLink } from "./guided/WireStageTurn";
-import { wireStagePlaceholder } from "./guided/WireStageTurn";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
 import { InlineSourceFallbackPrompt } from "./InlineSourceFallbackPrompt";
 import { sortedSourceEntries } from "@/utils/compositionState";
@@ -113,22 +67,12 @@ import type {
   CompositionState,
   InlineSourceSummary,
 } from "@/types/api";
-import {
-  GUIDED_CHAT_MESSAGE_MAX_LENGTH,
-  type ChatTurn as GuidedChatTurn,
-  type GuidedSession,
-  type GuidedSourceBlobCandidate,
-  type GuidedStep,
-  type GuidedRevisionMode,
-} from "@/types/guided";
 
 function isTerminalComposerPhase(
   phase: string | null | undefined,
 ): boolean {
   return phase === "complete" || phase === "failed" || phase === "cancelled";
 }
-
-const DEFAULT_PIPELINE_METADATA_NAME = "Untitled Pipeline";
 
 // Stable empty slice for the resolved-interpretations selector. A selector
 // that returns a fresh `[]` on every call compares unequal to itself under
@@ -244,80 +188,9 @@ function InterpretationConfirmation({
   );
 }
 
-const TUTORIAL_STEP_2_COMPOSING_SUBSTEPS = [
-  "Read output request",
-  "Choose sink shape",
-  "Prepare JSON file",
-] as const;
 
-function tutorialStep2ActiveSubstep(
-  phase: string | null | undefined,
-): number {
-  if (phase === null || phase === undefined || phase === "starting") {
-    return 0;
-  }
-  // calling_model and using_tools share substep 1 ("Choose sink shape"):
-  // the guided sink resolver (maybe_resolve_step_2_sink_chat) re-emits
-  // calling_model before EVERY provider round, including the round after
-  // a discovery tool call. Mapping calling_model to substep 0 (as this
-  // function used to) made the indicator jump backward mid-compose —
-  // 0 -> 1 (using_tools) -> 0 (next calling_model) -> 2 (complete) — for
-  // a ticket titled "never advances", a visible regression back to 0 is
-  // worse than the original bug. Folding both phases into substep 1 is
-  // monotonic regardless of how many discovery rounds run, and — the
-  // common case for the tutorial's one-line "Save ... to a JSON file"
-  // prompt — still lights up substep 1 even when the model resolves in a
-  // single shot with no discovery tool call at all (elspeth-a8eeebb3aa).
-  if (phase === "calling_model" || phase === "using_tools") {
-    return 1;
-  }
-  return 2;
-}
 
-/**
- * Best-effort row-count from CSV-like text content.
- *
- * Returns `null` when the mime type is not CSV-shaped — we'd rather be honest
- * about not knowing than infer a misleading number: absence is evidence, and a
- * fabricated count is indistinguishable from a measured one. For text/csv we
- * count newline-separated rows after trimming, subtracting one for the header
- * row when there is content.
- *
- * MIME normalisation: the input may be parameterised (e.g.
- * "text/csv; charset=utf-8" — a perfectly valid value the server may
- * record verbatim from the upload's Content-Type header).  We split on
- * `;` and lowercase before the comparison so parameterised CSVs are not
- * silently classified as "unknown row count".  RFC 7231 §3.1.1.1 reserves
- * `;` as the parameter separator; a literal `;` cannot appear inside the
- * type/subtype tokens.
- *
- * Exported for the ChatPanel test seam — the integration tests stub the blob
- * fetchers and feed text directly into this projector.
- */
-export function deriveRowCount(
-  mimeType: string,
-  text: string,
-): number | null {
-  return deriveInlineSourceRowCount(mimeType, text);
-}
 
-export function hasExistingCompositionContent(
-  state: CompositionState | null | undefined,
-): boolean {
-  const metadataName = state?.metadata.name?.trim() ?? "";
-  const metadataDescription = state?.metadata.description?.trim() ?? "";
-  return (
-    state !== null &&
-    state !== undefined &&
-    (Object.keys(state.sources).length > 0 ||
-      state.nodes.length > 0 ||
-      state.edges.length > 0 ||
-      state.outputs.length > 0 ||
-      (metadataName.length > 0 &&
-        metadataName !== DEFAULT_PIPELINE_METADATA_NAME) ||
-      metadataDescription.length > 0)
-  );
-}
 
 // ── Inline-source fallback heuristic (Phase 5a Task 5) ───────────────────────
 //
@@ -418,161 +291,21 @@ function isInlineSourceBlob(metadata: BlobMetadata): boolean {
   );
 }
 
-/**
- * Per-step placeholder text for the chat input in guided mode (Phase A slice 4).
- *
- * The wording frames what's *useful* to ask at each wizard step.  This is a
- * UX nudge, not a server-enforced scope — the backend still validates
- * step_index against the live session.step and the per-step skill briefing
- * shapes what the LLM will engage with.  Mirrors the playbook fragments in
- * src/elspeth/web/composer/guided/skills/step_*.md.
- *
- * CLOSED LIST — must cover every GuidedStep member EXCEPT `step_4_wire`,
- * whose caption is no longer a constant: it is a function of live blocker
- * state, and lives in `wireStagePlaceholder` (WireStageTurn.tsx) beside the
- * card whose two controls it names (elspeth-e4c2ebb697). The `Exclude` in the
- * type is what keeps that split honest in both directions — the key cannot
- * come back here without a compile error, and the lookup below only type-
- * checks inside the branch where TypeScript has already narrowed `step` to
- * the remaining three. Adding a NEW step member without extending this map
- * still produces a TypeScript exhaustiveness error at that lookup site.
- */
-const GUIDED_CHAT_PLACEHOLDERS: Record<
-  Exclude<GuidedStep, "step_4_wire">,
-  string
-> = {
-  step_1_source:
-    "Describe the source you have — e.g. a CSV, a store query, or pages to scrape…",
-  step_2_sink:
-    "Describe the output you want — the shape and fields the pipeline should produce…",
-  step_3_transforms:
-    "Describe what each row should become, or how to fix the proposed transforms…",
-};
 
-/**
- * Placeholder for the composer on the COMPLETED surface (elspeth-986801d218).
- *
- * A SEPARATE constant, deliberately not a fifth entry in the map above: the
- * map is keyed by `GuidedStep` (a closed wire enum) and completion is a
- * TERMINAL state, not a step. Widening the map to carry a pseudo-key would
- * break the exhaustiveness contract that map exists to hold.
- *
- * The wording sets the honest scope of the channel — the pipeline is
- * committed and chat is advisory: it explains, it cannot edit. (Structural
- * change is "Open freeform editor".)
- *
- * Length budget (the SAME measured one the step_4_wire entry above records):
- * a placeholder produces no scroll overflow, so anything past the 3-row box
- * at the 360px pane is cut silently, and a 93-char wording was measured
- * rendering 4 lines with the last clipped. This is 79; every sibling is
- * 76-80. The design's quoted copy ran to 100 chars — the three nouns it
- * named (a step, a route, a check) are kept and the verb phrases dropped.
- */
-const GUIDED_COMPLETED_CHAT_PLACEHOLDER =
-  "Ask about the pipeline you just built — a step, a route, or what a check means.";
 
-/**
- * Goal card copy, shown while a guided session has no composition state yet
- * (goal-first, elspeth-378cfa0e18).
- *
- * A SEPARATE pair of constants for the same reason
- * GUIDED_COMPLETED_CHAT_PLACEHOLDER is one: the step-keyed map is a closed
- * `GuidedStep` contract and "before the session has started" is not a step —
- * the session IS at step_1_source, it just has nothing persisted. This mirrors
- * the local "ready" pseudo-step idiom (a stepper-only label kept out of the
- * wire-keyed map) rather than widening the map and losing its exhaustiveness.
- *
- * The question is the CARD's, so it is a heading, not a placeholder; the
- * placeholder carries the worked example. Length budget does not bind the same
- * way here (the box is the only affordance on screen and the card carries the
- * question), but it stays close to the ≤80-char sibling register by leading
- * with the short instruction.
- */
-const GUIDED_GOAL_QUESTION = "What should this pipeline produce?";
-const GUIDED_GOAL_HINT =
-  "One sentence is enough. The assistant plans the processing steps from it after you have reviewed your source and output.";
-const GUIDED_GOAL_PLACEHOLDER =
-  "In one sentence: what should come out the other end — e.g. a summary per page, saved as JSON…";
 
 interface ChatPanelProps {
   onOpenSecrets?: () => void;
-  // Concern B (LLM-primary spec §"Frontend"): a TUTORIAL session must never
-  // reach a freeform surface. This client-only flag is passed truthy ONLY by
-  // TutorialGuidedShell. It is deliberately NOT a wire/profile field — there
-  // is no tutorial discriminator on the wire (ground truth Q2/Q4), and
-  // inferring tutorial from profile booleans is fragile. When true it (i)
-  // suppresses ExitToFreeformButton, (ii) suppresses CompletionSummary's
-  // "Open freeform editor" button, and (iii) redirects the discriminator's
-  // freeform fall-through to a guided placeholder (Task 3).
-  isTutorial?: boolean;
-  /**
-   * Tutorial locked prompts, PER GUIDED STAGE. When set, the guided "Describe
-   * what you want" chat input is prepopulated with the CURRENT phase's prompt
-   * (keyed by `guidedSession.step`) and locked read-only, so the tutorial
-   * learner steps through the normal staged flow without typing — each phase
-   * gets only its stage's intent. Supplied by TutorialGuidedShell (per-stage
-   * worked-example prompts; source carries the resolved synthetic URLs). Steps
-   * with no entry (wire) is confirm-only. Absent for a normal session
-   * (the input behaves as the editable freeform-intent box).
-   */
-  lockedChatPrompt?: Partial<Record<GuidedStep, string>>;
+  /** Embedded flows may need to keep their current session binding. */
+  allowFork?: boolean;
 }
 
-interface GuidedSourceBlobCandidateSet {
-  sessionId: string;
-  turnToken: string;
-  candidates: readonly GuidedSourceBlobCandidate[];
-  /**
-   * Sticky consent latch for this exact turn. Once the user has needed to
-   * distinguish files, filtering must not silently turn the remaining file
-   * back into an implicit choice.
-   */
-  requiresExplicitChoice: boolean;
-}
 
-interface GuidedUploadFence {
-  sessionId: string;
-  activationEpoch: number;
-  step: GuidedStep | null;
-  turnToken: string | null;
-  isSourceSingleSelect: boolean;
-  /** Plugin of the live Step-1 source schema_form turn, else null — an upload
-   * completing against this fence prefills that form's local path draft
-   * (elspeth-c70909c13a) instead of injecting the chat message. */
-  sourceSchemaFormPlugin: string | null;
-}
 
-interface GuidedUploadContext {
-  activeSessionId: string | null;
-  activationEpoch: number;
-  step: GuidedStep | null;
-  turnToken: string | null;
-  isSourceSingleSelect: boolean;
-  sourceSchemaFormPlugin: string | null;
-}
 
-/** A late upload binds to a source form only when the filename plausibly
- * matches the already-chosen plugin — the client-side mirror of the backend's
- * `_inspection_matches_source_plugin` (which sniffs content; the client only
- * has the name). A mismatch falls back to today's behavior untouched. */
-const SOURCE_PLUGIN_UPLOAD_EXTENSIONS: Record<string, readonly string[]> = {
-  csv: [".csv"],
-  json: [".json", ".jsonl"],
-  text: [".txt"],
-};
 
-function uploadMatchesSourcePlugin(plugin: string, filename: string): boolean {
-  const extensions = SOURCE_PLUGIN_UPLOAD_EXTENSIONS[plugin];
-  if (extensions === undefined) return false;
-  const lower = filename.toLowerCase();
-  return extensions.some((extension) => lower.endsWith(extension));
-}
 
-const CANONICAL_BLOB_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-// Stable empty for the guided-replay selector: a fresh [] per call would fail
-// zustand's Object.is bail-out and re-render the panel on every store write.
-const EMPTY_GUIDED_REPLAY_HISTORY: GuidedWireChatTurn[] = [];
 
 /**
  * Main chat panel combining the message list, composing indicator, and input.
@@ -580,36 +313,24 @@ const EMPTY_GUIDED_REPLAY_HISTORY: GuidedWireChatTurn[] = [];
  * Auto-scrolls to the bottom on new messages unless the user has scrolled up.
  * Focus returns to the ChatInput textarea after the assistant response arrives.
  */
-export function ChatPanel({
+export function ChatPanel(props: ChatPanelProps) {
+  const composer = useComposer();
+  return <ChatPanelContent {...props} composer={composer} />;
+}
+
+/** Chat controls sharing the caller's compose and cancellation owner. */
+export function ChatPanelContent({
   onOpenSecrets,
-  isTutorial,
-  lockedChatPrompt,
-}: ChatPanelProps) {
+  allowFork = true,
+  composer,
+}: ChatPanelProps & { composer: ReturnType<typeof useComposer> }) {
   const messages = useSessionStore((s) => s.messages);
-  // Guided replay (elspeth-2554bff719): a TERMINAL guided session's assistant
-  // conversation exists only in guidedSession.chat_history — guided turns
-  // persist zero role='assistant' chat_messages rows — so when the
-  // discriminator below falls through to this freeform body the whole guided
-  // conversation would otherwise vanish. Select the history here (not from
-  // the `guidedSession` selector further down: this feeds the chatTurns memo
-  // above the discriminator hoists) and render it at the top of the message
-  // log. Terminal-gated: a LIVE guided session renders its history on the
-  // guided surface itself, and the transient guidedNextTurn-null fall-through
-  // must not double-render it. The stable EMPTY keeps the selector
-  // referentially settled for zustand's Object.is comparison.
-  const guidedReplayHistory = useSessionStore((s) =>
-    s.guidedSession !== null && s.guidedSession.terminal !== null
-      ? s.guidedSession.chat_history
-      : EMPTY_GUIDED_REPLAY_HISTORY,
-  );
   // Project audit-grade message rows onto user-visible turns. One bubble per
   // turn — see ./turns.ts for the grouping rules. Memoised on the messages
   // reference because the store updates the array on append, not in place.
-  // The guided-phase user rows duplicated in the replayed history are
-  // filtered out first (consumption dedupe — see guidedReplay.ts).
   const chatTurns = useMemo(
-    () => groupIntoTurns(dedupeGuidedUserMessages(messages, guidedReplayHistory)),
-    [messages, guidedReplayHistory],
+    () => groupIntoTurns(messages),
+    [messages],
   );
   // Last complete agent turn id — the inline-source summary attaches to this
   // turn's bubble. null when no complete agent turn exists yet (e.g. fresh
@@ -624,8 +345,6 @@ export function ChatPanel({
     return null;
   }, [chatTurns]);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  const blobs = useBlobStore((s) => s.blobs);
-  const blobActivationEpoch = useBlobStore((s) => s.activationEpoch);
   const compositionState = useSessionStore((s) => s.compositionState);
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
   const staleProposalIds = useSessionStore((s) => s.staleProposalIds);
@@ -638,14 +357,7 @@ export function ChatPanel({
   const clearError = useSessionStore((s) => s.clearError);
   const forkFromMessage = useSessionStore((s) => s.forkFromMessage);
   // Honest completion labels (elspeth-bf9c296ee5), derived from the run
-  // gate's own signals rather than the generic terminal phase. Two axes of
-  // the same derivation (hoisted here per Rules of Hooks):
-  //   - freeform terminal badge: pipelineMutated is the per-turn verdict the
-  //     compose success branches persist; `?? true` keeps the legacy
-  //     "Updated"-family claim when the verdict is unknowable (e.g. a
-  //     terminal progress snapshot restored by polling after a reload);
-  //   - guided completion stepper: a completed guided terminal always
-  //     carries a composed pipeline, so its axis is fixed `true`.
+  // gate's own signals rather than the generic terminal phase.
   const lastComposeChangedPipeline = useSessionStore(
     (s) => s.lastComposeChangedPipeline,
   );
@@ -653,20 +365,7 @@ export function ChatPanel({
     activeSessionId,
     lastComposeChangedPipeline ?? true,
   );
-  const guidedCompletionOutcome = useCompletionOutcome(activeSessionId, true);
-  // Guided-mode discriminator state.  Selectors are hoisted here (not inside a
-  // branch) to comply with React's Rules of Hooks; the discriminator early
-  // returns below decide which surface to render based on these values.
-  const guidedSession = useSessionStore((s) => s.guidedSession);
-  const guidedNextTurn = useSessionStore((s) => s.guidedNextTurn);
-  const guidedProposalReview = useSessionStore((s) => s.guidedProposalReview);
-  const respondGuided = useSessionStore((s) => s.respondGuided);
-  const chatGuided = useSessionStore((s) => s.chatGuided);
-  const startGuided = useSessionStore((s) => s.startGuided);
-  const guidedChatPending = useSessionStore((s) => s.guidedChatPending);
-  const guidedResponsePending = useSessionStore((s) => s.guidedResponsePending);
-  // Bootstrap-race gate (single source of truth): guided sends read the same
-  // readiness the shared runComposeWithTimeout enforces for freeform.
+  // Bootstrap-race gate shared with composer sends.
   const composeTimeoutReady = useSessionStore((s) => s.composeTimeoutReady);
   // Stuck state (backend up but reported no compose timeout): drives the
   // Explain button's disabled reason so it matches the main Send instead of
@@ -674,186 +373,20 @@ export function ChatPanel({
   const composerTimeoutUnavailable = useSessionStore(
     (s) => s.composerTimeoutUnavailable,
   );
-  const guidedSelfHealNotice = useSessionStore((s) => s.guidedSelfHealNotice);
-  const guidedApprovalNotice = useSessionStore((s) => s.guidedApprovalNotice);
-  const approveWiring = useSessionStore((s) => s.approveWiring);
-  // ── Decision sheets (elspeth-f2a8550b3d, slice E first landing) ───────────
-  //
-  // The stage whose read-only decision sheet is open, or null. Client-only
-  // state: opening a sheet issues NO request — every fact it shows is already
-  // in the published session — so this never touches the store, never races a
-  // live turn and cannot be resumed into a stale view.
-  const [openDecisionStep, setOpenDecisionStep] = useState<GuidedStep | null>(
-    null,
-  );
-  const decisionSheetId = useId();
-  // Ticks that can open a sheet, so Close and Escape can put focus back on the
-  // control the user pressed. Keyed by stage rather than held as one ref: four
-  // ticks are mounted at once and any of them can be the opener.
-  const decisionTickRefs = useRef(new Map<GuidedStep, HTMLButtonElement>());
-  const registerDecisionTick = useCallback(
-    (step: GuidedStep, element: HTMLButtonElement | null) => {
-      if (element === null) decisionTickRefs.current.delete(step);
-      else decisionTickRefs.current.set(step, element);
-    },
-    [],
-  );
-  const closeDecisionSheet = useCallback(() => {
-    // Focus BEFORE the unmount, not inside the state updater: an updater runs
-    // during render and must stay pure. Moving focus to the tick first also
-    // means it is never on a node React is about to remove, so it can't fall
-    // through to <body>.
-    if (openDecisionStep !== null) {
-      decisionTickRefs.current.get(openDecisionStep)?.focus();
-    }
-    setOpenDecisionStep(null);
-  }, [openDecisionStep]);
-  const toggleDecisionSheet = useCallback((step: GuidedStep) => {
-    // The tick is the disclosure control, so pressing the open one closes it.
-    // No focus restore here — the tick IS the click target and already holds
-    // focus, and re-focusing it would fight a pointer user's next click.
-    setOpenDecisionStep((current) => (current === step ? null : step));
-  }, []);
-  const guidedStepForDecisionSheets = guidedSession?.step ?? null;
-  const guidedTerminalKindForDecisionSheets =
-    guidedSession?.terminal?.kind ?? null;
-  useEffect(() => {
-    // A sheet records a SETTLED stage; when the walk moves, what is settled
-    // moves with it, so the open sheet stops being the answer to the question
-    // the user asked. Close rather than re-project it under the new step.
-    //
-    // No focus restore: reaching a new step means the user pressed a control
-    // in the turn widget, so focus was never inside the sheet, and the
-    // step-advance focus effect below is already claiming it for the new turn.
-    setOpenDecisionStep(null);
-  }, [
-    guidedStepForDecisionSheets,
-    guidedTerminalKindForDecisionSheets,
-    activeSessionId,
-  ]);
-  const isProposalRevisionComposer =
-    guidedSession?.step === "step_3_transforms" &&
-    guidedNextTurn?.type === "propose_pipeline";
-  const proposalRevisionIdentity = isProposalRevisionComposer
-    ? `${activeSessionId ?? ""}:${guidedNextTurn.payload.proposal_id}:${guidedNextTurn.payload.draft_hash}`
-    : null;
-  const [guidedRevisionSelection, setGuidedRevisionSelection] = useState<{
-    identity: string | null;
-    mode: GuidedRevisionMode;
-  }>({ identity: proposalRevisionIdentity, mode: "amend" });
-  const guidedRevisionMode =
-    guidedRevisionSelection.identity === proposalRevisionIdentity
-      ? guidedRevisionSelection.mode
-      : "amend";
-  useEffect(() => {
-    setGuidedRevisionSelection({
-      identity: proposalRevisionIdentity,
-      mode: "amend",
-    });
-  }, [proposalRevisionIdentity]);
-  // Whether the CURRENT chat has any work — gates the mode-switch confirmation
-  // (ModeSwitchButton). Freeform work = messages or a non-empty composition;
-  // guided work = any chat turns or completed steps. Switching is
-  // non-destructive (the session retains both modes' state either way), so this
-  // only decides whether a stray click needs a confirm vs a single click.
-  const currentChatHasWork =
-    messages.length > 0 ||
-    hasExistingCompositionContent(compositionState) ||
-    (guidedSession !== null &&
-      (guidedSession.chat_history.length > 0 ||
-        guidedSession.history.length > 0));
-  // D12 / P3.6: block guided advancement while any pending user_approved
-  // interpretation card remains in the store. Hook is unconditional (called at
-  // the component top, not inside the conditional guided return); the empty
-  // session id is safe — pendingBySession[""] is undefined, so it returns false.
-  const hasPendingGuidedInterpretations = useHasPendingGuidedInterpretations(
-    activeSessionId ?? "",
-  );
-  // Named blockers for the wire-stage confirm (elspeth-3b35abf148 variant 1):
-  // the SAME pending cards the AcknowledgementStack renders (same order, same
-  // titles), projected to jump links WireStageTurn renders under the disabled
-  // Confirm-wiring button. Unconditional hooks — see the note above.
+  // The same pending cards rendered by AcknowledgementStack feed the decision panel.
   const pendingAcknowledgementEvents = usePendingAcknowledgements(
     activeSessionId ?? "",
   );
+  // A persisted handoff notice is actionable only while its review events
+  // remain pending. Keep the notice's projection tied to loaded review state.
   const reviewEventsLoaded = useInterpretationEventsStore((state) =>
     activeSessionId !== null && state.pendingBySession[activeSessionId] !== undefined,
   );
   const pendingReviewCreatedAt = useMemo(
-    () => reviewEventsLoaded ? pendingAcknowledgementEvents.map((event) => event.created_at) : undefined,
+    () => reviewEventsLoaded
+      ? pendingAcknowledgementEvents.map((event) => event.created_at)
+      : undefined,
     [reviewEventsLoaded, pendingAcknowledgementEvents],
-  );
-  const wirePendingAcknowledgements = useMemo<WireBlockerLink[]>(
-    () =>
-      pendingAcknowledgementEvents.map((event) => ({
-        id: event.id,
-        label: acknowledgementCardTitle(
-          event,
-          humaniseStepLabel(compositionState, event.affected_node_id),
-          humaniseStepTitle(compositionState, event.affected_node_id),
-        ),
-      })),
-    [pendingAcknowledgementEvents, compositionState],
-  );
-  // Client-known validation blockers (elspeth-3b35abf148 variant 3, client
-  // side): the persisted composition carries its Stage-1 errors; a non-empty
-  // list means a confirm would be rejected server-side, so WireStageTurn
-  // disables the button and names the issues instead of offering a dead click.
-  // The guided deferred-commit placeholder status is excluded: pre-commit
-  // guided states are empty-by-design until Confirm wiring commits the
-  // proposal, so that status is resolved by the confirm itself and gating on
-  // it deadlocks guided authoring (see clientWireBlockerMessages).
-  // Messages route through the same humaniser the validation summary uses —
-  // an engineer-grade contract dump must not land verbatim in the blockers
-  // panel either (same error-rendering discipline).
-  const wireValidationIssues = useMemo<string[]>(() => {
-    const raw = clientWireBlockerMessages(compositionState?.validation_errors ?? []);
-    if (raw.length === 0) return [];
-    const phraseFor = makePhraseFor(compositionState);
-    return raw.map(
-      (message) => humaniseValidationMessage(message, phraseFor).headline,
-    );
-  }, [compositionState]);
-  // "Approve wiring": the same two blockers the wire stage names, but read
-  // FRESH at the moment the store asks — the review_wiring transition that
-  // approval runs first can itself create acknowledgement cards and move the
-  // persisted composition, so the memoised values above (captured before the
-  // dispatch) would miss exactly the cases this must stop on. Reuses the same
-  // sources those memos use, never a second definition of "pending".
-  const wireApprovalClientBlockers = useCallback(() => {
-    const sessionId = activeSessionId ?? "";
-    const pending = Object.values(
-      useInterpretationEventsStore.getState().pendingBySession[sessionId] ?? {},
-    ).filter(isPendingAcknowledgement);
-    const liveComposition = useSessionStore.getState().compositionState;
-    return {
-      pendingAcknowledgements: pending.length,
-      validationIssues: clientWireBlockerMessages(
-        liveComposition?.validation_errors ?? [],
-      ).length,
-    };
-  }, [activeSessionId]);
-  // Guided chat abort plumbing (elspeth-fb4464cdf0): the same
-  // AbortController + client-timeout treatment freeform gets from
-  // useComposer.runWithTimeout, scoped to the guided step composer. Stored on
-  // a ref so Stop can abort the in-flight fetch; the store's chatGuided catch
-  // maps the abort reason to the cancelled/timeout copy and resets
-  // guidedChatPending so the turn can be retried.
-  const guidedChatControllerRef = useRef<AbortController | null>(null);
-  const sendGuidedChat = useCallback(
-    (content: string, revisionMode?: GuidedRevisionMode, retryTurnToken?: string) =>
-      // Same shared primitive freeform's useComposer.runWithTimeout uses: one
-      // timer + readiness guard for both paths. Until the backend wall clock
-      // has landed at boot the guided send does not run (no request, no
-      // timer) — the guided input is disabled until readiness.
-      runComposeWithTimeout(guidedChatControllerRef, composeTimeoutReady, (signal) =>
-        retryTurnToken !== undefined
-          ? chatGuided(content, signal, undefined, retryTurnToken)
-          : revisionMode === undefined
-            ? chatGuided(content, signal)
-            : chatGuided(content, signal, revisionMode),
-      ),
-    [chatGuided, composeTimeoutReady],
   );
   // Unsent drafts are keyed by session id (elspeth-ca38667856): ChatPanel
   // stays mounted across session switches, so a bare useState draft typed on
@@ -863,142 +396,6 @@ export function ChatPanel({
   // retention doctrine below forbids. The "" key carries the draft typed
   // while no session is active.
   const draftSessionKey = activeSessionId ?? "";
-  // Plain-guided prompt draft (elspeth-49b467d91a). The docked guided composer
-  // is CONTROLLED on this state — the same ChatInput controlled mode the
-  // tutorial (frozen per-step prompt) and freeform (`inputText`) already use;
-  // the plain guided surface was the one uncontrolled instance, so its typed
-  // prompt lived only inside ChatInput and was unrecoverable after the
-  // clear-on-send. ChatInput still clears this on Send (onChange("")); the
-  // retention wrapper below restores it when the send did not deliver.
-  const [guidedDraftsBySession, setGuidedDraftsBySession] = useState<
-    ReadonlyMap<string, string>
-  >(new Map());
-  const guidedDraft = guidedDraftsBySession.get(draftSessionKey) ?? "";
-  const updateGuidedDraftForSession = useCallback(
-    (sessionKey: string, action: SetStateAction<string>) =>
-      setGuidedDraftsBySession((drafts) =>
-        withSessionDraftSlot(drafts, sessionKey, action),
-      ),
-    [],
-  );
-  const setGuidedDraft = useCallback(
-    (action: SetStateAction<string>) =>
-      updateGuidedDraftForSession(draftSessionKey, action),
-    [updateGuidedDraftForSession, draftSessionKey],
-  );
-  // Parity with the tutorial frame (elspeth-49b467d91a): the tutorial retains
-  // its locked prompt until the server-authoritative chat_history carries the
-  // user turn (tutorialPromptSentForStep). The live composer gets the same
-  // doctrine — retain unless verifiably delivered — by checking, after the
-  // send settles, whether the prompt actually landed:
-  //   - chat path (a durable checkpoint existed): success appends the user
-  //     turn verbatim to chat_history — /guided/chat directly, and the step-3
-  //     propose_pipeline prose revision via /guided/respond (R2-F6 transcript
-  //     custody). An HTTP failure (5xx/4xx/network), 409 step-conflict resync,
-  //     Stop, or client timeout leaves chat_history without it
-  //     (sessionStore.chatGuided catch), so the draft is restored for retry.
-  //   - start path (compositionState was null → /guided/start): the intent is
-  //     durably rooted as a session MESSAGE, not a chat turn, so delivery is
-  //     the durable checkpoint chatGuided demands (compositionState non-null).
-  // Restore is skipped when the session changed mid-flight: the delivered
-  // check reads the ACTIVE session's guided state, so it cannot be evaluated
-  // for a session that is no longer active, and restoring unverified would
-  // re-offer a prompt that may have been delivered. Restore never clobbers
-  // newer typing — the textarea stays editable while the send is pending.
-  const sendGuidedChatRetainingDraft = useCallback(
-    async (content: string, revisionMode?: GuidedRevisionMode) => {
-      const before = useSessionStore.getState();
-      const sessionAtSend = before.activeSessionId;
-      const hadDurableCheckpoint = before.compositionState !== null;
-      const seqFloor = before.guidedSession?.chat_turn_seq ?? 0;
-      try {
-        await sendGuidedChat(content, revisionMode);
-      } finally {
-        // finally, not a bare await: chatGuided's offensive-programming
-        // guards THROW (precondition violations), and a thrown send
-        // delivered nothing — the draft must still be restored before the
-        // rejection propagates (review finding on elspeth-49b467d91a).
-        const after = useSessionStore.getState();
-        if (after.activeSessionId === sessionAtSend) {
-          const delivered = hadDurableCheckpoint
-            ? (after.guidedSession?.chat_history.some(
-                (turn) =>
-                  turn.role === "user" &&
-                  turn.seq >= seqFloor &&
-                  turn.content === content,
-              ) ?? false)
-            : after.compositionState !== null;
-          if (!delivered) {
-            // Slot-targeted (sessionAtSend, not the live draftSessionKey):
-            // under the same-session guard above they are equal, but the
-            // stable identity keeps this callback from churning per switch.
-            updateGuidedDraftForSession(sessionAtSend ?? "", (current) =>
-              current === "" ? content : current,
-            );
-          }
-        }
-      }
-    },
-    [sendGuidedChat, updateGuidedDraftForSession],
-  );
-  const cancelGuidedChat = useCallback(() => {
-    guidedChatControllerRef.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
-  }, []);
-  // C-2iii: Retry affordance on a synthetic-failure turn (GuidedChatHistory).
-  // Chat turns share one monotonic seq counter (slice 5 invariant), and every
-  // assistant reply today is paired with the user turn that triggered it at
-  // seq-1 (ChatRole's docstring: Phase A has no unpaired "opener" turns yet).
-  // Resend THAT message down the normal chat path — same retry semantics as
-  // freeform's MessageBubble Retry, reusing sendGuidedChat rather than a
-  // bespoke request — under the OCCURRENCE it was originally submitted for:
-  // the persisted turn_token rides the retry verbatim, so a retry whose
-  // occurrence has since been answered draws the server's ordinary stale-turn
-  // 409 (and its resync) instead of applying old prose to newer session
-  // state (elspeth-ea80e34fdc). If no token-bearing user turn exists (a
-  // future proactive opener, a transcript-only pair, or any other shape this
-  // invariant doesn't cover), there is nothing sound to resend blind;
-  // refetch the guided state instead so the wizard resyncs to the server's
-  // current truth — the same recovery the turn_not_emitted self-heal uses.
-  const handleRetrySyntheticFailure = useCallback(
-    (turn: GuidedChatTurn) => {
-      if (guidedSession === null || activeSessionId === null) return;
-      const preceding = guidedSession.chat_history.find(
-        (t) => t.seq === turn.seq - 1,
-      );
-      // Two ways a recorded token is dead on arrival, both decided here
-      // rather than by spending a round trip to earn a 409:
-      //
-      //  - On a COMPLETED session the only token the channel accepts is the
-      //    confirmation hash, so a synthetic failure recorded BEFORE the
-      //    commit carries a live-turn occurrence the completed arm refuses.
-      //  - On a session that is no longer completed but still carries
-      //    post-commit turns — a fork rewound to Step 2, a `/guided/reenter`
-      //    after a content change, both of which keep `chat_history` and clear
-      //    `terminal` — the confirmation hash is the dead one: resending it
-      //    replays the PARENT's occurrence into a live step-2 session.
-      //
-      // Every other recorded token still goes back verbatim: the server owns
-      // the staleness verdict for a live occurrence (elspeth-ea80e34fdc), and
-      // this must not quietly become "resend only the current token".
-      const completedToken = completedGuidedChatToken(guidedSession);
-      const afterConfirmationToken = afterConfirmationChatToken(guidedSession);
-      const resendable =
-        completedToken !== null
-          ? preceding?.turn_token === completedToken
-          : preceding?.turn_token !== afterConfirmationToken;
-      if (
-        preceding !== undefined &&
-        preceding.role === "user" &&
-        preceding.turn_token !== null &&
-        resendable
-      ) {
-        void sendGuidedChat(preceding.content, undefined, preceding.turn_token);
-      } else {
-        void startGuided(activeSessionId);
-      }
-    },
-    [guidedSession, activeSessionId, sendGuidedChat, startGuided],
-  );
 
   const {
     sendMessage,
@@ -1007,72 +404,16 @@ export function ChatPanel({
     isComposing,
     error,
     errorDetails,
-  } = useComposer();
+  } = composer;
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const guidedLogRef = useRef<HTMLDivElement>(null);
   // The docked chrome's scroll container (.chat-panel-dock) — named so the
   // proposal-arrival reveal can scroll IT, and only it. Mutable (| null)
   // because attachDock assigns it from a callback ref.
   const dockRef = useRef<HTMLDivElement | null>(null);
-  // Guided-chat pending focus contract (elspeth-6a9673ecd3, placement pass
-  // 2026-07-23). The input stays MOUNTED (disabled) while /guided/chat is in
-  // flight — the old unmount swap is retired — so into pending there is no
-  // programmatic move (yanking focus to the strip down in the conversation
-  // flow would be the disruption WCAG 2.4.3 guards against). An Enter-key
-  // send keeps focus in the textarea throughout; a mouse-click send drops
-  // focus to <body> mid-flight (Send clears the box synchronously → canSend
-  // flips false → the focused button disables under the pointer), which the
-  // out-of-pending restore below recovers. composerFocusWithinRef tracks
-  // whether focus is inside the composer section via bubbled focus/blur on
-  // the section — event-driven, so it is already correct BEFORE the pending
-  // flag flips.
-  const composerSectionRef = useRef<HTMLElement | null>(null);
-  const composerFocusWithinRef = useRef(false);
-  const prevGuidedChatPendingRef = useRef(guidedChatPending);
-  // useLayoutEffect (not useEffect) so no frame paints with focus at body.
-  // Out of pending: restore into the composer — to the textarea, or to the
-  // section when the tutorial resolve has replaced ChatInput with the
-  // static "Sent" line on the same commit the flag drops (inputRef null —
-  // React clears detached refs before layout effects). Safe-to-restore
-  // mirrors the freeform isComposing restore above: focus stayed inside
-  // the composer (Enter path — usually a no-op), OR nobody holds focus at
-  // all (the mouse-click path's blur-to-body, which also flipped
-  // composerFocusWithinRef false via the section's null-relatedTarget blur).
-  // A user who moved away to re-read the transcript holds focus on a real
-  // element outside the composer and must not be yanked back. The
-  // step-advance effect then owns the move to the fresh decision card.
-  useLayoutEffect(() => {
-    const was = prevGuidedChatPendingRef.current;
-    prevGuidedChatPendingRef.current = guidedChatPending;
-    if (guidedChatPending === was) return;
-    if (guidedChatPending) return;
-    const active = document.activeElement;
-    const safeToRestore =
-      composerFocusWithinRef.current ||
-      active === null ||
-      active === document.body;
-    if (!safeToRestore) return;
-    if (inputRef.current !== null) {
-      inputRef.current.focus({ preventScroll: true });
-    } else {
-      composerSectionRef.current?.focus({ preventScroll: true });
-    }
-  }, [guidedChatPending]);
-  // Guided authoring conversation column (.guided-authoring-scroll). Its own
-  // ref + at-bottom tracking — NOT freeform's scrollContainerRef
-  // machinery, which is keyed to sessionStore.messages and only mounted in the
-  // freeform body. Null on every non-guided branch, so the auto-scroll
-  // effect below no-ops there. The at-bottom flag is a ref (not state): it is
-  // only ever read inside the effect, and a scroll listener that set state
-  // would re-render the whole panel on every wheel tick.
-  const guidedWorkspaceScrollRef = useRef<HTMLDivElement>(null);
-  const guidedWorkspaceAtBottomRef = useRef(true);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [showBlobManager, setShowBlobManager] = useState(false);
-  // Freeform draft: same per-session scoping as guidedDraft above
-  // (elspeth-ca38667856).
   const [freeformDraftsBySession, setFreeformDraftsBySession] = useState<
     ReadonlyMap<string, string>
   >(new Map());
@@ -1122,36 +463,6 @@ export function ChatPanel({
       (useSessionStore.getState().activeSessionId ?? "") === sessionId,
     [],
   );
-  const [guidedSourceBlobCandidateSet, setGuidedSourceBlobCandidateSet] =
-    useState<GuidedSourceBlobCandidateSet | null>(null);
-  const pendingGuidedUploadsRef = useRef(new Map<string, GuidedUploadFence>());
-  const [pendingGuidedUploads, setPendingGuidedUploads] = useState<
-    ReadonlyMap<string, GuidedUploadFence>
-  >(new Map());
-  const sourceSchemaFormPlugin =
-    guidedSession?.step === "step_1_source" && guidedNextTurn?.type === "schema_form"
-      ? guidedNextTurn.payload.plugin
-      : null;
-  const guidedUploadContextRef = useRef<GuidedUploadContext>({
-    activeSessionId,
-    activationEpoch: blobActivationEpoch,
-    step: guidedSession?.step ?? null,
-    turnToken: guidedNextTurn?.turn_token ?? null,
-    isSourceSingleSelect:
-      guidedSession?.step === "step_1_source" &&
-      guidedNextTurn?.type === "single_select",
-    sourceSchemaFormPlugin,
-  });
-  guidedUploadContextRef.current = {
-    activeSessionId,
-    activationEpoch: blobActivationEpoch,
-    step: guidedSession?.step ?? null,
-    turnToken: guidedNextTurn?.turn_token ?? null,
-    isSourceSingleSelect:
-      guidedSession?.step === "step_1_source" &&
-      guidedNextTurn?.type === "single_select",
-    sourceSchemaFormPlugin,
-  };
   const activeComposerMessage = findActiveComposerMessage(messages);
   const proposalsByToolCallId = useMemo(
     () =>
@@ -1176,26 +487,6 @@ export function ChatPanel({
       : [];
   }, [chatTurns, isComposing]);
 
-  // Scroll the transcript to its end, touching NOTHING above it.
-  //
-  // This was `messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })`
-  // at all three freeform call sites, and scrollIntoView is the wrong
-  // instrument for a scroller we can name: it walks the ancestor chain and
-  // scrolls EVERY scrollable box it finds. `overflow: hidden` does not make a
-  // box unscrollable — it only removes the scrollbar — so .chat-panel itself
-  // was in that set. Whenever the docked chrome pushed the panel's content
-  // past its own box (a terminal ComposingIndicator with its details open
-  // plus a proposal banner is enough), this call scrolled the PANEL:
-  // measured scrollTop 0 -> 130, carrying .chat-panel-header off the top edge
-  // to -49 and leaving the composer stranded above a void. Nothing put it
-  // back, because a DOM scroll position is not React state and no re-render
-  // resets it — only a reload did.
-  //
-  // scrollTop is deliberately not used here: the smooth animation IS the
-  // affordance that tells the reader the transcript moved under them — except
-  // under prefers-reduced-motion, where the reader has asked us to drop that
-  // affordance and jump (preferredScrollBehavior owns the choice). The
-  // two guided call sites already scroll their container by name this way.
   const scrollTranscriptToEnd = useCallback(() => {
     const container = scrollContainerRef.current;
     if (container === null) return;
@@ -1219,20 +510,6 @@ export function ChatPanel({
       container.scrollHeight - container.scrollTop - container.clientHeight <
       threshold;
     setShowScrollButton(!atBottom);
-  }
-
-  // Guided conversation column: record whether the user sits at the bottom
-  // (freeform's 40px heuristic). Measured on scroll — BEFORE any append — so
-  // the auto-scroll effect below reads the pre-append position; measuring
-  // inside the effect would see the just-appended turn's height and misread
-  // "at bottom" as "scrolled up".
-  function handleGuidedWorkspaceScroll() {
-    const container = guidedWorkspaceScrollRef.current;
-    if (!container) return;
-    const threshold = 40; // pixels from bottom
-    guidedWorkspaceAtBottomRef.current =
-      container.scrollHeight - container.scrollTop - container.clientHeight <
-      threshold;
   }
 
   // The terminal snapshot is deliberately retained after a turn settles so
@@ -1269,12 +546,6 @@ export function ChatPanel({
         return false;
       }
 
-      // A non-null id that is absent from the freeform transcript belongs to
-      // another progress domain (notably the guided operation retained when
-      // exitToFreeform performs its final progress load) or is stale. The one
-      // legitimate freeform gap is before the canonical user row replaces the
-      // optimistic local row; keep terminal failure/cancellation visible while
-      // that current row is still explicitly pending or failed.
       const tail = chatTurns[chatTurns.length - 1];
       return !(
         tail !== undefined &&
@@ -1323,326 +594,17 @@ export function ChatPanel({
     setShowScrollButton(false);
   }, [activeSessionId]);
 
-  const readyGuidedSourceBlobs = useMemo(
-    () =>
-      new Map(
-        blobs
-          .filter(
-            (blob) =>
-              blob.session_id === activeSessionId &&
-              blob.status === "ready" &&
-              CANONICAL_BLOB_UUID.test(blob.id),
-          )
-          .map(
-            (blob) =>
-              [
-                blob.id,
-                {
-                  id: blob.id,
-                  filename: blob.filename,
-                  sizeBytes: blob.size_bytes,
-                  createdAt: blob.created_at,
-                } satisfies GuidedSourceBlobCandidate,
-              ] as const,
-          ),
-      ),
-    [activeSessionId, blobs],
-  );
 
-  const handleGuidedBlobUploaded = useCallback(
-    (blob: BlobMetadata) => {
-      const turn = guidedNextTurn;
-      if (
-        activeSessionId === null ||
-        blob.session_id !== activeSessionId ||
-        blob.status !== "ready" ||
-        !CANONICAL_BLOB_UUID.test(blob.id) ||
-        guidedSession?.step !== "step_1_source" ||
-        turn?.type !== "single_select"
-      ) {
-        return;
-      }
-      const candidate: GuidedSourceBlobCandidate = {
-        id: blob.id,
-        filename: blob.filename,
-        sizeBytes: blob.size_bytes,
-        createdAt: blob.created_at,
-      };
-      setGuidedSourceBlobCandidateSet((current) => {
-        if (
-          current?.sessionId === activeSessionId &&
-          current.turnToken === turn.turn_token
-        ) {
-          const candidates = [
-            ...current.candidates.filter((item) => item.id !== candidate.id),
-            candidate,
-          ];
-          return {
-            ...current,
-            candidates,
-            requiresExplicitChoice:
-              current.requiresExplicitChoice || candidates.length > 1,
-          };
-        }
-        return {
-          sessionId: activeSessionId,
-          turnToken: turn.turn_token,
-          candidates: [candidate],
-          requiresExplicitChoice: false,
-        };
-      });
-    },
-    [activeSessionId, guidedNextTurn, guidedSession?.step],
-  );
 
-  const handleGuidedBlobUploadStarted = useCallback(
-    (requestId: string, sessionId: string) => {
-      const context = guidedUploadContextRef.current;
-      if (context.activeSessionId !== sessionId) return;
-      pendingGuidedUploadsRef.current.set(requestId, {
-        sessionId,
-        activationEpoch: context.activationEpoch,
-        step: context.step,
-        turnToken: context.turnToken,
-        isSourceSingleSelect: context.isSourceSingleSelect,
-        sourceSchemaFormPlugin: context.sourceSchemaFormPlugin,
-      });
-      setPendingGuidedUploads(new Map(pendingGuidedUploadsRef.current));
-    },
-    [],
-  );
 
-  const isGuidedBlobUploadFenceCurrent = useCallback(
-    (requestId: string, sessionId: string): boolean => {
-      const fence = pendingGuidedUploadsRef.current.get(requestId);
-      const context = guidedUploadContextRef.current;
-      return (
-        fence !== undefined &&
-        fence.sessionId === sessionId &&
-        context.activeSessionId === fence.sessionId &&
-        context.activationEpoch === fence.activationEpoch &&
-        context.step === fence.step &&
-        context.turnToken === fence.turnToken &&
-        context.isSourceSingleSelect === fence.isSourceSingleSelect &&
-        context.sourceSchemaFormPlugin === fence.sourceSchemaFormPlugin
-      );
-    },
-    [],
-  );
 
-  // A source upload completing while the Step-1 schema_form turn is already
-  // live (elspeth-c70909c13a): the persisted turn is immutable replay
-  // authority, so the server cannot re-emit it prefilled — the blob lands in
-  // the form's LOCAL draft instead (the same blob:<id> sentinel the user would
-  // legally type). Keyed to the exact turn token so a later turn never
-  // inherits it; first compatible upload wins (no silent re-bind).
-  const [guidedSourceFormPathPrefill, setGuidedSourceFormPathPrefill] = useState<{
-    sessionId: string;
-    turnToken: string;
-    blob: GuidedSourceBlobCandidate;
-  } | null>(null);
 
-  const handleGuidedBlobUploadCompleted = useCallback(
-    (requestId: string, sessionId: string, blob: BlobMetadata): boolean => {
-      const fence = pendingGuidedUploadsRef.current.get(requestId);
-      if (
-        fence === undefined ||
-        blob.session_id !== sessionId ||
-        !isGuidedBlobUploadFenceCurrent(requestId, sessionId)
-      ) {
-        return false;
-      }
-      if (fence.isSourceSingleSelect) {
-        handleGuidedBlobUploaded(blob);
-        return true;
-      }
-      if (
-        fence.sourceSchemaFormPlugin !== null &&
-        fence.turnToken !== null &&
-        blob.status === "ready" &&
-        CANONICAL_BLOB_UUID.test(blob.id) &&
-        uploadMatchesSourcePlugin(fence.sourceSchemaFormPlugin, blob.filename)
-      ) {
-        const turnToken = fence.turnToken;
-        setGuidedSourceFormPathPrefill((current) =>
-          current?.sessionId === sessionId && current.turnToken === turnToken
-            ? current
-            : {
-                sessionId,
-                turnToken,
-                blob: {
-                  id: blob.id,
-                  filename: blob.filename,
-                  sizeBytes: blob.size_bytes,
-                  createdAt: blob.created_at,
-                },
-              },
-        );
-        // Returning false suppresses ChatInput's "please use it as the
-        // pipeline input" injection: that message routes to the tool-less
-        // Phase-A advisory, which cannot bind the blob and answers with a
-        // dead-end "paste the contents" request. The form's path row filling
-        // in is the honest feedback for this gesture.
-        return false;
-      }
-      return true;
-    },
-    [handleGuidedBlobUploaded, isGuidedBlobUploadFenceCurrent],
-  );
 
-  const handleGuidedBlobUploadRejected = useCallback(
-    (requestId: string, sessionId: string): boolean =>
-      isGuidedBlobUploadFenceCurrent(requestId, sessionId),
-    [isGuidedBlobUploadFenceCurrent],
-  );
 
-  const handleGuidedBlobUploadSettled = useCallback(
-    (requestId: string, sessionId: string) => {
-      const fence = pendingGuidedUploadsRef.current.get(requestId);
-      if (fence === undefined || fence.sessionId !== sessionId) return;
-      pendingGuidedUploadsRef.current.delete(requestId);
-      setPendingGuidedUploads(new Map(pendingGuidedUploadsRef.current));
-    },
-    [],
-  );
 
-  const hasPendingGuidedSourceUpload = useMemo(
-    () =>
-      [...pendingGuidedUploads.values()].some(
-        (fence) =>
-          fence.isSourceSingleSelect &&
-          fence.sessionId === activeSessionId &&
-          fence.activationEpoch === blobActivationEpoch &&
-          fence.step === guidedSession?.step &&
-          fence.turnToken === guidedNextTurn?.turn_token &&
-          guidedNextTurn?.type === "single_select",
-      ),
-    [
-      activeSessionId,
-      blobActivationEpoch,
-      guidedNextTurn,
-      guidedSession?.step,
-      pendingGuidedUploads,
-    ],
-  );
 
-  // Candidate provenance is scoped to one exact guided turn. Session/turn
-  // changes discard the whole set, and the live blob store invalidates files
-  // that were deleted or are no longer ready. The derived list repeats those
-  // checks synchronously so a stale candidate cannot leak during the effect's
-  // cleanup render.
-  //
-  // guidedSourceBlobCandidateSet is component-local state: a page reload or
-  // remount mid step_1_source loses it while the backend's ready blobs
-  // survive. When that happens with `current === null`, re-derive the set
-  // from the reloaded ready blobs — without this, the chooser silently
-  // disappears and the outgoing request omits source_blob_id even though
-  // multiple ready blobs exist.
-  //
-  // A mid-session turn_token rotation while still parked on
-  // step_1_source/single_select (e.g. the planner reissuing the step) hits
-  // the same symptom: `current` is scoped to the old token and must be
-  // invalidated. The effect has no dependency on the state it sets, so if
-  // invalidation simply returned null, the re-derive above would only run
-  // on the NEXT dependency change (typically the next blobs poll) — the
-  // chooser would vanish despite ready blobs being available right now.
-  // Falling through to re-derive in this same pass closes that window. The
-  // re-derived set mirrors the remount recovery above: it presents ALL
-  // ready session blobs, not just the ones accumulated via uploads during
-  // the (now-superseded) turn — that is the intended recovery surface.
-  useEffect(() => {
-    const deriveFromReadyBlobs = (): GuidedSourceBlobCandidateSet | null => {
-      if (
-        activeSessionId === null ||
-        guidedSession?.step !== "step_1_source" ||
-        guidedNextTurn?.type !== "single_select" ||
-        readyGuidedSourceBlobs.size === 0
-      ) {
-        return null;
-      }
-      const candidates = [...readyGuidedSourceBlobs.values()];
-      return {
-        sessionId: activeSessionId,
-        turnToken: guidedNextTurn.turn_token,
-        candidates,
-        requiresExplicitChoice: candidates.length > 1,
-      };
-    };
 
-    setGuidedSourceBlobCandidateSet((current) => {
-      if (current === null) {
-        return deriveFromReadyBlobs() ?? current;
-      }
-      if (
-        activeSessionId === null ||
-        guidedSession?.step !== "step_1_source" ||
-        guidedNextTurn?.type !== "single_select" ||
-        current.sessionId !== activeSessionId ||
-        current.turnToken !== guidedNextTurn.turn_token
-      ) {
-        return deriveFromReadyBlobs();
-      }
 
-      const candidates = current.candidates.flatMap((candidate) => {
-        const readyCandidate = readyGuidedSourceBlobs.get(candidate.id);
-        return readyCandidate === undefined ? [] : [readyCandidate];
-      });
-      const unchanged =
-        candidates.length === current.candidates.length &&
-        candidates.every(
-          (candidate, index) =>
-            candidate.id === current.candidates[index].id &&
-            candidate.filename === current.candidates[index].filename &&
-            candidate.sizeBytes === current.candidates[index].sizeBytes,
-        );
-      if (unchanged) return current;
-      return {
-        ...current,
-        candidates,
-        // A removed candidate invalidates any selection it may have carried.
-        // Keep the turn fail-closed even when filtering leaves one or no files.
-        requiresExplicitChoice:
-          current.requiresExplicitChoice ||
-          candidates.length < current.candidates.length,
-      };
-    });
-  }, [
-    activeSessionId,
-    guidedNextTurn?.turn_token,
-    guidedNextTurn?.type,
-    guidedSession?.step,
-    readyGuidedSourceBlobs,
-  ]);
-
-  const guidedSourceBlobCandidates = useMemo<
-    readonly GuidedSourceBlobCandidate[]
-  >(() => {
-    if (
-      guidedSession?.step !== "step_1_source" ||
-      guidedNextTurn?.type !== "single_select" ||
-      guidedSourceBlobCandidateSet?.sessionId !== activeSessionId ||
-      guidedSourceBlobCandidateSet.turnToken !== guidedNextTurn.turn_token
-    ) {
-      return [];
-    }
-    return guidedSourceBlobCandidateSet.candidates.flatMap((candidate) => {
-      const readyCandidate = readyGuidedSourceBlobs.get(candidate.id);
-      return readyCandidate === undefined ? [] : [readyCandidate];
-    });
-  }, [
-    activeSessionId,
-    guidedNextTurn,
-    guidedSession?.step,
-    guidedSourceBlobCandidateSet,
-    readyGuidedSourceBlobs,
-  ]);
-
-  const guidedSourceBlobChoiceRequired =
-    guidedSession?.step === "step_1_source" &&
-    guidedNextTurn?.type === "single_select" &&
-    guidedSourceBlobCandidateSet?.sessionId === activeSessionId &&
-    guidedSourceBlobCandidateSet.turnToken === guidedNextTurn.turn_token &&
-    guidedSourceBlobCandidateSet.requiresExplicitChoice;
 
   // ── Inline-source projection (Phase 5a Task 3) ─────────────────────────────
   //
@@ -1678,13 +640,6 @@ export function ChatPanel({
       (storedInlineSources[activeSessionId] ?? []).filter((summary) => summary.blobId === blobId),
     );
 
-  // ── Interpretation review surfacing ───────────────────────────────────────
-  //
-  // Both guided and freeform render pending interpretation events through the
-  // single AcknowledgementStack inside the decision panel, driven
-  // by the same `pendingBySession[sessionId]` projection.  The stack owns the
-  // ordering, the count announce, the cards, and the foot-of-stack opt-out;
-  // ChatPanel only supplies the post-resolve callbacks per mode.
 
   // ── Interpretation review resolve-success confirmation (Phase 5b.18b.8) ──
   //
@@ -1802,13 +757,6 @@ export function ChatPanel({
     [chatTurns, isComposing],
   );
 
-  // Confirmations that cannot be anchored: no tool_call_id on the row, or its
-  // call belongs to a turn that is not on screen (hidden by the atomic-reveal
-  // gate, or raised during a guided phase whose turns replay through
-  // GuidedChatHistory rather than as chatTurns). They render after the stream,
-  // which is where ALL of them used to render — the fallback is the old
-  // behaviour, kept deliberately so an approval is never dropped for want of
-  // a place to put it.
   const tailConfirmations = useMemo(() => {
     const onScreen = new Set<string>();
     for (const turn of renderedTurns) {
@@ -1877,21 +825,6 @@ export function ChatPanel({
     setInlineSourceSummary, retainInlineSourceSummaries,
   ]);
 
-  // A newly-actionable proposal must be SEEN (elspeth-2d1cf8908c). The dock
-  // is a scroll container by design (elspeth-ecf973fb9f), so a banner that
-  // mounts below its fold — an open blob drawer or a tall composing card is
-  // enough — leaves the Accept control invisible with no signal a decision
-  // is waiting. When an actionable proposal id appears that the previous
-  // render did not have, scroll the dock BY NAME to the banner. Never
-  // scrollIntoView: its ancestor walk scrolls every scrollable box it finds
-  // and is the exact mechanism behind the elspeth-ecf973fb9f defect. Keyed
-  // to arrivals by VALUE (set membership, not array identity — the derived
-  // proposal arrays rebuild on unrelated store writes) so it repositions
-  // once per arrival and never fights the operator's own dock scrolling.
-  // Second trigger: a freshly-MOUNTED dock (first freeform render, or the
-  // return from a guided surface with a proposal already pending) reveals
-  // any waiting decision via attachDock — a fresh mount has no operator
-  // scroll state to fight.
   const actionableBannerProposalIds = useMemo(
     () => actionableProposals(compositionProposals).map((p) => p.id),
     [compositionProposals],
@@ -1921,19 +854,11 @@ export function ChatPanel({
   useEffect(() => {
     revealActionableProposals(false);
   }, [revealActionableProposals]);
-  // Latest-reveal ref so the dock's attach callback below stays
-  // identity-stable: a callback ref that changed per proposal-set change
-  // would detach/reattach on every arrival. Render-time ref assignment is
-  // the house idiom (guidedUploadContextRef above).
   const revealActionableProposalsRef = useRef(revealActionableProposals);
   revealActionableProposalsRef.current = revealActionableProposals;
   const attachDock = useCallback((node: HTMLDivElement | null) => {
     dockRef.current = node;
     if (node === null) return;
-    // A freshly-mounted dock — the first freeform render, or the return
-    // from a guided surface with a proposal already pending — has no
-    // operator scroll state to respect: reveal ANY waiting decision, seen
-    // before or not. The change-effect above stays arrival-keyed.
     revealActionableProposalsRef.current(true);
   }, []);
 
@@ -2004,8 +929,6 @@ export function ChatPanel({
   const sessionDismissed =
     activeSessionId !== null && fallbackDismissedAt.has(activeSessionId);
 
-  const guidedDecisionMode = isGuidedBuildActive(guidedSession, guidedNextTurn) ||
-    guidedSession?.terminal?.kind === "completed";
 
   const shouldRenderFallback =
     fallbackCandidate !== null &&
@@ -2031,14 +954,13 @@ export function ChatPanel({
         compositionState,
         pendingInterpretations: pendingAcknowledgementEvents,
         proposals: compositionProposals,
-        inlineSourceCandidate: !guidedDecisionMode && shouldRenderFallback ? fallbackCandidate : null,
+        inlineSourceCandidate: shouldRenderFallback ? fallbackCandidate : null,
       }),
     [
       validationResult,
       compositionState,
       pendingAcknowledgementEvents,
       compositionProposals,
-      guidedDecisionMode,
       shouldRenderFallback,
       fallbackCandidate,
     ],
@@ -2057,14 +979,10 @@ export function ChatPanel({
   // backend's 422 (bootstrap race), so Apply stays closed until
   // composeTimeoutReady, and reads as connecting (or the stuck unavailable
   // state) rather than as a dead click.
-  // Guided suggestions are informational: applying them uses the existing
-  // freeform editing workflow rather than bypassing guided stage admission.
-  const decisionApplyDisabled = guidedDecisionMode || isComposing || !composeTimeoutReady;
-  const decisionApplyDisabledReason = guidedDecisionMode
-    ? "Pipeline suggestions can be applied in the freeform editor."
-    : composerTimeoutUnavailable
-      ? COMPOSE_UNAVAILABLE_MESSAGE
-      : COMPOSE_CONNECTING_MESSAGE;
+  const decisionApplyDisabled = isComposing || !composeTimeoutReady;
+  const decisionApplyDisabledReason = composerTimeoutUnavailable
+    ? COMPOSE_UNAVAILABLE_MESSAGE
+    : COMPOSE_CONNECTING_MESSAGE;
   const handleApplySuggestion = useCallback(
     (suggestion: ValidationEntryDTO) => {
       void sendMessage(applySuggestionPrompt(suggestion));
@@ -2075,12 +993,6 @@ export function ChatPanel({
     if (decisionApplyDisabled || validationResult === null) return;
     void sendMessage(repairGraphPrompt(validationResult.errors));
   }, [decisionApplyDisabled, sendMessage, validationResult]);
-  // Ruling D4: a blocker row DRAFTS a question; the user sends it. ChatPanel
-  // owns the freeform draft, so it sets it directly (the catalog's prefill
-  // event exists for surfaces that do not). The draft REPLACES the input, so
-  // the button is held closed while the input holds text the user typed.
-  // Freeform only: guided chat is step-scoped and its input can be a locked
-  // tutorial prompt.
   const handleAskAboutBlocker = useCallback(
     (detail: string, componentId: string | null, note: string | null) => {
       const stepPhrase = componentId === null ? null : decisionPhraseFor(componentId);
@@ -2151,129 +1063,8 @@ export function ChatPanel({
     [sendMessage, compositionState],
   );
 
-  // Guided workspace auto-scroll: keep the conversation column pinned to the
-  // bottom as turns arrive (chat_history growth) and when either kind of Send
-  // starts. Most guided chat uses guidedChatPending; the step-3 proposal
-  // composer deliberately delegates to respondGuided and therefore uses
-  // guidedResponsePending. Watch both so mounting either pending footer cannot
-  // leave the last few pixels below the viewport. Only pin while the reader
-  // already sits within 40px of the bottom — a reader scrolled up into the
-  // transcript must not be yanked down (freeform's heuristic, tracked
-  // pre-append by the onScroll handler above). Deliberately defined BEFORE the
-  // step-advance focus effect below: on a Send both fire, and the focus
-  // effect's scrollIntoView must win so the just-built decision presents itself.
-  const guidedChatHistoryLength = guidedSession?.chat_history.length ?? 0;
-  // Identity of the transcript the length above belongs to: the active
-  // session while a guided session is loaded, null otherwise. ChatPanel is
-  // mounted unkeyed and survives session switches, so without this a switch
-  // to a session with a LONGER history — or a freeform→guided flip
-  // (length 0→N) — read as chat growth and fired a spurious reveal-scroll
-  // that fought the pin-to-bottom on a freshly shown transcript. An identity
-  // change re-seeds the previous-length ref instead of comparing across
-  // transcripts; only genuine same-session appends reveal.
-  const guidedChatIdentity = guidedSession === null ? null : activeSessionId;
-  const prevGuidedChatLenRef = useRef(guidedChatHistoryLength);
-  const prevGuidedChatIdentityRef = useRef(guidedChatIdentity);
-  useEffect(() => {
-    const previousLength = prevGuidedChatLenRef.current;
-    const identityChanged =
-      prevGuidedChatIdentityRef.current !== guidedChatIdentity;
-    prevGuidedChatLenRef.current = guidedChatHistoryLength;
-    prevGuidedChatIdentityRef.current = guidedChatIdentity;
-    const container = guidedWorkspaceScrollRef.current;
-    if (!container) return;
-    if (!guidedWorkspaceAtBottomRef.current) return;
-    container.scrollTop = container.scrollHeight;
-    // Guided geometry inverts freeform's: the transcript sits ABOVE the
-    // decision card, so on chat_history growth the pin above re-shows the
-    // card while the newly appended turn (e.g. an Explain reply, which
-    // changes neither step_index nor turn type and so never fires the
-    // step-advance effect below) lands above the fold. Reveal it — the
-    // stage-divider rows carry no data-seq, so the last [data-seq] row is
-    // always the newest conversational turn. On a turn-rebuilding Send the
-    // step-advance effect still runs after this one and its scrollIntoView
-    // wins (ordering doctrine above).
-    if (!identityChanged && guidedChatHistoryLength > previousLength) {
-      const rows = container.querySelectorAll(
-        ".guided-chat-bubbles [data-seq]",
-      );
-      rows[rows.length - 1]?.scrollIntoView({
-        behavior: preferredScrollBehavior(),
-        block: "start",
-      });
-    }
-  }, [
-    guidedChatHistoryLength,
-    // Identity must be a dep: a switch between sessions with EQUAL history
-    // lengths otherwise never re-runs the effect, leaving stale refs that
-    // suppress (or misread) the next genuine append in the new session.
-    guidedChatIdentity,
-    guidedChatPending,
-    guidedResponsePending,
-  ]);
 
-  // Spec §7.4 — maintain focus on the first interactive element of the new turn
-  // after step advance.  Without this, a step-advancing button click unmounts
-  // the button before the browser can return focus elsewhere, so focus falls to
-  // <body>.  Keyboard users then have to Tab from the very top to reach the new
-  // turn widget — unacceptable for general a11y.
-  //
-  // Keyed on step_index AND turn type. Fires when the wizard advances to a new
-  // step (step_index changes) OR when a same-step build replaces the turn with a
-  // different type — e.g. a `/guided/chat` Send that resolves the source turns
-  // single_select → schema_form, or a later server-authored stage transition. The latter
-  // matters now the composer is docked at the BOTTOM for every session
-  // (including the tutorial): the just-built decision lands ABOVE the box the
-  // user just Sent from, so we scroll it into view + focus its first control
-  // rather than leaving it off-screen. It deliberately does NOT fire on
-  // same-step, same-type store churn (a new TurnPayload object with identical
-  // step_index + type) — that would yank focus while the user works the widget
-  // (pinned by the "does NOT re-focus … same-step store mutation" test). The
-  // ref-null short-circuit handles all non-guided branches implicitly —
-  // guidedLogRef.current is null whenever the chat-panel-guided-log div is not
-  // mounted (completed surface, freeform surface, no session). Observation
-  // elspeth-obs-5ea21f94af documents the original defect and the chosen
-  // Option (c) implementation.
-  useEffect(() => {
-    if (!guidedLogRef.current) return;
-    guidedLogRef.current.scrollIntoView({
-      behavior: preferredScrollBehavior(),
-      block: "nearest",
-    });
-    const first = guidedLogRef.current.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
-    first?.focus({ preventScroll: true });
-    // scrollIntoView targets the turn log, which ends before the decision
-    // footer. On short viewports that can leave a few pixels of the decision
-    // card below the fold. Preserve the reader-scrolled-up guard, but when the
-    // conversation was already live at the bottom, finish at the actual end
-    // after focus has settled.
-    const container = guidedWorkspaceScrollRef.current;
-    if (container && guidedWorkspaceAtBottomRef.current) {
-      container.scrollTop = container.scrollHeight;
-    }
-  }, [guidedNextTurn?.step_index, guidedNextTurn?.type]);
 
-  // Present the respond-rejection when it lands. A failed respond (e.g. a
-  // wire-confirm 409) mutates ONLY error/errorDetails/guidedResponsePending —
-  // nothing the auto-scroll or step-advance effects above watch — and the
-  // alert renders as the LAST content of the decision card, which sits at the
-  // bottom of a scroll region in both guided layouts. Without this presenter
-  // the alert can mount below the fold in the pinned-at-bottom state: a
-  // sighted user clicks Confirm and sees nothing but the button re-enable
-  // (the elspeth-3b35abf148 variant-3 silent-rejection failure, reintroduced
-  // by geometry). block:"nearest" is a no-op when the alert is already in
-  // view. Detail-less failures (errorDetails null) keep the always-visible
-  // top GuidedErrorBanner and need no scroll — do not key this on `error`.
-  const rejectionRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (errorDetails == null || errorDetails.length === 0) {
-      return;
-    }
-    rejectionRef.current?.scrollIntoView({
-      behavior: preferredScrollBehavior(),
-      block: "nearest",
-    });
-  }, [errorDetails]);
 
   const handleSend = useCallback(
     (content: string) => {
@@ -2354,8 +1145,8 @@ export function ChatPanel({
         phraseFor={decisionPhraseFor}
         stepLabelFor={decisionStepLabelFor}
         onApplySuggestion={handleApplySuggestion}
-        onAskAboutBlocker={guidedDecisionMode ? undefined : handleAskAboutBlocker}
-        onRepairGraph={guidedDecisionMode ? undefined : handleRepairGraph}
+        onAskAboutBlocker={handleAskAboutBlocker}
+        onRepairGraph={handleRepairGraph}
         askDisabledReason={decisionAskDisabledReason}
         onOpenChecks={handleOpenChecks}
         onAcceptProposal={acceptProposal}
@@ -2364,12 +1155,8 @@ export function ChatPanel({
         interpretationContent={
           <AcknowledgementStack
             sessionId={activeSessionId}
-            isTutorial={isTutorial}
             onFocusFallback={() => inputRef.current?.focus()}
-            onResolved={createInterpretationResolutionHandler(
-              activeSessionId,
-              guidedDecisionMode,
-            )}
+            onResolved={createInterpretationResolutionHandler(activeSessionId)}
           />
         }
         renderSourceFallback={(candidateText) => (
@@ -2384,970 +1171,12 @@ export function ChatPanel({
     </>
   );
 
-  // ── Shared guided chrome builders ───────────────────────────────────────────
-  //
-  // The conversation column and its docked composer are the SAME surface on
-  // the active guided branch and on the completed branch (elspeth-986801d218:
-  // a committed session keeps its conversation). They are built here, once,
-  // rather than copied into each branch, because three contracts are attached
-  // to this exact markup and a copy silently drops them:
-  //   - the pending-focus contract (composerSectionRef / composerFocusWithinRef
-  //     + the useLayoutEffect by the ref declarations),
-  //   - the chat-growth reveal effect, which scrolls the newest [data-seq] row
-  //     into view and finds nothing without `guidedWorkspaceScrollRef` mounted,
-  //   - the "Describe what you want" region locator that the staging e2e specs
-  //     and AT navigation both use.
-  // They are plain functions, not components: a component identity declared in
-  // a render body remounts its subtree on every render, which would blow away
-  // the composer's DOM (and its focus) on each keystroke.
 
-  /**
-   * The docked "Describe what you want" composer.
-   *
-   * `lockedValue` non-null puts the box in the tutorial's locked read-only
-   * mode showing that value; null is the ordinary editable draft box. This is
-   * a stage concept, NOT a tutorial-mode branch — the completed surface
-   * passes null and is therefore editable in the tutorial dwell too.
-   * `uploadEnabled` false wires NO blob-upload handlers and disables the
-   * upload affordance: an upload against a session with nothing left to
-   * author would orphan the blob and post "resolve this file" as an ordinary
-   * message.
-   */
-  const buildGuidedComposer = ({
-    placeholder,
-    lockedValue,
-    uploadEnabled,
-    onSend,
-    replacement = null,
-    revisionScope = null,
-  }: {
-    placeholder: string;
-    lockedValue: string | null;
-    uploadEnabled: boolean;
-    onSend: (content: string) => void;
-    /** Renders INSTEAD of the input (the tutorial's static "Sent" line). */
-    replacement?: React.ReactNode;
-    /** Rendered above the input (the step-3 revision-scope selector). */
-    revisionScope?: React.ReactNode;
-  }) => (
-    <section
-      // The composer docks as a plain input strip under the conversation
-      // column (freeform's border-top idiom) — no card chrome; the inner
-      // .chat-input carries the seam. The section + role=region +
-      // aria-label survive in BOTH modes — the "Describe what you want"
-      // landmark is load-bearing for AT navigation and the staging e2e
-      // locators (tutorial-probe/tutorial-reliability .staging.spec.ts).
-      className="guided-step-chat"
-      role="region"
-      aria-label="Describe what you want"
-      // Pending focus contract plumbing (see the useLayoutEffect by the
-      // ref declarations). tabIndex=-1 makes the section itself a legal
-      // programmatic focus landing (tutorial resolve path). The focus/blur
-      // pair track focus-within via bubbling; a null relatedTarget (window
-      // blur, click on non-focusable page chrome) counts as "left" — erring
-      // that way skips a restore after an app-switch, erring the other way
-      // yanks focus back from a user who clicked into the transcript.
-      ref={composerSectionRef}
-      tabIndex={-1}
-      onFocus={() => {
-        composerFocusWithinRef.current = true;
-      }}
-      onBlur={(e) => {
-        if (
-          !(e.relatedTarget instanceof Node) ||
-          !e.currentTarget.contains(e.relatedTarget)
-        ) {
-          composerFocusWithinRef.current = false;
-        }
-      }}
-    >
-      {/* No visible heading — the bare docked strip carries only the
-          aria-label for its accessible name (the old dashed-card heading
-          was live-guided furniture that died with the pre-workspace
-          layout). */}
-      {replacement !== null ? (
-        replacement
-      ) : (
-        <>
-          {revisionScope}
-          <ChatInput
-            onSend={onSend}
-            uploadPromptSentence={uploadedSourcePromptSentence}
-            // Upload handlers are wired only where an upload can mean
-            // something. Passing undefined is the affordance's OFF state,
-            // not a disabled-but-live one.
-            onBlobUploadStarted={
-              uploadEnabled ? handleGuidedBlobUploadStarted : undefined
-            }
-            onBlobUploadCompleted={
-              uploadEnabled ? handleGuidedBlobUploadCompleted : undefined
-            }
-            onBlobUploadRejected={
-              uploadEnabled ? handleGuidedBlobUploadRejected : undefined
-            }
-            onBlobUploadSettled={
-              uploadEnabled ? handleGuidedBlobUploadSettled : undefined
-            }
-            uploadDisabled={!uploadEnabled || hasPendingGuidedSourceUpload}
-            // Both pendings gate Send. `guidedResponsePending` blocks a chat
-            // WHILE a turn-respond is advancing the step — otherwise the chat
-            // captures the stale `guidedSession.step` and the backend rejects
-            // the step mismatch with 409 (guided.py step-match guard).
-            // `guidedChatPending` blocks a second send racing the in-flight
-            // one (belt: ChatInput's handleSend returns early on disabled;
-            // braces: sendGuidedChat's own pending admission gate). The old
-            // pending SWAP — unmounting the input and mounting the working
-            // strip in its place (elspeth-6a9673ecd3) — is retired: it read
-            // as a large panel occluding the typing area (operator
-            // 2026-07-23). The strip now rides in the conversation flow (see
-            // the guided-authoring-scroll mount); the input keeps its place
-            // with its ordinary disabled state, which also preserves any
-            // typed draft. Stop stays in the strip (it renders only while
-            // the abortable chat fetch exists).
-            disabled={guidedResponsePending || guidedChatPending}
-            inputRef={inputRef}
-            placeholder={placeholder}
-            maxLength={GUIDED_CHAT_MESSAGE_MAX_LENGTH}
-            // Kept controlled (value defined) across all phases to avoid
-            // controlled↔uncontrolled flips. Locked: the frozen per-stage
-            // prompt, read-only, with a no-op onChange so a tutorial prompt
-            // never leaks into guidedDraft and out onto a later live surface.
-            // Unlocked: controlled on guidedDraft (elspeth-49b467d91a) so the
-            // typed prompt is parent-owned and sendGuidedChatRetainingDraft
-            // can restore it when a send fails to deliver.
-            value={lockedValue ?? guidedDraft}
-            onChange={lockedValue !== null ? () => undefined : setGuidedDraft}
-            readOnly={lockedValue !== null}
-          />
-        </>
-      )}
-    </section>
-  );
 
-  /**
-   * The bounded conversation column. role="group" is REQUIRED for the
-   * aria-label to be exposed (a name on a role-less div is AT-invisible and
-   * an axe aria-prohibited-attr violation, elspeth-37293a3b7c). Deliberately
-   * NOT role=log / NOT a live region: the transcript log (and, on the active
-   * branch, the wizard log) live INSIDE it and must not nest in an outer live
-   * region (double-announce). tabIndex=0 lets keyboard users arrow-scroll it.
-   */
-  const buildGuidedWorkspaceScroller = (children: React.ReactNode) => (
-    <div
-      ref={guidedWorkspaceScrollRef}
-      onScroll={handleGuidedWorkspaceScroll}
-      className="guided-authoring-scroll"
-      role="group"
-      aria-label="Conversation"
-      tabIndex={0}
-    >
-      {children}
-    </div>
-  );
 
-  // ── Decision sheets: which ticks offer one, and what one contains ─────────
-  //
-  // Both halves read `guidedSession.reviewed_components` — the SERVER's ledger
-  // — rather than the store's `guidedReviewedComponents` copy. See the module
-  // note in guidedDecisionStages.ts: the copy is deliberately emptied on the
-  // refresh-required path so the right-pane graph stops drawing pre-failure
-  // nodes, and a stepper that forgot along with it would tell the user their
-  // finished stages never happened.
-  const guidedDecisionStagesFor = (
-    session: GuidedSession,
-  ): ReadonlySet<GuidedStep> =>
-    reviewedGuidedStages(
-      session.reviewed_components,
-      session.step,
-      session.terminal?.kind === "completed",
-    );
 
-  /**
-   * The open stage's sheet, or null when none is open. Built from the
-   * published session, the live wire card and the committed composition — no
-   * request, and nothing the transcript does not already hold.
-   */
-  const buildGuidedDecisionSheet = (
-    session: GuidedSession,
-  ): React.ReactNode => {
-    if (openDecisionStep === null) return null;
-    // Defensive rather than decorative: `openDecisionStep` is cleared whenever
-    // the step or the terminal moves, but a store publication can land in the
-    // same commit as the click, and a sheet for a stage that is no longer
-    // settled would claim a decision that does not exist.
-    if (!guidedDecisionStagesFor(session).has(openDecisionStep)) return null;
-    const completed = session.terminal?.kind === "completed";
-    return (
-      <GuidedDecisionSheet
-        id={decisionSheetId}
-        stage={openDecisionStep}
-        rows={guidedDecisionRows(
-          openDecisionStep,
-          session.reviewed_components,
-          guidedNextTurn?.type === "confirm_wiring"
-            ? guidedNextTurn.payload.nodes
-            : [],
-          compositionState,
-          completed,
-        )}
-        chatTurns={guidedDecisionTurns(
-          openDecisionStep,
-          session.chat_history,
-          afterConfirmationChatToken(session),
-          // The token outlives the completion (a reenter on changed content
-          // rewinds to Step 2 with terminal=null and keeps the answered
-          // confirmation record), so the post-commit boundary is only a
-          // boundary while the session is still completed — see
-          // guidedDecisionTurns.
-          completed,
-        )}
-        // Non-null on the wire stage only; guidedDecisionRecord owns that rule
-        // so the call site cannot disagree with it.
-        record={guidedDecisionRecord(openDecisionStep, session.history)}
-        onClose={closeDecisionSheet}
-      />
-    );
-  };
 
-  // ── Guided-mode discriminator ────────────────────────────────────────────────
-  //
-  // Precedence (intentional):
-  //   1. terminal.kind === "completed"  → CompletionSummary surface.
-  //   2. active guided session + non-null next turn  → GuidedTurn surface.
-  //   3. anything else (no guidedSession, exited_to_freeform terminal, or a
-  //      transient state where guidedSession is set but guidedNextTurn is null)
-  //      → fall through to the freeform body below.
-  //   4. (tutorial only) when `isTutorial` is set, the fall-through in (3) is
-  //      replaced by a guided placeholder surface instead of the freeform body,
-  //      so a tutorial can never land on a panel-less freeform screen (concern
-  //      B). The completed branch (1) still wins for a tutorial completion.
-  //
-  // The completed branch is checked FIRST so that a stale `guidedNextTurn`
-  // alongside a completed terminal still surfaces the summary (correct UX)
-  // rather than dispatching a widget.
-  //
-  // When `terminal.kind === "exited_to_freeform"`, branch 1 does not match
-  // (kind !== "completed") and branch 2 does not match (`!guidedSession.terminal`
-  // is false because `terminal` is set). Execution falls through to the existing
-  // freeform body — which is the correct outcome (non-tutorial only — see point 4)
-  // (the user has exited; show them the chat surface).
-  //
-  // Both branches preserve `id="chat-main"` so the skip-link target is honoured;
-  // the modifier class (`--guided` / `--completed`) provides a per-branch hook
-  // for future CSS without coupling layout to the freeform surface.
-  if (guidedSession?.terminal?.kind === "completed") {
-    return (
-      <div
-        id="chat-main"
-        className="chat-panel chat-panel--completed"
-        role="region"
-        aria-label="Pipeline summary"
-      >
-        {decisionLiveRegion}
-        <GuidedWorkflowStepper
-          activeStep="ready"
-          readyStepLabel={COMPLETED_READY_STEP_LABELS[guidedCompletionOutcome]}
-          // Every stage of a committed pipeline is settled, and none of them is
-          // current — so all four ticks open a read-only sheet here.
-          reviewedSteps={guidedDecisionStagesFor(guidedSession)}
-          openStep={openDecisionStep}
-          sheetId={decisionSheetId}
-          onOpenStep={toggleDecisionSheet}
-          registerTick={registerDecisionTick}
-        />
-        {error && (
-          <GuidedErrorBanner error={error} onDismiss={clearError} />
-        )}
-        {/* Between the stepper and the transcript, and OUTSIDE the scroll
-            group below: the sheet replays settled turns in GuidedChatHistory's
-            static `replay` mode, which must not sit inside the live transcript
-            log. Directly after the tick that opened it, so keyboard focus moves
-            forward into the panel rather than jumping past the conversation. */}
-        {buildGuidedDecisionSheet(guidedSession)}
-        {/* The conversation SURVIVES the commit (elspeth-986801d218). The
-            build is over — there is no wizard turn, no decision card and no
-            forward affordance — but the chat channel stays open so the user
-            can ask what the committed pipeline does. Same scroller, same
-            transcript log, same docked composer as the active branch, built
-            from the shared builders above; only the placeholder, the Explain
-            copy and the absent upload differ. `isGuidedBuildActive` stays
-            false, so the freeform SideRail (Run / Export) keeps its place. */}
-        {buildGuidedWorkspaceScroller(
-          <>
-            <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
-            <GuidedChatHistory
-              chatHistory={guidedSession.chat_history}
-              onRetrySyntheticFailure={handleRetrySyntheticFailure}
-              // Same readiness gate as the active branch's Retry and Explain:
-              // a restored transcript can render before the backend wall
-              // clock latches, and sendGuidedChat no-ops until it does.
-              retryDisabled={
-                guidedChatPending || guidedResponsePending || !composeTimeoutReady
-              }
-              afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
-            />
-            <div className="guided-completed-actions">
-              <Button
-                compact
-                // Same compact-Button hook the per-step Explain uses;
-                // .btn-compact carries the chrome.
-                className="guided-explain-btn"
-                onClick={() =>
-                  void sendGuidedChat(GUIDED_EXPLAIN_PIPELINE_MESSAGE)
-                }
-                disabled={
-                  guidedChatPending ||
-                  guidedResponsePending ||
-                  !composeTimeoutReady
-                }
-                title={
-                  !guidedChatPending &&
-                  !guidedResponsePending &&
-                  !composeTimeoutReady
-                    ? composerTimeoutUnavailable
-                      ? COMPOSE_UNAVAILABLE_MESSAGE
-                      : COMPOSE_CONNECTING_MESSAGE
-                    : undefined
-                }
-              >
-                Explain this pipeline
-              </Button>
-            </div>
-            {/* Direct child of the scroll region: OUTSIDE the transcript's
-                role=log, so its role=status is announced once. */}
-            {guidedChatPending ? (
-              <GuidedPendingStrip
-                composerProgress={composerProgress}
-                onStop={cancelGuidedChat}
-              />
-            ) : null}
-          </>,
-        )}
-        <div className="chat-panel-dock" tabIndex={0} ref={attachDock}>
-          {decisionPanel}
-          {approvalReadiness}
-        </div>
-        {buildGuidedComposer({
-          placeholder: GUIDED_COMPLETED_CHAT_PLACEHOLDER,
-          // Editable, in the tutorial dwell too: a locked prompt is an
-          // ACTIVE-stage script concept and there is no stage left to script.
-          lockedValue: null,
-          uploadEnabled: false,
-          onSend: (content) => {
-            void sendGuidedChatRetainingDraft(content);
-          },
-        })}
-      </div>
-    );
-  }
 
-  // STEP_3 renders the guided surface — crucially the docked composer — so the
-  // operator can describe the transforms. The 7.1 planner auto-stages a pipeline
-  // proposal at Output→Transforms, so step_3 now begins WITH a propose_pipeline
-  // turn: a Send here goes through chatGuided, which forwards it to /guided/respond
-  // as a prose proposal revision (regenerate the pipeline following the
-  // instruction) instead of /guided/chat — /guided/chat rejects a step_3 send with
-  // no deferred intents to manage. Render even without a next turn (e.g. a
-  // transient proposal-generation failure returned next_turn=null) so the box
-  // survives for retry; otherwise the panel falls through to the "Preparing…" flash.
-  //
-  // The predicate is shared with App (isGuidedBuildActive), which suppresses
-  // the freeform SideRail while this branch renders — the workspace rail
-  // replaces it. The inline null/terminal re-checks exist only so TypeScript
-  // narrows guidedSession inside the branch; they are implied by the helper.
-  if (
-    guidedSession &&
-    !guidedSession.terminal &&
-    isGuidedBuildActive(guidedSession, guidedNextTurn)
-  ) {
-    // Nothing is persisted for this session yet: the store adopted the lazy
-    // GET /guided stub (non-mutating) so the panel can open on the goal card
-    // without writing a rootless wizard. The session's first Send goes through
-    // chatGuided's cold-start branch and becomes POST /guided/start's intent.
-    const awaitingGoal = compositionState === null;
-    // Tutorial: the per-stage locked prompt has already been Sent once the
-    // current step carries a user turn in the server-authoritative chat_history.
-    // Only true after a SUCCESSFUL chatGuided round-trip (an HTTP failure leaves
-    // chat_history untouched — see sessionStore.chatGuided catch), so a failed
-    // send still shows the box for retry.
-    //
-    // TRIMMED EXACT EQUALITY against the step's locked prompt, not "any user
-    // turn that isn't Explain" (goal-first, elspeth-378cfa0e18): a started
-    // session's transcript now OPENS with the seeded goal turn, which the
-    // server stamps with step_1_source. Under the old predicate that turn alone
-    // satisfied step 1, so the locked source box flipped to the static "Sent"
-    // line before the learner had sent anything and the single-select the
-    // tutorial suppresses came back. Comparing against the prompt itself is
-    // also what the predicate always meant, and it subsumes the Explain
-    // exclusion the old shape needed as a special case. Trimmed on both sides
-    // because ChatInput trims on send (ChatInput.tsx) — the same trimmed
-    // comparison guidedReplay.ts uses for its own dedupe.
-    const lockedPromptForStep = (
-      lockedChatPrompt?.[guidedSession.step] ?? ""
-    ).trim();
-    const tutorialPromptSentForStep =
-      isTutorial === true &&
-      lockedPromptForStep !== "" &&
-      guidedSession.chat_history.some(
-        (t) =>
-          t.role === "user" &&
-          t.step === guidedSession.step &&
-          t.content.trim() === lockedPromptForStep,
-      );
-    // Only swap the locked box for the static "Sent" line when there is actually
-    // a forward affordance to confirm below — the turn widget OR a pending
-    // interpretation review. If a Send-driven step was sent but produced neither
-    // (e.g. a transient proposal-generation failure returns next_turn=null),
-    // keep the box so the learner can retry; hiding it would strand them with no
-    // widget and no exit (the tutorial suppresses ExitToFreeform / opt-out).
-    const tutorialStepBuilt =
-      tutorialPromptSentForStep &&
-      (guidedNextTurn != null || hasPendingGuidedInterpretations);
-    // Before the locked tutorial prompt is sent, the initial single-select is
-    // a rival driver whose choices do not represent the scripted build. After
-    // Send, however, a single-select can be the server-authored continuation
-    // of a legal component-review Add action. Keep that recovery path live.
-    const suppressTutorialSingleSelect =
-      isTutorial === true &&
-      guidedNextTurn?.type === "single_select" &&
-      !tutorialPromptSentForStep;
-    // "Describe what you want" composer, docked at the BOTTOM of the panel, full
-    // width — the primary chat affordance, mirroring the freeform body's
-    // ChatInput which docks below the message log. The tutorial uses the SAME
-    // docked position as the live composer (its locked prompt + read-only box,
-    // and the "Sent" line after, ride in this same slot); the passive
-    // "press Send → confirm what it built" reading order is preserved by the
-    // step-advance/type focus effect, which scrolls the just-built decision
-    // (above) into view after a Send.
-    // It routes plain English through the store's `chatGuided` action, which
-    // picks the endpoint by state: the first ordinary message uses /guided/start
-    // to establish the durable root; a step-3 proposal-review turn revises the
-    // staged proposal via /guided/respond; other later messages use /guided/chat
-    // against the existing checkpoint. The caption is keyed on the live step via
-    // GUIDED_CHAT_PLACEHOLDERS — except at the wire stage, where it is keyed on
-    // live blocker state instead (see below).
-    const stepComposer = buildGuidedComposer({
-      // Before the goal the box IS the goal box: the step-keyed caption would
-      // ask for a source description, which is not what this Send does (it
-      // establishes the session's root intent).
-      //
-      // At step 4 the caption is a FUNCTION of what is actually blocking the
-      // confirm, not a constant (elspeth-e4c2ebb697): the old single-state
-      // wording named the acknowledgement cards unconditionally, so on the
-      // common path — nothing pending, nothing invalid — it told the learner to
-      // clear a stack that was not there. `wireStagePlaceholder` owns the three
-      // arms and their length budget; it lives beside the card so the caption
-      // and the card's own blocker panel cannot drift apart.
-      //
-      // The two counts are the SAME memos the card's blockers panel renders
-      // (`wirePendingAcknowledgements` / `wireValidationIssues`, passed to the
-      // wire turn below), and the third argument is the SAME payload the card
-      // itself reads, so the box under the card and the card describe one
-      // screen. Without that payload the caption could not see `can_confirm`
-      // or `blockers` — the usual reason Confirm is off at step 4, since the
-      // pre-commit guided composition is empty-by-design and contributes no
-      // `wireValidationIssues` — and fell through to telling the learner to
-      // press a disabled button. No `isTutorial` branch: the tutorial's
-      // `lockedChatPrompt` has no `step_4_wire` key, so its read-only box is
-      // empty and this line is the only thing in it — which is exactly the
-      // explanation of why Send does nothing there.
-      placeholder: awaitingGoal
-        ? GUIDED_GOAL_PLACEHOLDER
-        : guidedSession.step === "step_4_wire"
-          ? wireStagePlaceholder(
-              {
-                pendingAcknowledgements: wirePendingAcknowledgements.length,
-                validationIssues: wireValidationIssues.length,
-              },
-              guidedNextTurn?.type === "confirm_wiring"
-                ? guidedNextTurn.payload
-                : null,
-            )
-          : GUIDED_CHAT_PLACEHOLDERS[guidedSession.step],
-      // Tutorial: the box is locked read-only and prefilled with the CURRENT
-      // phase's per-stage prompt (wire has none → empty, confirm-only).
-      lockedValue: isTutorial
-        ? (lockedChatPrompt?.[guidedSession.step] ?? "")
-        : null,
-      uploadEnabled: true,
-      replacement: tutorialStepBuilt ? (
-        // Tutorial: the locked prompt was already Sent for this step (it is
-        // in the transcript above) AND a forward affordance exists below.
-        // Replace the redundant active box — which otherwise kept the
-        // just-sent prompt with a live Send and read as "did it send?" —
-        // with a static confirmation line.
-        <p className="guided-step-chat-sent" role="status">
-          {/* Honest framing (elspeth-3b45c51564): the tutorial's continue is
-              a review-then-proceed, not a choice — don't dress it as one. */}
-          Sent — your request is in the transcript above and the assistant
-          has built this step. Review the decision, then continue.
-        </p>
-      ) : null,
-      revisionScope:
-        isProposalRevisionComposer && !isTutorial ? (
-          <label className="guided-proposal-revision-scope">
-            Revision scope
-            <select
-              value={guidedRevisionMode}
-              disabled={guidedResponsePending || guidedChatPending}
-              onChange={(event) => setGuidedRevisionSelection({
-                identity: proposalRevisionIdentity,
-                mode: event.target.value as GuidedRevisionMode,
-              })}
-            >
-              <option value="amend">Amend current proposal — preserve existing steps</option>
-              <option value="replace">Replace proposal — steps may be removed</option>
-            </select>
-          </label>
-        ) : null,
-      onSend: (content) => {
-        // Tutorial sends keep the plain action: retention is the
-        // frozen locked-prompt value itself, and writing a tutorial
-        // prompt into guidedDraft would leak it into a later live
-        // guided surface on the same session.
-        if (isTutorial === true) {
-          void sendGuidedChat(content);
-          return;
-        }
-        if (isProposalRevisionComposer) {
-          const liveState = useSessionStore.getState();
-          const liveTurn = liveState.guidedNextTurn;
-          const liveProposalRevisionIdentity =
-            liveState.guidedSession?.step === "step_3_transforms" &&
-            liveTurn?.type === "propose_pipeline"
-              ? `${liveState.activeSessionId ?? ""}:${liveTurn.payload.proposal_id}:${liveTurn.payload.draft_hash}`
-              : null;
-          const selectedMode =
-            guidedRevisionSelection.identity === liveProposalRevisionIdentity
-              ? guidedRevisionSelection.mode
-              : "amend";
-          // No eager reset-to-amend here: a DELIVERED revision
-          // advances the proposal identity, and the identity-keyed
-          // effect above already resets the selector; an eager reset
-          // made a FAILED send restore the prompt but silently flip
-          // the user's "replace" choice back to "amend", so the
-          // retry resubmitted a semantically different request
-          // (review finding on elspeth-49b467d91a). Draft and scope
-          // now retain or clear together.
-          void sendGuidedChatRetainingDraft(content, selectedMode);
-          return;
-        }
-        void sendGuidedChatRetainingDraft(content);
-      },
-    });
-
-    // The "current decision" panel (eyebrow + per-step rationale + the turn
-    // widget). Rendered LAST inside the conversation-column scroll region
-    // (.guided-authoring-scroll) — the action zone between the reply and the
-    // composer. It is deliberately NOT docked with the composer:
-    // a tall schema/wire widget in a fixed dock crushes the transcript (the
-    // recorded tutorial.css fill-viewport failure); inside the scroll region
-    // the step-advance focus effect scrolls it into view after a Send instead.
-    const decisionSection = (() => {
-      // Before the goal there is no decision to show. The stub's first
-      // single_select asks the user to pick a source, which is the wrong
-      // question two steps early — and the card's Explain button would be
-      // WORSE than wrong: Explain sends its canned question through
-      // sendGuidedChat, which pre-start is the cold-start branch, so pressing
-      // it would make "Why am I seeing this?" the session's root intent and
-      // the planner's brief. The goal card replaces the whole section (never
-      // renders beside it), so the id, the role=log live region and the
-      // Explain affordance all belong to exactly one of the two.
-      if (awaitingGoal) {
-        return (
-          <section
-            className="guided-goal-prompt"
-            aria-labelledby="guided-goal-prompt-heading"
-          >
-            <h2
-              id="guided-goal-prompt-heading"
-              className="guided-goal-prompt__question"
-            >
-              {GUIDED_GOAL_QUESTION}
-            </h2>
-            <p className="guided-goal-prompt__hint">{GUIDED_GOAL_HINT}</p>
-          </section>
-        );
-      }
-      const stepIsSendDriven =
-        isTutorial && (lockedChatPrompt?.[guidedSession.step] ?? "") !== "";
-      // Lead the decision with the dynamic build rationale (the LLM's "what I
-      // built" summary for this step); fall back to the static step purpose when
-      // no assistant turn exists yet so the headline is never blank.
-      const rationale = latestAssistantRationale(guidedSession);
-      return (
-        <section
-          className={
-            stepIsSendDriven
-              ? "guided-current-decision guided-current-decision--tutorial"
-              : "guided-current-decision"
-          }
-          aria-labelledby="guided-current-decision-heading"
-        >
-          <div className="guided-current-decision-copy">
-            <p className="guided-current-decision-eyebrow" aria-hidden="true">
-              Current decision
-            </p>
-            <h2
-              id="guided-current-decision-heading"
-              className="guided-current-decision-rationale"
-            >
-              {rationale ?? GUIDED_STEP_PURPOSES[guidedSession.step]}
-            </h2>
-            {stepIsSendDriven && !tutorialStepBuilt && (
-              <p className="guided-current-decision-tutorial-note">
-                {/* Directionally neutral (elspeth-eba8820005): the Send button
-                    sits RIGHT of the textarea and the columns reflow across
-                    breakpoints, so "below" is wrong somewhere for everyone. */}
-                You don't need to fill this in by hand — press the{" "}
-                <strong>Send</strong> button and the assistant builds this step.
-                Then review the decision and continue.
-              </p>
-            )}
-          </div>
-          <div
-            ref={guidedLogRef}
-            className="chat-panel-guided-log"
-            role="log"
-            aria-label="Guided wizard step"
-            aria-live="polite"
-            aria-relevant="additions"
-          >
-            {/* Interpretation reviews moved above the intent box (approve-before-
-                advance); the turn widget remains here as the current decision. */}
-            {guidedNextTurn && !suppressTutorialSingleSelect && (
-              <GuidedTurn
-                turn={guidedNextTurn}
-                onSubmit={(body) => void respondGuided(body)}
-                sourceBlobCandidates={guidedSourceBlobCandidates}
-                sourceBlobChoiceRequired={guidedSourceBlobChoiceRequired}
-                sourceUploadPending={hasPendingGuidedSourceUpload}
-                sourceFormPathPrefill={
-                  guidedSourceFormPathPrefill !== null &&
-                  guidedSourceFormPathPrefill.sessionId === activeSessionId &&
-                  guidedSourceFormPathPrefill.turnToken === guidedNextTurn.turn_token
-                    ? guidedSourceFormPathPrefill.blob
-                    : null
-                }
-                // M-10: gate on guidedChatPending too — otherwise a chip/form
-                // widget stays clickable while a /guided/chat is in flight and
-                // can race an in-flight step-respond (mirrors "Explain this
-                // step"'s gating just below).
-                disabled={
-                  guidedResponsePending ||
-                  guidedChatPending ||
-                  hasPendingGuidedInterpretations
-                }
-                isTutorial={isTutorial}
-                proposalReviewState={guidedProposalReview}
-                wirePendingAcknowledgements={
-                  hasPendingGuidedInterpretations
-                    ? wirePendingAcknowledgements
-                    : undefined
-                }
-                wireValidationIssues={wireValidationIssues}
-                // Withheld in tutorial mode at the source too: the tutorial
-                // walks the learner through the wire stage deliberately.
-                onApproveWiring={
-                  isTutorial
-                    ? undefined
-                    : (binding) => {
-                        void approveWiring(
-                          {
-                            chosen: ["review_wiring"],
-                            edited_values: null,
-                            custom_inputs: null,
-                            proposal_id: binding.proposal_id,
-                            draft_hash: binding.draft_hash,
-                            edit_target: null,
-                            control_signal: null,
-                          },
-                          wireApprovalClientBlockers,
-                        );
-                      }
-                }
-              />
-            )}
-          </div>
-          {/* Card footer: anchors the card's ambient furniture on one seam —
-              the pending "Saving decision" status (left) and the one-click
-              "why am I seeing this?" Explain affordance (right) — instead of
-              a floating bottom-right button over dead space plus a bare
-              status paragraph (operator-reported). Explain sends a canned
-              question down the NORMAL guided-chat path (user turn + assistant
-              bubble in the transcript; the pending strip shows while it
-              runs). The backend advisory prompt carries the LLM-safe
-              current-build context, so the answer names the actual
-              plugins/settings on screen. Only offered when a decision is
-              actually showing; disabled while any chat/respond is in flight
-              (same 409 guard as the composer). */}
-          {(guidedNextTurn !== null || guidedResponsePending) && (
-            <div className="guided-current-decision-footer">
-              {guidedResponsePending && (
-                <p
-                  className="guided-current-decision-pending guided-decision-pending"
-                  role="status"
-                >
-                  {/* Chat Send pending idiom (pulse + adaptive headline +
-                      elapsed readout): a decision submit can front a
-                      multi-minute planner run and must not read as stalled.
-                      The headline resolves to the live composer-progress
-                      phase when one is being published, else this copy. */}
-                  <GuidedDecisionPendingIndicator
-                    fallback="Saving decision..."
-                    composerProgress={composerProgress}
-                  />
-                </p>
-              )}
-              {guidedNextTurn && (
-                <Button
-                  compact
-                  // Composes .btn-compact (the shared.css:222 idiom). The
-                  // pre-migration class list carried a redundant `.btn` token;
-                  // every declaration it contributed is overridden by the
-                  // later .btn-compact block at equal specificity (or
-                  // duplicated verbatim in its hover/disabled rules), so
-                  // dropping it is computed-style inert.
-                  className="guided-explain-btn"
-                  onClick={() => void sendGuidedChat(GUIDED_EXPLAIN_MESSAGE)}
-                  // Bootstrap race: Explain routes sendGuidedChat ->
-                  // runComposeWithTimeout, which no-ops until the backend wall
-                  // clock lands. A guided decision restores from server state on
-                  // reload before App.checkHealth latches readiness, so gate the
-                  // button (dead-button doctrine) rather than leave a silent
-                  // no-op — same as the primary Send.
-                  disabled={
-                    guidedChatPending ||
-                    guidedResponsePending ||
-                    !composeTimeoutReady
-                  }
-                  title={
-                    !guidedChatPending &&
-                    !guidedResponsePending &&
-                    !composeTimeoutReady
-                      ? composerTimeoutUnavailable
-                        ? COMPOSE_UNAVAILABLE_MESSAGE
-                        : COMPOSE_CONNECTING_MESSAGE
-                      : undefined
-                  }
-                >
-                  Explain this step
-                </Button>
-              )}
-            </div>
-          )}
-          {/* C-3 self-heal notice (turn_not_emitted): a calm resync message,
-              deliberately role="status" (polite) rather than role="alert"
-              like the rejection banner below — the wizard resyncing itself
-              is not a failure, so it must not read as one. Cleared on the
-              next guided respond/chat attempt (sessionStore) or by
-              dismissing the generic error. */}
-          {guidedSelfHealNotice && (
-            <p className="guided-current-decision-pending" role="status">
-              {guidedSelfHealNotice}
-            </p>
-          )}
-          {/* "Approve wiring" refused to confirm unseen and left the user on
-              the wire review instead. Same polite role="status" treatment as
-              the self-heal notice above: a shortcut declining to skip a
-              warning is the feature working, not a failure — and without it
-              the landing reads as a button that did nothing. */}
-          {guidedApprovalNotice && (
-            <p className="guided-current-decision-pending" role="status">
-              {guidedApprovalNotice}
-            </p>
-          )}
-          {/* Backend rejection surfaced NEXT TO the turn widget it rejected —
-              never only the status strip, never silent (elspeth-3b35abf148
-              variant 3). `errorDetails` is only populated by guided respond
-              rejections; the generic top banner is suppressed while this
-              renders so the alert announces once. */}
-          {error && errorDetails != null && errorDetails.length > 0 && (
-            <div ref={rejectionRef} role="alert" className="guided-respond-rejection">
-              <p className="guided-respond-rejection-message">{error}</p>
-              <ul className="guided-respond-rejection-details">
-                {errorDetails.map((detail, index) => (
-                  <li key={index}>{detail}</li>
-                ))}
-              </ul>
-              <Button
-                variant="bare"
-                onClick={clearError}
-                className="chat-panel-error-dismiss"
-                aria-label="Dismiss error"
-              >
-                {"\u00D7"}
-              </Button>
-            </div>
-          )}
-        </section>
-      );
-    })();
-
-    return (
-      <div
-        id="chat-main"
-        className="chat-panel chat-panel--guided"
-        role="region"
-        aria-label="Guided composer"
-      >
-        {decisionLiveRegion}
-        {/* Header — mirrors the freeform body header so the mode-switch control
-            ("Exit to freeform") remains directly available in the header. The tutorial suppresses the exit
-            affordance, so it has no header. Session title and model identity
-            are app-level facts and live in AppHeader (elspeth-8fa71e6d15) —
-            this column keeps only compose-state chrome. */}
-        {!isTutorial && (
-          <div className="chat-panel-header">
-            <div className="chat-panel-header-actions">
-              <ModeSwitchButton target="freeform" hasWork={currentChatHasWork} />
-            </div>
-          </div>
-        )}
-        <GuidedWorkflowStepper
-          activeStep={guidedSession.step}
-          reviewedSteps={guidedDecisionStagesFor(guidedSession)}
-          openStep={openDecisionStep}
-          sheetId={decisionSheetId}
-          onOpenStep={toggleDecisionSheet}
-          registerTick={registerDecisionTick}
-        />
-        {/* Suppressed while the inline respond-rejection alert renders next to
-            the turn widget (errorDetails non-empty) — one alert, one announce. */}
-        {error && (errorDetails == null || errorDetails.length === 0) && (
-          <GuidedErrorBanner error={error} onDismiss={clearError} />
-        )}
-        {/* Between the stepper and the transcript, and OUTSIDE the scroll
-            group: the sheet's replayed turns must not land inside the live
-            transcript log. See the completed branch for the full rationale. */}
-        {buildGuidedDecisionSheet(guidedSession)}
-        {/* "What just happened / what to do" surfaces. The common
-            ComposerWorkspace owns artifact and inspector content; this branch
-            supplies only the guided authoring pane. */}
-        {(() => {
-          // Shared pieces. aria-live rationale: each piece owns its OWN live
-          // region — GuidedChatHistory (role=log), AcknowledgementLiveRegion
-          // (role=status) — announcing independently of wizard advances.
-          // Resolved GuidedHistory lives in the common Inspector History tab.
-          // The live TURN surface lives in decisionSection's own role=log
-          // wrapper — load-bearing for InspectAndConfirmTurn, which omits its
-          // own warnings live region under the convention that the parent
-          // wraps turn content.
-          const transcript = (
-            <GuidedChatHistory
-              chatHistory={guidedSession.chat_history}
-              onRetrySyntheticFailure={handleRetrySyntheticFailure}
-              // !composeTimeoutReady: the synthetic-failure turn restores from
-              // server-authoritative chat_history on reload, so its Retry can
-              // render before readiness latches. Retry routes sendGuidedChat ->
-              // runComposeWithTimeout, which no-ops when not ready; disable it
-              // so it is not a silent dead button (same gate as Explain).
-              retryDisabled={
-                guidedChatPending || guidedResponsePending || !composeTimeoutReady
-              }
-              // A LIVE session can still carry post-commit turns: a fork of a
-              // completed session rewinds the child to Step 2 with
-              // `terminal=None` and the transcript intact, and so does a
-              // `/guided/reenter` whose content changed under the exit.
-              // Without the boundary those turns read as ordinary build
-              // conversation under a step_4_wire stage divider sitting ahead
-              // of the session's current step.
-              afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
-            />
-          );
-          return (
-            <>
-              {buildGuidedWorkspaceScroller(
-                <>
-                  {transcript}
-                  {decisionSection}
-                  {/* Direct child of the scroll region: OUTSIDE both role=log
-                      containers, so its role=status is announced once. */}
-                  {guidedChatPending ? (
-                    <GuidedPendingStrip
-                      composerProgress={composerProgress}
-                      onStop={cancelGuidedChat}
-                      substeps={
-                        isTutorial === true && guidedSession.step === "step_2_sink"
-                          ? TUTORIAL_STEP_2_COMPOSING_SUBSTEPS
-                          : undefined
-                      }
-                      activeSubstepIndex={tutorialStep2ActiveSubstep(
-                        composerProgress?.phase,
-                      )}
-                    />
-                  ) : null}
-                </>,
-              )}
-              <div
-                ref={attachDock}
-                className="chat-panel-dock"
-                role="region"
-                aria-label="Decision controls"
-                tabIndex={0}
-              >
-                {decisionPanel}
-          {approvalReadiness}
-              </div>
-              {stepComposer}
-            </>
-          );
-        })()}
-      </div>
-    );
-  }
-
-  // ── Concern B: a tutorial shows the guided placeholder while loading ──
-  //
-  // Reaching this point means neither the completed branch nor the
-  // guided-active branch matched. For a non-tutorial session that is the
-  // legitimate freeform surface (below). For a TUTORIAL session, the
-  // placeholder covers the TutorialGuidedShell startup window: guidedSession
-  // is transiently null before the async start resolves, and a non-null
-  // pre-turn session is the gap during startGuided.
-  //
-  // An `exited_to_freeform` terminal is deliberately EXCLUDED and falls
-  // through to the freeform body: the wire-stage "Exit to freeform" button
-  // IS reachable in tutorial mode (on blocked outcomes it is the only
-  // affordance), and the old always-placeholder guard turned that terminal
-  // into a permanent "Preparing…" dead-end — nothing ever cleared it
-  // (elspeth-61591e64bb). On exit the tutorial shell's onExited hand-off
-  // persists the opt-out and unmounts the shell; rendering the freeform
-  // body here is the correct surface for the brief in-flight window.
-  //
-  // The rail falls back to "step_1_source" ONLY for the startup-flash case
-  // where `guidedSession === null` (no step exists yet); a non-null session
-  // carries its real step. Hardcoding step_1 in the non-null case would
-  // show the wrong step in the rail — a fidelity gap.
-  if (isTutorial && guidedSession?.terminal?.kind !== "exited_to_freeform") {
-    const placeholderStep: WorkflowStepId = guidedSession?.step ?? "step_1_source";
-    return (
-      <div
-        id="chat-main"
-        className="chat-panel chat-panel--guided"
-        role="region"
-        aria-label="Guided composer"
-        data-testid="tutorial-guided-loading"
-      >
-        {/* Same ledger rule as the two live branches — a stage the server has
-            settled must not read "not started" just because the panel is
-            mid-load. No onOpenStep: there is nothing to open a sheet against
-            while the session is still resolving, and a tick that offered one
-            and then lost it as the real branch mounted would be a flicker. */}
-        <GuidedWorkflowStepper
-          activeStep={placeholderStep}
-          reviewedSteps={
-            guidedSession === null
-              ? undefined
-              : guidedDecisionStagesFor(guidedSession)
-          }
-        />
-        <p role="status" className="guided-loading-status">
-          Preparing your guided pipeline…
-        </p>
-      </div>
-    );
-  }
 
   return (
     // role="region" so the aria-label is exposed as a named landmark —
@@ -3433,32 +1262,7 @@ export function ChatPanel({
           aria-relevant="additions"
           tabIndex={0}
         >
-          {/* Terminal guided session's conversation, replayed above the
-              freeform turns (elspeth-2554bff719): the assistant's guided
-              replies exist ONLY in guidedSession.chat_history, so without
-              this block a graduated tutorial / exited guided build shows a
-              transcript of user turns talking to nobody. Read-only replay —
-              no synthetic-failure Retry — and a static group rather than the
-              component's usual nested live log. The guided-phase user rows
-              in `messages` are deduped out of chatTurns above, so each turn
-              renders exactly once. */}
-          {/* The exited-replay boundary. `guidedReplayHistory` is non-empty
-              only on a TERMINAL session and a `completed` one returns from the
-              branch above, so the session reaching here is always
-              `exited_to_freeform` — whose channel is closed, which is why the
-              token cannot come from `completedGuidedChatToken`. It comes from
-              the transcript derivation instead: the exit did not un-commit the
-              build, so its post-commit questions are still after-confirmation
-              turns (review round 1, 2026-09-03 — the same second derivation
-              the fork and reenter cases need). */}
-          {guidedReplayHistory.length > 0 && (
-            <GuidedChatHistory
-              chatHistory={guidedReplayHistory}
-              replay
-              afterConfirmationToken={afterConfirmationChatToken(guidedSession)}
-            />
-          )}
-          {messages.length === 0 && guidedReplayHistory.length === 0 ? (
+          {messages.length === 0 ? (
             <FreeformIntroduction />
           ) : (
             // Render one bubble per *turn*, not one per audit row. The compose
@@ -3515,7 +1319,7 @@ export function ChatPanel({
                       message={repr}
                       isComposing={isComposing}
                       onRetry={turn.kind === "user" ? retryMessage : undefined}
-                      onFork={turn.kind === "user" ? handleFork : undefined}
+                      onFork={allowFork && turn.kind === "user" ? handleFork : undefined}
                       proposalsByToolCallId={proposalsByToolCallId}
                       compositionState={compositionState}
                       staleProposalIds={staleProposalIds}
@@ -3577,8 +1381,7 @@ export function ChatPanel({
             (elspeth-3574f87208, operator ruling 2026-09-01): three structural
             classes can never anchor — (A) backend-auto-surfaced events whose
             sentinel tool_call_id matches no provider call by construction,
-            (B) guided-raised events whose turns persist no assistant chat
-            rows, (C) revert/import/seed events bound to states no chat row
+            (B) revert/import/seed events bound to states no chat row
             references. Unsectioned, those rows read as assistant replies to the
             newest message and grow without bound (one per resolution,
             rehydrated on every load). The header carries the count — the
@@ -3700,190 +1503,12 @@ function withSessionDraftSlot(
   return next;
 }
 
-type WorkflowStepId = GuidedStep | "ready";
 
-const GUIDED_STEP_PURPOSES: Record<GuidedStep, string> = {
-  step_1_source: "Choose the input and confirm what ELSPETH can read.",
-  step_2_sink: "Choose the output shape and the fields the pipeline should produce.",
-  // Names where the steps came from (goal-first, elspeth-378cfa0e18): the
-  // session states its goal up front and the planner runs ONCE, at the step-2
-  // finish, from that goal. "Review the transform stages" described a stage the
-  // user was expected to author here; what actually happens is a review of what
-  // the assistant proposed.
-  step_3_transforms: "Review the processing steps the assistant proposed from your goal.",
-  step_4_wire: "Review and confirm the wiring between your pipeline steps.",
-};
 
-const GUIDED_WORKFLOW_STEPS: ReadonlyArray<{
-  id: WorkflowStepId;
-  label: string;
-}> = [
-  { id: "step_1_source", label: GUIDED_STEP_LABELS.step_1_source },
-  { id: "step_2_sink", label: GUIDED_STEP_LABELS.step_2_sink },
-  { id: "step_3_transforms", label: GUIDED_STEP_LABELS.step_3_transforms },
-  { id: "step_4_wire", label: GUIDED_STEP_LABELS.step_4_wire },
-  // "ready" is a stepper-only pseudo-step, not a GuidedStep — its label
-  // stays local rather than widening the shared wire-keyed map.
-  { id: "ready", label: "Ready" },
-];
 
-/** No stage settled — the stepper's default, and the shape of a fresh session. */
-const EMPTY_REVIEWED_STEPS: ReadonlySet<GuidedStep> = new Set<GuidedStep>();
 
-// Terminal-step label on the COMPLETED surface (elspeth-bf9c296ee5): the
-// pseudo-step stays fifth and current (the wizard genuinely finished), but
-// "Ready" is only honest once the run gate would pass. While pending
-// acknowledgement cards block execution the stage is "Review"; before the
-// backend admits the pipeline it is "Validation". Mid-wizard steppers keep
-// the default "Ready" — there the step is a yet-to-be-reached goal, not a
-// claim about the present. response_ready is unreachable on a guided
-// completion (its mutation axis is fixed true); mapped for totality.
-const COMPLETED_READY_STEP_LABELS: Record<CompletionOutcome, string> = {
-  review_required: "Review",
-  pipeline_updated: "Validation",
-  pipeline_ready: "Ready",
-  response_ready: "Ready",
-};
 
-function GuidedWorkflowStepper({
-  activeStep,
-  readyStepLabel = "Ready",
-  reviewedSteps = EMPTY_REVIEWED_STEPS,
-  openStep = null,
-  sheetId,
-  onOpenStep,
-  registerTick,
-}: {
-  activeStep: WorkflowStepId;
-  readyStepLabel?: string;
-  /**
-   * The stages the server has a settled decision for
-   * (`reviewedGuidedStages`). A tick is COMPLETE because it is in here — not
-   * because its index sits below the current step. The two agree on a forward
-   * walk and part company the moment a learner returns to an earlier stage:
-   * the Output they already settled is then downstream of the current step,
-   * and an index rule would call it "not started".
-   */
-  reviewedSteps?: ReadonlySet<GuidedStep>;
-  /** The stage whose decision sheet is open, so its tick reads as expanded. */
-  openStep?: GuidedStep | null;
-  /** DOM id of the mounted sheet, for the open tick's aria-controls. */
-  sheetId?: string;
-  /** Omit to render a stepper with no disclosure behaviour at all. */
-  onOpenStep?: (step: GuidedStep) => void;
-  registerTick?: (step: GuidedStep, element: HTMLButtonElement | null) => void;
-}) {
-  const activeIndex = GUIDED_WORKFLOW_STEPS.findIndex((step) => step.id === activeStep);
-  return (
-    <nav className="guided-workflow" aria-label="Guided workflow progress">
-      {/* The ol carries no aria-label of its own — the nav already announces
-          "Guided workflow progress"; two nested near-identical labels are
-          screen-reader noise (stepper visual-language spec,
-          elspeth-8fa71e6d15). */}
-      <ol className="guided-workflow-list">
-        {GUIDED_WORKFLOW_STEPS.map((step, index) => {
-          // "ready" is a stepper-only pseudo-step with no wire identity, so it
-          // is never in the reviewed set and never opens a sheet.
-          const wireStep: GuidedStep | null =
-            step.id === "ready" ? null : step.id;
-          const state =
-            index === activeIndex
-              ? "current"
-              : wireStep !== null && reviewedSteps.has(wireStep)
-                ? "complete"
-                : "upcoming";
-          const openable =
-            state === "complete" && wireStep !== null && onOpenStep !== undefined;
-          const isOpen = wireStep !== null && openStep === wireStep;
-          // Indicator is aria-hidden in every state: list order already
-          // conveys position, a bare numeral adds noise, and the check is
-          // purely visual. Complete/upcoming get a visually-hidden state
-          // suffix because with the indicator hidden from AT the distinction
-          // is otherwise visual-only; current needs none — aria-current
-          // announces it.
-          const tickContent = (
-            <>
-              <span className="guided-workflow-index" aria-hidden="true">
-                {state === "complete" ? (
-                  <svg
-                    className="guided-workflow-check"
-                    viewBox="0 0 24 24"
-                    focusable="false"
-                    aria-hidden="true"
-                  >
-                    <path d="M5 13l4 4L19 7" />
-                  </svg>
-                ) : (
-                  index + 1
-                )}
-              </span>
-              <span className="guided-workflow-label">
-                {step.id === "ready" ? readyStepLabel : step.label}
-              </span>
-              {state !== "current" && (
-                <span className="visually-hidden">
-                  {state === "complete" ? ", completed" : ", not started"}
-                </span>
-              )}
-            </>
-          );
-          return (
-            <li
-              key={step.id}
-              className={`guided-workflow-step guided-workflow-step--${state}`}
-              aria-current={state === "current" ? "step" : undefined}
-            >
-              {/* A settled stage the user is not standing on becomes a
-                  disclosure for its decision sheet; current and upcoming ticks
-                  stay static text. aria-controls is emitted only while THIS
-                  tick's sheet is mounted — one sheet exists at a time, so a
-                  closed tick would be pointing at an id that is not in the
-                  document. */}
-              {openable && wireStep !== null ? (
-                <Button
-                  variant="bare"
-                  className="guided-workflow-step-button"
-                  aria-expanded={isOpen}
-                  aria-controls={isOpen ? sheetId : undefined}
-                  ref={(element) => {
-                    registerTick?.(wireStep, element);
-                  }}
-                  onClick={() => onOpenStep(wireStep)}
-                >
-                  {tickContent}
-                </Button>
-              ) : (
-                tickContent
-              )}
-            </li>
-          );
-        })}
-      </ol>
-    </nav>
-  );
-}
 
-function GuidedErrorBanner({
-  error,
-  onDismiss,
-}: {
-  error: string;
-  onDismiss: () => void;
-}) {
-  return (
-    <div role="alert" className="chat-panel-error">
-      <span>{error}</span>
-      <Button
-        variant="bare"
-        onClick={onDismiss}
-        className="chat-panel-error-dismiss"
-        aria-label="Dismiss error"
-      >
-        {"\u00D7"}
-      </Button>
-    </div>
-  );
-}
 
 function findActiveComposerMessage(messages: ChatMessage[]): ChatMessage | null {
   for (let index = messages.length - 1; index >= 0; index -= 1) {

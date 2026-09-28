@@ -522,8 +522,8 @@ describe("ToolCallCard proposal change surface (elspeth-10f76f9250)", () => {
       arguments_redacted_json: { sources: {}, nodes: [], edges: [], outputs: [] },
       base_state_id: "older-state",
       pipeline_metadata: {
-        surface: "freeform", draft_hash: "d".repeat(64), base: { kind: "absent" },
-        reviewed_anchor_hash: "a".repeat(64), repair_count: 0, skill_hash: "s".repeat(64),
+        draft_hash: "d".repeat(64), base: { kind: "absent" },
+        repair_count: 0, skill_hash: "s".repeat(64),
         audit_payload_hash: "p".repeat(64), custody_result: "not_required",
       },
     }} currentState={currentState} />);

@@ -16,7 +16,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind, Interp
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
     parse_source_data_contract_accepted_fields,
@@ -198,10 +198,8 @@ async def _auto_surface_prompt_template_reviews_for_state(
     """Canonical ``llm_prompt_template`` surfacing pass (see the instance method).
 
     Module-level so persistence-layer callers that hold a sessions service but
-    no composer instance (the guided wire-confirm settlement) can run the SAME
-    surfacing the chat dispatcher and freeform settlement run, passing the
-    provenance they actually hold (for guided commits: the proposal row's
-    planner identity).
+    no composer instance can run the same surfacing as the chat dispatcher and
+    proposal settlement, passing the provenance they actually hold.
     """
 
     from elspeth.web.sessions.protocol import InterpretationResolveError
@@ -461,7 +459,7 @@ async def surface_pending_interpretation_reviews_for_state(
     ``only_missing_evidence`` repairs a surfacing DEBT rather than surfacing
     afresh: every site already carrying evidence on this state — in any
     resolution status — is left alone, and only genuinely missing sites are
-    written. The guided replay arm needs it because it re-runs this pass over
+    written. Replay can re-run this pass over
     a historical committed state that may since have been reviewed and
     superseded. Settlement-time callers leave it False: their state is new,
     nothing can have evidence yet, and the writer's own draft-aware dedup
@@ -470,12 +468,9 @@ async def surface_pending_interpretation_reviews_for_state(
     Canonical shared implementation behind
     :meth:`InterpretationSurfacing.surface_pending_interpretation_reviews` — see
     that method's docstring for the polarity/skip contract. Module-level so
-    the guided wire-confirm settlement (which holds a sessions service and
-    the proposal row's planner provenance, but no composer instance) can run
-    the SAME pass the chat dispatcher and freeform settlement run; without it
-    a guided commit whose nodes carry pending requirements produces no event
-    rows, no Accept card ever renders, and /execute fails closed with
-    ``UnresolvedInterpretationPlaceholderError`` (tutorial session e1332b5a).
+    settlement can run the same pass as the chat dispatcher without a composer
+    instance; otherwise pending requirements produce no event rows and
+    execution fails closed with ``UnresolvedInterpretationPlaceholderError``.
     """
 
     if session_id is None or current_state_id is None:
@@ -793,15 +788,9 @@ class InterpretationSurfacing:
         only_missing_evidence: bool = False,
         session_operation_context: SessionOperationContext,
     ) -> None:
-        """Kind-general backend surfacer for the GUIDED commit path (B1).
+        """Kind-general backend surfacer for persisted composition state.
 
-        The freeform fail-closed orphan gate
-        (:meth:`_missing_pending_interpretation_review_sites`) is unreachable
-        from the guided dispatcher, so guided commits that create
-        interpretation sites would otherwise orphan and only fail at run
-        time with ``UnresolvedInterpretationPlaceholderError``. This pass runs
-        after every site-creating guided commit (source / transform /
-        recipe-apply) and surfaces a resolvable pending EVENT for every site
+        This pass runs after site-creating commits and surfaces a resolvable pending EVENT for every site
         whose writer-boundary precondition holds — covering every
         ``InterpretationKind`` member, not just ``llm_prompt_template``.
 

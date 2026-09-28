@@ -25,13 +25,13 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     blob_deletion_cleanups_table,
     chat_messages_table,
-    guided_operations_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     session_read_admissions_table,
     sessions_table,
     web_instances_table,
 )
-from elspeth.web.sessions.protocol import SessionArchiveDisposition, SessionGuidedOperationInProgressError
+from elspeth.web.sessions.protocol import SessionArchiveDisposition, SessionReceiptInProgressError
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -180,7 +180,7 @@ def _seed_completed_fork_result(
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
-            insert(guided_operations_table).values(
+            insert(session_operation_receipts_table).values(
                 session_id=str(parent.id),
                 operation_id=str(uuid4()),
                 kind="session_fork",
@@ -189,7 +189,6 @@ def _seed_completed_fork_result(
                 lease_token=None,
                 lease_expires_at=None,
                 attempt=1,
-                result_kind="session",
                 result_session_id=str(result_session_id),
                 response_hash="b" * 64,
                 created_at=now,
@@ -208,13 +207,13 @@ def _seed_in_progress_fork(
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
-            insert(guided_operations_table).values(
+            insert(session_operation_receipts_table).values(
                 session_id=str(parent_session_id),
                 operation_id=str(uuid4()),
                 kind="session_fork",
                 status="in_progress",
                 request_hash="a" * 64,
-                lease_token="guided-lease",
+                lease_token="fork-lease",
                 lease_expires_at=now + timedelta(minutes=5),
                 attempt=1,
                 result_session_id=str(result_session_id) if result_session_id is not None else None,
@@ -675,7 +674,7 @@ def test_postgres_fenced_mutation_supports_same_session_crud(postgres_engine: En
 
 
 @pytest.mark.parametrize("blocker_relation", ("own", "incoming"))
-def test_postgres_archive_capability_rejects_active_guided_blockers(
+def test_postgres_archive_capability_rejects_active_fork_receipts(
     postgres_engine: Engine,
     blocker_relation: str,
 ) -> None:
@@ -693,7 +692,7 @@ def test_postgres_archive_capability_rejects_active_guided_blockers(
         lease_seconds=30,
     )
 
-    with pytest.raises(SessionGuidedOperationInProgressError):
+    with pytest.raises(SessionReceiptInProgressError):
         repository.mutate(
             context,
             lambda transaction: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),

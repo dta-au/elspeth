@@ -10,7 +10,7 @@ nothing of the kind.
 
 The census is an AST walk, not a grep, over ``error_class=`` keywords,
 ``"error_class":`` dict keys and ``error_class = ...`` assignments under
-``src/elspeth/web/composer`` (guided excluded). A string-literal label must be
+``src/elspeth/web/composer``. A string-literal label must be
 backed by an enclosing ``except`` clause or an annotated parameter. A
 ``type(X).__name__`` label must resolve ``X`` to a caught exception, a
 parameter, or an owned rejection constructor; building a builtin exception only
@@ -43,12 +43,6 @@ _COMPOSER = Path(__file__).resolve().parents[4] / "src" / "elspeth" / "web" / "c
 _OUT_OF_SCOPE: dict[tuple[str, str, str], str] = {
     ("pipeline_planner.py", "_allowlisted_candidate_feedback", "ValidationError"): (
         "planner feedback entry label for a closed validation code; sent to the planner, never an audit field"
-    ),
-    ("pipeline_planner.py", "_binding_rejection_feedback", "ValidationError"): (
-        "planner feedback entry label for a binding rejection; sent to the planner, never an audit field"
-    ),
-    ("pipeline_planner.py", "_deferred_intent_claim_feedback", "DeferredIntentClaimError"): (
-        "planner feedback entry label; sent to the planner, never an audit field"
     ),
     ("pipeline_planner.py", "_canonical_schema_feedback", "SchemaValidationError"): (
         "planner feedback entry label for a canonical-schema rejection; sent to the planner, never an audit field"
@@ -243,8 +237,6 @@ def _live_labels() -> list[_Label]:
     labels: list[_Label] = []
     for path in iter_gate_files(_COMPOSER):
         relative = path.relative_to(_COMPOSER)
-        if "guided" in relative.parts:
-            continue
         labels.extend(_error_class_labels(relative.as_posix(), path.read_text()))
     return labels
 

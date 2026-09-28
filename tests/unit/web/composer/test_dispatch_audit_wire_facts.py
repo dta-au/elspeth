@@ -10,7 +10,7 @@ the :class:`ComposerToolInvocation`, so an invocation stored by the route drain
 carries the same facts as the P4 row for the same call.
 
 The opening helpers default both facts to ``None`` for the callers that
-honestly do not know them (``pipeline_commit``, guided discovery, tests).
+honestly do not know them (``pipeline_commit`` and tests).
 """
 
 from __future__ import annotations

@@ -1,32 +1,8 @@
-"""Three-surface real-path parity matrix.
+"""Ten real-path freeform Composer capability fixtures.
 
-Ten canonical capability fixtures x three arbitrary authoring surfaces
-(freeform, guided-full, guided-staged), for 30 real-path cases. Each case drives one surface's
-production entrypoint from the fixture intent all the way to the immutable
-committed ``CompositionState`` (real prompt/tool assembly → terminal parser →
-custody → candidate validation → durable proposal → acceptance / confirm-wiring
-→ audited ``set_pipeline`` → public YAML compiler) and asserts the committed
-graph is semantically isomorphic to the ground-truth reference.
-
-All three surfaces drive all ten fixtures. Former guided-staged exclusions for
-``multi_source_queue``, ``fork_coalesce``, and ``multi_output`` remain in this
-matrix as permanent regressions for their repaired stage-protocol boundaries.
-
-No provider network, no skips, no xfail. Cross-surface parity is transitive:
-every surface is anchored to the same per-fixture reference committed graph.
-
-Two surfaces (``freeform``, ``guided_full``) let the planner emit the fixture's
-canonical component *names*, so they additionally assert byte-exact public-YAML
-semantics and the fixture's exact declared capability shape. The guided-staged
-surface reviews sources/outputs through the persisted stage protocol, which
-auto-assigns positional names (``source`` / ``source_2`` / ``output`` /
-``output_2`` …) the operator cannot override. The shared comparator
-canonicalizes connection names / source keys, so isomorphism to the reference
-is the complete, name-agnostic parity proof for that surface. It is paired with a
-positive guided-naming assertion — proving the committed graph really traversed
-the staged protocol and that the *only* delta from the reference is the expected
-renaming — rather than a weaker name-agnostic reimplementation of the semantic
-check (which could only mask a regression isomorphism already catches).
+Each case drives the production planner, proposal and accept lifecycle, then
+compares its committed graph, public YAML and declared capability shape with a
+reference graph. The provider response is scripted; validation and commit are real.
 """
 
 from __future__ import annotations
@@ -38,16 +14,6 @@ import pytest
 from tests.helpers.composer_graphs import assert_isomorphic, public_pipeline_semantics
 
 from .conftest import PARITY_FIXTURES, ParityEnv
-
-SURFACES = ["freeform", "guided_full", "guided_staged"]
-
-# Surfaces whose planner emits the fixture's canonical component names verbatim,
-# so byte-exact public-YAML equality and exact-name semantic expectations hold.
-_NAME_PRESERVING_SURFACES = frozenset({"freeform", "guided_full"})
-
-# Explicit (surface, fixture) grid: all 10 fixtures on all 3 surfaces = 30
-# real-path parity cases.
-_SURFACE_FIXTURE_PARAMS = [(surface, fixture) for surface in SURFACES for fixture in PARITY_FIXTURES]
 
 
 def _committed_nodes(state: Any) -> dict[str, dict[str, Any]]:
@@ -126,31 +92,8 @@ def _assert_semantic_expectations(state: Any, fixture: dict[str, Any]) -> None:
             assert actual["on_write_failure"] == expected["on_write_failure"], f"{fixture['class']}: output[{name}].on_write_failure"
 
 
-def _assert_guided_staged_naming(state: Any, fixture: dict[str, Any]) -> None:
-    """Positive proof the committed graph came through the staged protocol.
-
-    Guided-staged reviews sources/outputs one at a time and the protocol
-    assigns their names positionally (``source`` / ``source_2`` … and
-    ``output`` / ``output_2`` …). Asserting exactly those names — with the same
-    counts the fixture declares — proves the surface really traversed the staged
-    protocol (not a shortcut) and that the only difference from the reference is
-    the expected renaming that isomorphism already normalizes away.
-    """
-    committed = state.to_dict()
-    source_names = set(committed["sources"])
-    expected_sources = {"source"} | {f"source_{index}" for index in range(2, len(committed["sources"]) + 1)}
-    assert source_names == expected_sources, (
-        f"{fixture['class']}: guided-staged sources {sorted(source_names)} != guided defaults {sorted(expected_sources)}"
-    )
-    output_names = {output["name"] for output in committed["outputs"]}
-    expected_outputs = {"output"} | {f"output_{index}" for index in range(2, len(committed["outputs"]) + 1)}
-    assert output_names == expected_outputs, (
-        f"{fixture['class']}: guided-staged outputs {sorted(output_names)} != guided defaults {sorted(expected_outputs)}"
-    )
-
-
 def _assert_row_union_semantics(state: Any) -> None:
-    """Keep the correlated N-to-N contract exact even when staged names differ."""
+    """Keep the correlated N-to-N graph contract exact."""
     committed = state.to_dict()
     row_union = next(node for node in committed["nodes"] if node["node_type"] == "row_union")
     assert row_union["plugin"] is None
@@ -167,38 +110,16 @@ def _assert_row_union_semantics(state: Any) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("surface", "fixture"),
-    _SURFACE_FIXTURE_PARAMS,
-    ids=lambda value: value if isinstance(value, str) else value["class"],
-)
-async def test_surface_derives_isomorphic_committed_graph(
-    parity_env: ParityEnv,
-    surface: str,
-    fixture: dict[str, Any],
-) -> None:
+@pytest.mark.parametrize("fixture", PARITY_FIXTURES, ids=lambda fixture: fixture["class"])
+async def test_freeform_derives_isomorphic_committed_graph(parity_env: ParityEnv, fixture: dict[str, Any]) -> None:
     reference = parity_env.reference_state(fixture)
-    committed = await parity_env.drive(surface, fixture)
+    committed = await parity_env.drive_freeform(fixture)
 
-    # 1. Semantic graph isomorphism (the primary, name-agnostic parity proof;
-    #    applied to every surface). Cross-surface parity is transitive: all
-    #    three surfaces are anchored to the same per-fixture reference.
-    assert_isomorphic(committed, reference, left=f"{surface}:{fixture['class']}", right="reference")
+    assert_isomorphic(committed, reference, left=f"freeform:{fixture['class']}", right="reference")
     if fixture["class"] == "row_union":
         _assert_row_union_semantics(committed)
 
-    if surface in _NAME_PRESERVING_SURFACES:
-        # 2. Public compiled-pipeline (runtime graph) semantics agree byte-exact
-        #    (these surfaces emit canonical component names).
-        assert public_pipeline_semantics(committed) == public_pipeline_semantics(reference), (
-            f"{surface}:{fixture['class']}: public pipeline semantics diverged from reference"
-        )
-        # 3. The committed graph exposes the fixture's exact declared capability shape.
-        _assert_semantic_expectations(committed, fixture)
-    else:
-        # Guided-staged: isomorphism above is the complete parity proof because
-        # the comparator canonicalizes auto-assigned names. Add the positive
-        # guided-naming assertion and confirm the public pipeline compiles.
-        _assert_guided_staged_naming(committed, fixture)
-        public = public_pipeline_semantics(committed)
-        assert public.get("sources") and public.get("sinks"), f"{surface}:{fixture['class']}: public pipeline compiled empty sources/sinks"
+    assert public_pipeline_semantics(committed) == public_pipeline_semantics(reference), (
+        f"freeform:{fixture['class']}: public pipeline semantics diverged from reference"
+    )
+    _assert_semantic_expectations(committed, fixture)

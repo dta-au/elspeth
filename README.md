@@ -165,7 +165,7 @@ contract and remaining acceptance limits are documented in
 acceptance is not claimed.
 
 **Operational:** 0.8.1 is a pre-1.0 database cutover from session epoch 53
-to 70 and Landscape epoch 38 to 46; guided schema remains at 11. Archive or
+to 71 and Landscape epoch 38 to 46; archive or
 export required evidence, stop the old service, recreate both stale databases
 in the same service-stop window, and install 0.8.1.
 Preserve `data/auth.db` and follow the
@@ -222,7 +222,7 @@ Composer authoring, trust boundaries, and committed blob cleanup.
 - **Composer validation stays bound to current state.** Runtime preflight is
   keyed to the composition content that produced it instead of reusing a stale
   result for different unsaved state.
-- **Web Composer can author correlated row unions.** Freeform, guided,
+- **Web Composer can author correlated row unions.** Freeform Composer,
   import/export, validation, and graph surfaces support plugin-free,
   require-all `row_union` barriers that release branch rows unchanged in
   declared order for long-format processing. Audit, recovery, concurrency,
@@ -244,19 +244,9 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.8.0 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 53; guided schema moves to 11, and Landscape moves from epoch
-29 to 38. The individual session epochs are:
-
-| Session epoch | What changed |
-| ------------- | ------------ |
-| 40 | Makes the required coalesce timeout field an eager startup cutover, instead of allowing epoch-39 guided payloads to fail during replay |
-| 41 | Does the same for the projected node option summary the review cards render |
-| 42 | Retains the reviewed output-field gap needed to replay a failed guided operation with the same actionable HTTP response |
-| 43 | Attributes run-diagnostics LLM audit rows to their own chat writer principal |
-| 44 | Settles planner repair exhaustion under its own honest failure code, instead of a provider-blaming invalid-response envelope |
-| 45 | Moves web Textract authoring onto operator document profiles, so bucket identity never enters authored configuration or the audit trail |
-| 47 | Records an auto-commit blocked by the settlement trust-mode recheck as a durable proposal event |
-| 48 | Adds the session-operation coordination tables (retained per-session fences, guided-operation leases, and fork/blob-effect receipts) that ground the multi-replica fencing work |
+from epoch 35 to 53 and Landscape moves from epoch 29 to 38. Its session
+epochs tightened run-diagnostics attribution, operator-profile Textract
+authoring, durable proposal evidence, and multi-replica coordination.
 
 Archive or export evidence as required, stop the old service, recreate
 a stale session store and a Landscape store left at epoch 29, and install 0.8.0.
@@ -632,7 +622,7 @@ containing `landscape.url`, so the journal sits beside the audit database.
 ## Status and direction
 
 ELSPETH is a dual-surface authoring and execution platform: a CLI-first
-auditable pipeline engine plus a Web Composer for guided authoring, over one
+auditable pipeline engine plus a freeform Web Composer, over one
 shared execution and audit core.
 
 Current 0.8.0 behaviour:
@@ -640,9 +630,8 @@ Current 0.8.0 behaviour:
 - YAML remains a first-class operator path.
 - The Web Composer builds through discovery, mutation, blob, secret-reference,
   validation, service-side YAML export, and optional advisor tools.
-- Guided pipeline creation is LLM-primary: each stage is built by a language
-  model through `/guided/chat`, presented in a conversational builder with a
-  live verification panel and gated at the wire stage by an advisor sign-off.
+- Freeform pipeline creation is LLM-primary: the planner proposes the graph
+  through the ordinary conversation, with validation and review before a run.
 - Composer validation and web execution use runtime-shaped engine setup rather
   than a standalone UI validator.
 - The executor still runs from runtime-assembled settings and graph objects, not

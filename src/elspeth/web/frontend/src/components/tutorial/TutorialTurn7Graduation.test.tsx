@@ -20,7 +20,6 @@ describe("TutorialTurn7Graduation", () => {
     vi.clearAllMocks();
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "freeform",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
     });
@@ -32,7 +31,7 @@ describe("TutorialTurn7Graduation", () => {
       renameSession: vi.fn().mockResolvedValue(undefined),
       loadSessions: vi.fn().mockResolvedValue(undefined),
       selectSession: vi.fn().mockImplementation(async (id: string) => {
-        useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true, guidedSession: null });
+        useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true });
       }),
     } as never);
     vi.mocked(api.createSession).mockResolvedValue({
@@ -41,13 +40,9 @@ describe("TutorialTurn7Graduation", () => {
       created_at: "2026-05-19T12:30:00Z",
       updated_at: "2026-05-19T12:30:00Z",
     });
-    // Completion and Freeform preference are saved in one request.
+    // Completion is saved in one request.
     vi.mocked(api.updateUserComposerPreferences).mockImplementation(
       async (body) => ({
-        default_mode:
-          body.default_mode ??
-          usePreferencesStore.getState().defaultMode ??
-          "freeform",
         freeform_intro_dismissed_at: null,
         tutorial_completed_at:
           body.tutorial_completed_at === undefined
@@ -107,7 +102,6 @@ describe("TutorialTurn7Graduation", () => {
 
     await waitFor(() => {
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        default_mode: "freeform",
         tutorial_completed_at: expect.any(String),
         tutorial_completed_via: "complete",
       });
@@ -122,7 +116,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(api.createSession).not.toHaveBeenCalled();
   });
 
-  it("renames the tutorial session and saves Freeform with explicit completion intent", async () => {
+  it("renames the tutorial session and saves explicit completion intent", async () => {
     const user = userEvent.setup();
     render(
       <TutorialTurn7Graduation
@@ -142,13 +136,12 @@ describe("TutorialTurn7Graduation", () => {
       ),
     );
     expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-      default_mode: "freeform",
       tutorial_completed_at: expect.any(String),
       tutorial_completed_via: "complete",
     });
   });
 
-  it("does not rename a skipped tutorial session and saves Freeform", async () => {
+  it("does not rename a skipped tutorial session and saves completion", async () => {
     const user = userEvent.setup();
     render(
       <TutorialTurn7Graduation
@@ -163,7 +156,6 @@ describe("TutorialTurn7Graduation", () => {
     );
     await waitFor(() => {
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        default_mode: "freeform",
         tutorial_completed_at: expect.any(String),
         tutorial_completed_via: "skip",
       });
@@ -279,7 +271,6 @@ describe("TutorialTurn7Graduation", () => {
     await user.click(screen.getByRole("button", { name: "Take me to the composer" }));
     await waitFor(() => expect(usePreferencesStore.getState().tutorialCompleted).toBe(true));
     expect(useSessionStore.getState().activeSessionId).toBe("sess-new");
-    expect(useSessionStore.getState().guidedSession).toBeNull();
     expect(api.updateUserComposerPreferences).toHaveBeenCalledTimes(1);
   });
 });

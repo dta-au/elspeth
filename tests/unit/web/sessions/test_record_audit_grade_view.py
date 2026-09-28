@@ -20,7 +20,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.conftest import _make_session
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 async def _get(test_client: TestClient, url: str, *, raise_app_exceptions: bool = True) -> Response:
@@ -46,7 +46,7 @@ async def _get(test_client: TestClient, url: str, *, raise_app_exceptions: bool 
 
 @pytest.fixture
 def sessions_service(engine, tmp_path: Path) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

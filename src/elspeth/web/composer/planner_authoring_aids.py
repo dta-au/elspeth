@@ -1500,9 +1500,7 @@ def _collapse_uniform_variant_fields(fields: list[dict[str, object]]) -> list[di
 
     ``web/catalog/knob_schema`` lowers a discriminated union to a FLAT form by
     re-emitting every shared knob once per variant, separated only by
-    ``visible_when`` (``knob_schema.py:522``). That shape is what the guided
-    form renderer needs — ``SchemaFormTurn.tsx`` compares one field to one
-    scalar, so its predicate grammar has no set operator — but on the planner
+    ``visible_when`` (``knob_schema.py:522``). On the planner
     contract it is repetition the model gains nothing from: the ``llm``
     transform lowers to 114 fields carrying 36 distinct bodies, 39,093 bytes of
     a 49,152-byte budget the whole selection shares (elspeth-623c69c59f).

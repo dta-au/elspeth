@@ -22,3 +22,9 @@ def test_training_distinguishes_source_validation_from_producer_guarantees(relat
     text = " ".join((_ROOT / relative_path).read_text(encoding="utf-8").split())
 
     assert _BOUNDARY_DISTINCTION in text
+    assert "Auto-apply on" in text
+    assert "Approval required" in text
+    assert "Transforms step" not in text
+    assert "Classify step · prompt" in text
+    assert "guided" not in text.lower()
+    assert "freeform" in text.lower()

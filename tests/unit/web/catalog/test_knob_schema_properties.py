@@ -88,11 +88,9 @@ def test_lower_model_to_knob_schema_returns_valid_schema_for_generated_models(
 def test_enum_default_lowers_to_its_plain_json_value() -> None:
     """An Enum-defaulted field must not leak the member object into the knob.
 
-    The knob schema is a wire/persisted projection: the guided turn validator
-    (`_public_json_error`) accepts only exact JSON types, so a raw StrEnum
-    member as ``default`` turns the server-built source form into a 500
-    (invariant violation). The default must lower exactly like the choice
-    set in ``_kind_for_scalar`` — to the member's plain string value.
+    The knob schema is a wire/persisted projection: a raw StrEnum member as
+    ``default`` is not a plain JSON value. Lower it like the choice set in
+    ``_kind_for_scalar`` — to the member's plain string value.
     """
 
     class Format(StrEnum):

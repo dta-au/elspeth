@@ -65,7 +65,6 @@ async function markTutorialCompleted(apiBaseURL: string, token: string): Promise
   try {
     const resp = await ctx.patch("/api/composer-preferences", {
       data: {
-        default_mode: "freeform",
         tutorial_completed_at: new Date().toISOString(),
         tutorial_completed_via: "skip",
       },

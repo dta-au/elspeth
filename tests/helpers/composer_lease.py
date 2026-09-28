@@ -17,7 +17,7 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
     """Test adapter: compose() calls that name a session but carry no
     session-operation context acquire an exact, short-lived COMPOSE lease on
     the composer's sessions service for the duration of the call (mirrors
-    DualFencedSessionServiceHarness for the session writers)."""
+    FencedSessionServiceHarness for the session writers)."""
     from uuid import UUID
 
     from elspeth.contracts.session_operation import SessionOperationKind
@@ -80,7 +80,6 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
         current_state_id=None,
         user_id=None,
         progress=None,
-        guided_terminal=None,
         user_message_id=None,
         session_operation_context=None,
         completion_gates=None,
@@ -93,7 +92,6 @@ def install_fenced_compose_adapter(monkeypatch) -> None:
             "current_state_id": current_state_id,
             "user_id": user_id,
             "progress": progress,
-            "guided_terminal": guided_terminal,
             "user_message_id": user_message_id,
             "session_operation_context": session_operation_context,
             "completion_gates": completion_gates,

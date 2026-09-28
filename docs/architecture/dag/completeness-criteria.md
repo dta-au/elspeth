@@ -37,7 +37,7 @@ The DAG completeness boundary includes:
 - scheduling, durable state, sink delivery, and checkpoint/resume;
 - crash recovery, replay, lease expiry, fencing, and multi-process contention;
 - audit, lineage, diagnostics, export, and topology identity;
-- freeform, guided, import/export, and browser authoring surfaces; and
+- freeform, import/export, and browser authoring surfaces; and
 - versioned contracts, scale limits, ownership, and required CI evidence.
 
 It does not mean that every imaginable graph primitive must exist. A deliberately
@@ -80,7 +80,7 @@ themselves establish production support.
 | Concurrency and fencing | Exactly one effective owner mutates each claim epoch; stale or losing workers cannot commit protected effects. | Real multi-process claim, lease-expiry, reclaim, and late-worker tests. |
 | Atomic evidence | State and its explanation commit or roll back together; lineage remains attributable across retries and joins. | Transaction-failure tests for state, events, reasons, outcomes, and journal writes. |
 | Security | Runtime secrets never enter public graph identity, metadata, exports, diagnostics, checkpoints, or audit evidence. | Redaction/fingerprinting contract plus secret-form regression scans. |
-| Authoring parity | Every advertised authoring surface can express the supported topology set and rejects the same invalid semantics. | Freeform, guided, import/export, and browser parity matrix. |
+| Authoring parity | Every advertised authoring surface can express the supported topology set and rejects the same invalid semantics. | Freeform, import/export, and browser parity matrix. |
 | Semantic round-trip | Import, no-op edit, export, and re-import preserve canonical graph semantics rather than textual formatting. | Canonical before/after equality for every mandatory fixture. |
 | Scale | Supported topology and runtime limits are measured, declared, and enforced or monitored. | Repeatable benchmarks with release thresholds and failure behavior. |
 | Maintained contract | Normative docs, examples, tracker state, source, and required tests agree on supported behavior. | Versioned contract, CI gate, owner, and issue reconciliation. |

@@ -1,27 +1,3 @@
-// ============================================================================
-// interpretationIntegration.test.tsx — Phase 5b.18b.6 (acknowledge-stack era)
-//
-// End-to-end frontend integration: the LLM-interpretation review surface
-// reaches the wire through ONE unified affordance — the AcknowledgementStack
-// (pinned at the top of the chat column in both guided and freeform modes),
-// which renders an AcknowledgementCard per pending event.  Both modes consume
-// the same `useInterpretationResolver` hook and therefore the same
-// `interpretationEventsStore.resolveEvent` / `optOut` actions, which call
-// `api.resolveInterpretation` / `api.optOutOfInterpretations`.
-//
-// This integration test pins the contract ABOVE the unit tests: whatever the
-// operator touches, the wire payload sent to `POST /interpretations/{id}/
-// resolve` MUST match the body shape the backend expects.
-//
-//   Part A — hydration ordering: the post-5a composition nodes remain present
-//     when the card mounts, and the event's affected_node_id resolves to a
-//     live node (no dangling reference; humanised step label, not the raw id).
-//   Part B — Acknowledge → `{choice: 'accepted_as_drafted'}` (no amended_value).
-//   Part C — Change… + amend → `{choice: 'amended', amended_value: '<text>'}`.
-//
-// Mocked: the four `@/api/client` interpretation methods (the wire boundary).
-// Live: interpretationEventsStore, sessionStore, useInterpretationResolver.
-// ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";

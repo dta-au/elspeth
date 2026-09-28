@@ -6,7 +6,7 @@ an optimised deployment — while passing every CI run, every local run and ever
 mutation test, because none of those use ``-O``. The shape is invisible to
 normal testing, so nobody finds it by working (elspeth-37941f1731).
 
-The two guards pinned here were the census's TIER 1: sole enforcement, with no
+The guard pinned here was the census's TIER 1: sole enforcement, with no
 test consuming the guarded constant, so when the assertion vanished nothing
 else caught the drift.
 
@@ -14,25 +14,19 @@ else caught the drift.
   ``_INTERNAL_TRANSFORM_DETERMINISMS`` silently SHRINKS
   ``_AUDIT_FLAGGED_DETERMINISMS``, so a transform that should be audit-flagged
   stops being flagged. Silent audit-fidelity loss.
-* ``composer.guided.prompts`` — a ``GuidedStep`` member missing from
-  ``_STEP_FILE_NAMES`` silently drops that step from the skill handed to the
-  planner on every guided turn. That module's own comment promised to "fail
-  loudly at import time rather than silently omit the step"; as an ``assert``
-  it did the opposite under ``-O``.
-
 WHY THESE TESTS RUN A SUBPROCESS. The guard fires at MODULE LOAD, and the
 failure mode is specific to ``-O``, which cannot be toggled inside a running
 interpreter (``sys.flags.optimize`` is read-only and the parent pytest process
 is unoptimised). Importing the module in-process would therefore test the one
-configuration that was never broken. Each test compiles a patched copy of the
+configuration that was never broken. The test compiles a patched copy of the
 real module under a real ``-O`` interpreter and asserts the failure, which is
 what makes the pin fail if someone converts a ``raise`` back to an ``assert``.
 
 WHY THE DRIFT IS INJECTED RATHER THAN ASSERTED ABOUT. A test that merely reads
 the source and asserts "this module contains no bare assert" pins a spelling,
 not a behaviour: it passes against a guard that raises the wrong exception,
-compares the wrong things, or has been reduced to ``if False``. These tests
-inject the exact drift each guard exists to catch and require the import to
+compares the wrong things, or has been reduced to ``if False``. This test
+injects the exact drift the guard exists to catch and requires the import to
 fail — the consequence, not the mechanism.
 """
 
@@ -146,28 +140,6 @@ def test_audit_flagged_determinism_drift_still_fails_under_optimisation() -> Non
     )
     assert "stale_determinism_that_drifted" in result.stderr, (
         f"the import failed, but not with the drift guard's own message naming the stale member; "
-        f"the failure may be unrelated. stderr={result.stderr!r}"
-    )
-
-
-def test_guided_step_coverage_drift_still_fails_under_optimisation() -> None:
-    """A GuidedStep with no skill file must not be silently dropped from the composed skill."""
-    module_path = _SRC_ROOT / "elspeth" / "web" / "composer" / "guided" / "prompts.py"
-    result = _run_patched_module(
-        module_path,
-        old='    GuidedStep.STEP_4_WIRE: "step_4_wire.md",\n',
-        new="",
-        optimised=True,
-    )
-
-    assert result.returncode != 0, (
-        "composer.guided.prompts imported CLEAN under -O with STEP_4_WIRE missing from "
-        "_STEP_FILE_NAMES. That step would be silently omitted from the skill handed to the planner "
-        "on every guided turn — the exact outcome the guard's own comment promises to prevent. "
-        f"stdout={result.stdout!r}"
-    )
-    assert "STEP_4_WIRE" in result.stderr, (
-        f"the import failed, but not with the drift guard's own message naming the missing step; "
         f"the failure may be unrelated. stderr={result.stderr!r}"
     )
 

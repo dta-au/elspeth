@@ -2,8 +2,8 @@
 
 ``http.scraping_reason`` and ``http.abuse_contact`` are sent verbatim as the
 ``X-Scraping-Reason`` / ``X-Abuse-Contact`` request headers, which must be
-ASCII-encodable (enforced by ``WebScrapeHTTPConfig``). The guided LLM composer
-routinely emits typographic punctuation (em/en dashes, curly quotes, ellipses),
+ASCII-encodable (enforced by ``WebScrapeHTTPConfig``). The LLM composer
+can emit typographic punctuation (em/en dashes, curly quotes, ellipses),
 so the composer folds those to ASCII as options are finalized \u2014 letting
 composer-built pipelines (the first-run tutorial) round-trip. Characters with no
 ASCII mapping are left untouched so the config validator still rejects them as a

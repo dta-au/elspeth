@@ -39,8 +39,10 @@ _SESSION_METADATA_CREATE_LOCK = Lock()
 # vocabulary additions, so this semantic JSON cut requires store recreation.
 # Epoch 69 adds immutable freeform message ingress receipts and their same-session
 # bindings. Existing session stores cannot satisfy the new admission contract.
-# Epoch 70 replaces the persisted tutorial Build stage's guided label with build.
-_COORDINATION_HARD_CUT_EPOCH = 70
+# Epoch 70 replaces the persisted tutorial Build stage's old label with build.
+# Epoch 71 is freeform-only, removes the Composer mode preference, and adds
+# ordinary fork/revert receipts. Existing stores are recreated.
+_COORDINATION_HARD_CUT_EPOCH = 71
 _COORDINATION_HARD_CUT_EXPIRY_INDEXES: dict[str, str] = {
     "web_instances": "ix_web_instances_lease_expires_at",
     "session_operation_fences": "ix_session_operation_fences_lease_expires_at",
@@ -82,18 +84,9 @@ _COORDINATION_HARD_CUT_TABLES: frozenset[str] = frozenset({*_COORDINATION_HARD_C
 # * ``trg_message_ingress_receipts_no_update`` / ``no_delete`` — accepted
 #   freeform request IDs remain bound to one user row and original requested
 #   state. Whole-session deletion can cascade them with the owning session.
-# * ``trg_guided_operations_terminal_immutable`` — a reservation may renew or
-#   settle while in progress, but a completed/failed replay result cannot be
-#   changed after the terminal transition.
-# * ``trg_guided_operation_events_no_update`` / ``no_delete`` — lease,
-#   takeover, and settlement evidence is append-only; only the owning-session
-#   lifecycle cascade may remove it.
-# * ``trg_guided_operation_admission_blocks_no_update`` / ``no_delete`` — a
-#   negative admission decision is append-only; only the owning-session
-#   lifecycle cascade may remove it.
-# * the admission coexistence triggers reject either insertion order, plus an
-#   operation identity update, so a block and operation can never share one
-#   session-scoped operation id.
+# * ``trg_session_operation_receipts_terminal_immutable`` protects terminal
+#   fork/revert replay descriptors; receipt events are append-only except for
+#   whole-session lifecycle cascades.
 #
 # The validator catches the case where schema bootstrap succeeded but the
 # trigger DDL failed silently (e.g., if the DDL event listener was removed
@@ -110,14 +103,9 @@ _REQUIRED_AUDIT_TRIGGERS: frozenset[str] = frozenset(
         "trg_chat_messages_no_delete",
         "trg_message_ingress_receipts_no_update",
         "trg_message_ingress_receipts_no_delete",
-        "trg_guided_operations_terminal_immutable",
-        "trg_guided_operation_events_no_update",
-        "trg_guided_operation_events_no_delete",
-        "trg_guided_operation_admission_blocks_no_update",
-        "trg_guided_operation_admission_blocks_no_delete",
-        "trg_guided_operation_admission_blocks_reject_existing_operation",
-        "trg_guided_operations_reject_admission_block_insert",
-        "trg_guided_operations_reject_admission_block_update",
+        "trg_session_operation_receipts_terminal_immutable",
+        "trg_session_operation_receipt_events_no_update",
+        "trg_session_operation_receipt_events_no_delete",
     }
 )
 
@@ -406,19 +394,12 @@ class SessionSchemaAuthority:
                       'trg_message_ingress_receipts_no_update',
                       'trg_message_ingress_receipts_no_delete'
                     ))
-                    OR (relation.relname = 'guided_operation_events' AND trigger.tgname IN (
-                      'trg_guided_operation_events_no_update',
-                      'trg_guided_operation_events_no_delete'
+                    OR (relation.relname = 'session_operation_receipts' AND trigger.tgname IN (
+                      'trg_session_operation_receipts_terminal_immutable'
                     ))
-                    OR (relation.relname = 'guided_operation_admission_blocks' AND trigger.tgname IN (
-                      'trg_guided_operation_admission_blocks_no_update',
-                      'trg_guided_operation_admission_blocks_no_delete',
-                      'trg_guided_operation_admission_blocks_reject_existing_operation'
-                    ))
-                    OR (relation.relname = 'guided_operations' AND trigger.tgname IN (
-                      'trg_guided_operations_terminal_immutable',
-                      'trg_guided_operations_reject_admission_block_insert',
-                      'trg_guided_operations_reject_admission_block_update'
+                    OR (relation.relname = 'session_operation_receipt_events' AND trigger.tgname IN (
+                      'trg_session_operation_receipt_events_no_update',
+                      'trg_session_operation_receipt_events_no_delete'
                     ))
                   )
                 """

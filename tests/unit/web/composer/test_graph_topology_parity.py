@@ -46,8 +46,8 @@ from typing import get_args
 
 import elspeth
 from elspeth.core.config import CoalesceSettings
+from elspeth.web.composer import state
 from elspeth.web.composer._producer_resolver import _IMPLICIT_SELF_PUBLISHING_NODE_TYPES
-from elspeth.web.composer.guided import connection_consumers
 
 _PACKAGE_ROOT = Path(elspeth.__file__).parent
 _TOPOLOGY_PATH = _PACKAGE_ROOT / "web" / "frontend" / "src" / "lib" / "graphTopology.ts"
@@ -66,11 +66,10 @@ _FAN_IN_DECLARATION_RE = re.compile(
 )
 _TUPLE_RE_TEMPLATE = r"const\s+{name}\s*=\s*\[(?P<body>[^\]]*)\]\s*as\s+const\s*;"
 
-# The fan-in arm in connection_consumers.py:32 — `if node.node_type in
-# ("coalesce", "row_union"):` — read from source because it is an inline tuple
-# literal, not an importable constant.
+# The fan-in arm in state._runtime_nodes_downstream_of_connection reads
+# branch inputs instead of scalar input for these node kinds.
 _CONSUMER_FAN_IN_ARM_RE = re.compile(
-    r"if\s+node\.node_type\s+in\s+\(\s*(?P<body>[^)]*?)\s*\)\s*:",
+    r"node\.node_type\s+in\s+\(\s*(?P<body>[^)]*?)\s*\)\s+else\s+\(node\.input,\)",
 )
 
 
@@ -148,25 +147,24 @@ def test_topology_module_is_readable() -> None:
 
 
 def _py_fan_in_kinds() -> set[str]:
-    """Read the fan-in arm out of ``connection_consumers.py``'s own source.
+    """Read the fan-in arm out of the composition state's reachability projection.
 
-    Derived from the imported module via ``inspect.getsource`` rather than a
+    Derived from the imported function via ``inspect.getsource`` rather than a
     hand-built path, so it cannot go stale if the module moves. The arm is an
-    inline tuple literal inside an ``if``, not a module constant, so there is
-    nothing to import — this is the same read-from-source technique
+    inline tuple literal, not a module constant. This is the same read-from-source technique
     ``_ts_members`` uses on the TypeScript side.
     """
-    source = inspect.getsource(connection_consumers)
+    source = inspect.getsource(state._runtime_nodes_downstream_of_connection)
     matches = _CONSUMER_FAN_IN_ARM_RE.findall(source)
     assert len(matches) == 1, (
         f"Expected exactly one `node.node_type in (...)` fan-in arm in "
-        f"{connection_consumers.__name__}, matched {len(matches)}. The canonical consumer "
+        f"{state._runtime_nodes_downstream_of_connection.__name__}, matched {len(matches)}. The canonical consumer "
         "projection was restructured — re-anchor this regex rather than hardcoding the expected "
         "set, which would silently stop detecting Python-side drift."
     )
     kinds = set(_MEMBER_RE.findall(matches[0]))
     assert kinds, (
-        f"Parsed no kinds from the fan-in arm in {connection_consumers.__name__}, so the comparison "
+        f"Parsed no kinds from the fan-in arm in {state._runtime_nodes_downstream_of_connection.__name__}, so the comparison "
         "below would be vacuous. Either the regex matched something other than the tuple literal "
         "(re-anchor it), or the arm is genuinely empty (which is a Python-side change worth "
         "reading before adjusting this test). A one-member arm is legitimate and passes: the "
@@ -176,7 +174,7 @@ def _py_fan_in_kinds() -> set[str]:
 
 
 def test_fan_in_node_types_matches_the_canonical_consumer_projection() -> None:
-    """`FAN_IN_NODE_TYPES` mirrors the fan-in arm in `connection_consumers.py`.
+    """`FAN_IN_NODE_TYPES` mirrors the state reachability fan-in arm.
 
     That arm is the Python authority for "which node kinds declare their
     inbound wiring through `branches` rather than through the scalar `input`".
@@ -184,7 +182,7 @@ def test_fan_in_node_types_matches_the_canonical_consumer_projection() -> None:
     validates green (elspeth-625e85c59b).
 
     BOTH sides are read from source — the TS tuple out of ``graphTopology.ts``
-    and the Python tuple out of ``connection_consumers.py`` — so this fails
+    and the Python tuple out of ``state.py`` — so this fails
     whichever side drifts. An earlier version compared the TS members against a
     hardcoded ``{"coalesce", "row_union"}``, which was drift detection on the
     TypeScript side ONLY: a kind added in Python and not in TypeScript left it
@@ -196,7 +194,7 @@ def test_fan_in_node_types_matches_the_canonical_consumer_projection() -> None:
     assert ts_kinds, f"No members parsed from FAN_IN_NODE_TYPES in {_TOPOLOGY_PATH} — the assertion would be vacuous."
     assert ts_kinds == py_kinds, (
         f"FAN_IN_NODE_TYPES in {_TOPOLOGY_PATH.name} is {sorted(ts_kinds)}, but "
-        f"`connection_consumers.py`'s canonical consumer projection treats exactly "
+        f"`state.py`'s canonical consumer projection treats exactly "
         f"{sorted(py_kinds)} as branch-wired. A kind in one list and not the other means the "
         "Spec tab and the Graph tab infer a different inbound topology than the runtime builds."
     )

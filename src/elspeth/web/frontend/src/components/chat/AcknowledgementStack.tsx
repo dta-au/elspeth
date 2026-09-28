@@ -2,8 +2,7 @@
 // AcknowledgementStack.tsx — decision-panel rows for LLM-authored
 // decisions awaiting acknowledgement.
 //
-// Unifies BOTH guided and freeform modes onto one surface (the surfaces can
-// no longer drift).  Driven by the existing `pendingBySession[sessionId]`
+// Driven by the existing `pendingBySession[sessionId]`
 // projection; renders nothing when empty so the conversation is unobstructed
 // ("clear it to proceed").
 //
@@ -39,8 +38,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 /**
  * The single predicate that defines a "pending acknowledgement": a user-approved
  * interpretation still awaiting the operator's decision.  Shared by the stack
- * (which cards to render), the announcer (the count it reads aloud), and the
- * guided advancement gate so the three can never drift — an announced N that
+ * (which cards to render) and the announcer (the count it reads aloud) so an announced N that
  * disagreed with the rendered card count would be a fresh defect.
  */
 export function isPendingAcknowledgement(event: InterpretationEvent): boolean {
@@ -54,8 +52,6 @@ export interface AcknowledgementStackProps {
   sessionId: string;
   /** Restore focus to a stable parent control after the final decision. */
   onFocusFallback?: () => void;
-  /** Tutorial passive mode: hide the inline amend escape hatch + opt-out. */
-  isTutorial?: boolean;
   /**
    * Fired after a successful per-card resolve (with the resolved event) or a
    * session opt-out (event = null).  The parent uses the event for its own
@@ -107,7 +103,6 @@ export function usePendingAcknowledgements(
 
 export function AcknowledgementStack({
   sessionId,
-  isTutorial = false,
   onResolved,
   onFocusFallback,
 }: AcknowledgementStackProps): JSX.Element | null {
@@ -200,7 +195,7 @@ export function AcknowledgementStack({
               // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
               // open prompt card re-renders with fresh substitutions.
               compositionState={compositionState}
-              showAmend={!isTutorial && supportsAmendment(event.kind)}
+              showAmend={supportsAmendment(event.kind)}
               acceptButtonRef={(el) => {
                 if (el != null) acceptRefs.current.set(event.id, el);
                 else acceptRefs.current.delete(event.id);
@@ -221,8 +216,7 @@ export function AcknowledgementStack({
         ))}
       </ul>
 
-      {!isTutorial && (
-        <div className="ack-stack-opt-out">
+      <div className="ack-stack-opt-out">
           {optOutError !== null && (
             <div role="alert" className="ack-stack-error">
               <strong className="ack-stack-error-heading">
@@ -239,8 +233,7 @@ export function AcknowledgementStack({
           >
             Stop reviewing interpretations this session
           </Button>
-        </div>
-      )}
+      </div>
 
       {showOptOutConfirm && (
         <ConfirmDialog
@@ -259,20 +252,4 @@ export function AcknowledgementStack({
       )}
     </section>
   );
-}
-
-/**
- * True when the session has at least one pending user_approved interpretation
- * — the predicate the ChatPanel guided branch uses to block wizard
- * advancement while acknowledgements remain (D12).  Relocated here from the
- * retired GuidedInterpretationReviews module.
- */
-export function useHasPendingGuidedInterpretations(sessionId: string): boolean {
-  const pendingBySession = useInterpretationEventsStore(
-    (s) => s.pendingBySession,
-  );
-  return useMemo(() => {
-    const events = Object.values(pendingBySession[sessionId] ?? {});
-    return events.some(isPendingAcknowledgement);
-  }, [pendingBySession, sessionId]);
 }

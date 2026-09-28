@@ -250,7 +250,6 @@ def _inherited_cases() -> tuple[DiagnosticCase, ...]:
         for exception in (
             errors.SinkEffectCapabilityError,
             errors.VerificationMismatchError,
-            errors.GuidedCustodyIntegrityError,
             errors.PipelineLoweringError,
             errors.OrchestrationInvariantError,
             errors.PluginContractViolation,

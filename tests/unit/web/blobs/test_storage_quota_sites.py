@@ -36,7 +36,7 @@ from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.blobs import test_service as blob_service_tests
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 IDENTITY = "test-user"
 NOW = datetime(2026, 9, 13, tzinfo=UTC)
@@ -153,7 +153,7 @@ async def test_upload_reservation_admits_identity_growth_before_file_write(
 
 
 def _quota_app(engine: Engine, tmp_path: Path, recorded: list[QuotaExceeded]) -> FastAPI:
-    session_service = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session_service = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     authority = SQLiteLocalSessionOperationAuthority(engine, quota_exceeded_recorder=recorded.append)
     app = FastAPI()
 
@@ -237,7 +237,7 @@ def test_upload_http_refuses_when_storage_accounting_is_unavailable(
 
 
 @pytest.mark.parametrize(("cap", "refused"), [(100, True), (101, False)])
-def test_guided_full_inline_settlement_admits_on_held_connection(
+def test_inline_settlement_admits_on_held_connection(
     db_engine: Engine, session_id: UUID, recorded: list[QuotaExceeded], tmp_path: Path, cap: int, refused: bool
 ) -> None:
     request = blob_service_tests._custody_request(db_engine, session_id, content=b"x" * 11)
@@ -250,7 +250,6 @@ def test_guided_full_inline_settlement_admits_on_held_connection(
                 conn,
                 staged=staged,
                 max_storage_per_session=10_000,
-                write_fence=None,
                 quota_exceeded_recorder=recorded.append,
             )
         assert _rows(db_engine, session_id) == []
@@ -261,7 +260,6 @@ def test_guided_full_inline_settlement_admits_on_held_connection(
                 conn,
                 staged=staged,
                 max_storage_per_session=10_000,
-                write_fence=None,
                 quota_exceeded_recorder=recorded.append,
             )
         assert row.status == "ready"

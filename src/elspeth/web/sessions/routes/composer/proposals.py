@@ -166,10 +166,7 @@ def _missing_proposal_composer_context(
     )
     missing = [name for name, value in context_fields if value is None]
     if proposal.composer_provider == "server":
-        # provider="server" was the deleted guided synthesis gate's provenance
-        # (elspeth-b4a286d517). No code path can stage it any more, so a row
-        # carrying it is INVALID provenance, not merely legacy-incomplete —
-        # refuse it even when every provenance field is present.
+        # A server-authored graph is never valid composer provenance.
         missing.append("composer_provider (provider='server' is never valid provenance)")
     if user_message_content is None:
         missing.insert(0, "user_message_content")
@@ -294,7 +291,6 @@ async def accept_composition_proposal(
             proposal_authority = await service.get_authoritative_composition_proposal(
                 session_id=session.id,
                 proposal_id=proposal_id,
-                reviewed_facts=None,
             )
         except KeyError:
             primary = HTTPException(status_code=404, detail="Proposal not found")
@@ -704,7 +700,6 @@ async def reject_composition_proposal(
             authority = await service.get_authoritative_composition_proposal(
                 session_id=session.id,
                 proposal_id=proposal_id,
-                reviewed_facts=None,
             )
         except KeyError as primary:
             await _close_proposal_lease_before_commit(lease, primary=primary)
@@ -738,20 +733,12 @@ async def reject_composition_proposal(
                 raise asyncio.CancelledError
             return response
 
-        if authority.pipeline.proposal.surface.value in {"guided_staged", "tutorial_profile"}:
-            request_error = HTTPException(
-                status_code=409,
-                detail="This pipeline proposal must be rejected through its guided workflow.",
-            )
-            await _close_proposal_lease_before_commit(lease, primary=request_error)
-            raise request_error
         try:
             proposal, was_cancelled = await _await_with_deferred_cancellation(
                 service.reject_pipeline_composition_proposal(
                     session_id=session.id,
                     proposal_id=proposal_id,
                     draft_hash=authority.pipeline.proposal.draft_hash,
-                    reviewed_facts=None,
                     reason="operator_rejected",
                     dispatch=None,
                     actor=f"user:{user.user_id}",

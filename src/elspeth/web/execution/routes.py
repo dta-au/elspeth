@@ -1445,7 +1445,7 @@ def create_execution_router() -> APIRouter:
             # elspeth-0fcf68d50f: diagnostics audit rows land in the same
             # per-session ``chat_messages`` sequence the compose loop
             # writes, so serialize on the same per-session compose lock the
-            # compose/guided routes hold. The lock wraps ONLY this persist
+            # freeform route holds. The lock wraps ONLY this persist
             # step — never the LLM call above — so a slow diagnostics
             # evaluation cannot starve an in-flight compose turn, and the
             # lock order (compose lock, then the service's internal

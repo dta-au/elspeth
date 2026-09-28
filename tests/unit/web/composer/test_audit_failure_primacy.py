@@ -51,12 +51,12 @@ from tests.helpers.session_fences import RecordingSessionOperationAuthority, see
 # ``tests/unit/web/composer/conftest.py``, which does not exist —
 # synthesised review B5).
 from tests.unit.web.conftest import _make_session as _make_session_in_conn
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
 def service(engine, tmp_path):
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

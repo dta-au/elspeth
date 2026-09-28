@@ -54,7 +54,6 @@ from elspeth.web.composer.tools._common import (
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     _STEP_DESCRIPTION_DESCRIPTION,
     EmptyToolArgumentsModel,
-    PendingCustodyBlobView,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -415,8 +414,7 @@ def _schema_options_with_guarantees(
     - schema block is not a mapping, or its mode is not ``observed``: malformed
       or explicit-schema configs belong to validation, not to this stamp.
 
-    The merge mirrors ``guided/planning.py``'s sink materializer shape: the
-    existing schema block is extended in place-shape (mode and sibling keys
+    The existing schema block is extended in place-shape (mode and sibling keys
     preserved), never replaced wholesale.
     """
     if "columns" in options or "field_mapping" in options:
@@ -668,8 +666,7 @@ def _guarantee_stamp_is_card_owned(
     An explicit schema contract (``fields`` declared, or a non-observed
     mode) is a different evidence class: the runtime enforces it per row,
     the demand backtrace never asks a card for it, and Stage-1 validation
-    owns its honesty — the sanctioned authoring lane the guided emitters
-    prefill and the exemplars teach. Judged on the MERGE-PATCH RESULT
+    owns its honesty. Judged on the MERGE-PATCH RESULT
     (supplied wins, explicit ``None`` deletes), so a patch cannot dodge the
     guard by omitting context the stored options already carry.
     """
@@ -699,8 +696,7 @@ def _planner_guarantee_stamp_error(
     """Reject a planner-authored OBSERVED-mode guarantee stamp on non-hash-bound content.
 
     Evidence class decides who may declare ``schema.guaranteed_fields``
-    (John's ruling, 2026-08-27 — :func:`_options_with_derived_guarantees`,
-    and the three-lane model ``guided/emitters.py`` encodes):
+    (:func:`_options_with_derived_guarantees`):
 
     * LLM-authored content — exact bytes are content-hash-bound; the
       author's schema claim stands (``llm_authored=True`` exempts).
@@ -790,35 +786,6 @@ def _validate_source_name_argument(source_name: str) -> None:
         ) from exc
 
 
-def _pending_custody_tool_record(pending: PendingCustodyBlobView) -> BlobToolRecord:
-    """Project the deferred-custody view as the ready row it will settle to.
-
-    Field-for-field the row :func:`persist_inline_custody_blob_on_connection`
-    inserts at the atomic staging settlement (elspeth-282f392fae): the view
-    is built by the same normalization and storage-path derivation, so this
-    projection and the settled row cannot disagree.
-    """
-    return {
-        "id": pending.blob_id,
-        "session_id": pending.session_id,
-        "filename": pending.filename,
-        "mime_type": pending.mime_type,
-        "size_bytes": pending.size_bytes,
-        "content_hash": pending.content_hash,
-        "storage_path": pending.storage_path,
-        "created_by": "assistant",
-        "source_description": pending.source_description,
-        "status": "ready",
-        "creation_modality": pending.creation_modality,
-        "created_from_message_id": pending.created_from_message_id,
-        "creating_model_identifier": pending.creating_model_identifier,
-        "creating_model_version": pending.creating_model_version,
-        "creating_provider": pending.creating_provider,
-        "creating_composer_skill_hash": pending.creating_composer_skill_hash,
-        "creating_arguments_hash": pending.creating_arguments_hash,
-    }
-
-
 def _resolve_source_blob(
     *,
     blob_id: str,
@@ -849,17 +816,6 @@ def _resolve_source_blob(
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
     blob = _sync_get_blob(session_engine, blob_id, session_id)
-    # Deferred inline custody (elspeth-282f392fae): the planner's custody-safe
-    # revalidation runs BEFORE the atomic staging settlement materializes the
-    # blob, so the one blob this plan will settle is resolvable from the
-    # server-derived view on the context. Exact blob_id AND session_id match
-    # only; any other reference keeps the fail-closed database verdict, and a
-    # row that already exists (idempotent replay) stays authoritative.
-    pending_content: bytes | None = None
-    pending = context._pending_custody
-    if blob is None and pending is not None and pending.blob_id == blob_id and pending.session_id == session_id:
-        blob = _pending_custody_tool_record(pending)
-        pending_content = pending.content
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
 
@@ -900,22 +856,14 @@ def _resolve_source_blob(
         # custody lock: an unlocked read racing update_blob's in-transaction
         # file swap pairs the stale committed hash with the new bytes and
         # escalates a false BlobIntegrityError (elspeth-3d1d1fcb6c).
-        # A deferred-custody resolution has no row or file to lock yet; the
-        # view IS the single version (content and hash derived together
-        # server-side), so it satisfies the same one-version guarantee.
-        fresh_blob: BlobToolRecord | None
-        data: bytes | None
-        if pending_content is not None:
-            fresh_blob, data = blob, pending_content
-        else:
-            fresh_blob, data = _locked_read_ready_blob(
-                session_engine,
-                session_id,
-                blob_id,
-                data_dir=context.data_dir,
-                session_operation_context=context.session_operation_context,
-                session_operation_authority=context.session_operation_authority,
-            )
+        fresh_blob, data = _locked_read_ready_blob(
+            session_engine,
+            session_id,
+            blob_id,
+            data_dir=context.data_dir,
+            session_operation_context=context.session_operation_context,
+            session_operation_authority=context.session_operation_authority,
+        )
         if fresh_blob is None:
             return _failure_result(state, f"Blob '{blob_id}' not found.")
         if fresh_blob["status"] != "ready":

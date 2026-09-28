@@ -72,7 +72,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, SessionOperation
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _USER_ID = "execution-lease-user"
 
@@ -2870,7 +2870,7 @@ def _real_session_service(
 ) -> SessionServiceImpl:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id=_USER_ID)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.execution-lease-uow"),

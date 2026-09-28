@@ -1,13 +1,8 @@
 """Collector-authoring calibration via the FREEFORM composer battery.
 
-The ADR-031 collector scenario measures how much provider work collector
-authoring costs. That measurement does not need a browser: the guided
-Playwright walk spent five firings answering wizard turn types (select,
-schema form) that have nothing to do with the thing being measured, at
-~15 minutes and real provider spend per firing. This runner drives the
-same canonical prompt through the freeform planner using the real
-Battery.run_prompt path, and grades the collector shape plus the
-efficiency numbers the spec's COLLECTOR_BASELINE needs.
+This runner drives canonical collector prompts through the real freeform
+planner using Battery.run_prompt, then records collector shape and provider
+cost. No browser or alternate authoring mode is involved.
 
 Repeats are the point: a baseline set from one sample is a coin flip, so
 the recorded ceiling is the observed maximum across runs.
@@ -28,9 +23,7 @@ RUNS_DIR = BATTERY_DIR / "runs"
 BASE = "unix:///run/elspeth/uvicorn.sock"
 REPEATS = 3
 
-# Byte-identical to COLLECTOR_SCENARIO_PROMPT in
-# tests/e2e/tutorial-reliability.staging.spec.ts. On the freeform surface this
-# prompt does NOT author: the planner has no authoring-time URL fetch, and
+# The URL-only request does not author: the planner has no authoring-time URL fetch, and
 # correctly refuses to guess field names it has not seen (measured 0/3, 3
 # provider calls each, with the collector design named in prose). Kept as a
 # graded case so that refusal stays pinned rather than rediscovered.

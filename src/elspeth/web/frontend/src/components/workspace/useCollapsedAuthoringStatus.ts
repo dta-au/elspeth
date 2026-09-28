@@ -43,25 +43,16 @@ export function useCollapsedAuthoringStatus({
   const messages = useSessionStore((state) => state.messages);
   // selectSession sets this false when it clears the store for a new
   // selection and true in the SAME set() that lands the fetched history, so
-  // it marks the hydration boundary for messages and guided state alike.
+  // it marks the hydration boundary for messages.
   const historyLoaded = useSessionStore(
     (state) => state.compositionStateLoaded,
   );
-  const guidedTurnSequence = useSessionStore(
-    (state) => state.guidedSession?.chat_turn_seq ?? 0,
-  );
   const isComposing = useSessionStore((state) => state.isComposing);
-  const guidedChatPending = useSessionStore(
-    (state) => state.guidedChatPending,
-  );
-  const guidedResponsePending = useSessionStore(
-    (state) => state.guidedResponsePending,
-  );
   const error = useSessionStore((state) => state.error);
   const pendingAcknowledgements = usePendingAcknowledgements(
     activeSessionId ?? "",
   );
-  const messageSequence = messages.length + guidedTurnSequence;
+  const messageSequence = messages.length;
   const acknowledgementCount = pendingAcknowledgements.length;
   const baselineRef = useRef<UnreadBaseline>({
     sessionId: activeSessionId,
@@ -99,7 +90,7 @@ export function useCollapsedAuthoringStatus({
   if (error !== null) {
     return { text: `Authoring error: ${error}`, tone: "error" };
   }
-  if (isComposing || guidedChatPending || guidedResponsePending) {
+  if (isComposing) {
     return { text: "Authoring in progress", tone: "busy" };
   }
 

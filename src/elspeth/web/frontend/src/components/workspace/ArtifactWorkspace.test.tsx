@@ -27,10 +27,8 @@ import * as auditApi from "@/api/auditReadiness";
 import { DecisionPanel } from "@/components/chat/DecisionPanel";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
-import { EMPTY_GUIDED_REVIEWED_COMPONENTS } from "@/stores/guidedReviewedComponents";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
-import type { TurnPayload } from "@/types/guided";
 import { useHashRouter } from "@/hooks/useHashRouter";
 import {
   OPEN_CATALOG_EVENT,
@@ -45,7 +43,6 @@ import {
   ArtifactWorkspaceSurface,
 } from "./ArtifactWorkspace";
 import { WorkspacePaneProvider } from "./WorkspacePaneContext";
-import { WorkspaceInspector } from "./WorkspaceInspector";
 
 vi.mock("@xyflow/react", () => ({
   MarkerType: { ArrowClosed: "arrowclosed" },
@@ -73,7 +70,7 @@ class PassiveResizeObserver implements ResizeObserver {
 }
 
 interface RenderArtifactWorkspaceOptions {
-  inspector?: ReactNode;
+  probe?: ReactNode;
   runAvailable?: boolean;
   catalogAvailable?: boolean;
 }
@@ -90,10 +87,7 @@ function renderArtifactWorkspace(
           catalogAvailable={options.catalogAvailable}
         />
       }
-      inspector={
-        options.inspector ?? <button type="button">Validation status</button>
-      }
-      actionBar={<button type="button">Run pipeline</button>}
+      actionBar={<><button type="button">Run pipeline</button>{options.probe}</>}
     />,
   );
 }
@@ -164,8 +158,6 @@ describe("ArtifactWorkspace", () => {
       staleProposalIds: [],
       exportedYamlBlobBinding: null,
       selectedNodeId: null,
-      guidedNextTurn: null,
-      guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
     });
     useExecutionStore.setState({
       activeRunId: null,
@@ -265,61 +257,6 @@ describe("ArtifactWorkspace", () => {
     );
   });
 
-  it("draws a pending guided proposal in the Graph panel while the composition is empty (elspeth-9f0873426a)", () => {
-    // Guided mode keeps the composition empty until Confirm wiring; the
-    // learner still has to see the structure they are approving, and this
-    // pane — not the chat column — is where it belongs (review IA-1/V-1).
-    const SOURCE_ID = "00000000-0000-4000-8000-000000000912";
-    const OUTPUT_ID = "00000000-0000-4000-8000-000000000914";
-    const proposalTurn: TurnPayload = {
-      type: "propose_pipeline",
-      step_index: 2,
-      turn_token: "c".repeat(64),
-      payload: {
-        proposal_id: "00000000-0000-4000-8000-000000000911",
-        draft_hash: "d".repeat(64),
-        supersedes_draft_hash: null,
-        summary: "guided.proposal.summary.full_graph.v1",
-        rationale: "guided.proposal.rationale.review_required.v1",
-        component_counts: { sources: 1, nodes: 0, edges: 1, outputs: 1 },
-        blockers: [],
-        graph: {
-          sources: [
-            { stable_id: SOURCE_ID, label: "source-1", plugin: { kind: "source", id: "csv" } },
-          ],
-          edges: [
-            {
-              stable_id: "00000000-0000-4000-8000-000000000915",
-              from_endpoint: { kind: "source", stable_id: SOURCE_ID },
-              to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
-              flow: { kind: "source_success", branch: null },
-            },
-          ],
-        },
-        nodes: [],
-        outputs: [
-          { stable_id: OUTPUT_ID, label: "output-1", plugin: { kind: "sink", id: "json" } },
-        ],
-        edit_targets: [],
-      },
-    };
-    useSessionStore.setState({ guidedNextTurn: proposalTurn });
-    renderArtifactWorkspace();
-
-    const panel = screen.getByRole("tabpanel");
-    expect(
-      within(panel).getByRole("img", {
-        name: "Pipeline proposal graph with 2 components and 1 routes",
-      }),
-    ).toBeInTheDocument();
-    expect(
-      within(panel).getByText(
-        "Proposed pipeline, not yet committed. Confirm the wiring to commit it.",
-      ),
-    ).toBeInTheDocument();
-    expect(panel).not.toHaveTextContent("No pipeline to visualise.");
-  });
-
   it("disables Spec, YAML, and Checks without composition content but keeps Graph and Run available", () => {
     renderArtifactWorkspace();
 
@@ -401,7 +338,7 @@ describe("ArtifactWorkspace", () => {
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
     const user = userEvent.setup();
-    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+    renderArtifactWorkspace({ probe: <HashRouterProbe /> });
 
     await user.click(screen.getByRole("tab", { name: "Run" }));
     act(() => {
@@ -426,7 +363,7 @@ describe("ArtifactWorkspace", () => {
       sessions: [{ id: "session-1", title: "Session 1" }],
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
-    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+    renderArtifactWorkspace({ probe: <HashRouterProbe /> });
 
     // The palette's Export YAML command and the Ctrl+Shift+Y shortcut both
     // publish this exact intent; dispatch it directly.
@@ -455,7 +392,7 @@ describe("ArtifactWorkspace", () => {
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
     const user = userEvent.setup();
-    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+    renderArtifactWorkspace({ probe: <HashRouterProbe /> });
 
     await user.click(screen.getByRole("button", { name: "Fullscreen" }));
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
@@ -585,7 +522,6 @@ describe("ArtifactWorkspace", () => {
           />
         }
         artifact={<ArtifactWorkspace />}
-        inspector={null}
         actionBar={null}
       />,
     );
@@ -612,7 +548,7 @@ describe("ArtifactWorkspace", () => {
   it("routes a new-session request from the first committed layout effect", () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace({
-      inspector: <CommitRequestProbe watch="session" tab="spec" />,
+      probe: <CommitRequestProbe watch="session" tab="spec" />,
     });
 
     act(() => {
@@ -634,7 +570,7 @@ describe("ArtifactWorkspace", () => {
 
   it("uses newly committed availability when content becomes available", async () => {
     renderArtifactWorkspace({
-      inspector: <CommitRequestProbe watch="availability" tab="yaml" />,
+      probe: <CommitRequestProbe watch="availability" tab="yaml" />,
     });
 
     act(() => {
@@ -656,7 +592,7 @@ describe("ArtifactWorkspace", () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     const user = userEvent.setup();
     renderArtifactWorkspace({
-      inspector: <CommitRequestProbe watch="availability" tab="yaml" />,
+      probe: <CommitRequestProbe watch="availability" tab="yaml" />,
     });
     await user.click(screen.getByRole("tab", { name: "Spec" }));
 
@@ -1063,14 +999,10 @@ describe("ArtifactWorkspace", () => {
             authoringCollapsed: false,
             availableArtifactTabs: ["graph", "spec", "yaml", "run"],
             activeArtifactTab: "graph",
-            activeInspectorTab: null,
-            inspectorOpen: false,
             resizeTransient: vi.fn(),
             commitResize: vi.fn(),
             setAuthoringCollapsed: vi.fn(),
             selectArtifactTab,
-            openInspector: vi.fn(),
-            closeInspector: vi.fn(),
           } as never
         }
       >
@@ -1122,7 +1054,6 @@ describe("ArtifactWorkspace", () => {
             artifact={
               <ArtifactWorkspaceSurface activeSessionId={sessionId} />
             }
-            inspector={<button type="button">Validation status</button>}
             actionBar={<button type="button">Run pipeline</button>}
           />
           <SuspendAfterArtifact sessionId={sessionId} />
@@ -1214,7 +1145,7 @@ describe("ArtifactWorkspace", () => {
     expect(screen.getByRole("tablist", { name: "Pipeline artifacts" })).toBeInTheDocument();
     // Fullscreen belongs to the Workflow tab's panel, not the shared toolbar.
     expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Validation status" })).toBeEnabled();
+    expect(screen.getByRole("tab", { name: /^Checks/ })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Run pipeline" })).toBeEnabled();
 
     await user.click(screen.getByRole("tab", { name: "Workflow" }));
@@ -1413,14 +1344,10 @@ describe("ArtifactWorkspace", () => {
               authoringCollapsed: false,
               availableArtifactTabs: ["graph", "spec", "yaml", "run"],
               activeArtifactTab: "run",
-              activeInspectorTab: null,
-              inspectorOpen: false,
               resizeTransient: vi.fn(),
               commitResize: vi.fn(),
               setAuthoringCollapsed: vi.fn(),
               selectArtifactTab: vi.fn(),
-              openInspector: vi.fn(),
-              closeInspector: vi.fn(),
             } as never
           }
         >
@@ -1487,7 +1414,7 @@ describe("ArtifactWorkspace", () => {
   });
 
   // The OMITTED-prop arm, pinned separately from the explicit-false arm.
-  // TutorialGuidedShell does not pass runAvailable at all, so the tutorial's
+  // The tutorial shell does not pass runAvailable at all, so the tutorial's
   // freedom from a dead Run control rests entirely on this default — which
   // means a future `runAvailable = true` default would silently enable it
   // there while every tutorial test still passed.
@@ -1586,7 +1513,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     expect(screen.queryByRole("button", { name: "Fullscreen" })).not.toBeInTheDocument();
   });
 
-  it("omits the catalog trigger by default (tutorial/guided mounts)", () => {
+  it("omits the catalog trigger by default (tutorial mounts)", () => {
     // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
     useSessionStore.setState({ compositionState: makeComposition(1) });
     renderArtifactWorkspace();
@@ -1751,63 +1678,4 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
     });
   });
 
-  describe("history trigger", () => {
-    function guidedSessionWithHistory() {
-      return {
-        step: "step_3_transforms" as const,
-        history: [
-          {
-            step: "step_1_source" as const,
-            turn_type: "single_select" as const,
-            payload_hash: "payload",
-            response_hash: "response",
-            summary: "Use a CSV source",
-            emitter: "server" as const,
-          },
-        ],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      };
-    }
-
-    it("omits the trigger without completed guided history", () => {
-      renderArtifactWorkspace();
-      expect(screen.queryByRole("button", { name: "History" })).toBeNull();
-    });
-
-    it("mounts the trigger in the toolbar, ahead of the Workflow panel's Fullscreen control", () => {
-      // Fullscreen is a canvas control, so the graph needs a pipeline to draw.
-      useSessionStore.setState({ compositionState: makeComposition(1) });
-      useSessionStore.setState({
-        guidedSession: guidedSessionWithHistory(),
-      } as never);
-      renderArtifactWorkspace({ catalogAvailable: true });
-
-      const history = screen.getByRole("button", { name: "History" });
-      expect(history).toHaveAttribute("id", "artifact-history-trigger");
-      const focusGraph = screen.getByRole("button", { name: "Fullscreen" });
-      expect(history.parentElement).not.toContainElement(focusGraph);
-      expect(
-        history.compareDocumentPosition(focusGraph) &
-          Node.DOCUMENT_POSITION_FOLLOWING,
-      ).toBeTruthy();
-    });
-
-    it("opens the history drawer from the trigger", async () => {
-      useSessionStore.setState({
-        guidedSession: guidedSessionWithHistory(),
-      } as never);
-      const user = userEvent.setup();
-      renderArtifactWorkspace({ inspector: <WorkspaceInspector /> });
-
-      await user.click(screen.getByRole("button", { name: "History" }));
-
-      expect(
-        screen.getByRole("complementary", { name: "History" }),
-      ).toBeVisible();
-    });
-  });
 });

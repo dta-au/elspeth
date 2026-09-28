@@ -23,18 +23,9 @@ export function useComposer() {
   const compositionState = useSessionStore((s) => s.compositionState);
   const error = useSessionStore((s) => s.error);
   const errorDetails = useSessionStore((s) => s.errorDetails);
-  // Single source of truth for the bootstrap-race gate; passed to the shared
-  // primitive so freeform and guided (ChatPanel.sendGuidedChat) read the same
-  // readiness signal.
   const composeTimeoutReady = useSessionStore((s) => s.composeTimeoutReady);
   const activeControllerRef = useRef<AbortController | null>(null);
 
-  // Delegates to the shared compose-timeout primitive so freeform and guided
-  // (ChatPanel.sendGuidedChat) sends share ONE timer + readiness guard and
-  // cannot drift apart. The guard means a send started before the backend
-  // wall clock has landed (bootstrap window) does not run at all — the Send
-  // affordance is disabled until readiness, so this only backstops
-  // programmatic callers (SideRailValidationBanner).
   const runWithTimeout = useCallback(
     (runner: (signal: AbortSignal) => Promise<void>) =>
       runComposeWithTimeout(activeControllerRef, composeTimeoutReady, runner),

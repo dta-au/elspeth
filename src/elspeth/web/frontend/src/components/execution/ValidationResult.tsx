@@ -19,7 +19,7 @@ import { useMemo, useState } from "react";
 
 import { Button, Icon } from "@/components/ui";
 import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
-import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/guided/pipelineGloss";
+import { UNKNOWN_COMPONENT_PHRASE } from "@/components/chat/pipelineGloss";
 import { stepLabelForNodeId } from "@/components/chat/interpretationStepLabel";
 import { humaniseExecutionError, humaniseValidationWarning, makePhraseFor } from "@/lib/validationHumaniser";
 import { useShowAdvanced } from "@/stores/preferencesStore";

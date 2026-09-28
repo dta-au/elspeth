@@ -24,7 +24,6 @@ from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.yaml_generator import (
     generate_public_yaml,
-    reattach_guided_blob_refs_for_public_export,
     sources_reading_uploaded_blobs,
 )
 from elspeth.web.coordination.database_clock import database_now
@@ -362,8 +361,7 @@ class RepositoryLibraryAuthority:
         blob_backed = sources_reading_uploaded_blobs(state)
         if blob_backed:
             raise LibraryEntryNeedsProfileBoundSource(blob_backed)
-        export_state = reattach_guided_blob_refs_for_public_export(state)
-        payload_bytes = generate_public_yaml(export_state).encode("utf-8")
+        payload_bytes = generate_public_yaml(state).encode("utf-8")
         payload_digest = hashlib.sha256(payload_bytes).hexdigest()
         entry_id = str(uuid.uuid4())
         with self._engine.begin() as conn:

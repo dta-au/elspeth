@@ -15,7 +15,7 @@ import type {
 } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
-import { clearAllGuidedRetries } from "./guidedOperationRetry";
+import { clearAllSessionOperationRetries } from "./sessionOperationRetry";
 
 const clearValidationMock = vi.hoisted(() => vi.fn());
 const validateMock = vi.hoisted(() => vi.fn());
@@ -40,26 +40,8 @@ vi.mock("@/api/client", () => ({
   fetchStateVersions: vi.fn(),
   archiveSession: vi.fn(),
   renameSession: vi.fn(),
-  getGuided: vi.fn(),
-  respondGuided: vi.fn(),
-  // The three WRITING guided-entry routes. Mocked (rather than absent) so the
-  // goal-first tests below can assert they were NOT called: "nothing is
-  // persisted before the user states a goal" is the whole point of the
-  // GET-first probe, and an unmocked export makes that assertion impossible
-  // to state.
-  startGuidedSession: vi.fn(),
-  convertToGuided: vi.fn(),
-  reenterGuided: vi.fn(),
-  reconcileGuidedStartOperation: vi.fn(),
-  chatGuided: vi.fn(),
-  GuidedResponseReceiptError: class extends Error {},
-  // Phase 1B — sessionStore.createSession calls resolveDefaultMode() on the
-  // preferencesStore, which falls back to fetchUserComposerPreferences()
-  // when the prefs store hasn't been bootstrapped. The default mock returns
-  // freeform so existing createSession-touching tests (which preceded this
-  // change and assert non-guided behaviour) keep passing.
+  // Preference bootstrap is independent of session creation.
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
-    default_mode: "freeform",
     tutorial_completed_at: null,
     tutorial_stage: null,
     tutorial_session_id: null,
@@ -111,37 +93,6 @@ function makeCompositionState(version: number, nodeIds: string[] = []): Composit
   };
 }
 
-/**
- * The lazy in-memory stub GET /guided returns for a session with no persisted
- * guided state (get_guided's docstring): the first step-1 turn, an empty
- * transcript, and `composition_state: null`. Nothing has been written — which
- * is exactly what a guided-default session looks like before its goal.
- */
-function guidedStubResponse() {
-  return {
-    guided_session: {
-      step: "step_1_source",
-      history: [],
-      terminal: null,
-      chat_history: [],
-      chat_turn_seq: 0,
-      reviewed_components: { sources: [], outputs: [] },
-      profile: null,
-    },
-    next_turn: {
-      type: "single_select",
-      step_index: 0,
-      turn_token: "a".repeat(64),
-      payload: {
-        question: "Which source plugin should we use?",
-        options: [{ id: "csv", label: "CSV", hint: null }],
-        allow_custom: false,
-      },
-    },
-    terminal: null,
-    composition_state: null,
-  };
-}
 
 function makePendingInterpretationEvent(id: string): InterpretationEvent {
   return {
@@ -241,25 +192,18 @@ describe("sessionStore", () => {
   beforeEach(async () => {
     vi.resetAllMocks();
     window.sessionStorage.clear();
-    clearAllGuidedRetries();
+    clearAllSessionOperationRetries();
     resetStore(useSessionStore);
-    // Phase 1B: keep existing createSession-touching tests on the pre-change
-    // behaviour by pinning preferences to freeform-loaded. The new
-    // "createSession honours default mode" describe overrides this per test
-    // to exercise guided / unloaded paths explicitly.
+    // Keep preferences isolated between store tests.
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     resetStore(usePreferencesStore);
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "freeform",
       writing: false,
     });
-    // Reseed the @/api/client mock that vi.resetAllMocks() cleared so the
-    // preferences-bootstrap fallback path in resolveDefaultMode() still
-    // resolves under tests that drive an unloaded prefs store.
+    // Reseed the API mock cleared by vi.resetAllMocks().
     const apiMod = await import("@/api/client");
     (apiMod.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue({
-      default_mode: "freeform",
       tutorial_completed_at: null,
       tutorial_stage: null,
       tutorial_session_id: null,
@@ -539,7 +483,6 @@ describe("sessionStore", () => {
       // Pending identities are kept only in memory. A new store activation
       // reads the server transcript and never invents a replacement key.
       resetStore(useSessionStore);
-      (apiMod.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiMod.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       await useSessionStore.getState().selectSession("session-1");
       expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
@@ -912,9 +855,7 @@ describe("sessionStore", () => {
     it("refreshes pending interpretation events after a successful freeform compose turn", async () => {
       // Regression: a freeform compose turn can create new pending
       // interpretation events (invented_source / llm_prompt_template /
-      // llm_model_choice / pipeline_decision). Unlike guided mode (review
-      // delivered as a guided turn) and the tutorial (explicit refreshAll),
-      // the freeform path had no trigger to pull them into the
+      // llm_model_choice / pipeline_decision). The compose path must pull them into the
       // interpretationEventsStore — so the inline review widgets and their
       // sign-off buttons never rendered mid-session, while the run-gate still
       // blocked execution on the pending rows. selectSession refreshes on
@@ -1773,11 +1714,9 @@ describe("sessionStore", () => {
     });
 
     it("abandons the settle wait when a newer compose turn claims the poller", async () => {
-      // Guided chat sets guidedChatPending (not isComposing) and its route
-      // is not the freeform POST — a store-flag check cannot see it. Every
-      // compose entry point (sendMessage/retryMessage/chatGuided) claims
-      // the module-global progress poller via startComposerProgressPolling,
-      // so the poller generation is the mode-agnostic supersession signal:
+      // Every compose entry point claims the module-global progress poller
+      // via startComposerProgressPolling, so the poller generation is the
+      // supersession signal:
       // once a newer turn owns it, the aborted turn's resync must abandon
       // without fetching at all.
       vi.useFakeTimers();
@@ -1824,12 +1763,10 @@ describe("sessionStore", () => {
         controller.abort("compose_user_cancel");
         await vi.advanceTimersByTimeAsync(1_000); // waiter parked
 
-        // A guided chat turn starts in the same session: it claims the
-        // progress poller exactly as chatGuided does.
+        // A newer turn starts in the same session and claims the progress poller.
         useSessionStore.getState().startComposerProgressPolling("session-1");
-        // The registry then quiesces (the guided turn finished; guided
-        // requests are also counted server-side, but even a zero count
-        // must not revive the superseded resync).
+        // The registry then quiesces, but even a zero count must not revive
+        // the superseded resync.
         registry.phase = "complete";
         registry.inflight_requests = 0;
         await vi.advanceTimersByTimeAsync(2_000);
@@ -2562,9 +2499,6 @@ describe("sessionStore", () => {
       // explicit post-settle sync must still land on its return.
       async function armSelectSessionReads(): Promise<void> {
         const api = await import("@/api/client");
-        (api.getGuided as ReturnType<typeof vi.fn>).mockRejectedValue(
-          new Error("no guided state"),
-        );
         (api.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
           null,
         );
@@ -3793,9 +3727,6 @@ describe("sessionStore", () => {
         interpretation_review_disabled: false,
         updated_at: "2026-05-14T00:00:00Z",
       });
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockRejectedValue(
-        new Error("guided unavailable"),
-      );
 
       await useSessionStore.getState().selectSession("session-1");
 
@@ -3852,10 +3783,8 @@ describe("sessionStore", () => {
       const apiClient = await import("@/api/client");
       const proposal = makeCompositionProposal({
         pipeline_metadata: {
-          surface: "freeform",
           draft_hash: "d".repeat(64),
           base: { kind: "absent" },
-          reviewed_anchor_hash: "a".repeat(64),
           repair_count: 0,
           skill_hash: "s".repeat(64),
           audit_payload_hash: "p".repeat(64),
@@ -3887,13 +3816,13 @@ describe("sessionStore", () => {
   });
 
   describe("applyResolvedInterpretation", () => {
-    it.each([false, true])("guards delayed approval publication across activation changes (guided=%s)", async (guided) => {
+    it("guards delayed approval publication across activation changes", async () => {
       const api = await import("@/api/client");
       vi.mocked(api.fetchMessages).mockResolvedValue([]);
       vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
       useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
-      const resolve = createInterpretationResolutionHandler("session-1", guided);
+      const resolve = createInterpretationResolutionHandler("session-1");
       await useSessionStore.getState().selectSession("session-2");
       const destination = useSessionStore.getState().compositionState;
       validateMock.mockClear();
@@ -3906,11 +3835,11 @@ describe("sessionStore", () => {
       resolve(makeCompositionState(3));
       expect(useSessionStore.getState().compositionState).toBe(reactivated);
       expect(validateMock).not.toHaveBeenCalled();
-      const currentResolve = createInterpretationResolutionHandler("session-1", guided);
+      const currentResolve = createInterpretationResolutionHandler("session-1");
       const accepted = makeCompositionState(4);
       currentResolve(accepted);
       expect(useSessionStore.getState().compositionState).toBe(accepted);
-      if (!guided) expect(validateMock).toHaveBeenCalledWith("session-1");
+      expect(validateMock).toHaveBeenCalledWith("session-1");
     });
 
     it("applies the patched composition state and re-validates so the run-gate can reopen", () => {
@@ -4114,12 +4043,6 @@ describe("sessionStore", () => {
       (apiClient.fetchSessions as ReturnType<typeof vi.fn>).mockResolvedValue([
         { ...session, id: "00000000-0000-4000-8000-000000000702" },
       ]);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null,
-        next_turn: null,
-        terminal: null,
-        composition_state: null,
-      });
 
       const seedRecovery = () =>
         useSessionStore.setState({
@@ -4309,126 +4232,6 @@ describe("sessionStore", () => {
     });
   });
 
-  // ── Reload of a guided session that has not stated its goal ───────────────
-  //
-  // Goal-first (elspeth-378cfa0e18) removed the write that used to make this
-  // work by accident: convert persisted a rootless checkpoint, so a reload saw
-  // a real composition state and restored guided. With nothing persisted the
-  // probe returns the same lazy stub it returned the first time, and the only
-  // evidence that this session belongs on the guided surface is the account's
-  // default mode. Getting this wrong drops the user into freeform with the
-  // goal card gone — the failure the stub adoption exists to prevent.
-  describe("selectSession restores a goal-less guided-default session", () => {
-    async function setDefaultMode(mode: "guided" | "freeform"): Promise<void> {
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: mode,
-        writing: false,
-      });
-    }
-
-    async function selectWithStub(
-      messages: ReadonlyArray<Record<string, unknown>> = [],
-    ): Promise<void> {
-      const apiClient = await import("@/api/client");
-      (apiClient.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
-        messages,
-      );
-      (
-        apiClient.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(null);
-      (
-        apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-      (
-        apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue(
-        guidedStubResponse(),
-      );
-      await useSessionStore.getState().selectSession("sess-goal");
-    }
-
-    it("re-adopts the stub under a guided default so the session reopens on the goal card", async () => {
-      await setDefaultMode("guided");
-
-      await selectWithStub();
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).not.toBeNull();
-      expect(state.guidedNextTurn).not.toBeNull();
-      // Still nothing persisted: re-adopting must not be a write either.
-      expect(state.compositionState).toBeNull();
-      const apiClient = await import("@/api/client");
-      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
-      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
-    });
-
-    it("ignores the stub under a freeform default (a stub is not evidence of guided use)", async () => {
-      // The stub is returned for ANY session with no persisted guided state,
-      // including a brand-new freeform one. Adopting it unconditionally would
-      // flip a freeform-preferring user onto the guided surface on first load.
-      await setDefaultMode("freeform");
-
-      await selectWithStub();
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).toBeNull();
-      expect(state.guidedNextTurn).toBeNull();
-    });
-
-    it("leaves a worked freeform session in freeform even under a guided default", async () => {
-      // The stub is not a per-session signal — GET /guided answers with it for
-      // ANY session with no composition state, including a freeform session
-      // whose conversation never produced one (a message that triggered no
-      // compose tool call). Adopting on the preference alone would hide that
-      // real transcript behind the goal card, because the guided surface
-      // renders guided chat_history and not `messages`, and would do it
-      // retroactively to every message-only session the moment the user
-      // switched their default to guided. The adoption needs evidence about
-      // THIS session as well: an untouched one has no messages.
-      await setDefaultMode("guided");
-
-      await selectWithStub([
-        {
-          id: "user-1",
-          session_id: "sess-goal",
-          role: "user",
-          content: "what plugins can read a CSV?",
-          tool_calls: null,
-          created_at: "2026-09-03T00:00:00Z",
-        },
-      ]);
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).toBeNull();
-      expect(state.guidedNextTurn).toBeNull();
-      expect(state.messages).toHaveLength(1);
-    });
-
-    it("degrades to freeform when the default mode cannot be resolved", async () => {
-      // resolveDefaultMode throws when the preferences bootstrap produced no
-      // mode. Session selection must not become an error, and must not guess
-      // guided: the fallback is the same one createSession degrades to.
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: null,
-        writing: false,
-      });
-
-      await selectWithStub();
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).toBeNull();
-      expect(state.error).toBeNull();
-    });
-  });
 
   describe("retryMessage abort handling", () => {
     it("drops stale retryMessage responses after the active session changes", async () => {
@@ -4691,9 +4494,7 @@ describe("sessionStore", () => {
   describe("resetForTutorialSession", () => {
     it("binds activeSessionId and hydrates every field a stale session could leave behind", () => {
       // Dirty every field resetForTutorialSession is responsible for
-      // clearing, mirroring a completed guided session left over from a
-      // previously active (non-tutorial) session — the exact scenario
-      // TutorialGuidedShell's mount effect must recover from.
+      // clearing after another session was active.
       useSessionStore.setState({
         activeSessionId: "old-session",
         messages: [{ id: "old-message" } as unknown as ChatMessage],
@@ -4713,19 +4514,6 @@ describe("sessionStore", () => {
         isComposing: true,
         error: "some stale error",
         selectedNodeId: "old-node",
-        guidedSession: {
-          step: "step_4_wire",
-          history: [],
-          terminal: { kind: "completed", reason: null },
-          chat_history: [],
-          chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] },
-          profile: null,
-        } as never,
-        guidedNextTurn: {} as never,
-        guidedTerminal: { kind: "completed", reason: null } as never,
-        guidedChatPending: true,
-        guidedResponsePending: true,
         recoveryError: makeRecoveryError(),
         recoveryStartedCompositionVersion: 3,
       });
@@ -4745,11 +4533,6 @@ describe("sessionStore", () => {
       expect(state.isComposing).toBe(false);
       expect(state.error).toBeNull();
       expect(state.selectedNodeId).toBeNull();
-      expect(state.guidedSession).toBeNull();
-      expect(state.guidedNextTurn).toBeNull();
-      expect(state.guidedTerminal).toBeNull();
-      expect(state.guidedChatPending).toBe(false);
-      expect(state.guidedResponsePending).toBe(false);
       expect(state.recoveryError).toBeNull();
       expect(state.recoveryStartedCompositionVersion).toBeNull();
     });
@@ -4807,318 +4590,7 @@ describe("sessionStore", () => {
     });
   });
 
-  describe("guided source lifecycle rejection", () => {
-    it("removes the rejected exact UUID even when authoritative blob refresh fails", async () => {
-      const sessionId = "00000000-0000-4000-8000-000000000101";
-      const rejectedId = "00000000-0000-4000-8000-000000000901";
-      const otherId = "00000000-0000-4000-8000-000000000902";
-      const detail =
-        "Selected source blob is no longer a ready upload for this session.";
-      const apiMod = await import("@/api/client");
-      (apiMod.respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-        status: 400,
-        detail,
-      });
-      (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new Error("authoritative refresh failed"),
-      );
-      useBlobStore.getState().reset();
-      useBlobStore.getState().activateSession(sessionId);
-      const blobFixture = {
-        id: rejectedId,
-        session_id: sessionId,
-        filename: "rejected.csv",
-        mime_type: "text/csv",
-        size_bytes: 16,
-        content_hash: "a".repeat(64),
-        created_at: "2026-07-27T00:00:00Z",
-        created_by: "user",
-        source_description: null,
-        status: "ready",
-        creation_modality: "verbatim",
-        created_from_message_id: null,
-        creating_model_identifier: null,
-        creating_model_version: null,
-        creating_provider: null,
-        creating_composer_skill_hash: null,
-        creating_arguments_hash: null,
-      } satisfies BlobMetadata;
-      useBlobStore.setState({
-        blobs: [
-          blobFixture,
-          {
-            ...blobFixture,
-            id: otherId,
-            filename: "other.csv",
-            content_hash: "b".repeat(64),
-          },
-        ],
-      });
-      useSessionStore.setState({
-        activeSessionId: sessionId,
-        guidedSession: {
-          step: "step_1_source",
-          history: [],
-          terminal: null,
-          chat_history: [],
-          chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] },
-          profile: null,
-        },
-        guidedNextTurn: {
-          type: "single_select",
-          step_index: 0,
-          turn_token: "a".repeat(64),
-          payload: {
-            question: "Choose a source",
-            options: [{ id: "csv", label: "CSV", hint: null }],
-            allow_custom: false,
-          },
-        },
-      });
 
-      const outcome = await useSessionStore.getState().respondGuided({
-        chosen: ["csv"],
-        source_blob_id: rejectedId,
-        edited_values: null,
-        custom_inputs: null,
-        proposal_id: null,
-        draft_hash: null,
-        edit_target: null,
-        control_signal: null,
-      });
-
-      expect(apiMod.listBlobs).toHaveBeenCalledWith(sessionId);
-      expect(useBlobStore.getState().blobs.map((blob) => blob.id)).toEqual([
-        otherId,
-      ]);
-      expect(useBlobStore.getState().error).toBe("Failed to load files.");
-      expect(outcome).toEqual({
-        status: "not_applied",
-        reason: "rejected",
-        message: detail,
-      });
-      expect(useSessionStore.getState().error).toBe(detail);
-    });
-  });
-
-  // ── Phase 1B: createSession honours composer default-mode preference ──
-  describe("createSession honours default mode", () => {
-    it("leaves guidedSession null when default mode is freeform", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: "freeform",
-        writing: false,
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-1",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      await useSessionStore.getState().createSession();
-
-      expect(enterGuided).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().guidedSession).toBeNull();
-      expect(useSessionStore.getState().activeSessionId).toBe("sess-1");
-    });
-
-    it("enters guided mode when default mode is guided", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: "guided",
-        writing: false,
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-2",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      await useSessionStore.getState().createSession();
-
-      expect(enterGuided).toHaveBeenCalledTimes(1);
-      // The intent-less call is the contract: a brand-new session has no goal
-      // yet, so entry must land on the goal card (see the end-to-end pin
-      // below) rather than starting or converting anything.
-      expect(enterGuided).toHaveBeenCalledWith();
-    });
-
-    it("guided default: lands on the goal card by adopting the GET stub, writing NOTHING", async () => {
-      // The defect this pins (goal-first, elspeth-378cfa0e18): createSession's
-      // guided arm called enterGuided(), which called convertToGuided(), whose
-      // "no persisted state" branch PERSISTS a fresh rootless wizard. Every
-      // guided-default session was therefore created with a planner-reachable
-      // wizard behind no stated intent, and — because composition state was
-      // then non-null — the goal card could never render for it.
-      //
-      // enterGuided is deliberately NOT spied here: the sibling test above
-      // mocks it out and so proves only that the arm fires. This one runs the
-      // real action against a mocked GET so the routing itself is pinned.
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: "guided",
-        writing: false,
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-goal",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-        guidedStubResponse(),
-      );
-
-      await useSessionStore.getState().createSession();
-
-      const state = useSessionStore.getState();
-      expect(apiClient.getGuided).toHaveBeenCalledWith("sess-goal", undefined, true);
-      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
-      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
-      expect(state.guidedSession).not.toBeNull();
-      expect(state.guidedNextTurn).not.toBeNull();
-      // Null composition state IS the goal card's condition in ChatPanel, and
-      // it is the honest description of the session: nothing is persisted.
-      expect(state.compositionState).toBeNull();
-      expect(state.error).toBeNull();
-    });
-
-    it("prefs-bootstrap failure does NOT mask successful session creation (Panel M1)", async () => {
-      // Regression pin for the createSession try-block split. Earlier shape:
-      // single try wrapped both api.createSession() and resolveDefaultMode();
-      // a prefs-bootstrap rejection was attributed to "Failed to create
-      // session" even though the session had already been created and
-      // activated. New shape: separate try blocks per concern.
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      // Unloaded prefs, bootstrap rejects with a network error.
-      resetStore(usePreferencesStore);
-      (apiClient.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new Error("Network error"),
-      );
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-prefs-fail",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-
-      await useSessionStore.getState().createSession();
-
-      const state = useSessionStore.getState();
-      // Session was created and is the active session — NOT masked.
-      expect(state.activeSessionId).toBe("sess-prefs-fail");
-      expect(state.sessions[0]?.id).toBe("sess-prefs-fail");
-      // The error message names the *secondary* failure, not the false
-      // "Failed to create session" attribution.
-      expect(state.error).toMatch(/couldn't apply your default mode/i);
-      expect(state.error).not.toMatch(/failed to create session/i);
-      // No guided entry attempted because resolveDefaultMode threw before
-      // returning a mode value.
-      expect(state.guidedSession).toBeNull();
-    });
-
-    it("session-create failure still surfaces 'Failed to create session' (no regression)", async () => {
-      const apiClient = await import("@/api/client");
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new Error("500"),
-      );
-
-      await useSessionStore.getState().createSession();
-
-      const state = useSessionStore.getState();
-      expect(state.error).toMatch(/failed to create session/i);
-      // No session was added; the early-return prevented the activation
-      // set() from running.
-      expect(state.activeSessionId).toBeNull();
-    });
-
-    it("bootstrap race: createSession before bootstrap resolves still enters guided when prefs resolve to guided", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      // Start with unloaded prefs — resolveDefaultMode() must await bootstrap.
-      resetStore(usePreferencesStore);
-      (apiClient.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        default_mode: "guided",
-        tutorial_completed_at: null,
-        tutorial_stage: null,
-        tutorial_session_id: null,
-        tutorial_run_id: null,
-        tutorial_source_data_hash: null,
-        updated_at: "2026-05-15T00:00:00Z",
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-3",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      await useSessionStore.getState().createSession();
-
-      expect(apiClient.fetchUserComposerPreferences).toHaveBeenCalled();
-      expect(enterGuided).toHaveBeenCalledTimes(1);
-      expect(usePreferencesStore.getState().loaded).toBe(true);
-    });
-
-    it("drops delayed guided default when active session changes before prefs resolve", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      const prefs = deferred<"guided" | "freeform">();
-      vi.spyOn(usePreferencesStore.getState(), "resolveDefaultMode").mockReturnValue(prefs.promise);
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-delayed-default",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      const createPromise = useSessionStore.getState().createSession();
-      await vi.waitFor(() => {
-        expect(useSessionStore.getState().activeSessionId).toBe("sess-delayed-default");
-      });
-
-      useSessionStore.setState({
-        activeSessionId: "sess-existing",
-        sessions: [
-          {
-            id: "sess-existing",
-            title: "existing",
-            created_at: "2026-05-13T00:00:00Z",
-            updated_at: "2026-05-13T00:00:00Z",
-          },
-          ...useSessionStore.getState().sessions,
-        ],
-      });
-      prefs.resolve("guided");
-      await createPromise;
-
-      expect(enterGuided).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().activeSessionId).toBe("sess-existing");
-      expect(useSessionStore.getState().error).toBeNull();
-    });
-  });
 
   describe("session fork retry custody", () => {
     const parentId = "00000000-0000-4000-8000-000000000701";
@@ -5207,12 +4679,6 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null,
-        next_turn: null,
-        terminal: null,
-        composition_state: null,
-      });
       useSessionStore.setState({ activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -5236,9 +4702,6 @@ describe("sessionStore", () => {
         .mockResolvedValueOnce(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null, next_turn: null, terminal: null, composition_state: null,
-      });
       useSessionStore.setState({ activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -5250,27 +4713,6 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().activeSessionId).toBe(childId);
     });
 
-    it("keeps parent active and reuses the operation id when guided hydration returns 503", async () => {
-      const apiClient = await import("@/api/client");
-      (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ session_id: childId });
-      (apiClient.fetchSessions as ReturnType<typeof vi.fn>).mockResolvedValue([child]);
-      (apiClient.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>)
-        .mockRejectedValueOnce({ status: 503 })
-        .mockResolvedValueOnce({ guided_session: null, next_turn: null, terminal: null, composition_state: null });
-      useSessionStore.setState({ activeSessionId: parentId });
-
-      await useSessionStore.getState().forkFromMessage("message-1", "edited");
-      expect(useSessionStore.getState().activeSessionId).toBe(parentId);
-      await useSessionStore.getState().forkFromMessage("message-1", "edited");
-
-      const calls = (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mock.calls;
-      expect(calls[0]?.[1]).toBe(calls[1]?.[1]);
-      expect(useSessionStore.getState().activeSessionId).toBe(childId);
-    });
 
     it("retains retry custody for malformed 2xx fork responses", async () => {
       const apiClient = await import("@/api/client");
@@ -5295,9 +4737,6 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null, next_turn: null, terminal: null, composition_state: null,
-      });
       const renamedParent = { ...child, id: parentId, title: "Renamed while hydrating" };
       const archivedElsewhere = { ...child, id: "session-archived", title: "Archived elsewhere" };
       const createdElsewhere = { ...child, id: "session-created", title: "Created elsewhere" };
@@ -5366,9 +4805,6 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null, next_turn: null, terminal: null, composition_state: null,
-      });
       useSessionStore.setState({ activeSessionId: parentId, sessions: [] });
 
       const pending = useSessionStore.getState().forkFromMessage("message-1", "edited");

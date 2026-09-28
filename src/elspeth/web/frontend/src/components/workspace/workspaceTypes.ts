@@ -11,10 +11,6 @@ export type ArtifactTab = (typeof ARTIFACT_TABS)[number];
 
 export type AvailableArtifactTabs = readonly ["graph", ...ArtifactTab[]];
 
-/* Validation and audit left the inspector for the Checks artifact tab
-   (ChecksView); the drawer now holds guided history alone. */
-export type InspectorTab = "history";
-
 export interface PaneBounds {
   min: number;
   max: number;

@@ -1,4 +1,4 @@
-"""Private verification for exact guided reviewed-source reuse."""
+"""Private verification for exact owned-state source reuse."""
 
 from __future__ import annotations
 
@@ -24,8 +24,8 @@ _BLOB_PATH_KEYS = frozenset({"path", "file"})
 def _recorded_content_hash_prefix(raw_source: Mapping[str, Any], *, stable_id: str) -> str | None:
     """Parse the reviewed record's content identity anchor, if recorded.
 
-    Guided review captures the inspected blob's ``content_hash`` prefix into
-    the resolved source record; legacy records and non-blob sources carry
+    Source review captures the inspected blob's ``content_hash`` prefix into
+    the resolved source record; records without this evidence and non-blob sources carry
     ``None``.  A present-but-malformed anchor is an integrity anomaly, not
     an absent one.
     """
@@ -236,9 +236,9 @@ def resolve_owned_composition_source_authority(
     """Verify exact owned-state source bindings for private settlement.
 
     The synthesized reviewed-facts shape never leaves this function. It lets
-    the existing candidate boundary reuse its closed, hash-matched
-    ``ReviewedSourceAuthority`` contract while the proposal itself remains a
-    freeform proposal with an empty public reviewed-facts anchor.
+    the candidate boundary reuse its closed, hash-matched
+    ``ReviewedSourceAuthority`` contract without adding private source facts
+    to the public proposal.
     """
     reviewed_sources = {
         source_name: {

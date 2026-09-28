@@ -2,8 +2,7 @@
  * Tests for the account-level user-composer-preferences API helpers
  * (Phase 1B Task 1).
  *
- * Convention: vi.spyOn(globalThis, "fetch") — matches client.guided.test.ts
- * and client.recovery.test.ts. Spying on the real fetch exercises the real
+ * Convention: vi.spyOn(globalThis, "fetch"). Spying on the real fetch exercises the real
  * authHeaders() / parseResponse<T>() pipeline (including the 401-logout
  * interceptor and the FastAPI envelope decode); a module-level vi.mock
  * would stub those out and leave them uncovered.
@@ -20,7 +19,6 @@ function makePayload(
   overrides: Partial<UserComposerPreferencesPayload> = {},
 ): UserComposerPreferencesPayload {
   return {
-    default_mode: "guided",
     freeform_intro_dismissed_at: null,
     tutorial_completed_at: null,
     tutorial_stage: null,
@@ -46,7 +44,7 @@ describe("api/client user composer preferences", () => {
 
   it("GET parses the UserComposerPreferences payload", async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify(makePayload({ default_mode: "guided" })), {
+      new Response(JSON.stringify(makePayload()), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
@@ -54,7 +52,7 @@ describe("api/client user composer preferences", () => {
 
     const prefs = await fetchUserComposerPreferences();
 
-    expect(prefs.default_mode).toBe("guided");
+    expect(prefs.show_advanced).toBe(false);
     expect(prefs.tutorial_completed_at).toBeNull();
     const [url, init] = fetchSpy.mock.calls[0];
     expect(url).toBe("/api/composer-preferences");
@@ -63,22 +61,22 @@ describe("api/client user composer preferences", () => {
 
   it("PATCH sends only the supplied partial fields", async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify(makePayload({ default_mode: "freeform" })), {
+      new Response(JSON.stringify(makePayload({ show_advanced: true })), {
         status: 200,
         headers: { "content-type": "application/json" },
       }),
     );
 
     const result = await updateUserComposerPreferences({
-      default_mode: "freeform",
+      show_advanced: true,
     });
 
-    expect(result.default_mode).toBe("freeform");
+    expect(result.show_advanced).toBe(true);
     const [url, init] = fetchSpy.mock.calls[0];
     expect(url).toBe("/api/composer-preferences");
     expect(init?.method).toBe("PATCH");
     expect(JSON.parse(init?.body as string)).toEqual({
-      default_mode: "freeform",
+      show_advanced: true,
     });
   });
 
@@ -96,9 +94,9 @@ describe("api/client user composer preferences", () => {
     });
   });
 
-  it("PATCH throws an ApiError on 422 (invalid mode)", async () => {
+  it("PATCH throws an ApiError on 422 (invalid preference)", async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ detail: "invalid mode" }), {
+      new Response(JSON.stringify({ detail: "invalid preference" }), {
         status: 422,
         statusText: "Unprocessable Entity",
         headers: { "content-type": "application/json" },
@@ -106,8 +104,8 @@ describe("api/client user composer preferences", () => {
     );
 
     await expect(
-      // @ts-expect-error -- intentionally invalid mode to exercise the 422 branch
-      updateUserComposerPreferences({ default_mode: "kiosk" }),
+      // @ts-expect-error -- intentionally invalid field type to exercise the 422 branch
+      updateUserComposerPreferences({ show_advanced: "yes" }),
     ).rejects.toMatchObject({ status: 422 });
   });
   it("PATCH sends the tutorial resume fields when supplied (elspeth-918f4434b3)", async () => {

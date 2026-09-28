@@ -6240,7 +6240,7 @@ class TestSchemaContractValidation:
         assert sink_contract.satisfied is True
 
     @pytest.mark.parametrize("proven_sources", [("raw_url", "raw_summary"), ("raw_url",)])
-    def test_guided_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
+    def test_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
         """Upstream schema lower bounds do not narrow successful-row outputs."""
         state = self._empty_state()
         state = state.with_source(
@@ -6330,7 +6330,7 @@ class TestSchemaContractValidation:
     def test_contract_probe_ignores_authoring_metadata(self) -> None:
         """Composer-only authoring keys must not break the contract probe.
 
-        The guided flow stages ``interpretation_requirements`` inside node
+        The composer stages ``interpretation_requirements`` inside node
         options; every plugin config rejects unknown keys, so probing with
         unstripped options is a guaranteed ValueError -> a spurious
         "Computed contract probe ... failed" warning surfaced to the user

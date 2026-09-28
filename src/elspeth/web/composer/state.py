@@ -95,7 +95,6 @@ from elspeth.web.composer._validation_probe import (
     is_inline_content_reference,
     prepare_validation_probe_options,
 )
-from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
@@ -2048,8 +2047,8 @@ def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: st
     """Return True only for expected draft/config failures from probe construction.
 
     The single probe-tolerance taxonomy for this module and for every other
-    composer consumer (``guided.emitters``, ``_semantic_validator``), which
-    reuse it rather than restating it. Composer probes construct plugins from in-progress composer/
+    composer consumer (including ``_semantic_validator``), which
+    reuses it rather than restating it. Composer probes construct plugins from in-progress composer/
     LLM/user-authored config, so a config, lookup, or template failure is
     ordinary external input and the caller abstains. Anything else is a
     genuine engine defect and must crash through.
@@ -2667,9 +2666,7 @@ def _fork_branch_reaches_sink_before_closer(
     at all is the "no path to closer" limb (Stage-1 abstains — the roster's
     declared VALUES having no producer at all is
     ``coalesce_branch_unreachable``/``row_union_branch_unreachable``'s job,
-    already a more specific, planner-actionable diagnostic — see
-    guided-incident regression `test_orphaned_coalesce_rejects_with_the_
-    single_observed_code`). Firing here too would silently duplicate that
+    already a more specific, planner-actionable diagnostic). Firing here too would silently duplicate that
     single-code guarantee with a less specific message.
     """
     from elspeth.web.composer._producer_resolver import published_success_connection
@@ -2873,20 +2870,16 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
     the walk but are never a correct branch value, so the facts must not
     steer a repair toward them).
 
-    Guided session 277fb6c4 (2026-07-22) exhausted its repair budget on four
-    identical ``coalesce_branch_unreachable`` rejections: the observed
-    miswiring — branch transforms publishing straight to the sink — is
-    invisible from the bare code, and the planner's repair feedback strips
-    raw messages. Everything here is a node id or connection name the
+    Branch transforms publishing straight to a sink are invisible from the
+    bare ``coalesce_branch_unreachable`` code, and repair feedback strips raw
+    messages. Everything here is a node id or connection name the
     session owner / planner authored — the same redaction judgment as
     ``SchemaContractDetail`` — so forwarding it through the message-stripped
     repair feedback does not re-open the redaction boundary.
 
     A MAPPED branch whose branch-side transform CHAIN terminates in a
     sink-publishing hop carries ``sink_lure``: that transform's id and the
-    sink it publishes to. Guided attempt 14 (session 04200b45) re-wired
-    branch transforms to the reviewed sink three times WITH the bare facts
-    live — the repair needs the exact miswired node named. The lure rides
+    sink it publishes to. The repair needs the exact miswired node named. The lure rides
     on the branch record it explains, so nothing has to be joined back by
     connection name; the connection the coalesce expects is that record's
     own ``consumed_connection``.
@@ -7689,9 +7682,6 @@ class CompositionState:
         outputs: Sink configurations.
         metadata: Pipeline name and description.
         version: Monotonically increasing per session, starting at 1.
-        guided_session: Optional guided-mode session pointer. None for freeform
-            sessions; set to GuidedSession.initial() at session-create time for
-            guided sessions (spec §5.2).
     """
 
     nodes: tuple[NodeSpec, ...]
@@ -7699,7 +7689,6 @@ class CompositionState:
     outputs: tuple[OutputSpec, ...]
     metadata: PipelineMetadata
     version: int
-    guided_session: GuidedSession | None = None
     sources: Mapping[str, SourceSpec] = field(default_factory=dict)
     # Write-once memo slot for ``pipeline_proposal.composition_content_hash``:
     # the hash serializes the whole state, and preflight identity keys rebuild
@@ -7718,7 +7707,6 @@ class CompositionState:
         outputs: tuple[OutputSpec, ...],
         metadata: PipelineMetadata,
         version: int,
-        guided_session: GuidedSession | None = None,
         sources: Mapping[str, SourceSpec] | None = None,
         source: SourceSpec | None = None,
     ) -> None:
@@ -7732,7 +7720,6 @@ class CompositionState:
         object.__setattr__(self, "outputs", outputs)
         object.__setattr__(self, "metadata", metadata)
         object.__setattr__(self, "version", version)
-        object.__setattr__(self, "guided_session", guided_session)
         object.__setattr__(self, "sources", source_map)
         object.__setattr__(self, "_content_hash_memo", None)
         freeze_fields(self, "sources")
@@ -7943,10 +7930,6 @@ class CompositionState:
         The round-trip is CONTENT-exact, not identity-exact, in both directions,
         and callers that need either property must say which:
 
-        * ``from_dict(to_dict(state)) == state`` fails whenever ``state`` carries
-          a ``guided_session`` — ``to_dict`` never emits it and this never
-          restores it. It is carried on the ``composer_meta`` side channel
-          instead (``sessions/converters.py``).
         * ``to_dict(from_dict(payload)) == payload`` fails for any payload the
           spec constructors normalise (coalesce ``merge``/``policy`` defaults,
           ``row_union`` list branches), for any key not declared by the spec

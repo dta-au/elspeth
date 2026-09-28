@@ -48,8 +48,6 @@ from elspeth.web.blobs.protocol import (
     BlobForkFenceLostError,
     BlobForkPlanEntry,
     BlobForkWriteFence,
-    BlobGuidedOperationFenceLostError,
-    BlobGuidedOperationWriteFence,
     BlobInProgressForkError,
     BlobIntegrityError,
     BlobNotFoundError,
@@ -84,8 +82,8 @@ from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
     composition_states_table,
-    guided_operations_table,
     runs_table,
+    session_operation_receipts_table,
     sessions_table,
 )
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
@@ -108,7 +106,6 @@ _STREAM_CHUNK_BYTES = 1024 * 1024
 _INLINE_CUSTODY_NAMESPACE = UUID("8ef5fd65-8a90-5fe4-9084-eab5b9d2d2db")
 _INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_GUIDED_INLINE_CUSTODY_OPERATION_KINDS = ("guided_plan", "guided_respond")
 _LOWERCASE_UUID_HEX = re.compile(r"[0-9a-f]{32}\Z")
 _INLINE_CUSTODY_STAGE_SUFFIX = ".inline-custody-staged"
 
@@ -487,36 +484,19 @@ def _verify_fork_child_custody(
 def _require_live_fork_write_fence(conn: Connection, fence: BlobForkWriteFence) -> None:
     """Fail before reservation unless the exact parent lease still owns this child."""
     row = conn.execute(
-        select(guided_operations_table.c.session_id).where(
-            guided_operations_table.c.session_id == str(fence.source_session_id),
-            guided_operations_table.c.operation_id == fence.operation_id,
-            guided_operations_table.c.kind == "session_fork",
-            guided_operations_table.c.status == "in_progress",
-            guided_operations_table.c.result_session_id == str(fence.target_session_id),
-            guided_operations_table.c.lease_token == fence.lease_token,
-            guided_operations_table.c.attempt == fence.attempt,
-            guided_operations_table.c.lease_expires_at > func.current_timestamp(),
+        select(session_operation_receipts_table.c.session_id).where(
+            session_operation_receipts_table.c.session_id == str(fence.source_session_id),
+            session_operation_receipts_table.c.operation_id == fence.operation_id,
+            session_operation_receipts_table.c.kind == "session_fork",
+            session_operation_receipts_table.c.status == "in_progress",
+            session_operation_receipts_table.c.result_session_id == str(fence.target_session_id),
+            session_operation_receipts_table.c.lease_token == fence.lease_token,
+            session_operation_receipts_table.c.attempt == fence.attempt,
+            session_operation_receipts_table.c.lease_expires_at > func.current_timestamp(),
         )
     ).one_or_none()
     if row is None:
         raise BlobForkFenceLostError(fence.operation_id, attempt=fence.attempt)
-
-
-def _require_live_guided_operation_write_fence(conn: Connection, fence: BlobGuidedOperationWriteFence) -> None:
-    """Fail unless an exact closed planner-operation lease owns this write."""
-    row = conn.execute(
-        select(guided_operations_table.c.session_id).where(
-            guided_operations_table.c.session_id == str(fence.session_id),
-            guided_operations_table.c.operation_id == fence.operation_id,
-            guided_operations_table.c.kind.in_(_GUIDED_INLINE_CUSTODY_OPERATION_KINDS),
-            guided_operations_table.c.status == "in_progress",
-            guided_operations_table.c.lease_token == fence.lease_token,
-            guided_operations_table.c.attempt == fence.attempt,
-            guided_operations_table.c.lease_expires_at > func.current_timestamp(),
-        )
-    ).one_or_none()
-    if row is None:
-        raise BlobGuidedOperationFenceLostError(fence.operation_id, attempt=fence.attempt)
 
 
 def _require_live_blob_write_fence(
@@ -524,18 +504,11 @@ def _require_live_blob_write_fence(
     *,
     session_id: str,
     fork_write_fence: BlobForkWriteFence | None,
-    guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
 ) -> None:
-    if fork_write_fence is not None and guided_operation_write_fence is not None:
-        raise AuditIntegrityError("Blob persistence accepts exactly one operation write fence")
     if fork_write_fence is not None:
         if str(fork_write_fence.target_session_id) != session_id:
             raise AuditIntegrityError("Fork blob write fence targets a different session")
         _require_live_fork_write_fence(conn, fork_write_fence)
-    if guided_operation_write_fence is not None:
-        if str(guided_operation_write_fence.session_id) != session_id:
-            raise AuditIntegrityError("Guided operation blob write fence targets a different session")
-        _require_live_guided_operation_write_fence(conn, guided_operation_write_fence)
 
 
 def _require_fork_cleanup_authorization(
@@ -549,12 +522,12 @@ def _require_fork_cleanup_authorization(
     """Require one exact live or failed operation plus its retained plan."""
     if live_write_fence is None:
         operation = conn.execute(
-            select(guided_operations_table.c.status).where(
-                guided_operations_table.c.session_id == source_session_id,
-                guided_operations_table.c.operation_id == operation_id,
-                guided_operations_table.c.kind == "session_fork",
-                guided_operations_table.c.status == "failed",
-                guided_operations_table.c.result_session_id.is_(None),
+            select(session_operation_receipts_table.c.status).where(
+                session_operation_receipts_table.c.session_id == source_session_id,
+                session_operation_receipts_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.kind == "session_fork",
+                session_operation_receipts_table.c.status == "failed",
+                session_operation_receipts_table.c.result_session_id.is_(None),
             )
         ).one_or_none()
         if operation is None:
@@ -1384,7 +1357,6 @@ def _reserve_pending_blob(
     max_storage_per_session: int,
     idempotent: bool,
     fork_write_fence: BlobForkWriteFence | None,
-    guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
 ) -> tuple[Row[Any], bool]:
     session_id = expected["session_id"]
@@ -1395,7 +1367,6 @@ def _reserve_pending_blob(
             conn,
             session_id=session_id,
             fork_write_fence=fork_write_fence,
-            guided_operation_write_fence=guided_operation_write_fence,
         )
         row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
         if row is None:
@@ -1465,7 +1436,6 @@ def _finalize_reserved_blob(
     storage: Path,
     expected: _ExpectedBlobFields,
     fork_write_fence: BlobForkWriteFence | None,
-    guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
 ) -> Row[Any]:
     session_id = expected["session_id"]
     with _blob_phase_transaction(engine, held_connection) as conn:
@@ -1474,7 +1444,6 @@ def _finalize_reserved_blob(
             conn,
             session_id=session_id,
             fork_write_fence=fork_write_fence,
-            guided_operation_write_fence=guided_operation_write_fence,
         )
         row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
         _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
@@ -1522,7 +1491,6 @@ def _persist_blob_content(
     creating_arguments_hash: str | None,
     idempotent: bool,
     fork_write_fence: BlobForkWriteFence | None = None,
-    guided_operation_write_fence: BlobGuidedOperationWriteFence | None = None,
     write_guard: Callable[[], None] | None = None,
     session_operation_authority: SessionOperationAuthority | None = None,
     session_operation_context: SessionOperationContext | None = None,
@@ -1643,7 +1611,6 @@ def _persist_blob_content(
             content,
             session_operation_context,
             idempotent=idempotent,
-            guided_operation_write_fence=guided_operation_write_fence,
         )
     if fork_write_fence is None:
         raise AuditIntegrityError("blob persistence requires exact session-operation or composite fork authority")
@@ -1660,7 +1627,6 @@ def _persist_blob_content(
                 max_storage_per_session=max_storage_per_session,
                 idempotent=idempotent,
                 fork_write_fence=fork_write_fence,
-                guided_operation_write_fence=guided_operation_write_fence,
                 quota_exceeded_recorder=quota_exceeded_recorder,
             )
             storage_existed_before_write = storage.exists()
@@ -1683,7 +1649,6 @@ def _persist_blob_content(
                 storage=storage,
                 expected=expected,
                 fork_write_fence=fork_write_fence,
-                guided_operation_write_fence=guided_operation_write_fence,
             )
         except Exception:
             if not idempotent and created_reservation:
@@ -2037,7 +2002,6 @@ def persist_inline_custody_blob_on_connection(
     *,
     staged: StagedInlineCustody,
     max_storage_per_session: int,
-    write_fence: BlobGuidedOperationWriteFence | None,
     quota_exceeded_recorder: Callable[[QuotaExceeded], None] = refuse_unrecorded_quota_exceeded,
 ) -> tuple[Row[Any], InlineCustodyPublication]:
     """Insert pre-staged metadata into the originating message/proposal cohort.
@@ -2045,14 +2009,12 @@ def persist_inline_custody_blob_on_connection(
     The caller retains BLOB_CUSTODY from preparation until publication. This
     function performs only SQL; the lineage FK becomes satisfiable after the
     message insert in this transaction. The existing exact operation and
-    guided-operation proofs are repeated by the cohort and this boundary.
+    session-operation proof is repeated by the cohort and this boundary.
     """
     if type(staged) is not StagedInlineCustody:
         raise TypeError("staged must be an exact StagedInlineCustody")
     if type(max_storage_per_session) is not int or max_storage_per_session <= 0:
         raise ValueError("max_storage_per_session must be a positive exact integer")
-    if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
-        raise TypeError("write_fence must be an exact BlobGuidedOperationWriteFence")
     record = staged.record
     blob_id = str(record.id)
     session_id = str(record.session_id)
@@ -2081,7 +2043,6 @@ def persist_inline_custody_blob_on_connection(
         conn,
         session_id=session_id,
         fork_write_fence=None,
-        guided_operation_write_fence=write_fence,
     )
     row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
     if row is None:
@@ -2322,11 +2283,11 @@ def _row_to_blob_record(row: Any) -> BlobRecord:
 def _in_progress_session_fork_operation_id(conn: Connection, session_id: str) -> str | None:
     """Return the operation retaining every blob in a session, if any."""
     return conn.execute(
-        select(guided_operations_table.c.operation_id)
+        select(session_operation_receipts_table.c.operation_id)
         .where(
-            guided_operations_table.c.session_id == session_id,
-            guided_operations_table.c.kind == "session_fork",
-            guided_operations_table.c.status == "in_progress",
+            session_operation_receipts_table.c.session_id == session_id,
+            session_operation_receipts_table.c.kind == "session_fork",
+            session_operation_receipts_table.c.status == "in_progress",
         )
         .limit(1)
     ).scalar_one_or_none()
@@ -2746,7 +2707,6 @@ class BlobServiceImpl:
         session_operation_context: SessionOperationContext,
         *,
         idempotent: bool,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None = None,
     ) -> BlobRecord:
         """Share exact-context reservation, publication and commit recovery."""
         _require_blob_operation_context(session_operation_context, allowed_kinds=_CREATE_BLOB_OPERATION_KINDS)
@@ -2758,9 +2718,6 @@ class BlobServiceImpl:
 
         def _guard() -> None:
             self._session_operation_authority.compare_and_swap(session_operation_context)
-            if guided_operation_write_fence is not None:
-                with self._engine.begin() as conn:
-                    _require_live_guided_operation_write_fence(conn, guided_operation_write_fence)
 
         def _sync() -> BlobRecord:
             with _blob_custody_session_lock(self._engine, str(session_id)):
@@ -2785,7 +2742,6 @@ class BlobServiceImpl:
                             record=reservation,
                             max_storage_per_session=self._max_storage_per_session,
                             idempotent=idempotent,
-                            guided_operation_write_fence=guided_operation_write_fence,
                         ),
                     )
                     reserved = self._fenced_blob_record(blob_id, session_operation_context)
@@ -2805,7 +2761,6 @@ class BlobServiceImpl:
                         session_operation_context,
                         lambda transaction: transaction.blobs.mark_blob_ready(
                             blob_id=blob_id,
-                            guided_operation_write_fence=guided_operation_write_fence,
                         ),
                     )
                 except BaseException as primary_exc:
@@ -2843,7 +2798,6 @@ class BlobServiceImpl:
                                 session_operation_context,
                                 lambda transaction: transaction.blobs.discard_pending_blob(
                                     blob_id=blob_id,
-                                    guided_operation_write_fence=guided_operation_write_fence,
                                 ),
                             )
                             if not discarded:
@@ -2861,12 +2815,9 @@ class BlobServiceImpl:
         self,
         request: InlineCustodyRequest,
         *,
-        write_fence: BlobGuidedOperationWriteFence | None = None,
         session_operation_context: SessionOperationContext,
     ) -> BlobRecord:
         """Idempotently materialize one composer inline source."""
-        if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
-            raise TypeError("reserve_inline_custody write_fence must be an exact BlobGuidedOperationWriteFence")
         fields = _normalized_inline_custody_fields(request)
         blob_id = inline_custody_blob_id(request)
         row = await self._run_sync(
@@ -2889,7 +2840,6 @@ class BlobServiceImpl:
                 creating_composer_skill_hash=fields["creating_composer_skill_hash"],
                 creating_arguments_hash=fields["creating_arguments_hash"],
                 idempotent=True,
-                guided_operation_write_fence=write_fence,
                 session_operation_context=session_operation_context,
                 session_operation_authority=self._session_operation_authority,
             )

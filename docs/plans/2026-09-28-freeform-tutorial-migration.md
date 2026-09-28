@@ -51,7 +51,7 @@
 - [x] Commit only task paths, run branch safety, merge into local `release/0.8.1`, verify ancestry and integrated tests. Do not push.
 - [x] Rebuild served frontend and restart the local application. Create one disposable local account, complete Welcome→Build→Run→Audit→Graduate in a real browser, verify persisted session/audit evidence, then delete only that account.
 
-**Local acceptance:** `01d96af9a` was fast-forward merged into `release/0.8.1`; no push. The served build and `/api/ready` passed. A fresh account completed the real browser tutorial through Graduation. Sessions run `f630cfda-becb-4d7f-b164-85283149aab8` completed with 3/3 successful rows; its matching Landscape run contains 3 source rows and recorded LLM calls. The completed preference was persisted, the disposable credential removed and identity disabled, and `dta_user` remained active with admin role. The paired pre-reset databases were archived under `data/archives/freeform-tutorial-epoch70.0Z2OuANV/`.
+**Local acceptance:** `01d96af9a` was fast-forward merged into `release/0.8.1`; no push. The served build and `/api/ready` passed. A fresh account completed the real browser tutorial through Graduation. Sessions run `f630cfda-becb-4d7f-b164-85283149aab8` completed with 3/3 successful rows; its matching Landscape run contains 3 source rows and recorded LLM calls. The completed preference was persisted, the disposable credential removed and identity disabled, and the designated operator account remained active with admin role. The paired pre-reset databases were archived under `data/archives/freeform-tutorial-epoch70.0Z2OuANV/`.
 
 ## Acceptance invariants
 

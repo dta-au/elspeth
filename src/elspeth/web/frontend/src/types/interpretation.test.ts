@@ -1,4 +1,4 @@
-// Tests for interpretation.ts — type-assertion style mirroring guided.test.ts.
+// Tests for interpretation.ts — compile-time and runtime contract assertions.
 //
 // The compile-time `Equals<A, B>` helper is the load-bearing test: drift
 // between the TS union and the Python StrEnum's value set turns into a
@@ -22,7 +22,6 @@ import type {
   InterpretationOptOutResponse,
   OptOutSummaryResponse,
 } from "./interpretation";
-import type { TurnType } from "./guided";
 
 // Compile-time mutual-extends check.
 type Equals<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -93,29 +92,6 @@ describe("interpretation protocol types", () => {
     expect(isInterpretationKind(null)).toBe(false);
   });
 
-  it("TurnType union has 7 current values", () => {
-    const _exact: Equals<
-      TurnType,
-      | "inspect_and_confirm"
-      | "single_select"
-      | "multi_select_with_custom"
-      | "schema_form"
-      | "review_components"
-      | "propose_pipeline"
-      | "confirm_wiring"
-    > = true;
-    const all: TurnType[] = [
-      "inspect_and_confirm",
-      "single_select",
-      "multi_select_with_custom",
-      "schema_form",
-      "review_components",
-      "propose_pipeline",
-      "confirm_wiring",
-    ];
-    expect(_exact).toBe(true);
-    expect(all).toHaveLength(7);
-  });
 
   it("InterpretationEvent has the exhaustive 24-field shape (compile-time exact-keys check)", () => {
     // Adding/removing a field on the TS interface breaks this assignment.

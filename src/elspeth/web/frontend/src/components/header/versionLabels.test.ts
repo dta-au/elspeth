@@ -301,31 +301,27 @@ describe("isSnapshotOnly", () => {
   it("classifies a row differing only in bookkeeping axes as snapshot-only", () => {
     const v2 = {
       ...makeVersion({ id: "st-2", version: 2 }),
-      composer_meta: { guided_session: { step: "step_3", turn: 4 } },
+      composer_meta: { checkpoint: 4 },
       is_valid: false,
       validation_errors: ["dangling edge"],
     } as CompositionStateVersion;
     const v3 = {
       ...makeVersion({ id: "st-3", version: 3 }),
-      composer_meta: { guided_session: { step: "step_4", turn: 5 } },
+      composer_meta: { checkpoint: 5 },
       is_valid: true,
       validation_errors: null,
     } as CompositionStateVersion;
     expect(isSnapshotOnly(v3, v2)).toBe(true);
   });
 
-  // Guard-quality pin: the discriminator reads the content fields plus ONE
-  // named exception (guided reviewed-source blob bindings, pinned below), so
-  // a future field added anywhere else under composer_meta can never flip
-  // real edits to "no change" (nor bookkeeping flips to "changed").
-  it("classifies a row where ONLY composer_meta.guided_session differs as snapshot-only", () => {
+  it("classifies a row where only composer_meta differs as snapshot-only", () => {
     const v2 = {
       ...makeVersion({ id: "st-2", version: 2 }),
-      composer_meta: { guided_session: { transition_consumed: false } },
+      composer_meta: { checkpoint: 1 },
     } as CompositionStateVersion;
     const v3 = {
       ...makeVersion({ id: "st-3", version: 3 }),
-      composer_meta: { guided_session: { transition_consumed: true } },
+      composer_meta: { checkpoint: 2 },
     } as CompositionStateVersion;
     expect(isSnapshotOnly(v3, v2)).toBe(true);
   });
@@ -382,154 +378,5 @@ describe("isSnapshotOnly", () => {
     const full = makeVersion({ id: "st-3", version: 3 });
     expect(isSnapshotOnly(slim, full)).toBe(false);
     expect(isSnapshotOnly(full, slim)).toBe(false);
-  });
-});
-
-// The guided blob-swap case. A guided commit strips `blob_ref` from the
-// executable source and the backend redaction then overwrites that source's
-// path carriers with a CONSTANT sentinel, so replacing the input file leaves
-// sources/nodes/edges/outputs/metadata byte-identical on the wire. The only
-// retained discriminator is the reviewed snapshot's own binding under
-// composer_meta.guided_session.reviewed_sources — verified against
-// web/composer/redaction.py (redact_guided_snapshot_storage_paths) and
-// web/composer/guided_blob_refs.py, which redact only the "path"/"file"
-// carriers and leave `blob_ref` and public `blob:<uuid>` sentinels intact.
-describe("isSnapshotOnly — guided reviewed-source blob bindings", () => {
-  const REDACTED_PATH = "<redacted-blob-source-path>";
-  const BLOB_A = "11111111-1111-4111-8111-111111111111";
-  const BLOB_B = "22222222-2222-4222-8222-222222222222";
-
-  /** A guided row as the wire delivers it after the explicit-ref redaction:
-   *  the committed source carries only the constant sentinel path, and the
-   *  reviewed snapshot keeps the blob_ref. */
-  function guidedExplicitRefVersion(
-    id: string,
-    version: number,
-    blobRef: string,
-    guidedExtras: Record<string, unknown> = {},
-  ): CompositionStateVersion {
-    return {
-      ...makeVersion({
-        id,
-        version,
-        sources: {
-          main: { plugin: "csv_source", options: { path: REDACTED_PATH } },
-        },
-      }),
-      composer_meta: {
-        guided_session: {
-          ...guidedExtras,
-          reviewed_sources: {
-            "src-1": {
-              name: "main",
-              options: { blob_ref: blobRef, path: REDACTED_PATH },
-            },
-          },
-          pending_source_intents: {},
-        },
-      },
-    } as CompositionStateVersion;
-  }
-
-  it("refuses 'no change' when the guided input blob was swapped (explicit-ref arm)", () => {
-    const v2 = guidedExplicitRefVersion("st-2", 2, BLOB_A);
-    const v3 = guidedExplicitRefVersion("st-3", 3, BLOB_B);
-    // Every CONTENT_FIELD is byte-identical — the blob_ref is the whole
-    // difference, and it is a real change of the data the pipeline reads.
-    for (const field of ["sources", "nodes", "edges", "outputs", "metadata"] as const) {
-      expect(JSON.stringify(v3[field])).toBe(JSON.stringify(v2[field]));
-    }
-    expect(isSnapshotOnly(v3, v2)).toBe(false);
-  });
-
-  it("still classifies a guided bookkeeping turn as snapshot-only when the blob is unchanged", () => {
-    const v2 = guidedExplicitRefVersion("st-2", 2, BLOB_A, {
-      step: "step_3",
-      transition_consumed: false,
-    });
-    const v3 = guidedExplicitRefVersion("st-3", 3, BLOB_A, {
-      step: "step_4",
-      transition_consumed: true,
-    });
-    expect(isSnapshotOnly(v3, v2)).toBe(true);
-  });
-
-  it("refuses 'no change' when a guided source gains or loses a blob binding", () => {
-    const bound = guidedExplicitRefVersion("st-3", 3, BLOB_A);
-    const unbound = {
-      ...makeVersion({
-        id: "st-2",
-        version: 2,
-        sources: {
-          main: { plugin: "csv_source", options: { path: REDACTED_PATH } },
-        },
-      }),
-      composer_meta: {
-        guided_session: {
-          reviewed_sources: {
-            "src-1": { name: "main", options: { path: REDACTED_PATH } },
-          },
-          pending_source_intents: {},
-        },
-      },
-    } as CompositionStateVersion;
-    expect(isSnapshotOnly(bound, unbound)).toBe(false);
-    expect(isSnapshotOnly(unbound, bound)).toBe(false);
-  });
-
-  // Public-sentinel arm: the reviewed snapshot passes through the redaction
-  // untouched and its path carriers are `blob:<uuid>` strings. Read as a
-  // binding too, so the axis is complete in both wire shapes.
-  it("reads a public blob: sentinel carrier as a binding", () => {
-    const sentinelVersion = (
-      id: string,
-      version: number,
-      blobRef: string,
-    ): CompositionStateVersion =>
-      ({
-        ...makeVersion({
-          id,
-          version,
-          sources: {
-            main: { plugin: "csv_source", options: { path: REDACTED_PATH } },
-          },
-        }),
-        composer_meta: {
-          guided_session: {
-            reviewed_sources: {
-              "src-1": { name: "main", options: { path: `blob:${blobRef}` } },
-            },
-            pending_source_intents: {},
-          },
-        },
-      }) as CompositionStateVersion;
-    expect(
-      isSnapshotOnly(sentinelVersion("st-3", 3, BLOB_B), sentinelVersion("st-2", 2, BLOB_A)),
-    ).toBe(false);
-    expect(
-      isSnapshotOnly(sentinelVersion("st-3", 3, BLOB_A), sentinelVersion("st-2", 2, BLOB_A)),
-    ).toBe(true);
-  });
-
-  it("refuses 'no change' when composer_meta cannot be read at all", () => {
-    const readable = guidedExplicitRefVersion("st-2", 2, BLOB_A);
-    const unreadable = {
-      ...makeVersion({
-        id: "st-3",
-        version: 3,
-        sources: {
-          main: { plugin: "csv_source", options: { path: REDACTED_PATH } },
-        },
-      }),
-      composer_meta: { guided_session: { reviewed_sources: "not-a-mapping" } },
-    } as CompositionStateVersion;
-    expect(isSnapshotOnly(unreadable, readable)).toBe(false);
-    expect(isSnapshotOnly(readable, unreadable)).toBe(false);
-  });
-
-  it("ignores a freeform row's absent composer_meta rather than treating it as unreadable", () => {
-    const v2 = makeVersion({ id: "st-2", version: 2 });
-    const v3 = makeVersion({ id: "st-3", version: 3 });
-    expect(isSnapshotOnly(v3, v2)).toBe(true);
   });
 });

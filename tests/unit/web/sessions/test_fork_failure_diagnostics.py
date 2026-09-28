@@ -10,7 +10,7 @@ class _UnrenderableFailure(RuntimeError):
 
 
 def test_static_settlement_reason_is_preserved_but_unknown_text_is_not() -> None:
-    safe = "Guided fork settlement parent is missing"
+    safe = "Fork settlement parent is missing"
     assert _fork_failure_diagnostic(AuditIntegrityError(safe), phase="settlement") == safe
     error = AuditIntegrityError("database password=private")
     error.add_note("provider-secret")

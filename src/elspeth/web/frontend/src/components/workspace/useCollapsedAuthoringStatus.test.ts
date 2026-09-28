@@ -140,28 +140,6 @@ describe("useCollapsedAuthoringStatus", () => {
     });
   });
 
-  it.each(["guidedChatPending", "guidedResponsePending"] as const)(
-    "shows busy while %s is true",
-    (field) => {
-      const { result, rerender } = renderHook(
-        ({ collapsed }) =>
-          useCollapsedAuthoringStatus({
-            activeSessionId: SESSION_A,
-            authoringCollapsed: collapsed,
-          }),
-        { initialProps: { collapsed: false } },
-      );
-      rerender({ collapsed: true });
-
-      act(() => useSessionStore.setState({ [field]: true }));
-
-      expect(result.current).toEqual({
-        text: "Authoring in progress",
-        tone: "busy",
-      });
-    },
-  );
-
   it("reports new messages and acknowledgements received while collapsed", () => {
     const { result, rerender } = renderHook(
       ({ collapsed }) =>

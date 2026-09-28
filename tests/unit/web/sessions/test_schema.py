@@ -24,7 +24,6 @@ from elspeth.web.sessions.models import (
     runs_table,
     session_operation_fences_table,
     sessions_table,
-    user_preferences_table,
     user_secrets_table,
     web_instances_table,
     websocket_tickets_table,
@@ -109,11 +108,9 @@ def _seed_session_state(conn) -> tuple[str, str]:
     return session_id, state_id
 
 
-def test_preferences_omitted_mode_uses_freeform_database_default(engine) -> None:
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="default-mode")
-        conn.execute(insert(user_preferences_table).values(user_id="default-mode", updated_at=datetime.now(UTC)))
-        assert conn.execute(select(user_preferences_table.c.default_composer_mode)).scalar_one() == "freeform"
+def test_preferences_have_no_composer_mode_column(engine) -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("user_preferences")}
+    assert "default_composer_mode" not in columns
 
 
 def _seed_run(conn) -> str:
@@ -356,7 +353,6 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # 56 couples sparse proposal display with structured stored validation errors.
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
-    # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 61 defaults preferences to freeform and retires the mode banner.
     # Epoch 64 admits the distinct cost-accounting failure classification.
     # Epoch 65: completion_gates.advisor_signoff.note became a required key
@@ -365,10 +361,12 @@ def test_current_schema_includes_coordination_hard_cut_tables_and_expiry_indexes
     # must be rejected at startup rather than during conversation replay.
     # Epoch 67 binds coalesce branch order and sources order in the composer
     # authority hashes; stored epoch-66 preimages cannot be re-verified.
-    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
+    # Epoch 68 adds ordinary proposal checkpoint rebase reasons.
     # Epoch 69 adds immutable freeform message ingress receipts.
-    # Epoch 70 replaces the persisted tutorial stage's guided label with build.
-    assert SESSION_SCHEMA_EPOCH == 70
+    # Epoch 70 stores the tutorial Build stage as build.
+    # Epoch 71 removes the Composer mode preference and adds mode-neutral
+    # fork/revert receipts.
+    assert SESSION_SCHEMA_EPOCH == 71
     expected_tables = frozenset(
         {
             "web_instances",
@@ -620,17 +618,13 @@ def test_postgres_schema_emits_native_audit_trigger_ddl() -> None:
         "trg_chat_messages_no_delete",
         "trg_message_ingress_receipts_no_update",
         "trg_message_ingress_receipts_no_delete",
-        "trg_guided_operations_terminal_immutable",
-        "trg_guided_operation_events_no_update",
-        "trg_guided_operation_events_no_delete",
-        "trg_guided_operation_admission_blocks_no_update",
-        "trg_guided_operation_admission_blocks_no_delete",
-        "trg_guided_operation_admission_blocks_reject_existing_operation",
-        "trg_guided_operations_reject_admission_block_insert",
-        "trg_guided_operations_reject_admission_block_update",
+        "trg_session_operation_receipts_terminal_immutable",
+        "trg_session_operation_receipt_events_no_update",
+        "trg_session_operation_receipt_events_no_delete",
     ):
         assert f"CREATE TRIGGER {trigger_name}" in ddl
     assert not any("SELECT RAISE" in statement for statement in emitted)
+    assert "guided_operations" not in ddl
 
 
 def test_postgres_schema_uses_postgres_non_blank_check_syntax() -> None:
@@ -1069,97 +1063,6 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
         match=rf"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
-
-
-def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tmp_path) -> None:
-    """The pre-decline epoch-36 CHECKs are rejected as an older schema."""
-    db_path = tmp_path / "epoch-36-without-declined-result.db"
-    engine = create_session_engine(f"sqlite:///{db_path}")
-    initialize_session_schema(engine)
-    with engine.begin() as connection:
-        guided_operations_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        declined_result_kind = "'composition_state', 'pipeline_proposal', 'session', 'declined'"
-        prior_result_kind = "'composition_state', 'pipeline_proposal', 'session'"
-        declined_result_locator = (
-            "(kind = 'guided_plan' AND result_kind = 'declined' "
-            "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
-            "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
-        )
-        epoch_36_sql = guided_operations_sql.replace(declined_result_kind, prior_result_kind).replace(
-            declined_result_locator,
-            "",
-        )
-        assert epoch_36_sql != guided_operations_sql
-        assert "'declined'" not in epoch_36_sql
-        connection.execute(text("PRAGMA writable_schema = ON"))
-        connection.execute(
-            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
-            {"sql": epoch_36_sql},
-        )
-        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
-        connection.execute(text("PRAGMA user_version = 36"))
-        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
-        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
-        connection.execute(text("PRAGMA writable_schema = OFF"))
-    engine.dispose()
-
-    stale_engine = create_session_engine(f"sqlite:///{db_path}")
-    with stale_engine.connect() as connection:
-        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 36
-        stored_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        assert "'declined'" not in stored_sql
-
-    with pytest.raises(
-        SessionSchemaError,
-        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
-        r"Delete the session DB file and restart",
-    ):
-        initialize_session_schema(stale_engine)
-
-
-def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with_recreate_guidance(tmp_path) -> None:
-    """The epoch-30 operation CHECKs cannot be opened by epoch-33 code."""
-    db_path = tmp_path / "epoch-30-without-guided-plan.db"
-    engine = create_session_engine(f"sqlite:///{db_path}")
-    initialize_session_schema(engine)
-    with engine.begin() as connection:
-        guided_operations_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        assert "'guided_plan'" in guided_operations_sql
-        epoch_30_sql = guided_operations_sql.replace("'guided_plan'", "'guided_convert'")
-        assert epoch_30_sql != guided_operations_sql
-        assert "'guided_plan'" not in epoch_30_sql
-        connection.execute(text("PRAGMA writable_schema = ON"))
-        connection.execute(
-            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
-            {"sql": epoch_30_sql},
-        )
-        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 30 WHERE store_kind = 'session'"))
-        connection.execute(text("PRAGMA user_version = 30"))
-        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
-        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
-        connection.execute(text("PRAGMA writable_schema = OFF"))
-    engine.dispose()
-
-    stale_engine = create_session_engine(f"sqlite:///{db_path}")
-    with stale_engine.connect() as connection:
-        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 30
-        stored_sql = connection.execute(
-            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
-        ).scalar_one()
-        assert "'guided_plan'" not in stored_sql
-
-    with pytest.raises(
-        SessionSchemaError,
-        match=rf"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
-        r"Delete the session DB file and restart",
-    ):
-        initialize_session_schema(stale_engine)
 
 
 @pytest.mark.parametrize("renamed_column", ["singleton_id", "application_id", "store_kind", "schema_epoch"])

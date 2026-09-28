@@ -1274,7 +1274,6 @@ def _execute_splice_transform(
         outputs=state.outputs,
         metadata=state.metadata,
         version=state.version,
-        guided_session=state.guided_session,
     )
     canonical_error = _composition_canonical_interpretation_requirement_error(
         proposed,

@@ -7,7 +7,6 @@ import {
 } from "@/api/client";
 import type {
   ApiError,
-  ComposerMode,
   PersistedTutorialStage,
   UserComposerPreferencesPayload,
 } from "@/types/api";
@@ -30,7 +29,6 @@ export interface TutorialProgress {
 }
 
 interface PreferencesState {
-  defaultMode: ComposerMode | null;
   freeformIntroDismissedAt: string | null;
   tutorialCompletedAt: string | null;
   tutorialCompleted: boolean;
@@ -43,15 +41,13 @@ interface PreferencesState {
   showAdvanced: boolean;
   loaded: boolean;
   writing: boolean;
-  // Most-recent error from a setDefaultMode or dismiss call. Components
+  // Most-recent error from a preference write. Components
   // render this as an accessible role="alert" region (Panel a11y F2).
   // Cleared on the next successful write or by explicit clearError().
   writeError: string | null;
   bootstrapError: string | null;
   bootstrap: () => Promise<void>;
   saveTutorialProgress: (progress: TutorialProgress) => Promise<void>;
-  resolveDefaultMode: () => Promise<ComposerMode>;
-  setDefaultMode: (mode: ComposerMode) => Promise<void>;
   setShowAdvanced: (value: boolean) => Promise<void>;
   markTutorialGraduated: (options: {
     publishLocally?: boolean;
@@ -86,7 +82,6 @@ function isRateLimitedApiError(
 const MAX_RETRY_AFTER_WAIT_MS = 3_000;
 
 const INITIAL_STATE = {
-  defaultMode: null as ComposerMode | null,
   freeformIntroDismissedAt: null as string | null,
   tutorialCompletedAt: null as string | null,
   tutorialCompleted: false,
@@ -108,7 +103,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     try {
       const payload = await fetchUserComposerPreferences();
       set({
-        defaultMode: payload.default_mode,
         freeformIntroDismissedAt: payload.freeform_intro_dismissed_at,
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
@@ -121,23 +115,14 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         bootstrapError: null,
       });
     } catch (err) {
-      // No-fabrication shape: an absent value stays null rather than
-      // coerced to a default, because absence is evidence. Leave
-      // defaultMode and tutorialCompletedAt at null — we genuinely
-      // don't know what they were. Setting defaultMode="guided" here
-      // would attribute a preference choice to the user that they
-      // never made; the audit trail would later carry a confident
-      // answer to a question the system never resolved.
+      // No-fabrication shape: leave tutorialCompletedAt null because
+      // absence is evidence, not a completion verdict.
       //
       // Set loaded:true so the UI unblocks (gating the whole UI on
       // loaded would leave a corrupt-row user unable to create a
       // session at all — strictly worse than presenting them with an
       // accurate "we couldn't load your preferences" banner).
       //
-      // resolveDefaultMode() continues to throw when defaultMode is
-      // null after a bootstrap pass; sessionStore.createSession()
-      // catches that and presents the "couldn't apply your default
-      // mode, you're in freeform" message — honest about not knowing.
       const apiError = err as Partial<ApiError>;
       const isCorrupt = apiError?.error_type === "corrupt_preferences";
       const message = isCorrupt
@@ -192,59 +177,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
     }
   },
 
-  resolveDefaultMode: async () => {
-    const current = get();
-    if (current.loaded) {
-      // bootstrap has already run. If defaultMode is null at this point,
-      // bootstrap failed (bootstrapError is set) and a second bootstrap pass
-      // would just re-fail against the same broken backend. Throw
-      // immediately so sessionStore.createSession surfaces the honest
-      // secondary-failure attribution to the user without an extra
-      // round-trip.
-      if (current.defaultMode === null) {
-        throw new Error(
-          "preferencesStore: loaded=true but defaultMode is null — bootstrap failed or backend returned a null default_mode (contract violation)",
-        );
-      }
-      return current.defaultMode;
-    }
-    await get().bootstrap();
-    const after = get();
-    if (after.defaultMode === null) {
-      // bootstrap resolved without populating defaultMode — backend contract
-      // violation (Phase 1A's GET always returns a row, defaulting to freeform).
-      throw new Error(
-        "preferencesStore: bootstrap completed but defaultMode is null",
-      );
-    }
-    return after.defaultMode;
-  },
-
-  setDefaultMode: async (mode) => {
-    if (get().writing) return;
-    const previous = get().defaultMode;
-    set({ defaultMode: mode, writing: true, writeError: null });
-    try {
-      const payload = await updateUserComposerPreferences({
-        default_mode: mode,
-      });
-      set({
-        defaultMode: payload.default_mode,
-        writing: false,
-      });
-    } catch (err) {
-      set({
-        defaultMode: previous,
-        writing: false,
-        writeError:
-          err instanceof Error
-            ? `Couldn't save your preference: ${err.message}`
-            : "Couldn't save your preference.",
-      });
-      throw err;
-    }
-  },
-
   setShowAdvanced: async (value) => {
     if (get().writing) return;
     const previous = get().showAdvanced;
@@ -293,7 +225,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       writeError: null,
     });
     const patchBody = {
-      default_mode: "freeform" as const,
       tutorial_completed_at: stamp,
       tutorial_completed_via: options.via,
     };
@@ -320,7 +251,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         payload = await updateUserComposerPreferences(patchBody);
       }
       set({
-        defaultMode: payload.default_mode,
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: publishLocally && tutorialCompletedFrom(payload.tutorial_completed_at),
         // Completion-clears-progress (backend rule): the server just
@@ -385,7 +315,6 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorial_source_data_hash: null,
       });
       set({
-        defaultMode: payload.default_mode,
         tutorialCompletedAt: payload.tutorial_completed_at,
         tutorialCompleted: tutorialCompletedFrom(payload.tutorial_completed_at),
         // A retake restarts cleanly at Welcome: the reset PATCH also

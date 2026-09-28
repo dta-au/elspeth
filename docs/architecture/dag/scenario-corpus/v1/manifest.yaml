@@ -512,8 +512,8 @@ evidence:
     stages: [config, build, runtime, audit]
   - id: composer-row-union-authoring-parity
     kind: pytest
-    locator: tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph
-    claim: Freeform, guided-full, and guided-staged authoring derive the canonical row-union A/B graph and public runtime pipeline semantics.
+    locator: tests/integration/web/composer/parity/test_fixture_matrix.py::test_freeform_derives_isomorphic_committed_graph
+    claim: Freeform authoring derives the canonical row-union A/B graph and public runtime pipeline semantics.
     stages: [config, build]
   - id: harness-aggregation-immutable-batch-eof-immutable-membership
     kind: harness
@@ -743,11 +743,6 @@ scenarios:
       freeform: &freeform_pass
         status: pass
         evidence: [yaml-importer-generator, yaml-importer-generator-02]
-      guided: &guided_partial
-        status: partial
-        reason: Guided authoring has only partial evidence for this scenario.
-        owner_issue: elspeth-7e2dd67275
-        exit_gate: The guided-authoring corpus case passes canonical graph equality for this scenario.
       round_trip: &round_trip_partial
         status: partial
         reason: Import and export helpers exist, but canonical browser-backed round-trip equality is incomplete.
@@ -1449,11 +1444,6 @@ scenarios:
           - harness-multiple-independent-sources-independent-roots-reopen-resume
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: &guided_fail
-        status: fail
-        reason: Guided authoring cannot express this mandatory non-linear topology.
-        owner_issue: elspeth-7e2dd67275
-        exit_gate: The guided-authoring corpus case passes canonical graph equality for this scenario.
       round_trip:
         status: partial
         evidence: [core-builder-schema-plural-sources-06]
@@ -2222,7 +2212,6 @@ scenarios:
         evidence: [harness-multi-source-queue-fan-in-queued-fan-in-reopen-resume]
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_partial
       scale: *scale_unknown
 
@@ -3491,7 +3480,6 @@ scenarios:
           - harness-conditional-routing-route-reopen-resume-second-sink
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_partial
       scale: *scale_unknown
 
@@ -3555,7 +3543,6 @@ scenarios:
         evidence: [harness-fork-multiple-terminals-partial-failure-reopen-after-partial-terminal]
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: &round_trip_unknown
         status: unknown
         reason: No canonical browser-backed round-trip case exists for this scenario.
@@ -3845,7 +3832,6 @@ scenarios:
         owner_issue: elspeth-ef29ef6ba4
         exit_gate: The scenario corpus contention case passes single-effective-owner and stale-worker fencing assertions.
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_partial
       scale: *scale_unknown
 
@@ -3929,7 +3915,6 @@ scenarios:
         exit_gate: A genuine public between-merge corpus seam passes, or the requirement is deliberately revised, and the deferred-platform rerun passes.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_unknown
       scale: *scale_unknown
 
@@ -3992,7 +3977,6 @@ scenarios:
         exit_gate: A public-resume case passes with one parallel coalesce barrier durably complete while the other remains held, then this case and the complete corpus gate pass again after the deferred-platform rebase.
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_unknown
       scale: *scale_unknown
 
@@ -4048,7 +4032,6 @@ scenarios:
         owner_issue: elspeth-ef29ef6ba4
         exit_gate: The scenario corpus contention case passes single-effective-owner and stale-worker fencing assertions.
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_unknown
       scale: *scale_unknown
 
@@ -4128,7 +4111,6 @@ scenarios:
         owner_issue: elspeth-ef29ef6ba4
         exit_gate: The expansion corpus contention case passes single-effective-owner assertions for every child identity.
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_unknown
       scale: *scale_unknown
 
@@ -4203,8 +4185,7 @@ scenarios:
         reason: No complete row-union contention and fencing case exists.
         owner_issue: elspeth-a5b86149d4
         exit_gate: The row-union corpus contention case passes single-effective-owner, declared-order release, and stale-worker fencing assertions.
-      freeform: *freeform_pass
-      guided:
+      freeform:
         status: pass
         evidence: [composer-row-union-authoring-parity]
       round_trip:
@@ -4324,7 +4305,6 @@ scenarios:
         evidence: [harness-retry-quarantine-discard-routed-errors-retry-success-reopen-resume]
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
-      guided: *guided_fail
       round_trip: *round_trip_partial
       scale: *scale_unknown
 
@@ -4373,7 +4353,6 @@ scenarios:
           - harness-sink-write-pending-redrive-pending-redrive-reopen
       concurrency: *concurrency_partial
       freeform: *freeform_pass
-      guided: *guided_partial
       round_trip: *round_trip_partial
       scale: *scale_unknown
 
@@ -4419,7 +4398,6 @@ scenarios:
       freeform: &checkpoint_authoring_not_applicable
         status: not_applicable
         reason: Checkpoint/resume is a runtime lifecycle, not an authored topology.
-      guided: *checkpoint_authoring_not_applicable
       round_trip: *checkpoint_authoring_not_applicable
       scale: *scale_unknown
 
@@ -4484,6 +4462,5 @@ scenarios:
         owner_issue: elspeth-ef29ef6ba4
         exit_gate: The scenario corpus contention case passes single-effective-owner and stale-worker fencing assertions.
       freeform: *worker_authoring_not_applicable
-      guided: *worker_authoring_not_applicable
       round_trip: *worker_authoring_not_applicable
       scale: *scale_unknown

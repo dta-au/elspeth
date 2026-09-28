@@ -7,8 +7,14 @@
 // ============================================================================
 
 import type { AuditCharacteristicFlag } from "../components/catalog/auditCharacteristics";
-import type { FieldTier, VisibilityPredicate } from "./guided";
 import type { FailedTurn } from "./recovery";
+
+export type FieldTier = "essential" | "common" | "advanced";
+
+export interface VisibilityPredicate {
+  field: string;
+  equals: unknown;
+}
 
 // ── Auth ────────────────────────────────────────────────────────────────────
 
@@ -303,10 +309,8 @@ export type ComposerDensityDefault = "high" | "medium" | "low";
 export type ProposalLifecycleStatus = "pending" | "committed" | "rejected";
 
 export interface PipelineProposalMetadata {
-  surface: "freeform" | "guided_full" | "guided_staged" | "tutorial_profile";
   draft_hash: string;
   base: Record<string, unknown>;
-  reviewed_anchor_hash: string;
   repair_count: number;
   skill_hash: string;
   audit_payload_hash: string;
@@ -373,9 +377,6 @@ export type ComposerProgressReason =
   | "convergence_composition_budget"
   | "convergence_discovery_budget"
   | "convergence_wall_clock_timeout"
-  // Per-turn tool-call cap. Python-only until 2026-08-17: the only surface that
-  // reached it was guided, and freeform hardcoded `provider_unavailable` over
-  // every planner outcome, so the gap was invisible (elspeth-ad5628ecda).
   | "tool_call_cap_exceeded"
   | "provider_auth_failed"
   | "provider_unavailable"
@@ -452,15 +453,6 @@ export interface PluginSummary {
   audit_characteristics: AuditCharacteristicFlag[];
 }
 
-/** One lowered composer knob as the inspector needs it — the catalog side of
- *  the same lowered field the guided form reads as KnobField (types/guided.ts).
- *  `tier` is OPTIONAL: the catalog lowering sets it on every field
- *  (knob_schema.py _attach_tier), but the operator-profile policy views
- *  (web/plugin_policy/profiles.py) hand-build their projections and have
- *  shipped fields with no `tier` at all — the live `transform:llm` policy
- *  view was entirely untiered (elspeth-a6ea581e8a). A field the catalog
- *  knows but does not tier reads as "common" (see `optionTier` in
- *  components/chat/guided/optionTiers.ts): visible, never demoted. */
 export type CatalogKnobField = {
   name: string;
   tier?: FieldTier;
@@ -1186,9 +1178,6 @@ export interface ApiError {
   /** Exact accepted send receipt, distinct from the server request correlation id. */
   client_request_id?: string;
   user_message_id?: string;
-  /** Closed guided-operation failure code (guided_operation_terminal_failure
-   *  envelopes). "policy_blocked" is permanent by construction — retry
-   *  affordances must not invite a retry for it. */
   failure_code?: string;
   /** Static provider or accounting guidance supplied by the Composer route. */
   guidance?: string;

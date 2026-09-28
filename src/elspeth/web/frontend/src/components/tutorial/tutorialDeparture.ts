@@ -9,9 +9,6 @@ function assertLoadedFreeformSession(sessionId: string): void {
   if (!current.compositionStateLoaded || current.error !== null) {
     throw new Error(current.error ?? "The tutorial session has not loaded. Reload it before retrying.");
   }
-  if (current.guidedSession !== null) {
-    throw new Error("The tutorial session is not in freeform mode. Reopen it before retrying.");
-  }
   if (current.isComposing || current.proposalActionPendingIds.length > 0) {
     throw new Error("Wait for the current Composer operation before leaving the tutorial.");
   }

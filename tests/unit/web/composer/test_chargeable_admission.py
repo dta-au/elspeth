@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import cast
 from unittest.mock import patch
 from uuid import UUID
 
@@ -20,17 +20,11 @@ from elspeth.contracts.session_operation import SessionOperationContext, Session
 from elspeth.web.composer import provider_gateway, provider_quota
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
-from elspeth.web.composer.guided.profile import EMPTY_PROFILE
-from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
-from elspeth.web.composer.pipeline_proposal import PresentBase, composition_content_hash
 from elspeth.web.composer.protocol import ComposerAdmissionRefused
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions import _auto_title
-from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence, SessionServiceProtocol
+from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, SessionServiceProtocol
 
 _SESSION_ID = "00000000-0000-0000-0000-000000000001"
 _CONTEXT = SessionOperationContext(
@@ -71,7 +65,7 @@ class _AdmissionService:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["compose", "guided_full", "guided_delta", "diagnostics", "signoff"])
+@pytest.mark.parametrize("entry", ["compose", "diagnostics", "signoff"])
 @pytest.mark.parametrize("reason", [AdmissionRefusalReason.IDENTITY_DISABLED, AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE])
 async def test_public_entry_refuses_before_provider_work(
     composer_service_without_sessions_service: ComposerServiceImpl, entry: str, reason: AdmissionRefusalReason
@@ -84,10 +78,8 @@ async def test_public_entry_refuses_before_provider_work(
     service._planning_application._chargeable_admission = service._chargeable_admission
     service._advisor_checkpoint._sessions_service = service._sessions_service
     service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
-    origin = PlannerOriginatingMessage(_SESSION_ID, None, "Build a pipeline", "owner")
     # These later-stage dependencies deliberately fail if reached. The admission
     # boundary must precede planner preparation as well as outbound model calls.
-    unused: Any = None
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     with (
         patch.object(service._provider_gateway, "_call_llm", autospec=True) as tool_provider,
@@ -104,31 +96,6 @@ async def test_public_entry_refuses_before_provider_work(
                 session_id=_SESSION_ID,
                 user_id="owner",
                 user_message_id="00000000-0000-0000-0000-000000000002",
-                session_operation_context=_CONTEXT,
-            )
-        elif entry == "guided_full":
-            await service._planning_application.plan_guided_full_pipeline(
-                intent="Build a pipeline",
-                current_state=state,
-                originating_message=origin,
-                base=unused,
-                policy_catalog=unused,
-                plugin_snapshot=unused,
-                recorder=BufferingRecorder(),
-                operation_fence=unused,
-                session_operation_context=_CONTEXT,
-            )
-        elif entry == "guided_delta":
-            await service._planning_application.plan_guided_pipeline(
-                intent="Build a pipeline",
-                current_state=state,
-                guided=unused,
-                originating_message=origin,
-                base=unused,
-                user_id="owner",
-                supersedes_draft_hash=None,
-                recorder=BufferingRecorder(),
-                operation_fence=unused,
                 session_operation_context=_CONTEXT,
             )
         elif entry == "diagnostics":
@@ -240,7 +207,7 @@ async def test_rootless_admission_controls_actual_provider_transition(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["rootless", "guided_full", "guided_delta", "signoff"])
+@pytest.mark.parametrize("entry", ["rootless", "signoff"])
 @pytest.mark.parametrize("allowed", [True, False])
 async def test_same_valid_request_reaches_planner_only_when_admitted(
     composer_service_with_real_sessions: ComposerServiceImpl, entry: str, allowed: bool
@@ -259,38 +226,6 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     authority = _AdmissionService(None if allowed else AdmissionRefusalReason.IDENTITY_DISABLED)
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     message_id = "00000000-0000-0000-0000-000000000002"
-    origin = PlannerOriginatingMessage(_SESSION_ID, message_id, "Build a CSV pipeline", "owner")
-    base = PresentBase(state_id=UUID(message_id), composition_content_hash=composition_content_hash(state))
-    fence = GuidedOperationFence(session_id=UUID(_SESSION_ID), operation_id="guided-operation", lease_token="token", attempt=1)
-    snapshot, catalog = service._policy_context.build("owner")
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    guided = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        profile=EMPTY_PROFILE,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
     preferences = ComposerSessionPreferencesRecord(
         session_id=UUID(_SESSION_ID),
         trust_mode="explicit_approve",
@@ -307,37 +242,12 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     ):
         if entry == "rootless":
             await service.compose(
-                origin.content,
+                "Build a CSV pipeline",
                 [],
                 state,
                 session_id=_SESSION_ID,
                 user_id="owner",
                 user_message_id=message_id,
-                session_operation_context=_CONTEXT,
-            )
-        elif entry == "guided_full":
-            await service._planning_application.plan_guided_full_pipeline(
-                intent=origin.content,
-                current_state=state,
-                originating_message=origin,
-                base=base,
-                policy_catalog=catalog,
-                plugin_snapshot=snapshot,
-                recorder=BufferingRecorder(),
-                operation_fence=fence,
-                session_operation_context=_CONTEXT,
-            )
-        elif entry == "guided_delta":
-            await service._planning_application.plan_guided_pipeline(
-                intent=origin.content,
-                current_state=state,
-                guided=guided,
-                originating_message=origin,
-                base=base,
-                user_id="owner",
-                supersedes_draft_hash=None,
-                recorder=BufferingRecorder(),
-                operation_fence=fence,
                 session_operation_context=_CONTEXT,
             )
         else:

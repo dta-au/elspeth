@@ -491,7 +491,7 @@ def test_private_profile_binding_never_reaches_tool_message_audit_yaml_or_logs(c
         "proposal_arguments_redacted": json.dumps(authored_payload, sort_keys=True),
         "persisted_state": json.dumps(authored_payload, sort_keys=True),
         "public_yaml": generate_public_yaml(state),
-        "guided_audit_evidence": json.dumps(
+        "validation_audit_evidence": json.dumps(
             {
                 "errors": [entry.to_dict() for entry in validation.validation.errors],
                 "warnings": [entry.to_dict() for entry in validation.validation.warnings],

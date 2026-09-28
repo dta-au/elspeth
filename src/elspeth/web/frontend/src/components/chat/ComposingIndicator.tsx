@@ -193,20 +193,6 @@ export function formatElapsed(totalSeconds: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-/**
- * Elapsed-time readout for the in-flight compose card (elspeth-b189b5b3b8
- * part a): a slow turn must not read identically to a stalled request.
- * Model calls count from the server's progress timestamp, including after
- * reload. Other work counts from mount. Terminal phases unmount the readout.
- *
- * The ticking readout is aria-hidden: the indicator sits in a role="status"
- * live region and a once-per-second text mutation would spam screen readers
- * with announcements. Sighted users get the timer; AT users get the phase
- * headline changes, which already convey progress.
- *
- * Exported for the guided pending strip (GuidedPendingStrip.tsx), which
- * uses the mount-based timer when no server start timestamp is supplied.
- */
 export function ElapsedReadout({ startedAt }: { startedAt?: string } = {}) {
   const startRef = useRef<number>(startedAt === undefined ? Date.now() : Date.parse(startedAt));
   const [elapsedSeconds, setElapsedSeconds] = useState(

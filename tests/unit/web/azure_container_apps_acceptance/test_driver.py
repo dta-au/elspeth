@@ -139,8 +139,6 @@ elif name == "curl":
     if args[-1].endswith("/api/sessions") or args[-1].endswith("/blobs/inline"):
         import uuid
         target.write_text(json.dumps({"id": str(uuid.uuid4())}))
-    elif args[-1].endswith("/guided/start"):
-        target.write_text(json.dumps({"next_turn": {"turn_token": "9" * 64}}))
     else:
         target.write_text('{"ready":true}')
     if "--write-out" in args:
@@ -249,8 +247,8 @@ def driver(tmp_path: Path) -> DriverRun:
     source_blob.write_text(json.dumps({"filename": "probe.csv", "content": "row_id\n1\n", "mime_type": "text/csv"}))
     message = tmp_path / "message.json"
     message.write_text(json.dumps({"content": "Explain the existing pipeline without changing it."}))
-    guided_action = tmp_path / "guided-action.json"
-    guided_action.write_text(json.dumps({"custom_inputs": ["Use the provided CSV source"]}))
+    p1_message = tmp_path / "p1-message.json"
+    p1_message.write_text(json.dumps({"content": "Inspect the acceptance fixture"}))
     pipeline = tmp_path / "pipeline.yaml"
     pipeline.write_text("sources: {}\n")
     command_log = tmp_path / "commands.jsonl"
@@ -273,8 +271,7 @@ def driver(tmp_path: Path) -> DriverRun:
         "ELSPETH_JOB_WAIT_SECONDS": "1",
         "ELSPETH_POLL_SECONDS": "1",
         "P1_TRIAL_REQUESTS": str(document),
-        "P1_BODY": str(guided_action),
-        "P1_INTENT": "Inspect the acceptance fixture",
+        "P1_BODY": str(p1_message),
         "P2_SESSION_IDS": str(document),
         "P3_SESSION_ID": "p3-session",
         "P4_SESSION_ID": "p4-session",
@@ -331,8 +328,8 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
     assert p2[p2.index("--trials") + 1] == "20"
     p1_requests = json.loads((driver.evidence / "p1-trial-requests.json").read_text())
     assert len(p1_requests) == len({trial["session_id"] for trial in p1_requests}) == 20
-    assert len({trial["body"]["operation_id"] for trial in p1_requests}) == 20
-    assert all(trial["body"]["turn_token"] == "9" * 64 for trial in p1_requests)
+    assert len({trial["body"]["client_request_id"] for trial in p1_requests}) == 20
+    assert all(trial["body"]["content"] == "Inspect the acceptance fixture" for trial in p1_requests)
     single_requests = json.loads((driver.evidence / "single-p1-trial-requests.json").read_text())
     single_sessions = {trial["session_id"] for trial in single_requests}
     assert len(single_requests) == len(single_sessions) == 20

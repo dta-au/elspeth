@@ -5,14 +5,13 @@ site (`.github/workflows/pages.yaml` serves this tree at the site root, so
 `/tutorial-site/<name>` resolves). All of it is invented data, marked as such.
 
 - `project-1.html`, `project-2.html`, `project-3.html` — three "government
-  project brief" pages used by the first-run guided tutorial's `web_scrape`
+  project brief" pages used by the first-run freeform tutorial's `web_scrape`
   demo. The tutorial fetches them at `{base}/tutorial-site/project-N.html`
   (`src/elspeth/web/composer/tutorial_sample.py`) and has an LLM write a short
   summary of each. Their values differ deliberately, so the derived facts vary.
 - `multi-doc-sections.json` — the multi-document corpus cited by the
-  collector-authoring scenario prompt (`COLLECTOR_SCENARIO_PROMPT` in
-  `src/elspeth/web/frontend/tests/e2e/tutorial-reliability.staging.spec.ts` and
-  `evals/composer-battery/calibration/run_collector_calibration.py`). Three
+  freeform collector-authoring calibration in
+  `evals/composer-battery/calibration/run_collector_calibration.py`. Three
   documents with `document_id` / `title` / `sections`, each with a different
   section count so a `require_all` collector losing a section is observable.
   The array is nested under a top-level `documents` key (alongside the

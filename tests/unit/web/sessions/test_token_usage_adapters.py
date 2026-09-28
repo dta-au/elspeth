@@ -38,7 +38,6 @@ from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import service as service_module
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
 from elspeth.web.sessions.models import (
     chat_messages_table,
     quota_policies_table,
@@ -54,7 +53,7 @@ from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, seed_token_policies
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.coordination.test_durable_run_admission import _admission
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 DAY = datetime(2026, 9, 13, tzinfo=UTC)
 _REQUIRED = ChargeableAdmissionPolicy(identity_token_quota_configured=True, secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
@@ -118,10 +117,10 @@ def _ledger(engine: Engine) -> list[tuple[Any, ...]]:
 
 
 @pytest.fixture
-def harness(engine: Engine) -> DualFencedSessionServiceHarness:
+def harness(engine: Engine) -> FencedSessionServiceHarness:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    return FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
 
 
 # ── the Composer adapters ─────────────────────────────────────────────────
@@ -208,7 +207,7 @@ async def test_undispatched_cancellation_rejects_changed_model_and_dispatched_se
 
 @pytest.mark.asyncio
 async def test_auto_title_cancellation_after_committed_admission_never_dispatches(
-    harness: DualFencedSessionServiceHarness, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    harness: FencedSessionServiceHarness, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id, context = _seed_compose_session(engine)
     admitted = asyncio.Event()
@@ -327,9 +326,7 @@ async def test_undispatched_cancellation_rolls_back_all_three_records_on_failure
 
 
 @pytest.mark.asyncio
-async def test_composer_cohort_charges_its_provider_calls_with_the_audit_rows(
-    harness: DualFencedSessionServiceHarness, engine: Engine
-) -> None:
+async def test_composer_cohort_charges_its_provider_calls_with_the_audit_rows(harness: FencedSessionServiceHarness, engine: Engine) -> None:
     session_id, context = _seed_compose_session(engine)
     await harness.add_messages_atomic(
         UUID(session_id),
@@ -351,7 +348,7 @@ async def test_composer_cohort_charges_its_provider_calls_with_the_audit_rows(
 
 @pytest.mark.asyncio
 async def test_composer_cohort_that_fails_after_charging_leaves_no_ledger_row(
-    harness: DualFencedSessionServiceHarness, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    harness: FencedSessionServiceHarness, engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ledger row rolls back with the audit cohort: accounting never outlives the evidence it was derived from."""
     session_id, context = _seed_compose_session(engine)
@@ -388,35 +385,6 @@ async def test_composer_charges_completion_day_across_midnight_not_settlement_da
     assert recorded_at.replace(tzinfo=UTC) == completion_time
 
 
-def test_guided_ledger_failure_rolls_back_audit_and_accounting(harness, engine, monkeypatch) -> None:
-    session_id, context = _seed_compose_session(engine)
-    rows = prepare_guided_audit_rows(invocations=(), llm_calls=(_call(prompt=5, completion=6),), chat_turns=())
-    original = service_module.record_token_usage_on_connection
-
-    def fail_after_write(*args, **kwargs):
-        original(*args, **kwargs)
-        raise RuntimeError("after ledger insert")
-
-    monkeypatch.setattr(service_module, "record_token_usage_on_connection", fail_after_write)
-    with (
-        pytest.raises(RuntimeError, match="after ledger insert"),
-        harness._session_process_locked_begin(session_id) as conn,
-        harness._session_write_lock(conn, session_id),
-    ):
-        harness._insert_prepared_guided_audit_rows_on_connection(
-            conn,
-            session_id=session_id,
-            composition_state_id=None,
-            audit_rows=rows,
-            sequence_no=harness._reserve_sequence_range(conn, session_id, count=len(rows)),
-            created_at=datetime.now(UTC),
-            session_operation_context=context,
-        )
-    assert _ledger(engine) == []
-    with engine.connect() as conn:
-        assert conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.session_id == session_id)).all() == []
-
-
 @pytest.mark.asyncio
 async def test_diagnostics_ledger_failure_rolls_back_audit_and_accounting(harness, engine, monkeypatch) -> None:
     session = await harness.create_session("alice", "Pipeline", "local")
@@ -446,29 +414,8 @@ async def test_diagnostics_ledger_failure_rolls_back_audit_and_accounting(harnes
         assert conn.execute(select(chat_messages_table.c.id).where(chat_messages_table.c.session_id == str(session.id))).all() == before
 
 
-def test_guided_cohort_charges_its_llm_rows(harness: DualFencedSessionServiceHarness, engine: Engine) -> None:
-    session_id, context = _seed_compose_session(engine)
-    rows = prepare_guided_audit_rows(
-        invocations=(), llm_calls=(_call(prompt=5, completion=6), _call(status=ComposerLLMCallStatus.TIMEOUT)), chat_turns=()
-    )
-    with harness._session_process_locked_begin(session_id) as conn, harness._session_write_lock(conn, session_id):
-        harness._insert_prepared_guided_audit_rows_on_connection(
-            conn,
-            session_id=session_id,
-            composition_state_id=None,
-            audit_rows=rows,
-            sequence_no=harness._reserve_sequence_range(conn, session_id, count=len(rows)),
-            created_at=datetime.now(UTC),
-            session_operation_context=context,
-        )
-    assert _ledger(engine) == [
-        ("test_user", session_id, "composer", None, "test/model", 5, 6),
-        ("test_user", session_id, "composer", None, "test/model", None, None),
-    ]
-
-
 @pytest.mark.asyncio
-async def test_run_diagnostics_cohort_charges_its_llm_rows(harness: DualFencedSessionServiceHarness, engine: Engine) -> None:
+async def test_run_diagnostics_cohort_charges_its_llm_rows(harness: FencedSessionServiceHarness, engine: Engine) -> None:
     session = await harness.create_session("alice", "Pipeline", "local")
     state = await harness.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
     run = await harness.create_run(session.id, state.id)
@@ -485,9 +432,7 @@ async def test_run_diagnostics_cohort_charges_its_llm_rows(harness: DualFencedSe
 
 
 @pytest.mark.asyncio
-async def test_record_token_usage_charges_auto_title_under_compose_authority(
-    harness: DualFencedSessionServiceHarness, engine: Engine
-) -> None:
+async def test_record_token_usage_charges_auto_title_under_compose_authority(harness: FencedSessionServiceHarness, engine: Engine) -> None:
     session_id, context = _seed_compose_session(engine)
     entry = TokenUsageEntry(model="openai/title", prompt_tokens=30, completion_tokens=6, cached_prompt_tokens=None, reasoning_tokens=None)
     entry_ids = await harness.record_token_usage(session_operation_context=context, source="auto_title", run_id=None, entries=(entry,))
@@ -496,9 +441,7 @@ async def test_record_token_usage_charges_auto_title_under_compose_authority(
 
 
 @pytest.mark.asyncio
-async def test_record_token_usage_refuses_run_spend_under_compose_authority(
-    harness: DualFencedSessionServiceHarness, engine: Engine
-) -> None:
+async def test_record_token_usage_refuses_run_spend_under_compose_authority(harness: FencedSessionServiceHarness, engine: Engine) -> None:
     _session_id, context = _seed_compose_session(engine)
     entry = TokenUsageEntry(model="openai/run", prompt_tokens=1, completion_tokens=1, cached_prompt_tokens=None, reasoning_tokens=None)
     with pytest.raises(ValueError, match="source='run' token usage requires execute authority"):

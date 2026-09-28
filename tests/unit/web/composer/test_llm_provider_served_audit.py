@@ -41,7 +41,6 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import admit_llm_provider_metadata, build_llm_call_record
-from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
 
 # Every ``provider_name`` in the OpenRouter endpoints API for the three models
 # the plan measured (deepseek/deepseek-v4.1-flash, z-ai/glm-5.3, openai/gpt-5.5),
@@ -262,20 +261,3 @@ class TestSurvivesToThePersistedProjection:
         call_payload = _envelope_call(_llm_call(provider_served="DeepInfra"))
 
         assert "provider_served" not in call_payload
-
-    def test_guided_failure_row_preserves_provider_served(self) -> None:
-        rows = prepare_guided_audit_rows(
-            invocations=(),
-            llm_calls=(
-                _llm_call(
-                    provider_served="DeepInfra",
-                    status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
-                    error_class="MalformedResponse",
-                    error_message="truncated mid tool call",
-                ),
-            ),
-            chat_turns=(),
-        )
-
-        (row,) = rows
-        assert row.envelope["call"]["provider_served"] == "DeepInfra"

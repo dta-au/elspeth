@@ -515,7 +515,7 @@ class SessionOperationLease:
 
         The hidden child is intentionally archived while staging, so generic
         session CAS/renew must continue to reject it. Validation and renewal
-        instead prove the parent fence, guided binding, child lineage, and
+        instead prove the parent fence, operation receipt, child lineage, and
         exact child fence together under canonical pair locks.
         """
         from elspeth.web.sessions.protocol import SessionForkAuthority as RuntimeSessionForkAuthority

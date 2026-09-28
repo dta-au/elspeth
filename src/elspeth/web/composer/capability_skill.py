@@ -11,7 +11,6 @@ from typing import Any, Final, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.skills import load_skill_with_hash
 
 PLANNER_DISCOVERY_TOOL_NAMES: Final[tuple[str, ...]] = (
@@ -161,8 +160,6 @@ def render_with_pipeline_capabilities(interaction_skill: str) -> str:
 class PlannerCapabilityManifest:
     """Hash-only audit facts derived from one exact outbound planner call."""
 
-    surface: PlannerSurface
-    profile: str
     planner_implementation_id: str
     capability_core_hash: str
     canonical_schema_hash: str
@@ -170,10 +167,6 @@ class PlannerCapabilityManifest:
     rendered_prompt_hash: str
 
     def __post_init__(self) -> None:
-        if type(self.surface) is not PlannerSurface:
-            raise TypeError("surface must be an exact PlannerSurface")
-        if self.profile not in {"ordinary", "tutorial"}:
-            raise ValueError("profile must be 'ordinary' or 'tutorial'")
         if type(self.planner_implementation_id) is not str or not self.planner_implementation_id:
             raise ValueError("planner_implementation_id must be a non-empty exact string")
         for name, value in (
@@ -186,14 +179,8 @@ class PlannerCapabilityManifest:
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
 
 
-def _expected_profile(surface: PlannerSurface) -> str:
-    return "tutorial" if surface is PlannerSurface.TUTORIAL_PROFILE else "ordinary"
-
-
 def build_planner_capability_manifest(
     *,
-    surface: PlannerSurface,
-    profile: str,
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[Mapping[str, Any]],
     canonical_schema: Mapping[str, Any],
@@ -206,12 +193,8 @@ def build_planner_capability_manifest(
     request-owned, order-preserving discovery subset followed by the terminal;
     ``"terminal_only"`` is the escape-hatch overtime turn.
     """
-    if type(surface) is not PlannerSurface:
-        raise TypeError("surface must be an exact PlannerSurface")
     if tool_surface not in {"full", "terminal_only"}:
         raise ValueError("tool_surface must be 'full' or 'terminal_only'")
-    if profile != _expected_profile(surface):
-        raise AuditIntegrityError("planner surface/profile identity mismatch")
     canonical_json(messages)
     canonical_json(tools)
     core = load_pipeline_capability_core()
@@ -255,8 +238,6 @@ def build_planner_capability_manifest(
     validate_capability_field_contract(capability_schema or canonical_schema, core)
 
     return PlannerCapabilityManifest(
-        surface=surface,
-        profile=profile,
         planner_implementation_id=PLANNER_IMPLEMENTATION_ID,
         capability_core_hash=hashlib.sha256(core.encode("utf-8")).hexdigest(),
         canonical_schema_hash=stable_hash(advertised_schema),

@@ -164,8 +164,7 @@ require verified output artifacts.
 
 ## Deployment boundary
 
-The dedicated `cost_unavailable` guided-operation failure code changes the
-Sessions schema from epoch 63 to 64. The pre-1.0 schema policy requires store
+The pre-1.0 schema policy requires store
 recreation; there is no automatic migration. Do not replace or delete a
 production store without the operator's explicit authorization. Local tests
 and mocked Azure responses do not establish live production acceptance.

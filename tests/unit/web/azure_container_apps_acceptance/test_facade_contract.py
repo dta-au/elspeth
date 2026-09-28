@@ -109,14 +109,30 @@ def test_trial_session_inventory_rejects_duplicates_and_wrong_count(tmp_path: Pa
     assert facade._trial_session_ids(str(inventory), trials=20) == tuple(sessions)
 
 
-def test_guided_trial_inventory_requires_distinct_current_turns(tmp_path: Path) -> None:
-    requests = [{"session_id": f"session-{index}", "body": {"turn_token": str(index)}} for index in range(20)]
-    path = _protected(tmp_path / "guided.json", requests)
+def test_freeform_trial_inventory_requires_distinct_sessions_and_valid_message_bodies(tmp_path: Path) -> None:
+    requests = [
+        {
+            "session_id": f"session-{index}",
+            "body": {"content": "Build a pipeline", "client_request_id": f"00000000-0000-4000-8000-{index:012x}"},
+        }
+        for index in range(20)
+    ]
+    path = _protected(tmp_path / "freeform.json", requests)
     assert facade._fence_trial_requests(path, trials=20) == tuple((item["session_id"], item["body"]) for item in requests)
     requests[1] = requests[0]
     _protected(Path(path), requests)
     with pytest.raises(AcceptanceInputError, match="distinct sessions"):
         facade._fence_trial_requests(path, trials=20)
+    requests[1] = {"session_id": "session-1", "body": {"content": "Build a pipeline", "client_request_id": "not-a-uuid"}}
+    _protected(Path(path), requests)
+    with pytest.raises(AcceptanceInputError, match="client_request_id"):
+        facade._fence_trial_requests(path, trials=20)
+
+
+def test_current_schema_facts_use_mode_neutral_release_labels() -> None:
+    facts = _expected_schema_facts("B")
+    assert str(facts["structural_changes"]).endswith("_blob_cleanup_row_union_barrier_and_coordination_schema")
+    assert facts["semantics_only_changes"] == "coalesce_timeout_seconds_and_node_options_summary_required"
 
 
 def test_default_twenty_trial_path_executes_each_prepared_session_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

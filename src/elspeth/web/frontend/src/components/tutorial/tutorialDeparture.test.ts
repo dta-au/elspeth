@@ -15,14 +15,12 @@ describe("freeform tutorial departure custody", () => {
     useSessionStore.setState({
       activeSessionId: "tutorial",
       compositionStateLoaded: true,
-      guidedSession: null,
       isComposing: false,
       proposalActionPendingIds: [],
       error: null,
     });
-    usePreferencesStore.setState({ loaded: true, defaultMode: "freeform" });
+    usePreferencesStore.setState({ loaded: true });
     vi.mocked(api.updateUserComposerPreferences).mockImplementation(async (body) => ({
-      default_mode: body.default_mode ?? "freeform",
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: body.tutorial_completed_at ?? null,
       tutorial_stage: null,
@@ -34,13 +32,12 @@ describe("freeform tutorial departure custody", () => {
     }));
   });
 
-  it("graduates the loaded freeform session without switching modes", async () => {
-    const exitToFreeform = vi.fn();
-    useSessionStore.setState({ exitToFreeform });
-
+  it("graduates the loaded freeform session without a mode preference write", async () => {
     await departTutorialSession("tutorial", "complete");
 
-    expect(exitToFreeform).not.toHaveBeenCalled();
+    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith(
+      expect.not.objectContaining({ default_mode: expect.anything() }),
+    );
     expect(useSessionStore.getState().activeSessionId).toBe("tutorial");
     expect(usePreferencesStore.getState().tutorialCompleted).toBe(true);
   });

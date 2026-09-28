@@ -23,7 +23,6 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_audit import ToolArgumentErrorCategory
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
@@ -38,14 +37,6 @@ from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS, _compose_preflight_repair_message
-from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
-from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
-from elspeth.web.composer.guided.prompts import load_step_planner_skill
-from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.composer.pipeline_planner import PipelineCandidatePolicyRejection, PlannerOriginatingMessage
-from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.planning_application import (
     _freeform_planner_conversation_context,
 )
@@ -66,7 +57,6 @@ from elspeth.web.composer.service import ComposerAvailability, ComposerServiceIm
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
-    NodeSpec,
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
@@ -90,7 +80,6 @@ from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
-from elspeth.web.sessions.protocol import GuidedOperationFence
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -111,8 +100,7 @@ from tests.unit.web.composer._helpers import (
 from tests.unit.web.composer._helpers import (
     _make_llm_response as _make_raw_llm_response,
 )
-from tests.unit.web.conftest import _make_session
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _REAL_RUN_ADVISOR_CHECKPOINT = AdvisorCheckpointOwner._run_advisor_checkpoint
 
@@ -142,527 +130,11 @@ def _advisor_checkpoint_responses(*replies: str) -> Callable[..., Awaitable[tupl
     return respond
 
 
-@pytest.fixture
-def guided_session_authority(composer_service_with_real_sessions: ComposerServiceImpl):
-    """Persist a real owner/session and hold its production COMPOSE lease."""
-    sessions = composer_service_with_real_sessions._require_sessions_service()
-    session_id = uuid4()
-    with sessions._engine.begin() as conn:
-        _make_session(conn, session_id=str(session_id), user_id="test-user")
-    with fenced_operation_context(sessions._engine, session_id) as context:
-        yield session_id, context
-
-
 def test_service_rejects_uninferrable_advisor_provider() -> None:
     settings = _make_settings(composer_advisor_model="custom-model-without-provider")
 
     with pytest.raises(ValueError, match="composer_advisor_model provider could not be inferred"):
         ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("profile", "expected_surface", "expected_profile"),
-    (
-        (EMPTY_PROFILE, PlannerSurface.GUIDED_STAGED, "ordinary"),
-        (TUTORIAL_PROFILE, PlannerSurface.TUTORIAL_PROFILE, "tutorial"),
-    ),
-)
-async def test_guided_service_routes_step3_through_the_planner_only_capability_prompt(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    guided_session_authority,
-    monkeypatch: pytest.MonkeyPatch,
-    profile: Any,
-    expected_surface: PlannerSurface,
-    expected_profile: str,
-) -> None:
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    guided = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        profile=profile,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-    captured: list[dict[str, Any]] = []
-    sentinel_plan = object()
-
-    async def capture_plan_pipeline(**kwargs: Any) -> Any:
-        captured.append(kwargs)
-        return sentinel_plan
-
-    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", capture_plan_pipeline)
-    current_state = _empty_state()
-    session_id, session_context = guided_session_authority
-    # F2: the guided planner threads the same per-session schema tracker the
-    # freeform batch writes — seeded here so the threading is observable.
-    composer_service_with_real_sessions._schema_disclosure.mark_plugin_schema_loaded(str(session_id), "source", "csv")
-    custody_fence = GuidedOperationFence(
-        session_id=session_id,
-        operation_id=str(uuid4()),
-        lease_token=uuid4().hex,
-        attempt=1,
-    )
-    result, _catalog_ids = await composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
-        session_operation_context=session_context,
-        intent="Build the reviewed pipeline.",
-        current_state=current_state,
-        guided=guided,
-        originating_message=PlannerOriginatingMessage(
-            session_id=str(session_id),
-            message_id=str(uuid4()),
-            content="Build the reviewed pipeline.",
-            user_id="test-user",
-        ),
-        base=PresentBase(state_id=uuid4(), composition_content_hash="0" * 64),
-        user_id="test-user",
-        supersedes_draft_hash=None,
-        recorder=BufferingRecorder(),
-        operation_fence=custody_fence,
-    )
-
-    assert result is sentinel_plan
-    assert len(captured) == 1
-    assert captured[0]["surface"] is expected_surface
-    assert captured[0]["profile"] == expected_profile
-    assert captured[0]["rendered_skill"] == load_step_planner_skill(GuidedStep.STEP_3_TRANSFORMS)
-    assert captured[0]["custody_config"].write_fence == BlobGuidedOperationWriteFence(
-        session_id=custody_fence.session_id,
-        operation_id=custody_fence.operation_id,
-        lease_token=custody_fence.lease_token,
-        attempt=custody_fence.attempt,
-    )
-    # F2 threading: the tracker's current view rides in, and the marking
-    # callback writes back into the SAME per-session tracker (no parallel one).
-    assert captured[0]["schemas_loaded"] == frozenset({("source", "csv")})
-    captured[0]["mark_schema_loaded"]("transform", "field_mapper")
-    assert composer_service_with_real_sessions._schema_disclosure.schemas_loaded_for_session(str(session_id)) == frozenset(
-        {("source", "csv"), ("transform", "field_mapper")}
-    )
-
-
-def _reviewed_guided_for_revision() -> GuidedSession:
-    """A step-3 guided session with one reviewed source and output."""
-
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    return GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        root_intent_message_id="33333333-3333-4333-8333-333333333333",
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-
-
-@pytest.mark.asyncio
-async def test_guided_service_names_the_root_goal_beside_a_revision_never_inside_its_intent(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    guided_session_authority,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The session's goal reaches a revision as a NAMED fact with a precedence rule.
-
-    ``intent`` means the request being made now. Concatenating the standing
-    goal into it made a revision that narrows, changes, or withdraws part of
-    the goal argue against the goal inside that one field — and fed the
-    deterministic guards that parse it (``_stated_threshold_for_planner_request``,
-    ``_intent_selected_schema_keys``) words the author had already superseded.
-    The goal therefore rides in ``reviewed_planner_context`` with the sentence
-    that orders the two, the same idiom ``unproducible_output_fields_usage``
-    uses.
-
-    The fresh-candidate run at the step-2 finish is the other half of the rule:
-    there the goal IS the request, so naming it separately is refused rather
-    than silently accepted as a second copy.
-    """
-
-    guided = _reviewed_guided_for_revision()
-    predecessor = _empty_state()
-    captured: dict[str, Any] = {}
-
-    async def capture_plan_pipeline(**kwargs: Any) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", capture_plan_pipeline)
-    session_id, session_context = guided_session_authority
-    goal = "Route rows scoring over 8 to the review sink and everything else to the archive."
-    instruction = "Actually put everything in one sink; no routing."
-
-    def call(**overrides: Any):
-        return composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
-            intent=instruction,
-            current_state=predecessor,
-            guided=guided,
-            originating_message=PlannerOriginatingMessage(
-                session_id=str(session_id),
-                message_id=str(uuid4()),
-                content=instruction,
-                user_id="test-user",
-            ),
-            base=PresentBase(state_id=uuid4(), composition_content_hash=composition_content_hash(predecessor)),
-            user_id="test-user",
-            supersedes_draft_hash="f" * 64,
-            recorder=BufferingRecorder(),
-            operation_fence=GuidedOperationFence(
-                session_id=session_id,
-                operation_id=str(uuid4()),
-                lease_token=uuid4().hex,
-                attempt=1,
-            ),
-            session_operation_context=session_context,
-            **overrides,
-        )
-
-    await call(
-        revision_authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
-        root_goal=goal,
-    )
-
-    assert captured["intent"] == instruction
-    reviewed_context = captured["reviewed_planner_context"]
-    assert reviewed_context["root_goal"] == goal
-    assert "the current instruction is the request" in reviewed_context["root_goal_usage"]
-
-    # Neither authority: this is a fresh-candidate request, where the goal is
-    # the intent. A second, named copy is refused before any planner work.
-    captured.clear()
-    with pytest.raises(ValueError, match="root_goal names the standing goal"):
-        await call(root_goal=goal)
-    assert captured == {}
-
-    # Exact-type, non-empty: an owned parameter is nominally typed (ADR-032).
-    for bad_goal in ("", cast(str, 17)):
-        with pytest.raises(TypeError, match="root_goal must be a non-empty exact str"):
-            await call(
-                revision_authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
-                root_goal=bad_goal,
-            )
-    assert captured == {}
-
-
-@pytest.mark.asyncio
-async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_repair(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    guided_session_authority,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    guided = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        root_intent_message_id="33333333-3333-4333-8333-333333333333",
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-    predecessor = CompositionState(
-        sources={
-            "input": SourceSpec(
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                on_success="rows",
-                on_validation_failure="discard",
-            )
-        },
-        nodes=(
-            NodeSpec(
-                id="keep",
-                node_type="transform",
-                plugin="passthrough",
-                input="rows",
-                on_success="results",
-                on_error="discard",
-                options={"schema": {"mode": "observed"}},
-                condition=None,
-                routes=None,
-                fork_to=None,
-                branches=None,
-                policy=None,
-                merge=None,
-            ),
-        ),
-        edges=(),
-        outputs=(
-            OutputSpec(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                on_write_failure="discard",
-            ),
-        ),
-        metadata=PipelineMetadata(),
-        version=1,
-    )
-    captured: dict[str, Any] = {}
-
-    async def capture_plan_pipeline(**kwargs: Any) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("elspeth.web.composer.planning_application.plan_pipeline", capture_plan_pipeline)
-    session_id, session_context = guided_session_authority
-    await composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
-        session_operation_context=session_context,
-        intent="Add a normalization transform.",
-        current_state=predecessor,
-        guided=guided,
-        originating_message=PlannerOriginatingMessage(
-            session_id=str(session_id),
-            message_id=str(uuid4()),
-            content="Add a normalization transform.",
-            user_id="test-user",
-        ),
-        base=PresentBase(state_id=uuid4(), composition_content_hash=composition_content_hash(predecessor)),
-        user_id="test-user",
-        supersedes_draft_hash="f" * 64,
-        recorder=BufferingRecorder(),
-        operation_fence=GuidedOperationFence(
-            session_id=session_id,
-            operation_id=str(uuid4()),
-            lease_token=uuid4().hex,
-            attempt=1,
-        ),
-        revision_authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
-    )
-
-    finalizer = captured["candidate_finalizer"]
-    acceptance = captured["candidate_acceptance"]
-    assert callable(finalizer)
-    assert callable(acceptance)
-
-    violating = predecessor.to_dict()
-    violating.pop("version")
-    violating["nodes"][0]["plugin"] = "field_mapper"
-    rebound = finalizer(violating)
-    assert rebound["nodes"][0]["plugin"] == "passthrough"
-    with pytest.raises(PipelineCandidatePolicyRejection) as contract_rejection:
-        acceptance(predecessor)
-    assert contract_rejection.value.error_code == "guided_amend_contract_violation"
-
-    unchanged = predecessor.to_dict()
-    unchanged.pop("version")
-    finalizer(unchanged)
-    with pytest.raises(PipelineCandidatePolicyRejection) as unchanged_rejection:
-        acceptance(predecessor)
-    assert unchanged_rejection.value.error_code == "guided_revision_unchanged"
-    edge_only = replace(
-        predecessor,
-        edges=(
-            EdgeSpec(
-                id="ui-edge-churn",
-                from_node="input",
-                to_node="keep",
-                edge_type="on_success",
-                label="display-only change",
-            ),
-        ),
-    )
-    metadata_only = replace(
-        predecessor,
-        metadata=PipelineMetadata(name="Aspirational rename", description="No execution change."),
-    )
-    for nonsemantic_candidate in (edge_only, metadata_only):
-        with pytest.raises(PipelineCandidatePolicyRejection) as nonsemantic_rejection:
-            acceptance(nonsemantic_candidate)
-        assert nonsemantic_rejection.value.error_code == "guided_revision_unchanged"
-
-    captured.clear()
-    await composer_service_with_real_sessions._planning_application.plan_guided_pipeline(
-        session_operation_context=session_context,
-        intent="Replace the current transform topology.",
-        current_state=predecessor,
-        guided=guided,
-        originating_message=PlannerOriginatingMessage(
-            session_id=str(session_id),
-            message_id=str(uuid4()),
-            content="Replace the current transform topology.",
-            user_id="test-user",
-        ),
-        base=PresentBase(state_id=uuid4(), composition_content_hash=composition_content_hash(predecessor)),
-        user_id="test-user",
-        supersedes_draft_hash="f" * 64,
-        recorder=BufferingRecorder(),
-        operation_fence=GuidedOperationFence(
-            session_id=session_id,
-            operation_id=str(uuid4()),
-            lease_token=uuid4().hex,
-            attempt=1,
-        ),
-        revision_authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
-    )
-    replace_finalizer = captured["candidate_finalizer"]
-    replace_acceptance = captured["candidate_acceptance"]
-    assert callable(replace_finalizer)
-    assert callable(replace_acceptance)
-    replace_finalizer(unchanged)
-    with pytest.raises(PipelineCandidatePolicyRejection) as replace_unchanged_rejection:
-        replace_acceptance(predecessor)
-    assert replace_unchanged_rejection.value.error_code == "guided_revision_unchanged"
-    for nonsemantic_candidate in (edge_only, metadata_only):
-        with pytest.raises(PipelineCandidatePolicyRejection) as replace_nonsemantic_rejection:
-            replace_acceptance(nonsemantic_candidate)
-        assert replace_nonsemantic_rejection.value.error_code == "guided_revision_unchanged"
-
-
-@pytest.mark.asyncio
-async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provider_requests(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    guided_session_authority,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import elspeth.web.composer.pipeline_planner as planner_module
-
-    sessions = cast(SessionServiceImpl | None, composer_service_with_real_sessions._sessions_service)
-    assert sessions is not None
-    actual_service = ComposerServiceImpl.for_trained_operator(
-        _mock_catalog(),
-        composer_service_with_real_sessions._settings,
-        sessions_service=sessions,
-        session_engine=sessions._engine,
-    )
-    session = await sessions.get_session(guided_session_authority[0])
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    ordinary = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        profile=EMPTY_PROFILE,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-    manifests: list[Any] = []
-    requests: list[dict[str, Any]] = []
-    real_builder = planner_module.build_planner_capability_manifest  # type: ignore[attr-defined]
-
-    def capture_manifest(**kwargs: Any) -> Any:
-        manifest = real_builder(**kwargs)
-        manifests.append(manifest)
-        return manifest
-
-    async def mutating_completion(**kwargs: Any) -> Any:
-        kwargs["messages"][0]["content"] += "\nprovider-side mutation"
-        requests.append(kwargs)
-        raise LiteLLMAPIError(
-            status_code=503,
-            message="provider unavailable",
-            llm_provider="test-provider",
-            model="test/planner",
-        )
-
-    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)  # type: ignore[attr-defined]
-    monkeypatch.setattr("litellm.acompletion", mutating_completion)
-
-    for guided in (ordinary, replace(ordinary, profile=TUTORIAL_PROFILE)):
-        with pytest.raises(AuditIntegrityError, match="planner call inputs changed"):
-            await actual_service._planning_application.plan_guided_pipeline(
-                session_operation_context=guided_session_authority[1],
-                intent="Build the reviewed pipeline.",
-                current_state=_empty_state(),
-                guided=guided,
-                originating_message=PlannerOriginatingMessage(
-                    session_id=str(session.id),
-                    message_id=None,
-                    content="Build the reviewed pipeline.",
-                    user_id="test-user",
-                ),
-                base=PresentBase(state_id=UUID("55555555-5555-4555-8555-555555555555"), composition_content_hash="0" * 64),
-                user_id="test-user",
-                supersedes_draft_hash=None,
-                recorder=BufferingRecorder(),
-                operation_fence=GuidedOperationFence(
-                    session_id=session.id,
-                    operation_id=str(uuid4()),
-                    lease_token=uuid4().hex,
-                    attempt=1,
-                ),
-            )
-
-    assert len(manifests) == len(requests) == 2
-    assert [manifest.surface for manifest in manifests] == [PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE]
-    assert [manifest.profile for manifest in manifests] == ["ordinary", "tutorial"]
-    assert manifests[0].rendered_prompt_hash == manifests[1].rendered_prompt_hash
-    assert manifests[0].effective_tool_hash == manifests[1].effective_tool_hash
-    assert requests[0]["messages"] == requests[1]["messages"]
-    assert requests[0]["tools"] == requests[1]["tools"]
 
 
 def _execute_tool(
@@ -837,7 +309,7 @@ def _verbatim_blob_context(engine: Any, session_id: str, content: str) -> dict[s
 
 
 def _test_sessions_service(engine: Any, data_dir: Path | None = None) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),
@@ -1068,7 +540,7 @@ def test_freeform_planner_context_present_but_invalid_authorship_marker_crashes(
     """The marker is NotRequired[Literal[True]]: absence skips the entry, but a
     PRESENT non-True value (e.g. None) is a broken first-party contract and must
     raise instead of being folded into the absent path by a ``.get()`` default."""
-    from elspeth.web.composer.guided.errors import InvariantError
+    from elspeth.web.composer.invariants import InvariantError
 
     with pytest.raises(InvariantError, match="user-authorship marker is malformed"):
         _freeform_planner_conversation_context(
@@ -9985,56 +9457,3 @@ class TestComposeLoopForcedRepair:
         # Gate skipped — only one LLM call, no repair turns.
         assert mock_llm.call_count == 1
         assert result.repair_turns_used == 0
-
-
-def test_log_guided_planner_failure_emits_typed_disposition() -> None:
-    """A guided planner failure logs its closed code + deduped rejection codes.
-
-    Parity with the freeform ``planner_failure_disposition`` (which carries
-    ``planner_code`` + ``rejection_codes``): the guided route's terminal slog
-    records only ``exc_class`` + frames, so a churned guided failure
-    (REPAIR_EXHAUSTED after the escape hatch, tutorial run 7 / session
-    cbb00f4b) was opaque. This is the one in-fence emit that names the wall.
-    """
-    from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-    from elspeth.web.composer.planning_application import _log_guided_planner_failure
-
-    exc = PipelinePlannerError(
-        "planner repair budget exhausted",
-        code="REPAIR_EXHAUSTED",
-        # Unsorted with a duplicate: the emit must dedupe and sort.
-        detail_codes=("web_scrape_http_identity", "plugin_options_invalid", "web_scrape_http_identity"),
-    )
-
-    with structlog.testing.capture_logs() as events:
-        _log_guided_planner_failure(
-            exc,
-            session_id="cbb00f4b-b7b7-4e95-9068-29db1dccb0c9",
-            operation_id="d3ea675b-84f2-41aa-99f3-68ca54082ab4",
-            surface="tutorial_profile",
-        )
-
-    assert len(events) == 1
-    event = events[0]
-    assert event["event"] == "composer.guided_planner_failure"
-    assert event["log_level"] == "error"
-    assert event["planner_code"] == "REPAIR_EXHAUSTED"
-    assert event["rejection_codes"] == ["plugin_options_invalid", "web_scrape_http_identity"]
-    assert event["session_id"] == "cbb00f4b-b7b7-4e95-9068-29db1dccb0c9"
-    assert event["operation_id"] == "d3ea675b-84f2-41aa-99f3-68ca54082ab4"
-    assert event["surface"] == "tutorial_profile"
-
-
-def test_log_guided_planner_failure_empty_rejection_codes_on_non_rejection_failure() -> None:
-    """A non-rejection failure (timeout/provider) carries no rejection codes."""
-    from elspeth.web.composer.pipeline_planner import PipelinePlannerError
-    from elspeth.web.composer.planning_application import _log_guided_planner_failure
-
-    exc = PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT")
-
-    with structlog.testing.capture_logs() as events:
-        _log_guided_planner_failure(exc, session_id="s", operation_id="o", surface="guided_staged")
-
-    assert len(events) == 1
-    assert events[0]["planner_code"] == "TIMEOUT"
-    assert events[0]["rejection_codes"] == []

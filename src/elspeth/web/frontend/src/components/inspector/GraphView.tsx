@@ -39,8 +39,6 @@ import dagre from "@dagrejs/dagre";
 import "@xyflow/react/dist/style.css";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
-import { projectGuidedGraph } from "@/components/chat/guided/guidedGraphProjection";
-import { GuidedGraphPane } from "./GuidedGraphPane";
 import { useTheme } from "@/hooks/useTheme";
 import {
   hasCompositionContent,
@@ -849,27 +847,6 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   );
   const selectedNodeId = useSessionStore((s) => s.selectedNodeId);
   const selectNode = useSessionStore((s) => s.selectNode);
-  // Guided pre-commit projection (elspeth-9f0873426a, IA-1 / V-1): what the
-  // learner has reviewed or is being asked to approve. The pending decision
-  // comes from the guided turn payload; the reviewed ledger is the SERVER's
-  // projection (elspeth-f2a8550b3d), published on `guided_session` and read
-  // through `selectGuidedReviewedComponents` — not folded from turns, so a
-  // reload mid-build still draws the confirmed components. Both selectors
-  // return stable references (the ledger is the wire object itself).
-  const guidedNextTurn = useSessionStore((s) => s.guidedNextTurn);
-  const guidedReviewedComponents = useSessionStore(
-    (s) => s.guidedReviewedComponents,
-  );
-  const guidedTerminal = useSessionStore((s) => s.guidedTerminal);
-  const guidedProjection = useMemo(
-    () =>
-      projectGuidedGraph({
-        nextTurn: guidedNextTurn,
-        reviewed: guidedReviewedComponents,
-        terminal: guidedTerminal,
-      }),
-    [guidedNextTurn, guidedReviewedComponents, guidedTerminal],
-  );
   const { resolvedTheme } = useTheme();
 
   const validationResult = useExecutionStore((s) => s.validationResult);
@@ -2099,17 +2076,6 @@ export function GraphView({ onFullscreen }: GraphViewProps = {}) {
   // explicit {" "} keeps the two sentences one whitespace-normalised string
   // for text-content assertions.
   //
-  // Guided builds first (elspeth-9f0873426a): a pending proposal or wire
-  // stage is what the learner is deciding on, so it is drawn even over a
-  // committed composition (a re-entered session keeps its old graph until
-  // the new one is confirmed — and the proposal card no longer draws its
-  // own copy). The weaker reviewed-components ledger only fills the void.
-  if (
-    guidedProjection !== null &&
-    (guidedProjection.stage !== "reviewed" || nodes.length === 0)
-  ) {
-    return <GuidedGraphPane projection={guidedProjection} onFullscreen={onFullscreen} />;
-  }
   if (nodes.length === 0) {
     return (
       <div className="empty-state graph-view-empty">

@@ -1,67 +1,7 @@
-// ============================================================================
-// graphTopology — THE frontend's single model of how composition components
-// join up: what a node publishes, what a fan-in node reads, and what is not
-// a connection at all. Every surface that needs to answer "which component is
-// on the other end of this connection?" imports from here. If you are about
-// to write a second one, this is the one you were looking for.
-//
-// Deliberately a LEAF module — it imports only types and the type-only
-// utils/compositionState.ts — so the Graph tab
-// (components/inspector/GraphView.tsx) and the Spec tab
-// (components/workspace/specRouting.ts) can both import it with no cycle and
-// no React in the dependency graph. Same contract as lib/validationHumaniser.ts
-// and components/chat/guided/stepLabels.ts, and it exists for the same reason
-// stepLabels.ts does: hand-mirrored copies of one rule drift
-// (elspeth-93f5621f18, Wave 3).
-//
-// Every rule here mirrors a NAMED backend authority, by path, so that a
-// `git grep _producer_resolver` or `git grep connection_consumers` run from
-// the Python side finds this mirror. Do not re-derive one from the wire shape:
-//
-//   * src/elspeth/web/composer/_producer_resolver.py:98
-//     `published_success_connection(node)` decides what a node publishes:
-//     on_success if set, else the node id for queue/coalesce/aggregation,
-//     else nothing. `publishedSuccessConnection` below is its mirror.
-//     Also :208 — `if connection_name is None or connection_name == "discard"`
-//     is the statement that `discard` is a sentinel, not a connection;
-//     DISCARD_CONNECTION below is that literal, named.
-//   * src/elspeth/web/composer/guided/connection_consumers.py:31-40
-//     the canonical consumer projection: it registers each BRANCH connection
-//     as consumed by the coalesce/row_union and then `continue`s, never
-//     registering `node.input` for a fan-in node — that scalar is only the
-//     backend-compatible first-branch placeholder.
-//   * src/elspeth/core/config.py `CoalesceSettings.branches`
-//     is a "Branch identity -> INPUT connection mapping". A fan-in node's
-//     branches are what it READS, never what it publishes. Reading them as
-//     outbound makes a coalesce name ITSELF, because its own `input` is one
-//     of its branch connections.
-//   * src/elspeth/core/config.py `CoalesceSettings.policy` / `.merge`
-//     the coalesce policy and merge Literals, mirrored below as tuples.
-//
-// The comments on each declaration are the record of the two incidents that
-// produced these rules (session 3f02c8fa; elspeth-625e85c59b). They moved
-// here verbatim and must stay that way.
-// ============================================================================
 
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import type { CompositionState } from "@/types/index";
 
-/**
- * Not a connection: the backend's sentinel for "drop this, and record the
- * drop in the audit trail" (_producer_resolver.py:208 refuses to register a
- * producer for it). Named here because two frontend sites spelled it as a
- * bare literal and nothing tied them to that rule:
- * components/workspace/PipelineSpecView.tsx:52 and
- * components/chat/guided/SchemaFormTurn.tsx, in the blob-prefill effect's
- * `on_validation_failure` default.
- *
- * NOT the same word as `ProposalEndpointKind`'s "discard"
- * (`ProposalEndpointKind` in api/guidedDecoder.ts, `ProposalTargetEndpoint`
- * in types/guided.ts). That is a guided-proposal
- * ENDPOINT KIND — a discriminated-union literal whose narrowing REQUIRES the
- * literal in the type position, so this constant cannot and must not replace
- * it. Two vocabularies, one word. Do not merge them.
- */
 export const DISCARD_CONNECTION = "discard";
 
 /**
@@ -71,21 +11,6 @@ export const DISCARD_CONNECTION = "discard";
  */
 export const FORK_CONNECTION = "fork";
 
-/**
- * The coalesce member sets, mirrored from `CoalesceSettings.policy` and
- * `.merge` in core/config.py and lifted out of api/guidedDecoder.ts, which
- * held the frontend's only copy privately (it now builds its validation Sets
- * from these tuples).
- *
- * `as const` so consumers get a union type. Be precise about what that buys:
- * a display map keyed `Record<CoalescePolicy, string>` fails the BUILD when
- * a member is added to or removed from THIS TUPLE without a phrase. It does
- * NOT fail when core/config.py gains a member — `tsc` cannot see Python.
- * What catches that is the parity assertion in
- * tests/unit/web/composer/test_graph_topology_parity.py, which
- * regexes these two tuples and compares them against the Literals. Both
- * halves are needed; neither is the other.
- */
 export const COALESCE_POLICIES = ["require_all", "quorum", "best_effort", "first"] as const;
 export type CoalescePolicy = (typeof COALESCE_POLICIES)[number];
 
@@ -191,35 +116,6 @@ export function branchEntries(
     : Object.entries(branches);
 }
 
-/**
- * Connection name -> ids of the components that PUBLISH it.
- *
- * Lifted from GraphView.tsx's `buildProducerRegistry` — the `ProducerInfo`
- * type, the map, `registerProducer`, and the source and node registration
- * loops it feeds — which together held the only statement of the rule
- * "which fields publish a connection". A MULTIMAP, not one producer per
- * connection: ELSPETH allows many producers on one connection name under a
- * declared queue (structural fan-in, ADR-028), and overwriting would silently
- * drop every producer but the last and misrender the intentional fan-in.
- *
- * This is the registration rule ONLY. GraphView decorates each entry with its
- * own `edgeType`/`label` for ReactFlow, and applies three further DRAWING
- * rules on top that are NOT topology and deliberately stay there:
- * queue-as-sole-canonical-producer (GraphView.tsx's `queueIds` set), the
- * row_union authoritative-outbound semantics
- * (`authoritativeRowUnionOutboundSemantics`), and the phase-1 alias dedup
- * (`inferredBranchSemantics`).
- *
- * The ids are COMPONENT ids, the one namespace sources and nodes share:
- * a source publishes under `sourceComponentId(name)` ("source" for the default
- * source, `source:<name>` otherwise), a node under its own id. That is the
- * vocabulary `buildProducerRegistry`'s source loop registers, the vocabulary
- * `buildProducerRegistry` is cross-checked against in graphTopology.test.ts,
- * and the vocabulary lib/validationHumaniser.ts and chat/guided/pipelineGloss.ts
- * key their phrase maps on. A bare source NAME would collide with a node whose
- * id happens to match it, and would make the cross-check pin unable to compare
- * the two indexes on the source axis at all.
- */
 export function buildConnectionProducers(
   state: CompositionState,
 ): Map<string, string[]> {

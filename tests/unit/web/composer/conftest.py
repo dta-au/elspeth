@@ -127,7 +127,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composer_lease import install_fenced_compose_adapter
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _dict_strategy(thing: type) -> st.SearchStrategy[dict[Any, Any]]:
@@ -715,7 +715,7 @@ def build_test_sessions_service(
     )
     if engine is None:
         initialize_session_schema(resolved_engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         resolved_engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),

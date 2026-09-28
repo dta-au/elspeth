@@ -528,32 +528,6 @@ class TestSessionResponseHappyPath:
         assert resp.validation_warnings[0].component == "c"
 
 
-def test_workflow_profile_response_wire_subset_and_strict() -> None:
-    from elspeth.web.sessions.schemas import WorkflowProfileResponse
-
-    model = WorkflowProfileResponse(coaching=True, bookends=True)
-    dumped = model.model_dump()
-    assert set(dumped.keys()) == {
-        "coaching",
-        "bookends",
-    }
-
-    import pydantic
-
-    with pytest.raises(pydantic.ValidationError):
-        WorkflowProfileResponse(
-            coaching=True,
-            bookends=True,
-            injected="leak",
-        )
-
-    with pytest.raises(pydantic.ValidationError):
-        WorkflowProfileResponse(
-            coaching="yes",
-            bookends=True,
-        )
-
-
 class TestResponseStrictnessTripwire:
     """Every response model is strict and closed; no model admits extras.
 

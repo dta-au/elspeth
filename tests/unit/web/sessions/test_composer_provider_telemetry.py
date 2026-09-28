@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import threading
-from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -27,7 +25,7 @@ from elspeth.web.sessions.models import chat_messages_table, quota_provider_atte
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _call() -> ComposerLLMCall:
@@ -56,7 +54,7 @@ def _call() -> ComposerLLMCall:
 def _service(engine) -> SessionServiceImpl:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.composer-provider-telemetry"),
@@ -424,120 +422,3 @@ async def test_freeform_cancellation_projects_worker_commit_before_reraising(eng
     assert durable_count == 1
     assert len(projected) == 1
     assert request_calls.points == [(1, {"surface": "freeform", "status": "cancelled"})]
-
-
-@pytest.mark.asyncio
-async def test_guided_cancellation_projects_worker_commit_before_reraising(engine, monkeypatch) -> None:
-    service = _service(engine)
-    call = _call()
-    started = threading.Event()
-    release = threading.Event()
-    worker_done = threading.Event()
-    original_run_sync = service._run_sync
-
-    async def blocked_run_sync(func, *args, **kwargs):
-        def blocked() -> object:
-            started.set()
-            assert release.wait(timeout=5)
-            try:
-                return func(*args, **kwargs)
-            finally:
-                worker_done.set()
-
-        return await original_run_sync(blocked)
-
-    committed: list[bool] = []
-    projected: list[tuple[ComposerLLMCall, ...]] = []
-    monkeypatch.setattr(service, "_run_sync", blocked_run_sync)
-    monkeypatch.setattr(
-        service_module,
-        "record_settled_composer_provider_calls",
-        lambda calls, *, surface: projected.append(calls),
-    )
-
-    task = asyncio.create_task(
-        service._run_guided_sync_with_provider_projection(
-            lambda: committed.append(True),
-            llm_calls=(call,),
-        )
-    )
-    assert await run_sync_in_worker(started.wait, 5)
-    task.cancel()
-    await asyncio.sleep(0)
-    release.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert await run_sync_in_worker(worker_done.wait, 5)
-    assert committed == [True]
-    assert projected == [(call,)]
-
-
-@pytest.mark.asyncio
-async def test_guided_cancellation_projects_nothing_when_worker_rolls_back(engine, monkeypatch) -> None:
-    service = _service(engine)
-    call = _call()
-    started = threading.Event()
-    release = threading.Event()
-    original_run_sync = service._run_sync
-
-    async def blocked_run_sync(func, *args, **kwargs):
-        def blocked() -> object:
-            started.set()
-            assert release.wait(timeout=5)
-            return func(*args, **kwargs)
-
-        return await original_run_sync(blocked)
-
-    projected: list[tuple[ComposerLLMCall, ...]] = []
-    monkeypatch.setattr(service, "_run_sync", blocked_run_sync)
-    monkeypatch.setattr(
-        service_module,
-        "record_settled_composer_provider_calls",
-        lambda calls, *, surface: projected.append(calls),
-    )
-
-    def roll_back() -> None:
-        raise IntegrityError("rollback", {}, RuntimeError("database rejected transaction"))
-
-    task = asyncio.create_task(
-        service._run_guided_sync_with_provider_projection(
-            roll_back,
-            llm_calls=(call,),
-        )
-    )
-    assert await run_sync_in_worker(started.wait, 5)
-    task.cancel()
-    await asyncio.sleep(0)
-    release.set()
-
-    with pytest.raises(asyncio.CancelledError) as cancelled:
-        await task
-    assert isinstance(cancelled.value.__cause__, IntegrityError)
-    assert projected == []
-
-
-@pytest.mark.parametrize(
-    "method",
-    (
-        pytest.param(SessionServiceImpl.fail_guided_operation_with_audit, id="fail_guided_operation_with_audit"),
-        pytest.param(SessionServiceImpl.save_state_for_guided_operation, id="save_state_for_guided_operation"),
-        pytest.param(SessionServiceImpl.settle_guided_state_operation, id="settle_guided_state_operation"),
-        pytest.param(SessionServiceImpl.stage_guided_full_pipeline_proposal, id="stage_guided_full_pipeline_proposal"),
-        pytest.param(SessionServiceImpl.decline_guided_full_pipeline_proposal, id="decline_guided_full_pipeline_proposal"),
-        pytest.param(SessionServiceImpl.stage_guided_pipeline_proposal, id="stage_guided_pipeline_proposal"),
-        pytest.param(SessionServiceImpl.back_edit_guided_pipeline_proposal, id="back_edit_guided_pipeline_proposal"),
-        pytest.param(SessionServiceImpl.accept_guided_pipeline_proposal, id="accept_guided_pipeline_proposal"),
-    ),
-)
-def test_every_unconditional_guided_audit_settlement_uses_post_commit_projection(method: Callable[..., object]) -> None:
-    source = inspect.getsource(method)
-
-    assert "_run_guided_sync_with_provider_projection" in source
-
-
-def test_convergent_guided_start_projects_only_on_the_audit_inserting_branch() -> None:
-    source = inspect.getsource(SessionServiceImpl.seed_or_complete_guided_start_operation)
-
-    assert "GuidedStartStateSeeded" in source
-    assert "record_settled_composer_provider_calls" in source

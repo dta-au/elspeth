@@ -48,6 +48,7 @@ from elspeth.web.sessions.models import (
 )
 from tests.helpers.session_fences import fenced_operation_context
 from tests.integration.web.composer.test_freeform_proposal_prevalidation import (
+    _clean_advisor_checkpoint,
     _count_rows,
     _harness,
     _incremental_base_state,
@@ -397,7 +398,6 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     authority = await harness.sessions.get_authoritative_composition_proposal(
         session_id=UUID(harness.session_id),
         proposal_id=proposals[0].id,
-        reviewed_facts=None,
     )
     assert authority.pipeline is not None
     assert proposals[0].pipeline_metadata is not None
@@ -408,7 +408,6 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.PROPOSAL) as operation:
         prepared = await prepare_pipeline_proposal_commit(
             authority=authority.pipeline,
-            reviewed_facts={},
             current_state=initial_state,
             current_state_id=None,
             policy_catalog=view,
@@ -427,7 +426,6 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
             ),
             recorder=BufferingRecorder(),
             actor="user:proposal-prevalidation-user",
-            settlement_surface="generic",
         )
     assert prepared.result.success is True
     assert prepared.result.validation.is_valid is True
@@ -682,7 +680,6 @@ async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeli
     authority = await harness.sessions.get_authoritative_composition_proposal(
         session_id=UUID(harness.session_id),
         proposal_id=proposal.id,
-        reviewed_facts=None,
     )
     assert authority.pipeline is not None
     sealed = deep_thaw(authority.pipeline.proposal.pipeline)
@@ -842,6 +839,7 @@ async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_e
     with (
         patch.object(composer._policy_context, "build", return_value=(snapshot, view)),
         patch.object(composer._provider_gateway, "_call_llm", new=llm),
+        patch.object(composer._advisor_checkpoint, "_run_advisor_checkpoint", new=_clean_advisor_checkpoint),
     ):
         result = await composer.compose(
             "Add the final JSON output and prepare the complete pipeline for review.",
@@ -1196,7 +1194,6 @@ def test_accept_incremental_proposal_wires_controls_before_state_publication(
             service.get_authoritative_composition_proposal(
                 session_id=session_id,
                 proposal_id=proposal_id,
-                reviewed_facts=None,
             )
         )
         assert proposal.row.status == "pending"

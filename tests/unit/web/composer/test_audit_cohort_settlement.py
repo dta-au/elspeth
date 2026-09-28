@@ -39,7 +39,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerDeclined
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -344,12 +344,8 @@ def _plan() -> PipelinePlanResult:
     proposal = PipelineProposal.create(
         pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     return PipelinePlanResult(
         proposal=proposal,

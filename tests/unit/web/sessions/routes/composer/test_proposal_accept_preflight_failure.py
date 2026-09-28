@@ -135,7 +135,7 @@ def test_pipeline_accept_maps_runtime_preflight_failure_and_leaves_proposal_pend
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
+    from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
@@ -163,12 +163,8 @@ def test_pipeline_accept_maps_runtime_preflight_failure_and_leaves_proposal_pend
     envelope = PipelineProposal.create(
         pipeline=pipeline,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.FREEFORM,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
     plan = PipelinePlanResult(
         proposal=envelope,

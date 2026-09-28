@@ -14,8 +14,7 @@ Membership is pinned by
 ``tests/unit/web/composer/test_error_code_redaction.py``: every code a
 producer passes as ``error_code`` (keyword, ``ValidationEntry`` positional, or
 ``"error_code"`` dict key) anywhere under ``web/`` is registered, apart from
-the census's named exclusions (guided mode and the deployment acceptance
-clients). That covers the producers outside ``web/composer`` whose codes reach
+the census's named deployment-acceptance-client exclusions. That covers the producers outside ``web/composer`` whose codes reach
 a tool response: plugin-policy findings (``validate_composition_state``) and
 execution validation (``ToolResult.runtime_preflight``). The guidance
 catalogue ``_VALIDATION_GUIDANCE_BY_CODE`` is a subset.
@@ -110,19 +109,6 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "gate_route_labels_mismatch",
         "gate_route_target_unknown",
         "gate_routes_empty",
-        "guided_amend_contract_violation",
-        "guided_collector_opener_unresolved",
-        "guided_correction_unchanged",
-        "guided_delta_authority_violation",
-        "guided_delta_duplicate_stable_id",
-        "guided_delta_nonincident_route",
-        "guided_delta_reviewed_failure_route_required",
-        "guided_delta_unknown_reference",
-        "guided_delta_unknown_stable_id",
-        "guided_output_alias_collision",
-        "guided_reviewed_name_shadowed",
-        "guided_revision_unchanged",
-        "guided_route_target_unknown",
         "interpretation_requirements_invalid",
         "interpretation_review_contract_unsatisfied",
         "interpretation_review_draft_malformed",
@@ -140,7 +126,6 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "node_timeout_unsupported",
         "on_error_closer_out_of_region",
         "output_name_invalid",
-        "passthrough_cannot_produce_declared_fields",
         "pipeline_collection_cap_exceeded",
         "pipeline_cycle",
         "pipeline_decision_unregistered",
@@ -150,7 +135,6 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "field_name_header_spelling",
         "prompt_template_undeclared_row_fields",
         "proof_repair_exhausted",
-        "proposal_missing_requested_transforms",
         "quarantine_unknown_output",
         "query_input_columns_undeclared",
         "query_template_unbound_row_fields",
@@ -159,7 +143,6 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "queue_no_consumer",
         "reserved_node_id",
         "review_reconciliation_failed",
-        "reviewed_output_projection_conflict",
         "round_trip_unavailable",
         "row_union_branch_aggregation_invalid",
         "row_union_branch_alias_unreachable",
@@ -250,10 +233,9 @@ _EMITTED_POLICY_AND_EXECUTION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "gate_expression_unbounded_string_amplification",
         "source_inspection_failed",
         "text_source_url_without_web_scrape",
-        # Session-route validation (persisted runtime-preflight failure and
-        # guided replay). Not tool responses; registered so the census covers
+        # Session-route validation (persisted runtime-preflight failure).
+        # Not tool responses; registered so the census covers
         # the whole web tree without a special case.
-        "guided_composition_invalid",
         "runtime_preflight_failed",
     }
 )

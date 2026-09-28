@@ -41,9 +41,6 @@ class WithheldReply:
     the words on the request's ``BufferingRecorder`` and the caller that does
     hold one persists them inside the planner audit cohort.
 
-    The guided lane does not use this: its audit cohort is hash-only by design
-    (``ComposerChatTurn.assistant_message_hash``), so a guided planning
-    request's staged replies are never persisted.
     """
 
     origin: WithheldReplyOrigin

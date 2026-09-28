@@ -61,8 +61,6 @@ from elspeth.contracts.composer_audit import (
     ToolArgumentErrorCategory,
 )
 from elspeth.contracts.composer_llm_audit import (
-    ComposerChatTurn,
-    ComposerChatTurnRecorder,
     ComposerLLMCall,
     ComposerLLMCallRecorder,
     ComposerLLMCallStatus,
@@ -209,7 +207,6 @@ def build_canonicalization_sentinel(
 class BufferingRecorder(
     ComposerToolRecorder,
     ComposerLLMCallRecorder,
-    ComposerChatTurnRecorder,
     ComposerPlannerAttemptRecorder,
 ):
     """Append-only in-memory buffer for composer audit records.
@@ -219,7 +216,7 @@ class BufferingRecorder(
     ``SessionServiceProtocol.persist_compose_turn_async`` inside the loop;
     the route-layer ``tool_invocations`` drain is retained only for older
     non-loop carriers. LLM calls, their exact-once semantic planner attempts,
-    and guided chat-turn sidecars still use this buffer as their
+    and withheld replies still use this buffer as their
     route-persisted staging area. All four channels use the same locking
     discipline, and each exposed tuple is an immutable point-in-time snapshot.
 
@@ -232,7 +229,6 @@ class BufferingRecorder(
     def __init__(self) -> None:
         self._invocations: list[ComposerToolInvocation] = []
         self._llm_calls: list[ComposerLLMCall] = []
-        self._chat_turns: list[ComposerChatTurn] = []
         self._planner_attempts: list[ComposerPlannerAttempt] = []
         self._withheld_replies: list[WithheldReply] = []
         self._lock = threading.Lock()
@@ -248,16 +244,6 @@ class BufferingRecorder(
             return
         with self._lock:
             self._llm_calls.append(call)
-
-    def record_chat_turn(self, turn: ComposerChatTurn) -> None:
-        """Append a :class:`ComposerChatTurn` record (Phase A slice 5).
-
-        Persistence to the audit DB is wired by the route handler via
-        the future ``_persist_chat_turns`` helper; this buffer is the
-        in-memory staging area for the request's per-turn records.
-        """
-        with self._lock:
-            self._chat_turns.append(turn)
 
     def record_planner_attempt(self, attempt: ComposerPlannerAttempt) -> None:
         """Append one semantic planner response disposition."""
@@ -294,12 +280,6 @@ class BufferingRecorder(
         """Snapshot the current LLM-call buffer as an immutable tuple."""
         with self._lock:
             return tuple(self._llm_calls)
-
-    @property
-    def chat_turns(self) -> tuple[ComposerChatTurn, ...]:
-        """Snapshot the current chat-turn buffer as an immutable tuple."""
-        with self._lock:
-            return tuple(self._chat_turns)
 
     @property
     def planner_attempts(self) -> tuple[ComposerPlannerAttempt, ...]:
@@ -489,11 +469,9 @@ def llm_call_audit_summary(call: ComposerLLMCall) -> str:
     without digging.
 
     Every drain site that persists an LLM-call audit row
-    (``sessions/routes/_helpers._persist_llm_calls``,
-    ``composer/service._persist_pipeline_planner_audit``,
-    ``sessions/guided_audit.prepare_guided_audit_rows``) builds its
-    ``content`` here, so the three rows are the same projection by
-    construction rather than by three hand-copies staying in sync.
+    (``sessions/routes/_helpers._persist_llm_calls`` and
+    ``composer/service._persist_pipeline_planner_audit``) builds its
+    ``content`` here, so both rows are the same projection.
 
     Abnormal finish reasons
     -----------------------
@@ -536,19 +514,6 @@ def llm_call_audit_summary(call: ComposerLLMCall) -> str:
     if finish_reason is not None and finish_reason not in _ROUTINE_FINISH_REASONS:
         summary["finish_reason"] = finish_reason
     return json.dumps(summary)
-
-
-def chat_turn_audit_envelope(turn: ComposerChatTurn) -> dict[str, object]:
-    """Wrap a chat turn in the canonical ``tool_calls`` JSON envelope.
-
-    Sibling of :func:`llm_call_audit_envelope`.  The ``_kind`` discriminator
-    distinguishes this from LLM-call audit payloads so a reader of
-    ``chat_messages`` can dispatch on the field without inspecting the body.
-
-    ``turn.to_dict()`` already serialises the enum + datetimes; the envelope
-    just adds the kind tag.
-    """
-    return {"_kind": "chat_turn_audit", "turn": turn.to_dict()}
 
 
 # ---------------------------------------------------------------------------
@@ -619,8 +584,8 @@ def begin_dispatch(
     audit-row sizes for pathological LLM output.
 
     ``strict_sent`` / ``wire_conformant`` are the caller's wire facts for
-    this call. Callers that sent no wire schema (MCP-shaped paths, guided,
-    commit) leave the ``None`` defaults; the compose loop passes them.
+    this call. Callers that sent no wire schema leave the ``None`` defaults;
+    the compose loop passes them.
     """
     if isinstance(arguments, str):
         # 4 KiB is the same boundary as POSIX PIPE_BUF — a sane upper

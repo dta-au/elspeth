@@ -15,7 +15,7 @@ vi.mock("@/api/client", () => ({
   }),
   getTutorialReadiness: vi.fn().mockResolvedValue({ state_id: "state-1" }),
 }));
-vi.mock("@/components/chat/ChatPanel", () => ({ ChatPanel: () => <div>Ordinary freeform chat</div> }));
+vi.mock("@/components/chat/ChatPanel", () => ({ ChatPanelContent: () => <div>Ordinary freeform chat</div> }));
 vi.mock("./TutorialWorkspaceFrame", () => ({
   TutorialWorkspaceFrame: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
 }));
@@ -32,6 +32,7 @@ beforeEach(() => {
   resetStore(useSessionStore);
   resetStore(useInterpretationEventsStore);
   useSessionStore.setState({
+    composeTimeoutReady: true,
     selectSession: vi.fn(async (id: string) => {
       useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true });
     }),
@@ -40,6 +41,29 @@ beforeEach(() => {
 });
 
 describe("TutorialFreeformShell", () => {
+  it("hydrates the session again after a transient selection failure", async () => {
+    const user = userEvent.setup();
+    const selectSession = vi.fn(async (id: string) => {
+      useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true, error: null });
+    }).mockImplementationOnce(async (id: string) => {
+      useSessionStore.setState({
+        activeSessionId: id,
+        compositionStateLoaded: true,
+        error: "Failed to load session. Please refresh the page.",
+      });
+    });
+    useSessionStore.setState({ selectSession });
+    render(<TutorialFreeformShell sessionId="session-1" onCompleted={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Failed to load session");
+    expect(api.getTutorialSample).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Retry loading example" }));
+
+    await screen.findByRole("button", { name: "Send tutorial brief" });
+    expect(selectSession).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("submits one complete brief through the ordinary freeform send action", async () => {
     const user = userEvent.setup();
     const onCompleted = vi.fn();

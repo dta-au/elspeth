@@ -205,7 +205,7 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_70() -> None:
+def test_current_session_schema_epoch_is_71() -> None:
     """Tripwire, not a truth check — this test deliberately restates the constant.
 
     Bumping ``SESSION_SCHEMA_EPOCH`` delete-and-recreates every deployed
@@ -237,7 +237,6 @@ def test_current_session_schema_epoch_is_70() -> None:
     # paired with Landscape41. Existing approvals are not reinterpreted.
     # 58: 64-bit quota limits and nullable token-ledger usage measures.
     # 59: timestamp-leading indexes for container quota scans.
-    # 60: durable guided fork failure diagnostics.
     # 63: blob_inline_resolutions.content_hash CHECK carries the lowercase-hex
     # class as well as the length (elspeth-f99b16fc2f).
     # 65: completion_gates.advisor_signoff.note became a required key
@@ -245,9 +244,10 @@ def test_current_session_schema_epoch_is_70() -> None:
     # 66: control-message v2 binds provenance alongside content. No v1 replay.
     # 67: composer authority hashes and the advisor fingerprint bind coalesce
     # mapping-branch order and multi-source sources order. Stores recreated.
-    # 68: guided and ordinary proposal checkpoint rebase reasons are persisted.
+    # 68: ordinary proposal checkpoint rebase reasons are persisted.
     # 69: freeform message ingress receipts bind retry UUIDs to accepted user rows.
-    assert SESSION_SCHEMA_EPOCH == 70
+    # 71: ordinary fork/revert receipts move to a mode-neutral durable ledger.
+    assert SESSION_SCHEMA_EPOCH == 71
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:
@@ -1212,9 +1212,9 @@ class TestSchemaValidatorCatchesMissingTrigger:
             "trg_chat_messages_no_delete",
             "trg_message_ingress_receipts_no_update",
             "trg_message_ingress_receipts_no_delete",
-            "trg_guided_operations_terminal_immutable",
-            "trg_guided_operation_events_no_update",
-            "trg_guided_operation_events_no_delete",
+            "trg_session_operation_receipts_terminal_immutable",
+            "trg_session_operation_receipt_events_no_update",
+            "trg_session_operation_receipt_events_no_delete",
         ],
     )
     def test_validator_raises_when_trigger_dropped(self, trigger_name: str, tmp_path) -> None:

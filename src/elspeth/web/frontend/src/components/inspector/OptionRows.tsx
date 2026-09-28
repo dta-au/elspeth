@@ -28,10 +28,8 @@ import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 
 import { ConfigValue, STRUCTURAL_OPTION_CONTAINER_KEYS } from "./ConfigRows";
 
-// Wire sentinel for a blob-backed source's `path` knob (mirrors
-// BLOB_REF_PATH_PREFIX in web/composer/guided/protocol.py and
-// components/chat/guided/SchemaFormTurn.tsx's `maskBlobRef`): the guided
-// emitter commits `blob:<blob_ref>` in place of the absolute storage_path,
+// Wire sentinel for a blob-backed source's `path` knob. The authoring
+// surface commits `blob:<blob_ref>` in place of the absolute storage_path,
 // but a raw UUID means nothing to the reader and duplicates the decoy
 // `blob_ref` internal key this component already hides. `path` renders
 // unconditionally in one partition or the other — the raw sentinel must
@@ -251,15 +249,14 @@ export function OptionRows({
     advancedKeys = candidateKeys.filter((key) => !FALLBACK_VISIBLE_OPTION_KEYS.includes(key));
   } else {
     // A discriminated schema repeats same-named fields once per variant. Only
-    // the active copy participates in tiering, using SchemaFormTurn's exact
+    // the active copy participates in tiering, using the catalog's
     // visible_when predicate semantics against the authored options. Otherwise
     // registry order would decide the tier through a last-wins Map.
     //
     // Absent tier = "common": a field the catalog KNOWS but does not tier is
     // visible, never demoted. The operator-profile policy views hand-build
     // their projections and have shipped fields with no `tier`; this keeps the
-    // same posture as `optionTier` in components/chat/guided/optionTiers.ts
-    // (elspeth-a6ea581e8a). A key no active schema field lists remains advanced.
+    // field's default tier. A key no active schema field lists remains advanced.
     const activeFields = schema.knob_schema.fields.filter(
       (field) =>
         field.visible_when === undefined

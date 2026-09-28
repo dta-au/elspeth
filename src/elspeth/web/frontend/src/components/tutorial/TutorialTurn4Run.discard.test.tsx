@@ -69,9 +69,7 @@ describe("TutorialTurn4Run — source-discarded row surfacing (#28)", () => {
   });
 
   it("labels the completed-run Back button with real behaviour, not the retired prompt-editor copy", async () => {
-    // The staged guided walk replaced the old free-text prompt turn; there is
-    // no "edit prompt and start over" surface any more (F6). The label must
-    // not resurrect that stale claim.
+    // Back revisits run results; it does not edit the Build prompt.
     vi.mocked(api.runTutorialPipeline).mockResolvedValue({
       run_id: "run-label",
       output: {

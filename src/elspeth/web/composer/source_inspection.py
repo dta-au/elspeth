@@ -22,11 +22,10 @@ Contract:
 from __future__ import annotations
 
 import csv
-import hmac
 import io
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
@@ -34,20 +33,12 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
-from elspeth.contracts.blobs import (
-    BlobContentMissingError,
-    BlobIntegrityError,
-    BlobNotFoundError,
-    BlobServiceProtocol,
-    BlobStateError,
-)
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.blobs import BlobContentMissingError, BlobIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.sources.field_normalization import resolve_field_names
-from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.response_contracts import SelectedResponseContract
 
 _MAX_BYTES: Final[int] = 8 * 1024
@@ -112,120 +103,6 @@ class SourceInspectionFacts:
             raise ValueError(f"SourceInspectionFacts.byte_range_inspected must satisfy 0 <= start <= end; got ({start}, {end})")
         if self.sample_row_count < 0:
             raise ValueError(f"SourceInspectionFacts.sample_row_count must be non-negative; got {self.sample_row_count}")
-
-
-class SourceInspectionBlobLifecycleError(ValueError):
-    """A selected ready blob changed lifecycle state before inspection."""
-
-
-def resolve_source_inspection_blob_id(
-    *,
-    selected_blob_id: UUID | None,
-    ready_blob_ids: Sequence[UUID],
-) -> UUID | None:
-    """Resolve one immutable ready-blob identity for guided source inspection.
-
-    An explicit selection is authoritative when it names a ready blob in the
-    current session. The legacy no-selection path remains usable only when the
-    ready set contains exactly one blob. Multiple ready blobs are deliberately
-    ambiguous: their order is temporal session state, not source intent.
-    """
-    if selected_blob_id is not None and type(selected_blob_id) is not UUID:
-        raise TypeError("selected_blob_id must be UUID or None")
-    ready = tuple(ready_blob_ids)
-    if any(type(blob_id) is not UUID for blob_id in ready):
-        raise TypeError("ready_blob_ids must contain UUID values")
-    if len(set(ready)) != len(ready):
-        raise InvariantError("ready_blob_ids must contain unique blob identities")
-    if selected_blob_id is not None:
-        if selected_blob_id not in ready:
-            raise ValueError("selected source blob is not ready in this session")
-        return selected_blob_id
-    return ready[0] if len(ready) == 1 else None
-
-
-async def inspect_selected_ready_session_blob(
-    blob_service: BlobServiceProtocol,
-    session_id: UUID,
-    *,
-    selected_blob_id: UUID | None,
-    session_operation_context: SessionOperationContext,
-) -> SourceInspectionFacts | None:
-    """Inspect one explicit or unambiguous ready blob owned by a session.
-
-    An explicit ``selected_blob_id`` resolves with a direct, session-qualified
-    ``get_blob`` lookup rather than listing every blob in the session and
-    filtering in Python — a session can accumulate an unbounded number of
-    blobs, and every guided selection previously paid the cost of
-    materializing all of them just to find the one the caller named.
-
-    The no-selection legacy path (exactly one ready blob resolves
-    unambiguously) still needs the full listing, and deliberately keeps
-    ``limit=None``: ready-status filtering happens in Python after the
-    fetch, so passing a numeric page limit here could return a page of
-    non-ready blobs and miss the one ready blob further down — silently
-    turning an unambiguous inspection into a false ``None``.
-    """
-    if selected_blob_id is not None and type(selected_blob_id) is not UUID:
-        raise TypeError("selected_blob_id must be UUID or None")
-
-    if selected_blob_id is not None:
-        try:
-            record = await blob_service.get_blob(selected_blob_id, session_operation_context=session_operation_context)
-        except BlobNotFoundError as exc:
-            raise ValueError("selected source blob is not ready in this session") from exc
-        if record.session_id != session_id or record.status != "ready":
-            raise ValueError("selected source blob is not ready in this session")
-    else:
-        records = await blob_service.list_blobs(session_id, limit=None)
-        ready_records = tuple(r for r in records if r.status == "ready")
-        resolved_blob_id = resolve_source_inspection_blob_id(
-            selected_blob_id=None,
-            ready_blob_ids=tuple(r.id for r in ready_records),
-        )
-        if resolved_blob_id is None:
-            return None
-        record = next(r for r in ready_records if r.id == resolved_blob_id)
-
-    try:
-        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(
-            record.id,
-            prefix_bytes=_MAX_BYTES,
-            session_operation_context=session_operation_context,
-        )
-    except (BlobNotFoundError, BlobStateError) as exc:
-        raise SourceInspectionBlobLifecycleError from exc
-    if record.content_hash is None:
-        raise AuditIntegrityError("ready source-inspection blob has no content hash")
-    # Not redundant with the store's own internal verification, even though
-    # every compliant implementation already verifies bytes against its own
-    # freshly-read row before returning them: `record` here is a separately
-    # obtained snapshot (from `get_blob`/`list_blobs`, taken before this
-    # read), so this independently certifies that *this* module's own audit
-    # claim — the `content_hash_prefix` stamped into redacted_identity below
-    # — matches the bytes actually inspected, rather than relaying an
-    # unverified claim about a `BlobServiceProtocol` implementation's
-    # internals. `read_blob_content_prefix_verified` streams the blob in
-    # bounded chunks and verifies one full-content sha256 incrementally —
-    # `verified_hash` below is that single digest, checked against
-    # `record.content_hash`. Exactly one hash pass over the bytes, with
-    # memory bounded to chunk size + the inspection prefix regardless of
-    # blob size — a prefix/bounded read alone could never serve this check,
-    # since a partial digest can never validate a full-content hash.
-    if not hmac.compare_digest(verified_hash, record.content_hash):
-        raise BlobIntegrityError(
-            str(record.id),
-            expected=record.content_hash,
-            actual=verified_hash,
-        )
-    return inspect_blob_content(
-        content=prefix,
-        filename=record.filename,
-        mime_type=record.mime_type,
-        blob_id=record.id,
-        content_hash=record.content_hash,
-        total_size_bytes=total_size,
-    )
 
 
 def inspect_blob_content(
@@ -635,7 +512,7 @@ def _inspect_csv(
     # count and affected positions: a malformed or headerless CSV can make
     # the first data row look like headers, so the raw values must not cross
     # the blob metadata-only boundary in a warning copied to model diagnostics
-    # or persisted in durable guided inspection state. Do not fabricate a
+    # or persisted in inspection state. Do not fabricate a
     # disambiguated key here.
     if len(set(headers)) < len(headers):
         counts = Counter(headers)

@@ -91,7 +91,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.web.composer import provider_gateway
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --- sys.path shim ------------------------------------------------------
 # ``gateway/`` is not on the default ELSPETH import path (see
@@ -319,7 +319,7 @@ def _build_sessions_service(tmp_path: Path) -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

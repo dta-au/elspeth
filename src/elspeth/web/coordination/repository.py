@@ -30,8 +30,6 @@ from elspeth.contracts.blobs import (
     BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
-    BlobGuidedOperationFenceLostError,
-    BlobGuidedOperationWriteFence,
     BlobInProgressForkError,
     BlobPendingProposalError,
     BlobRecord,
@@ -60,7 +58,6 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
-from elspeth.web.composer.redaction import assert_guided_custody_persistable
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
 from elspeth.web.coordination.approval_authority import (
     ApprovalGateInputs,
@@ -89,7 +86,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
 )
 from elspeth.web.coordination.quota_authority import QuotaExceeded, RepositoryQuotaAuthority, refuse_unrecorded_quota_exceeded
 from elspeth.web.coordination.run_start_permit_authority import RepositoryRunStartPermitAuthority
-from elspeth.web.sessions.converters import pending_guided_checkpoint, pipeline_dict_from_record
+from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import locked_session_transaction, process_session_lock, transaction_session_lock
 from elspeth.web.sessions.models import (
     approvals_table,
@@ -103,7 +100,6 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_rejection_events_table,
     composition_states_table,
-    guided_operations_table,
     interpretation_events_table,
     library_entries_table,
     proposal_blob_effect_receipts_table,
@@ -115,6 +111,7 @@ from elspeth.web.sessions.models import (
     run_execution_inputs_table,
     runs_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     session_read_admissions_table,
     sessions_table,
     token_usage_ledger_table,
@@ -123,16 +120,14 @@ from elspeth.web.sessions.models import (
 from elspeth.web.sessions.proposal_blob_effects import BlobSnapshotPayload, blob_record_snapshot_payload, proposal_blob_arguments_hash
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 from elspeth.web.sessions.protocol import (
-    GUIDED_OPERATION_KIND_VALUES,
     LEGAL_RUN_TRANSITIONS,
     OPERATOR_COMPLETION_RUN_STATUS_VALUES,
     SESSION_RUN_EVENT_TYPE_VALUES,
     SESSION_RUN_STATUS_VALUES,
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     CompositionStateRecord,
-    GuidedOperationFence,
-    GuidedOperationKind,
     IllegalRunTransitionError,
+    OperationReceiptFence,
     RunAlreadyActiveError,
     RunEventRecord,
     RunRecord,
@@ -146,8 +141,7 @@ from elspeth.web.sessions.protocol import (
     SessionForkChildStateCreation,
     SessionForkCreationTransaction,
     SessionForkParentAuthority,
-    SessionForkParentGuidedMutations,
-    SessionGuidedOperationInProgressError,
+    SessionForkParentReceiptMutations,
     SessionNotFoundError,
     SessionOperationBlobMutations,
     SessionOperationCompositionMutations,
@@ -160,6 +154,7 @@ from elspeth.web.sessions.protocol import (
     SessionPendingInterpretationSiteSnapshot,
     SessionPendingInterpretationSnapshot,
     SessionPendingInterpretationValidator,
+    SessionReceiptInProgressError,
     SessionRecord,
     SessionRunEventType,
     SessionRunStatus,
@@ -340,7 +335,6 @@ _BLOB_DELETION_RECOVERY_OPERATION_KINDS = frozenset(
 # plan is a write: a shareable BLOB_READ admission (no fence row) must never
 # hold it, so the writer set is the recovery set minus the read kind.
 _BLOB_RECOVERY_WRITE_OPERATION_KINDS = _BLOB_DELETION_RECOVERY_OPERATION_KINDS - {SessionOperationKind.BLOB_READ}
-_GUIDED_INLINE_CUSTODY_OPERATION_KINDS = frozenset({"guided_plan", "guided_respond"})
 
 _ACTIVE_RUN_COMPOSITION_COLUMNS = (
     runs_table.c.id.label("run_id"),
@@ -726,33 +720,30 @@ class _RepositorySessionMutations:
             raise TypeError("archived_at must be an exact datetime")
         archived_at = _ensure_utc(archived_at)
         session_id = state._session_id
-        active_guided_kind = connection.execute(
-            select(guided_operations_table.c.kind)
+        active_receipt_kind = connection.execute(
+            select(session_operation_receipts_table.c.kind)
             .where(
-                guided_operations_table.c.session_id == session_id,
-                guided_operations_table.c.status == "in_progress",
+                session_operation_receipts_table.c.session_id == session_id,
+                session_operation_receipts_table.c.status == "in_progress",
             )
-            .order_by(guided_operations_table.c.operation_id)
+            .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
         ).scalar_one_or_none()
-        if active_guided_kind is not None:
-            if active_guided_kind not in GUIDED_OPERATION_KIND_VALUES:
-                raise AuditIntegrityError("Tier 1: active guided operation has an invalid kind")
-            raise SessionGuidedOperationInProgressError(
-                session_id=UUID(session_id),
-                kind=cast(GuidedOperationKind, active_guided_kind),
-            )
+        if active_receipt_kind is not None:
+            if active_receipt_kind not in {"session_fork", "state_revert"}:
+                raise AuditIntegrityError("Tier 1: active ordinary operation receipt has an invalid kind")
+            raise SessionReceiptInProgressError(session_id=UUID(session_id), kind=active_receipt_kind)
         incoming_active_fork = connection.execute(
-            select(guided_operations_table.c.operation_id)
+            select(session_operation_receipts_table.c.operation_id)
             .where(
-                guided_operations_table.c.kind == "session_fork",
-                guided_operations_table.c.status == "in_progress",
-                guided_operations_table.c.result_session_id == session_id,
+                session_operation_receipts_table.c.kind == "session_fork",
+                session_operation_receipts_table.c.status == "in_progress",
+                session_operation_receipts_table.c.result_session_id == session_id,
             )
             .limit(1)
         ).first()
         if incoming_active_fork is not None:
-            raise SessionGuidedOperationInProgressError(
+            raise SessionReceiptInProgressError(
                 session_id=UUID(session_id),
                 kind="session_fork",
             )
@@ -762,20 +753,20 @@ class _RepositorySessionMutations:
                 select(composer_completion_events_table.c.id).where(composer_completion_events_table.c.session_id == session_id).limit(1)
             ).first()
             or connection.execute(
-                select(guided_operations_table.c.operation_id)
+                select(session_operation_receipts_table.c.operation_id)
                 .where(
-                    guided_operations_table.c.session_id == session_id,
-                    guided_operations_table.c.kind == "session_fork",
-                    guided_operations_table.c.status.in_(("completed", "failed")),
+                    session_operation_receipts_table.c.session_id == session_id,
+                    session_operation_receipts_table.c.kind == "session_fork",
+                    session_operation_receipts_table.c.status.in_(("completed", "failed")),
                 )
                 .limit(1)
             ).first()
             or connection.execute(
-                select(guided_operations_table.c.operation_id)
+                select(session_operation_receipts_table.c.operation_id)
                 .where(
-                    guided_operations_table.c.kind == "session_fork",
-                    guided_operations_table.c.status == "completed",
-                    guided_operations_table.c.result_session_id == session_id,
+                    session_operation_receipts_table.c.kind == "session_fork",
+                    session_operation_receipts_table.c.status == "completed",
+                    session_operation_receipts_table.c.result_session_id == session_id,
                 )
                 .limit(1)
             ).first()
@@ -843,17 +834,6 @@ class _RepositoryCompositionStateMutations:
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
 
         connection = _resolve_mutation_connection(state._connection_token)
-        current_metadata = connection.execute(
-            select(composition_states_table.c.composer_meta)
-            .where(composition_states_table.c.session_id == state._session_id)
-            .order_by(composition_states_table.c.version.desc())
-            .limit(1)
-        ).scalar_one_or_none()
-        if (
-            pending_guided_checkpoint(unwrap_state_column(current_metadata)) is not None
-            or pending_guided_checkpoint(creation.data.composer_meta) is not None
-        ):
-            raise AuditIntegrityError("a pending guided proposal checkpoint requires an atomic lifecycle settlement")
         derived_from_state_id = creation.derived_from_state_id
         if derived_from_state_id is not None:
             predecessor = connection.execute(
@@ -875,11 +855,6 @@ class _RepositoryCompositionStateMutations:
             ).scalar_one()
         )
         data = creation.data
-        # An active guided pair that cannot bind would re-raise on every read of
-        # this row; refuse it here, under the operation fence, before it becomes
-        # the tip. Every composition-state INSERT in this repository runs the
-        # same admission, matching ``SessionServiceImpl._insert_composition_state``.
-        assert_guided_custody_persistable(deep_thaw(data.sources), deep_thaw(data.composer_meta))
         connection.execute(
             insert(composition_states_table).values(
                 id=str(creation.id),
@@ -1296,11 +1271,8 @@ class _RepositoryInterpretationMutations:
             )
             data = appended_state.data
             # This append is a genuine session HEAD (version MAX+1, derived_from
-            # set), so it owes the same two obligations as every other head
-            # writer: refuse an unbindable active guided pair before it becomes
-            # the tip, and retire in THIS transaction the pending reviews whose
-            # site the new head extinguished.
-            assert_guided_custody_persistable(deep_thaw(data.sources), deep_thaw(data.composer_meta))
+            # set), so retire pending reviews whose site the new head extinguished
+            # in this transaction.
             connection.execute(
                 insert(composition_states_table).values(
                     id=str(appended_state.id),
@@ -1993,35 +1965,6 @@ class _RepositoryBlobMutations:
     def _require_execute(self) -> SessionOperationContext:
         return self._require_operation_kinds(frozenset({SessionOperationKind.EXECUTE}))
 
-    def _require_guided_operation_write_fence(
-        self,
-        fence: BlobGuidedOperationWriteFence | None,
-    ) -> None:
-        if fence is None:
-            return
-        if type(fence) is not BlobGuidedOperationWriteFence:
-            raise TypeError("guided_operation_write_fence must be an exact BlobGuidedOperationWriteFence")
-        state = self.__state
-        if str(fence.session_id) != state._session_id:
-            raise AuditIntegrityError("guided operation blob write fence targets a different session")
-        row = (
-            _resolve_mutation_connection(state._connection_token)
-            .execute(
-                select(guided_operations_table.c.session_id).where(
-                    guided_operations_table.c.session_id == state._session_id,
-                    guided_operations_table.c.operation_id == fence.operation_id,
-                    guided_operations_table.c.kind.in_(_GUIDED_INLINE_CUSTODY_OPERATION_KINDS),
-                    guided_operations_table.c.status == "in_progress",
-                    guided_operations_table.c.lease_token == fence.lease_token,
-                    guided_operations_table.c.attempt == fence.attempt,
-                    guided_operations_table.c.lease_expires_at > state._database_now,
-                )
-            )
-            .one_or_none()
-        )
-        if row is None:
-            raise BlobGuidedOperationFenceLostError(fence.operation_id, attempt=fence.attempt)
-
     @staticmethod
     def _validate_link_direction(value: object) -> BlobRunLinkDirection:
         if type(value) is not str or value not in BLOB_RUN_LINK_DIRECTIONS:
@@ -2696,7 +2639,6 @@ class _RepositoryBlobMutations:
         record: BlobRecord,
         max_storage_per_session: int,
         idempotent: bool,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     ) -> bool:
         """Reserve one pending row inside the exact fenced session UoW."""
         state = self.__state
@@ -2712,7 +2654,6 @@ class _RepositoryBlobMutations:
         if type(idempotent) is not bool:
             raise TypeError("idempotent must be an exact bool")
         operation_context = self._require_operation_kinds(_BLOB_CREATION_OPERATION_KINDS)
-        self._require_guided_operation_write_fence(guided_operation_write_fence)
         connection = _resolve_mutation_connection(state._connection_token)
         existing = connection.execute(select(blobs_table).where(blobs_table.c.id == str(record.id)).with_for_update()).one_or_none()
         if existing is not None:
@@ -2850,12 +2791,10 @@ class _RepositoryBlobMutations:
         self,
         *,
         blob_id: UUID,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     ) -> BlobRecord:
         state = self.__state
         state._require_active()
         operation_context = self._require_operation_kinds(_BLOB_CREATION_OPERATION_KINDS)
-        self._require_guided_operation_write_fence(guided_operation_write_fence)
         row = state._require_blob(blob_id)
         if row.status == "ready":
             if row.custody_operation_id is not None or row.custody_operation_epoch is not None or row.custody_operation_kind is not None:
@@ -2893,12 +2832,10 @@ class _RepositoryBlobMutations:
         self,
         *,
         blob_id: UUID,
-        guided_operation_write_fence: BlobGuidedOperationWriteFence | None,
     ) -> bool:
         state = self.__state
         state._require_active()
         operation_context = self._require_operation_kinds(_BLOB_CREATION_OPERATION_KINDS)
-        self._require_guided_operation_write_fence(guided_operation_write_fence)
         result = _resolve_mutation_connection(state._connection_token).execute(
             delete(blobs_table).where(
                 blobs_table.c.id == str(blob_id),
@@ -3078,18 +3015,18 @@ class _RepositoryBlobMutations:
     def _in_progress_session_fork_operation_id(self) -> str | None:
         state = self.__state
         connection = _resolve_mutation_connection(state._connection_token)
-        guided_operation_id = connection.execute(
-            select(guided_operations_table.c.operation_id)
+        receipt_operation_id = connection.execute(
+            select(session_operation_receipts_table.c.operation_id)
             .where(
-                guided_operations_table.c.session_id == state._session_id,
-                guided_operations_table.c.kind == SessionOperationKind.SESSION_FORK.value,
-                guided_operations_table.c.status == "in_progress",
+                session_operation_receipts_table.c.session_id == state._session_id,
+                session_operation_receipts_table.c.kind == SessionOperationKind.SESSION_FORK.value,
+                session_operation_receipts_table.c.status == "in_progress",
             )
-            .order_by(guided_operations_table.c.operation_id)
+            .order_by(session_operation_receipts_table.c.operation_id)
             .limit(1)
         ).scalar_one_or_none()
-        if guided_operation_id is not None:
-            return str(guided_operation_id)
+        if receipt_operation_id is not None:
+            return str(receipt_operation_id)
         operation_id = connection.execute(
             select(session_operation_fences_table.c.operation_id)
             .where(
@@ -4008,10 +3945,6 @@ class _ForkChildSessionMutations:
         if type(creation) is not SessionForkChildStateCreation:
             raise TypeError("fork child state creation must be exact")
         state = creation.data
-        # The child's first state is copied custody: an active guided pair that
-        # cannot bind in the child would re-raise on every read of the forked
-        # row, so it is refused here rather than at the child's first read.
-        assert_guided_custody_persistable(deep_thaw(state.sources), deep_thaw(state.composer_meta))
         connection = self._require_exact_child_context()
         next_version = connection.execute(
             select(func.coalesce(func.max(composition_states_table.c.version), 0) + 1).where(
@@ -4077,16 +4010,16 @@ class _ForkChildSessionMutations:
 
 
 @final
-class _ForkParentGuidedMutations:
-    """Exact guided-parent binding over the fork transaction's lifetime token."""
+class _ForkParentReceiptMutations:
+    """Exact parent receipt binding over the fork transaction's lifetime token."""
 
     __slots__ = (
         "__child_session_id",
         "__connection_token",
         "__database_now",
-        "__guided_operation",
         "__parent_authority",
         "__parent_session_id",
+        "__receipt",
     )
 
     def __init__(
@@ -4094,24 +4027,24 @@ class _ForkParentGuidedMutations:
         connection_token: str,
         *,
         fork_authority: SessionForkAuthority,
-        guided_operation: dict[str, object],
+        receipt: dict[str, object],
         database_now: datetime,
     ) -> None:
         self.__connection_token = connection_token
         self.__parent_authority = fork_authority.parent
         self.__parent_session_id = fork_authority.parent.parent_context.fence.session_id
         self.__child_session_id = fork_authority.child_context.fence.session_id
-        self.__guided_operation = guided_operation
+        self.__receipt = receipt
         self.__database_now = database_now
 
-    def _require_exact_guided_authority(self) -> tuple[Connection, GuidedOperationFence, dict[str, object]]:
+    def _require_exact_receipt_authority(self) -> tuple[Connection, OperationReceiptFence, dict[str, object]]:
         connection = _resolve_fork_mutation_connection(
             self.__connection_token,
             parent_session_id=self.__parent_session_id,
             child_session_id=self.__child_session_id,
         )
-        fence = self.__parent_authority.guided_fence
-        row = self.__guided_operation
+        fence = self.__parent_authority.receipt_fence
+        row = self.__receipt
         if (
             str(fence.session_id) != self.__parent_session_id
             or row["session_id"] != self.__parent_session_id
@@ -4122,13 +4055,13 @@ class _ForkParentGuidedMutations:
             or row["status"] != "in_progress"
             or _ensure_utc(row["lease_expires_at"]) <= self.__database_now
         ):
-            raise AuditIntegrityError("fork parent guided authority is no longer exact")
+            raise AuditIntegrityError("fork parent receipt authority is no longer exact")
 
         live_row = (
             connection.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == self.__parent_session_id,
-                    guided_operations_table.c.operation_id == fence.operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == self.__parent_session_id,
+                    session_operation_receipts_table.c.operation_id == fence.operation_id,
                 )
             )
             .mappings()
@@ -4144,8 +4077,6 @@ class _ForkParentGuidedMutations:
             "lease_expires_at",
             "attempt",
             "originating_message_id",
-            "proposal_id",
-            "result_kind",
             "result_state_id",
             "result_session_id",
             "response_hash",
@@ -4163,15 +4094,15 @@ class _ForkParentGuidedMutations:
             )
             for field in exact_fields
         ):
-            raise AuditIntegrityError("fork parent live guided authority differs from cached authority")
+            raise AuditIntegrityError("fork parent live receipt authority differs from cached authority")
         return connection, fence, row
 
     @staticmethod
-    def _null_safe_guided_predicate(field: str, value: Any) -> ColumnElement[bool]:
-        column = guided_operations_table.c[field]
+    def _null_safe_receipt_predicate(field: str, value: Any) -> ColumnElement[bool]:
+        column = session_operation_receipts_table.c[field]
         return column.is_(None) if value is None else column == value
 
-    def bind_guided_fork(
+    def bind_fork_receipt(
         self,
         *,
         originating_message_id: UUID,
@@ -4180,13 +4111,13 @@ class _ForkParentGuidedMutations:
         if type(originating_message_id) is not UUID:
             raise TypeError("originating_message_id must be an exact UUID")
         message_id = str(originating_message_id)
-        connection, fence, row = self._require_exact_guided_authority()
+        connection, fence, row = self._require_exact_receipt_authority()
         current_message_id = row["originating_message_id"]
         current_child_id = row["result_session_id"]
         if current_message_id not in {None, message_id}:
-            raise AuditIntegrityError("Guided fork is bound to a different originating message")
+            raise AuditIntegrityError("Fork receipt is bound to a different originating message")
         if current_child_id not in {None, self.__child_session_id}:
-            raise AuditIntegrityError("Guided fork is bound to a different child session")
+            raise AuditIntegrityError("Fork receipt is bound to a different child session")
         exact_fields = (
             "kind",
             "status",
@@ -4195,8 +4126,6 @@ class _ForkParentGuidedMutations:
             "lease_expires_at",
             "attempt",
             "originating_message_id",
-            "proposal_id",
-            "result_kind",
             "result_state_id",
             "result_session_id",
             "response_hash",
@@ -4206,23 +4135,22 @@ class _ForkParentGuidedMutations:
             "settled_at",
         )
         changed = connection.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == self.__parent_session_id,
-                guided_operations_table.c.operation_id == fence.operation_id,
-                *(self._null_safe_guided_predicate(field, row[field]) for field in exact_fields),
-                guided_operations_table.c.lease_expires_at > self.__database_now,
+                session_operation_receipts_table.c.session_id == self.__parent_session_id,
+                session_operation_receipts_table.c.operation_id == fence.operation_id,
+                *(self._null_safe_receipt_predicate(field, row[field]) for field in exact_fields),
+                session_operation_receipts_table.c.lease_expires_at > self.__database_now,
             )
             .values(
                 originating_message_id=message_id,
-                proposal_id=row["proposal_id"],
                 result_state_id=row["result_state_id"],
                 result_session_id=self.__child_session_id,
                 updated_at=self.__database_now,
             )
         ).rowcount
         if changed != 1:
-            raise AuditIntegrityError("Guided fork binding lost its exact authority")
+            raise AuditIntegrityError("Fork receipt binding lost its exact authority")
         row.update(
             {
                 "originating_message_id": message_id,
@@ -4242,9 +4170,9 @@ class _ForkCreationTransaction:
         "__child_session_id",
         "__connection_token",
         "__database_now",
-        "__guided_operation",
-        "__parent_guided_mutations",
+        "__parent_receipt_mutations",
         "__parent_session_id",
+        "__receipt",
     )
 
     def __init__(
@@ -4252,20 +4180,20 @@ class _ForkCreationTransaction:
         connection: Connection,
         *,
         fork_authority: SessionForkAuthority,
-        guided_operation: RowMapping,
+        receipt: RowMapping,
         database_now: datetime,
         child_created: bool,
     ) -> None:
         if type(fork_authority) is not SessionForkAuthority:
             raise TypeError("fork_authority must be an exact SessionForkAuthority")
-        guided_row = dict(guided_operation)
+        receipt_row = dict(receipt)
         parent_session_id = fork_authority.parent.parent_context.fence.session_id
         child_session_id = fork_authority.child_context.fence.session_id
         self.__connection_token = _register_authorized_fork_mutation_connection(connection, fork_authority)
         try:
             self.__parent_session_id = parent_session_id
             self.__child_session_id = child_session_id
-            self.__guided_operation = guided_row
+            self.__receipt = receipt_row
             self.__database_now = database_now
             self.__child_created = child_created
             self.__child_mutations = _ForkChildSessionMutations(
@@ -4274,10 +4202,10 @@ class _ForkCreationTransaction:
                 child_context=fork_authority.child_context,
                 database_now=database_now,
             )
-            self.__parent_guided_mutations = _ForkParentGuidedMutations(
+            self.__parent_receipt_mutations = _ForkParentReceiptMutations(
                 self.__connection_token,
                 fork_authority=fork_authority,
-                guided_operation=guided_row,
+                receipt=receipt_row,
                 database_now=database_now,
             )
         except BaseException:
@@ -4297,9 +4225,9 @@ class _ForkCreationTransaction:
         return self.__child_mutations
 
     @property
-    def parent_guided_mutations(self) -> SessionForkParentGuidedMutations:
+    def parent_receipt_mutations(self) -> SessionForkParentReceiptMutations:
         self._require_active()
-        return self.__parent_guided_mutations
+        return self.__parent_receipt_mutations
 
     @staticmethod
     def _require_uuid(value: UUID, *, field_name: str) -> str:
@@ -4307,14 +4235,14 @@ class _ForkCreationTransaction:
             raise TypeError(f"{field_name} must be an exact UUID")
         return str(value)
 
-    def require_parent_guided_operation(
+    def require_parent_fork_receipt(
         self,
-        fence: GuidedOperationFence,
+        fence: OperationReceiptFence,
     ) -> tuple[Mapping[str, Any], datetime]:
         self._require_active()
-        if type(fence) is not GuidedOperationFence:
-            raise TypeError("fork guided fence must be exact")
-        row = self.__guided_operation
+        if type(fence) is not OperationReceiptFence:
+            raise TypeError("fork receipt fence must be exact")
+        row = self.__receipt
         if (
             str(fence.session_id) != self.__parent_session_id
             or fence.operation_id != row["operation_id"]
@@ -4323,7 +4251,7 @@ class _ForkCreationTransaction:
             or row["status"] != "in_progress"
             or _ensure_utc(row["lease_expires_at"]) <= self.__database_now
         ):
-            raise AuditIntegrityError("fork creation guided authority is no longer exact")
+            raise AuditIntegrityError("fork creation receipt authority is no longer exact")
         return dict(row), self.__database_now
 
     def read_parent_session(self) -> Any | None:
@@ -4447,7 +4375,7 @@ class _ForkCreationTransaction:
         ``sessions/service.py::_effective_pipeline_proposal_base`` could not
         run on the fork path and the anchor was held at the immutable creation
         base — which refuses a parent whose pending proposal has been rebased,
-        the ordinary outcome of a guided local replan (elspeth-ed67eb9d0d).
+        the ordinary outcome of a local replan.
         Scoped and shaped exactly like its ``proposal.created`` sibling.
         """
         self._require_active()
@@ -4480,55 +4408,6 @@ class _ForkCreationTransaction:
             )
             .scalar_one()
         )
-
-    def read_parent_guided_root_authority(
-        self,
-        message_id: UUID,
-    ) -> tuple[Any | None, tuple[Any, ...], Any | None]:
-        """Read the parent rows one guided root-intent derivation needs.
-
-        The operation filter admits ``guided_convert`` as well as
-        ``guided_start``: a converted session's root intent is claimed by a
-        ``guided_convert`` row, and scoping this accessor to starts left the
-        fork path deriving root authority from ZERO operations for such a
-        parent. The rows are returned unjudged so
-        ``sessions/service.py::_verified_guided_root_authority`` — the single
-        derivation both the ordinary-connection and the fork-transaction path
-        run — decides kind, profile and hash.
-        """
-        self._require_active()
-        message_id_str = self._require_uuid(message_id, field_name="message_id")
-        connection = _resolve_mutation_connection(self.__connection_token)
-        message = connection.execute(
-            select(
-                chat_messages_table.c.role,
-                chat_messages_table.c.content,
-                chat_messages_table.c.writer_principal,
-            ).where(
-                chat_messages_table.c.session_id == self.__parent_session_id,
-                chat_messages_table.c.id == message_id_str,
-            )
-        ).one_or_none()
-        operations = tuple(
-            connection.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == self.__parent_session_id,
-                    guided_operations_table.c.kind.in_(("guided_start", "guided_convert")),
-                    guided_operations_table.c.status == "completed",
-                    guided_operations_table.c.originating_message_id == message_id_str,
-                    guided_operations_table.c.result_kind == "composition_state",
-                )
-            ).all()
-        )
-        state = None
-        if len(operations) == 1 and operations[0].result_state_id is not None:
-            state = connection.execute(
-                select(composition_states_table).where(
-                    composition_states_table.c.session_id == self.__parent_session_id,
-                    composition_states_table.c.id == operations[0].result_state_id,
-                )
-            ).one_or_none()
-        return message, operations, state
 
     def read_child_snapshot(
         self,
@@ -5136,13 +5015,13 @@ class _SessionOperationAuthorityRepository:
             parent_context,
             database_now=database_now,
         )
-        guided = self._require_fork_guided_row(
+        receipt = self._require_fork_receipt_row(
             conn,
             parent_authority=authority.parent,
             database_now=database_now,
         )
-        if self._canonical_bound_child_id(guided["result_session_id"]) != child_id:
-            raise AuditIntegrityError("fork child lease is not the guided operation's exact bound child")
+        if self._canonical_bound_child_id(receipt["result_session_id"]) != child_id:
+            raise AuditIntegrityError("fork child lease is not the receipt's exact bound child")
         child = conn.execute(select(sessions_table).where(sessions_table.c.id == child_id).with_for_update()).mappings().one_or_none()
         if child is None:
             raise SessionOperationFenceLost(FenceLossReason.MISSING)
@@ -5294,34 +5173,34 @@ class _SessionOperationAuthorityRepository:
                 transaction._close()
 
     @staticmethod
-    def _require_fork_guided_row(
+    def _require_fork_receipt_row(
         conn: Connection,
         *,
         parent_authority: SessionForkParentAuthority,
         database_now: datetime | None = None,
     ) -> RowMapping:
         parent_session_id = parent_authority.parent_context.fence.session_id
-        guided = parent_authority.guided_fence
+        receipt = parent_authority.receipt_fence
         row = (
             conn.execute(
-                select(guided_operations_table).where(
-                    guided_operations_table.c.session_id == parent_session_id,
-                    guided_operations_table.c.operation_id == guided.operation_id,
+                select(session_operation_receipts_table).where(
+                    session_operation_receipts_table.c.session_id == parent_session_id,
+                    session_operation_receipts_table.c.operation_id == receipt.operation_id,
                 )
             )
             .mappings()
             .one_or_none()
         )
         if row is None:
-            raise AuditIntegrityError("fork creation guided operation is missing")
+            raise AuditIntegrityError("fork creation receipt is missing")
         if row["kind"] != "session_fork" or row["status"] != "in_progress":
-            raise AuditIntegrityError("fork creation guided operation is not an in-progress session fork")
+            raise AuditIntegrityError("fork creation receipt is not an in-progress session fork")
         if (
-            row["lease_token"] != guided.lease_token
-            or row["attempt"] != guided.attempt
+            row["lease_token"] != receipt.lease_token
+            or row["attempt"] != receipt.attempt
             or (database_now is not None and _ensure_utc(row["lease_expires_at"]) <= database_now)
         ):
-            raise AuditIntegrityError("fork creation guided operation fence is not exact and live")
+            raise AuditIntegrityError("fork creation receipt fence is not exact and live")
         return row
 
     @staticmethod
@@ -5329,13 +5208,13 @@ class _SessionOperationAuthorityRepository:
         if value is None:
             return None
         if type(value) is not str:
-            raise AuditIntegrityError("fork creation guided operation has a malformed child binding")
+            raise AuditIntegrityError("fork creation receipt has a malformed child binding")
         try:
             parsed = UUID(value)
         except ValueError as exc:
-            raise AuditIntegrityError("fork creation guided operation has a malformed child binding") from exc
+            raise AuditIntegrityError("fork creation receipt has a malformed child binding") from exc
         if str(parsed) != value:
-            raise AuditIntegrityError("fork creation guided operation has a noncanonical child binding")
+            raise AuditIntegrityError("fork creation receipt has a noncanonical child binding")
         return value
 
     @classmethod
@@ -5351,7 +5230,7 @@ class _SessionOperationAuthorityRepository:
         transaction: _ForkCreationTransaction,
         database_now: datetime,
     ) -> None:
-        guided = cls._require_fork_guided_row(
+        receipt = cls._require_fork_receipt_row(
             conn,
             parent_authority=parent_authority,
             database_now=database_now,
@@ -5384,8 +5263,8 @@ class _SessionOperationAuthorityRepository:
             previously_bound_child_id == child_session_id and not transaction._child_created
         )
         if (
-            guided["result_session_id"] != child_session_id
-            or guided["originating_message_id"] != expected_message_id
+            receipt["result_session_id"] != child_session_id
+            or receipt["originating_message_id"] != expected_message_id
             or not valid_child
             or not valid_fence
             or not valid_transition
@@ -5535,7 +5414,7 @@ class _SessionOperationAuthorityRepository:
         child: SessionForkChildCreation,
         mutation: Callable[[SessionForkCreationTransaction, SessionForkAuthority], T],
     ) -> T:
-        """Run guided fork staging under canonical parent/hidden-child locks."""
+        """Run receipt-backed fork staging under canonical parent/hidden-child locks."""
         self._validate_fork_parent_authority(parent_authority)
         if type(child) is not SessionForkChildCreation:
             raise TypeError("child must be an exact SessionForkChildCreation")
@@ -5547,7 +5426,7 @@ class _SessionOperationAuthorityRepository:
         candidate_id = str(_new_session_id())
         for _attempt in range(_MAX_SESSION_ID_COLLISION_ATTEMPTS):
             with self._engine.connect() as probe:
-                probe_row = self._require_fork_guided_row(
+                probe_row = self._require_fork_receipt_row(
                     probe,
                     parent_authority=parent_authority,
                 )
@@ -5555,7 +5434,7 @@ class _SessionOperationAuthorityRepository:
             locked_child_id = bound_child_id or candidate_id
             retry_child_id: str | None = None
             with self._locked_pair_transaction(parent_id, locked_child_id) as conn:
-                current_row = self._require_fork_guided_row(
+                current_row = self._require_fork_receipt_row(
                     conn,
                     parent_authority=parent_authority,
                 )
@@ -5569,7 +5448,7 @@ class _SessionOperationAuthorityRepository:
                         parent_context,
                         database_now=database_now,
                     )
-                    current_row = self._require_fork_guided_row(
+                    current_row = self._require_fork_receipt_row(
                         conn,
                         parent_authority=parent_authority,
                         database_now=database_now,
@@ -5604,7 +5483,7 @@ class _SessionOperationAuthorityRepository:
                     transaction = _ForkCreationTransaction(
                         conn,
                         fork_authority=fork_authority,
-                        guided_operation=current_row,
+                        receipt=current_row,
                         database_now=database_now,
                         child_created=child_created,
                     )

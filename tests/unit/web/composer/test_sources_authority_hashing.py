@@ -29,7 +29,6 @@ from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     composition_content_hash,
 )
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -115,12 +114,8 @@ def _proposal(pipeline: dict[str, Any]) -> PipelineProposal:
     return PipelineProposal.create(
         pipeline=pipeline,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.GUIDED_FULL,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
 
 

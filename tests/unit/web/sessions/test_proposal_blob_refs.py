@@ -1,13 +1,8 @@
 """Unit tests for the closed proposal blob-reference extractor.
 
-``proposal_blob_reference_ids`` is the single authority deciding which blobs
-a pending proposal retains (blocking their mutation/deletion) and which blob
-references a staged proposal must prove ownership of.  It historically
-recognized only ``set_pipeline`` ``source.blob_id`` and owned-authority
-top-level ``options.blob_ref`` — the guided ``blob:<uuid>`` path sentinels
-and nested inline markers were invisible, so a reviewed blob could be
-deleted while a proposal depending on it was pending
-(elspeth-b3feba9a7c).
+``proposal_blob_reference_ids`` decides which blobs a pending proposal retains
+and which staged references must prove ownership, including nested inline
+markers and ``blob:<uuid>`` path sentinels.
 """
 
 from __future__ import annotations

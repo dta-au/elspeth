@@ -48,7 +48,7 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_70(engine) -> None:
+def test_blob_inline_resolutions_schema_epoch_is_71(engine) -> None:
     # 51: the multi-replica session-operation substrate landed on top of
     # mainline's 50 (elspeth-4d6c0dd0f5).
     # 52: pluggable SSO and the identity substrate (elspeth-07cd19ba73) —
@@ -61,18 +61,18 @@ def test_blob_inline_resolutions_schema_epoch_is_70(engine) -> None:
     # 56: sparse proposal arguments and structured validation errors.
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
-    # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 63 gives this table's content_hash the full lowercase SHA-256 CHECK.
     # Epoch 65: completion_gates.advisor_signoff.note became a required key
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
-    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
+    # Epoch 68 adds ordinary proposal checkpoint rebase reasons.
     # Epoch 69 binds freeform message ingress receipts.
     # Epoch 70 renames the persisted tutorial Build stage to build.
-    assert SESSION_SCHEMA_EPOCH == 70
+    # Epoch 71 adds mode-neutral fork/revert receipts.
+    assert SESSION_SCHEMA_EPOCH == 71
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 70
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 71
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

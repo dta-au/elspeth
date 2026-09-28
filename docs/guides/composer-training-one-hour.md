@@ -25,9 +25,9 @@ The first principles taught here are ELSPETH's, not computing's.
 1. Explain a pipeline as *Sense → Decide → Act*, with *Audit* recording all three.
 2. Build, validate, and run a pipeline in the Composer from a plain-English
    request, and read the graph, spec, and YAML it produced.
-3. Recognise and act on every kind of card the Composer puts in front of them:
-   a **proposal** (Accept / Reject) and a **decision the LLM made** (Acknowledge
-   / Approve / Change…).
+3. Distinguish an auto-applied, versioned change from a pending **proposal**
+   (Accept / Reject), and act on a **decision the LLM made** (Acknowledge /
+   Approve / Change…).
 4. Say what the Audit panel's six rows mean and why some **block a run** and
    others are **advisory**.
 5. Name the four advanced shapes (fork + coalesce, row union, scope + collector,
@@ -70,7 +70,7 @@ and add an LLM to it (Segment 5); the trainer demonstrates the advanced shapes
 | 0–5 | 1 | Why this exists: a pipeline, and why it must be auditable | Talk | 1–4 |
 | 5–11 | 2 | The shell: what is on the screen | Trainer demo | 5–8 |
 | 11–24 | 3 | Your first pipeline: threshold gate, from a sentence | **Hands-on** | 9–14 |
-| 24–28 | 4 | What just happened: proposals, validation, the run | Talk over their screens | 15–17 |
+| 24–28 | 4 | What just happened: committed changes, validation, the run | Talk over their screens | 15–17 |
 | 28–38 | 5 | Adding an LLM: the decisions the LLM made, and the controls you did not ask for | **Hands-on** | 18–22 |
 | 38–47 | 6 | Advanced shapes: fork/coalesce, row union, scope/collector, aggregation | Trainer demo (pre-built) | 23–27 |
 | 47–53 | 7 | Trust and evidence: readiness rows, failures explained, what the run recorded | Trainer demo | 28–31 |
@@ -142,46 +142,49 @@ bottom. Participants watch; they get their own hands in Segment 3.
 
 **Slide 5 — The screen (annotated screenshot).**
 - Header: `ELSPETH` · `Session: …` switcher · `v1 ▾` version selector · `Account`
-- Left: the **authoring pane** — the conversation (freeform) or the guided stepper
+- Left: the **authoring pane** — the Composer conversation
 - Right: the **pipeline artifact** — tabs `Graph` · `Spec` · `YAML` · `Run`
 - Bottom action bar: `Validation: …` · `Audit: …` · `Share inspect link` · `Import YAML` · `Run pipeline`
-- The **Inspector** slides in when you click a status: tabs `Validation` · `Audit` (· `History` in guided)
+- The **Inspector** slides in when you click a status: tabs `Validation` · `Audit`
 
 *Notes.* Point, name, move on. The four artifact tabs become available as the
 pipeline gains content (empty: only `Graph` and `Run`). The divider drags;
 `Collapse authoring pane` gives the graph the whole width.
 
 **Demo (2 min).**
-1. `Account` → `Composer preferences`: show `Default mode for new sessions`
-   (`Guided (recommended)` / `Freeform`), `Theme`, `Detail level` — leave all on defaults.
+1. `Account` → `Composer preferences`: show `Theme` and `Detail level` — leave
+   both on defaults.
 2. Press `?` — the `Keyboard shortcuts` dialog. Mention three: `Ctrl+K` command
    palette, `Ctrl+E` Run pipeline, `Ctrl+/` focus chat input.
 3. `Plugin catalog` (toolbar, or `Ctrl+Shift+P`): tabs Sources / Transforms /
    Sinks. "These are the building blocks. You never have to remember their
    names — you describe what you want and the planner picks."
 
-**Slide 6 — Guided and freeform: two conversations, one planner.**
-- **Guided** walks four stages: `Source` → `Output` → `Transforms` → `Wire` (→ `Ready`)
-- **Freeform** takes the whole request at once and refines
-- "Guided and freeform differ in interaction, not in capability." — user manual
-- Switch any time: `Switch to guided` / `Exit to freeform`
+**Slide 6 — One conversation, one planner.**
+- Describe the complete outcome or begin with a smaller request.
+- Check the chat header: **Auto-apply on** is the default; **Approval required**
+  holds changes for explicit review.
+- Inspect the applied change or pending proposal, then ask for a revision if needed.
+- Continue in the same conversation to change the pipeline.
 
-*Notes.* Both talk to the same planner and both can author every pipeline
-structure. One asymmetry to state plainly: guided → freeform carries the graph
-exactly; turning guided **on** over freeform work for the first time starts a
-fresh wizard as a new version (the old draft stays in version history).
+*Notes.* The LLM authors the structure. ELSPETH validates each proposed
+change and keeps the operator in control of what becomes the current pipeline.
 
-**Slide 7 — The three kinds of thing the planner shows you.**
+**Slide 7 — Three signals in the authoring conversation.**
 - A **ribbon**: `Looked up: list_transforms` — it read something; nothing changed
-- A **proposal card**: `Proposed: set_pipeline` … `Why:` … `Affects:` … `Accept` / `Reject`
-- A **decision card**: "N decisions the LLM made — acknowledge each" — `Acknowledge` / `Approve` / `Change…`
+- An **applied change** under **Auto-apply on**, or a **proposal card** with
+  `Accept` / `Reject` when approval is required or auto-commit cannot proceed
+- A **decision card** such as `Classify step · prompt` — `Acknowledge` /
+  `Approve` / `Change…`
 
-*Notes.* This slide is the interaction model for the entire product. Nothing
-executes, and nothing is committed to the pipeline, without you clicking one
-of these. Say it now; they will see all three in the next ten minutes.
+*Notes.* The authority chip states whether the session auto-applies eligible
+changes. A full-pipeline proposal needs a green runtime preflight before
+auto-commit; otherwise it waits for review. Neither path runs the pipeline:
+`Run pipeline` remains a separate action. Decision cards can still need a
+human response after a change commits.
 
 **Slide 8 — Variant: the first-run tutorial.**
-- Every new account starts on it. Five steps: welcome → guided build → run → audit story → graduation.
+- Every new account starts on it. Five steps: welcome → freeform build → run → audit story → graduation.
 - Fixed script: "Scrape these three synthetic project-brief pages and, for each
   page, have an LLM write a short summary of the page. Remove the raw HTML and
   write the rows to a JSON file named project_brief_summaries.json."
@@ -194,7 +197,7 @@ can be shorter and you can reference "the assumption callout you saw". **(B)
 Live opener:** run it yourself on a reset account in place of the shell demo —
 it hits web scrape, LLM, auto-wired controls, run, and the audit story in one
 pass. Do not do both; do not promise participants a re-run — a completed
-tutorial wizard is not re-enterable within the same tutorial session.
+tutorial flow is not re-enterable within the same tutorial session.
 
 ---
 
@@ -209,7 +212,7 @@ Option B. Trainer builds alongside on the projector, half a step ahead.
 - Bonus outcome: afterwards, ask "why did Bob's $1500 go to high_values?" and get an answer.
 
 **Slide 10 — Steps (leave this up while they work).**
-1. Session switcher → `+ New session` (or `Ctrl+N`). Stay in guided.
+1. Session switcher → `+ New session` (or `Ctrl+N`).
 2. In the chat input: `Upload file` → choose `input.csv`.
 3. Paste this prompt:
 
@@ -217,19 +220,21 @@ Option B. Trainer builds alongside on the projector, half a step ahead.
    > routes rows with amount > 1000 to a high_values CSV output and all other
    > rows to a normal CSV output. Validate it before running.
 
-4. Watch the stepper: `Source` → `Output` → `Transforms` → `Wire`.
-5. Read each proposal. If asked for field types: `id: int`, `name: str`, `amount: int`, `category: str`.
-6. At `Review wiring`, clear any pending acknowledgements, then confirm wiring.
-7. When `Validation:` shows `Passed` → `Run pipeline` → confirm the disclosure dialog.
+4. Inspect the graph and versioned change. If asked for field types: `id: int`, `name: str`, `amount: int`, `category: str`.
+5. Resolve any pending review cards; accept or reject a pipeline proposal if one remains pending.
+6. When `Validation:` shows `Passed` → `Run pipeline` → confirm the disclosure dialog.
 
-**Slide 11 — Reading a proposal card.**
+**Slide 11 — Reading a proposal card when one is pending.**
 - `Proposed: <tool>` — what it wants to do
 - Summary — in your words; `Why:` — its reasoning; `Affects:` — which components
 - Before/after diff, and `View arguments (JSON)` if you want the raw form
 - `Accept` commits a new pipeline version. `Reject` discards and you can ask for a revision.
 
-*Notes.* Circulate. The common stumbles: (1) someone types before uploading —
-fine, guided retains the intent; (2) a "Source data / Data contract" card
+*Notes.* Under the default **Auto-apply on** mode, a valid full-pipeline change
+may already be committed; use the graph and version history instead of waiting
+for a proposal card. **Approval required** always asks for an explicit decision.
+Circulate. The common stumbles: (1) someone types before uploading —
+ask them to attach the file and clarify the request; (2) a "Source data / Data contract" card
 appears — that is Segment 4's topic, tell them to read it and `Acknowledge`;
 (3) the disclosure dialog on Run — read it out: "This run leaves the composer
 and uses your stored credentials".
@@ -264,8 +269,8 @@ command line, and vice versa."
 Short, spoken over their finished runs.
 
 **Slide 15 — The four things ELSPETH did that you did not.**
-- **Validated** the proposal before it became your pipeline (wiring, route targets, schema compatibility)
-- **Recorded** a new version (`v2 ▾` in the header) — every accept is a version
+- **Validated** the resulting pipeline (wiring, route targets, schema compatibility)
+- **Recorded** a new version (`v2 ▾` in the header) — every committed change is versioned
 - **Gated** the run: `Run pipeline` was disabled until `Validation: Passed`
 - **Wrote the audit trail**: run configuration, every row's path, the gate result per row, output file hashes
 
@@ -293,10 +298,9 @@ Same session. Participants ask the planner to add a classification step.
 - Ask for: "Before routing, have an LLM classify each transaction's `category`
   as `retail`, `wholesale` or `corporate` from its name and amount, and write
   the label to a new field `llm_category`. Keep the same routing."
-- Accept the proposal. Then **do not** run yet — look at the cards.
+- Inspect the committed change, or accept a pending proposal. Then **do not** run yet — look at the cards.
 
-*Notes.* Freeform or guided both work; in guided, this is a revision of the
-`Transforms` stage. Expect a longer planner turn — narrate the `Working on...`
+*Notes.* This is a revision of the current pipeline. Expect a longer planner turn — narrate the `Working on...`
 indicator and its `Show details` while they wait.
 
 **Slide 19 — "N decisions the LLM made — acknowledge each".**
@@ -446,7 +450,7 @@ Fast demo; invite participants to try any one thing on their own session.
 **Slide 32 — YAML out, YAML in.**
 - `YAML` tab → `Copy` / `Download` (`pipeline-v<n>.yaml`). Every export writes an audit event
 - `Import YAML` (action bar): paste or choose a file; live `Parsed preview` + `Validation summary` before anything is sent; bind uploaded files for session-bound sources
-- Import **replaces** the pipeline — the old one stays in version history; in guided it switches you to freeform
+- Import **replaces** the pipeline — the old one stays in version history
 
 **Slide 33 — Share inspect link.**
 - `Share inspect link` → `Share for review` → a `Share URL`
@@ -472,7 +476,7 @@ depths. Engineers and auditors flip it on; everyone else leaves it off.
 ### Segment 9 — Recap (58–60 min, slides 36–37)
 
 **Slide 36 — What you can now do.**
-- Describe a pipeline → review proposals → acknowledge the LLM's decisions → validate → run → read the evidence
+- Describe a pipeline → inspect the committed change or decide on a pending proposal → acknowledge the LLM's decisions → validate → run → read the evidence
 - Four advanced words: **fork + coalesce**, **row union**, **scope + collector**, **aggregation**
 - Six audit rows; `Blocks run` vs `Advisory`; three trust tiers
 - Out: YAML, review link, versions, message fork, detail level
@@ -480,7 +484,7 @@ depths. Engineers and auditors flip it on; everyone else leaves it off.
 **Slide 37 — Where next.**
 - `Help & documentation` (Account menu)
 - `docs/guides/your-first-pipeline.md` — the walkthrough you just did, CLI and browser
-- `docs/guides/user-manual.md` — Web Composer section; `docs/guides/troubleshooting.md` — "Web Composer — Guided Mode"
+- `docs/guides/user-manual.md` — Web Composer section; `docs/guides/troubleshooting.md` — "Web Composer"
 - `examples/README.md` — "If You Want to See…" lookup table; every advanced shape has a runnable example
 - Pitch, one last time: "Validation and audit are part of the workflow, not after-the-fact diagnostics."
 
@@ -490,7 +494,7 @@ depths. Engineers and auditors flip it on; everyone else leaves it off.
 
 | Say this | Not this | Why |
 |----------|----------|-----|
-| **Output** (guided stage), sink (structure) | — | The guided stepper shows `Output`; YAML and Spec say sink. Both are correct; introduce both. |
+| **Output** (user-facing), sink (pipeline structure) | — | The user's output destination is represented by a sink in YAML and Spec. |
 | **validation**, **audit readiness**, validation summary | preflight | "Preflight" never appears in Composer UI or user docs. |
 | **proposal card**, **decision card** / approval card, assumption | "interpretation requirement", "staged", "surfaced" | The planner is instructed to describe these to users as cards to review. |
 | **audit trail**, the **Audit panel** | Landscape | Landscape is the system's name for the store; say it once, then "audit trail". |
@@ -527,10 +531,8 @@ deployment you will teach on.
    session therefore needs a batch-aware plugin other than `report_assemble`
    (for example `batch_stats`) authorised on the deployment; a stock
    deployment authorises none. Check `Plugin catalog`.
-3. **Guided coverage.** The user manual at HEAD states guided authors all nine
-   structures including require-all coalesce and cross-sink `on_write_failure`.
-   An older snapshot listed those two as freeform-only. If your deployment is
-   older than this branch, build the Segment 6 sessions in freeform.
+3. **Composer coverage.** Build the Segment 6 example sessions against the
+   deployment and verify their actual plugin and topology support before class.
 4. **Planner turn time.** Time one advanced build on the deployment. If a turn
    exceeds ~90 s, do not build anything live beyond Segment 3.
 5. **Tutorial pre-work.** If you choose Option A on slide 8, send the
@@ -544,10 +546,10 @@ deployment you will teach on.
 - `README.md` — pitch, Sense/Decide/Act, Data Trust Model, When to Use
 - `docs/release/guarantees.md` — The Core Promise, §1.1–1.4
 - `docs/release/composer-guide.md` — narrative framing, completion gestures
-- `docs/guides/user-manual.md` §"Web Composer: Guided Mode" — stages, parity, nine structures, mode switching
+- `docs/guides/user-manual.md` §"Web Composer" — authoring, review, execution
 - `docs/guides/your-first-pipeline.md` Option B — the Segment 3 lab, verbatim prompt
 - `docs/guides/sharing-pipelines.md` — Share inspect link lifecycle
-- `docs/guides/troubleshooting.md` §"Web Composer — Guided Mode"
+- `docs/guides/troubleshooting.md` §"Web Composer"
 - `docs/guides/landscape-mcp-analysis.md`, `docs/runbooks/investigate-routing.md` — Segment 7 "deeper questions"
 - `docs/architecture/adr/031-tutorial-is-a-fixed-script-canary.md` — tutorial doctrine
 - `docs/architecture/adr/040-composer-runtime-validation-posture.md` — validation surfaces

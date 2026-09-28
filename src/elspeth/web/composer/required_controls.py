@@ -36,7 +36,7 @@ rejection.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Final, Literal, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -71,8 +71,8 @@ from elspeth.web.composer.state import (
 
 # The shared on_validation_failure canonicalizer is the single owner of the
 # "" -> 'discard' fold (elspeth-bcd7051143); deep-importing tools._common is
-# the established cross-package pattern (pipeline_planner, pipeline_commit,
-# guided.emitters do the same).
+# the established cross-package pattern (pipeline_planner and pipeline_commit
+# do the same).
 from elspeth.web.composer.tools._common import (
     _canonicalize_authored_interpretation_requirements,
     canonicalize_source_validation_failure,
@@ -994,7 +994,7 @@ def wire_required_controls_state(
         finalized_state = CompositionState.from_dict(restored)
     except (KeyError, TypeError, ValueError) as exc:
         raise AuditIntegrityError("Required-control state finalization produced an invalid owned state") from exc
-    return replace(finalized_state, guided_session=state.guided_session)
+    return finalized_state
 
 
 def merge_required_control_affected_components(

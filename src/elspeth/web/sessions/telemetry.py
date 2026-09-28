@@ -201,15 +201,13 @@ class _SessionsTelemetry:
     # permanent record of the cancellation, while this counter exposes cleanup
     # pressure by source without turning logs into a lifecycle channel.
     orphaned_runs_cancelled_total: _Counter
-    # ── Phase 8 (mode / session-switched / tutorial / B3 cohort / B5) ──
+    # ── Phase 8 (session-switched / tutorial / B3 cohort / B5) ──
     # Counters added unconditionally to the container even when the
     # consuming emit-site is conditional on an earlier-phase surface
     # shipping (B3 cohort a/b1/b2, B5 dynamic-source). The cost of an
     # unused counter slot is effectively zero; the cost of branching
     # the container shape on probe outcomes is real bootstrap-order
     # complexity. Probe gates live at the emit sites, not here.
-    mode_opted_out_total: _Counter
-    mode_opted_in_total: _Counter
     session_switched_total: _Counter
     # Tutorial counters wired by Task 6 (conditional on Phase 4 ship).
     # tutorial_completed_total — DELIBERATELY ABSENT here: completions are
@@ -276,8 +274,6 @@ def build_sessions_telemetry(*, meter: _Meter | None = None) -> _SessionsTelemet
             progress_broadcast_dropped_total=_FakeCounter(),
             orphaned_runs_cancelled_total=_FakeCounter(),
             # Phase 8 counters.
-            mode_opted_out_total=_FakeCounter(),
-            mode_opted_in_total=_FakeCounter(),
             session_switched_total=_FakeCounter(),
             tutorial_started_total=_FakeCounter(),
             session_completed_total=_FakeCounter(),
@@ -319,24 +315,6 @@ def build_sessions_telemetry(*, meter: _Meter | None = None) -> _SessionsTelemet
         # ``description`` keyword argument is supplied so the
         # Prometheus exposition (B1-r3 MeterProvider) carries
         # operator-readable HELP text for each metric.
-        mode_opted_out_total=meter.create_counter(
-            "composer.mode.opted_out_total",
-            description=(
-                "Composer account-level opt-outs from guided mode "
-                "(default_mode set to 'freeform' on PATCH /api/composer-preferences). "
-                "Post-state counter: fires on every PATCH whose body sets "
-                "default_mode=freeform, regardless of prior state. "
-                "Denominator is composer.preferences.patch_total."
-            ),
-        ),
-        mode_opted_in_total=meter.create_counter(
-            "composer.mode.opted_in_total",
-            description=(
-                "Composer account-level opt-ins to guided mode "
-                "(default_mode set to 'guided' on PATCH /api/composer-preferences). "
-                "Post-state counter; symmetric to composer.mode.opted_out_total."
-            ),
-        ),
         session_switched_total=meter.create_counter(
             "composer.session.switched_total",
             description=(
