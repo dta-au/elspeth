@@ -19,6 +19,7 @@ pins it for the plugin-returned row-level error, across every per-row site the
 ticket covers.
 """
 
+import json
 from typing import Any
 
 import pytest
@@ -31,7 +32,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.core.config import ElspethSettings, SinkSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
-from elspeth.core.landscape.schema import token_outcomes_table
+from elspeth.core.landscape.schema import token_outcomes_table, tokens_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -1456,11 +1457,17 @@ def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_v
     failed = [json.loads(state.error_json) for state in states if state.status == "failed"]
     [flush_error] = [error for error in failed if error["type"] == "PluginContractViolation"]
     assert flush_error["phase"] == "collector_flush"
-    # batch_stats under an observed schema declares no output field, so the
-    # field name is withheld too (a field name can itself be row data).
-    assert flush_error["exception"].startswith(
-        "Collector transform 'batch_stats' emitted non-canonical data at emitted row 0, "
-        "in a field its output schema does not declare (IntegerDomainError). "
+    # batch_stats' output schema is observed, and an observed schema rejects a
+    # number canonical JSON refuses (the one canonical-number rule, H1 of lane
+    # 5887: it used to reject only NaN/Infinity), so the out-of-range sum fails
+    # the flush's OUTPUT VALIDATION, value-free, before the release hash sees it.
+    # The text names the rule and blames the computed number, not a schema bug
+    # (review-codexfix-handoffs-r1 M1).
+    assert flush_error["exception"] == (
+        "Collector transform 'batch_stats' output validation failed for emitted row 0: "
+        "1 validation error: <root>: [non_canonical_number]. It emitted a number canonical JSON cannot represent. "
+        "Ensure output contains only JSON-serializable types within the JSON safe integer range. "
+        "Use None instead of NaN for missing values."
     )
     member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
     assert len(member_errors) == 2
@@ -1472,47 +1479,65 @@ def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_v
     # in the same run: the DB scan finds the violation text in the very cell
     # a leak would reach, and the payload scan finds the page values the
     # source and the explode legitimately stored.
-    assert ("node_states", "error_json") in _audit_cells_containing(db, "emitted non-canonical data")
+    assert ("node_states", "error_json") in _audit_cells_containing(db, "output validation failed for emitted row 0")
     assert _audit_cells_containing(db, str(_NON_CANONICAL_SUM)) == []
     payloads = [path.read_bytes() for path in (tmp_path / "payloads").rglob("*") if path.is_file()]
     assert any(str(_BIG_PAGE_VALUE).encode() in payload for payload in payloads)
     assert not any(str(_NON_CANONICAL_SUM).encode() in payload for payload in payloads)
 
 
-_NON_CANONICAL_SOURCE_INT = 9_182_737_777_777_777_777_777_777_777_777
+def test_a_transform_computing_an_unsafe_integer_routes_naming_the_rule_not_a_schema_bug(tmp_path: Any) -> None:
+    """review-codexfix-handoffs-r1 M1: the per-row seam's text for a computed out-of-range integer.
 
-
-def test_a_source_row_the_ingest_hash_refuses_ends_the_run_without_the_value(tmp_path: Any) -> None:
-    """The fourth non-canonical seam: a VALID source row hashed at ingest (C3 fix round 1).
-
-    A json source passes an integer beyond the JSON safe range as a valid row;
-    the ingest transaction's hash refuses it and the run ends (the source's
-    contract breach). rfc8785's own text is the integer, and it reached the
-    source operation's error and the printed traceback. The violation names the
-    row index, withholds the observed (data-derived) field name, and carries
-    neither the value nor a chained cause.
+    value_transform multiplies a safe integer past ±(2**53-1). Its observed
+    output schema refuses the result (the one canonical-number rule), the row
+    routes to on_error, and the recorded reason names the rule and the
+    canonical-JSON guidance — not "a transform schema bug" — with no value.
     """
+    import json
+
     from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.core.landscape.schema import transform_errors_table
     from elspeth.engine.orchestrator.run_status import cli_completion_for
 
-    (tmp_path / "input.jsonl").write_text('{"id": 1, "n": ' + str(_NON_CANONICAL_SOURCE_INT) + "}\n")
-    settings = f"""
-sources:
+    computed = 10**12 * 1_000_000
+    _write_jsonl(tmp_path / "in.jsonl", ({"id": 1, "big": 5}, {"id": 2, "big": 10**12}, {"id": 3, "big": 7}))
+    settings = f"""sources:
   src:
     plugin: json
-    on_success: out
+    on_success: rows
     options:
-      path: {tmp_path / "input.jsonl"}
+      path: {tmp_path / "in.jsonl"}
       format: jsonl
+      on_validation_failure: discard
       schema:
         mode: observed
-      on_validation_failure: discard
+transforms:
+- name: multiply
+  plugin: value_transform
+  input: rows
+  on_success: out
+  on_error: failed
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prod
+      expression: row['big'] * 1000000
 sinks:
   out:
     plugin: json
     on_write_failure: discard
     options:
       path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  failed:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "failed.jsonl"}
       format: jsonl
       schema:
         mode: observed
@@ -1524,17 +1549,387 @@ payload_store:
 """
     cli = _run_cli(tmp_path, settings)
 
-    assert cli.exit_code not in (0, cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1]), cli.output
-    assert (
-        "Source 'json' emitted a valid row with non-canonical data at emitted row 0, in a field its output schema does not declare (IntegerDomainError)."
-        in cli.output
-    )
-    assert str(_NON_CANONICAL_SOURCE_INT) not in cli.output
-    assert "direct cause" not in cli.output
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1] == 1, cli.output
+    assert "Traceback" not in cli.output
+    assert [row["id"] for row in _read_jsonl(tmp_path / "out.jsonl")] == [1, 3]
+    assert [row["id"] for row in _read_jsonl(tmp_path / "failed.jsonl")] == [2]
 
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
-    # Positive control: the violation text reaches the very cell the leak reached.
-    assert ("operations", "error_message") in _audit_cells_containing(db, "emitted a valid row with non-canonical data")
+    with db.engine.connect() as conn:
+        [details] = conn.execute(select(transform_errors_table.c.error_details_json)).scalars().all()
+    assert json.loads(details)["error"] == (
+        "Transform 'value_transform' output validation failed for emitted row 0: "
+        "1 validation error: <root>: [non_canonical_number]. It emitted a number canonical JSON cannot represent. "
+        "Ensure output contains only JSON-serializable types within the JSON safe integer range. "
+        "Use None instead of NaN for missing values."
+    )
+    assert _audit_cells_containing(db, str(computed)) == []
+
+
+_NON_CANONICAL_SOURCE_INT = 9_182_737_777_777_777_777_777_777_777_777
+
+
+@pytest.mark.parametrize("on_validation_failure", ["quarantine", "discard"])
+def test_a_source_row_carrying_an_unsafe_integer_is_quarantined_without_the_value(tmp_path: Any, on_validation_failure: str) -> None:
+    """H1 (lane 5887): a Tier-3 integer outside canonical JSON is quarantined at the source.
+
+    A json source reads an integer beyond the JSON safe range. It used to pass
+    the row as valid; the ingest transaction's hash refused it and the run
+    ended with the row's token left without an outcome. The source-boundary
+    schema now rejects the value, so the row takes the source's
+    on_validation_failure route like any invalid row: the run completes with
+    failures, the rows around it deliver, every token has a terminal outcome,
+    and the reason names no value. The raw row is kept only where raw rows
+    belong (``validation_errors.row_data_json``, the record of what was seen);
+    the quarantine sink receives the row with the value replaced by null.
+    """
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    lines = ['{"id": 1, "n": 5}', '{"id": 2, "n": ' + str(_NON_CANONICAL_SOURCE_INT) + "}", '{"id": 3, "n": 7}']
+    (tmp_path / "input.jsonl").write_text("\n".join(lines) + "\n")
+    # A sink no route reaches fails graph validation, so the quarantine sink
+    # exists only when the source routes to it.
+    quarantine_sink = (
+        f"""  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "quarantine.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        if on_validation_failure == "quarantine"
+        else ""
+    )
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: out
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: {on_validation_failure}
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+{quarantine_sink}landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    expected_status = RunStatus.COMPLETED_WITH_FAILURES if on_validation_failure == "quarantine" else RunStatus.COMPLETED
+    assert cli.exit_code == cli_completion_for(expected_status)[1], cli.output
+    assert str(_NON_CANONICAL_SOURCE_INT) not in cli.output
+    assert "Traceback" not in cli.output
+    delivered = [json.loads(line)["id"] for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert delivered == [1, 3]
+    if on_validation_failure == "quarantine":
+        assert [json.loads(line) for line in (tmp_path / "quarantine.jsonl").read_text().splitlines()] == [{"id": 2, "n": None}]
+    else:
+        assert not (tmp_path / "quarantine.jsonl").exists()
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        outcomes = conn.execute(select(token_outcomes_table.c.token_id, token_outcomes_table.c.completed)).all()
+        tokens = conn.execute(select(tokens_table.c.token_id)).scalars().all()
+    # Every token reaches exactly one completed outcome (discard creates no token for the row).
+    assert sorted(token_id for token_id, completed in outcomes if completed) == sorted(tokens)
+    assert len(tokens) == (3 if on_validation_failure == "quarantine" else 2)
+    # Positive control: the value-free reason reaches the validation record.
+    assert ("validation_errors", "error") in _audit_cells_containing(db, "<root>: [non_canonical_number]")
+    # The value is only in the raw-row record of what the source saw.
+    assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == [("validation_errors", "row_data_json")]
+
+
+def test_a_row_quarantined_for_another_field_that_also_carries_an_unsafe_integer_reaches_its_sink(tmp_path: Any) -> None:
+    """The quarantine path sanitizes an unsafe integer as it does NaN (H1, lane 5887).
+
+    The source quarantines row 2 for its ``id`` (not an int); the row also
+    carries an integer outside ±(2**53-1). The quarantine router makes the
+    row hashable with ``sanitize_for_canonical`` before recording it — which
+    used to replace only NaN/Infinity, so the quarantine token's hash raised
+    rfc8785's own text (the value) and the run ended with two tokens and no
+    outcome. The sanitizer now asks the canonicalizer, so the row reaches its
+    quarantine sink with the value nulled and every token terminal.
+    """
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    lines = ['{"id": 1, "n": 5}', '{"id": "x", "n": ' + str(_NON_CANONICAL_SOURCE_INT) + "}"]
+    (tmp_path / "input.jsonl").write_text("\n".join(lines) + "\n")
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: out
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      schema:
+        mode: fixed
+        fields: ["id: int", "n: int"]
+      on_validation_failure: quarantine
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "quarantine.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1], cli.output
+    assert str(_NON_CANONICAL_SOURCE_INT) not in cli.output
+    assert [json.loads(line) for line in (tmp_path / "quarantine.jsonl").read_text().splitlines()] == [{"id": "x", "n": None}]
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        completed = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars().all()
+        tokens = conn.execute(select(tokens_table.c.token_id)).scalars().all()
+    assert len(tokens) == 2
+    assert sorted(completed) == sorted(tokens)
+    assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == [("validation_errors", "row_data_json")]
+
+
+@pytest.mark.parametrize(
+    ("schema", "on_validation_failure", "neighbour_big", "expected_status", "delivered_ids", "quarantined"),
+    [
+        # A valid row carrying an integral double in [2**53, 1e21) is delivered
+        # (the observed contract infers `big: float` from the first row).
+        ("mode: observed", "discard", "1.5", RunStatus.COMPLETED, [1, 2, 3], []),
+        # Under `big: int` the double becomes an int beyond ±(2**53-1): the row is
+        # quarantined, and its raw row (still the double) reaches the quarantine sink.
+        ('mode: fixed\n        fields: ["id: int", "big: int"]', "quarantine", "1", RunStatus.COMPLETED_WITH_FAILURES, [1, 3], [2]),
+    ],
+    ids=["valid-observed-double", "exponent-form-under-int-quarantined"],
+)
+def test_a_row_carrying_an_integral_double_beyond_2_53_reaches_a_terminal_outcome(
+    tmp_path: Any,
+    schema: str,
+    on_validation_failure: str,
+    neighbour_big: str,
+    expected_status: RunStatus,
+    delivered_ids: list[int],
+    quarantined: list[int],
+) -> None:
+    """review-codexfix-handoffs-r1 F1: the sink-effect round trip reads canonical text back as the double.
+
+    RFC 8785 writes an integral double below 1e21 in integer notation
+    (1e17 -> 100000000000000000). The sink boundary normalized each row with
+    ``json.loads(canonical_json(row))``, which read that literal back as an int
+    beyond ±(2**53-1); the member freeze refused it and the run ended with the
+    row's token (valid or quarantined) left without an outcome. The canonical
+    reader returns the double, so the row is written and every token is terminal.
+    """
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    lines = ['{"id": 1, "big": ' + neighbour_big + "}", '{"id": 2, "big": 1e17}', '{"id": 3, "big": ' + neighbour_big + "}"]
+    (tmp_path / "input.jsonl").write_text("\n".join(lines) + "\n")
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: out
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      schema:
+        {schema}
+      on_validation_failure: {on_validation_failure}
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  quarantine:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "quarantine.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    if not quarantined:
+        # A sink no route reaches fails graph validation.
+        settings = settings.replace(settings[settings.index("  quarantine:\n") : settings.index("landscape:")], "")
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code == cli_completion_for(expected_status)[1], cli.output
+    assert "Traceback" not in cli.output
+    delivered = [json.loads(line) for line in (tmp_path / "out.jsonl").read_text().splitlines()]
+    assert [row["id"] for row in delivered] == delivered_ids
+    for row in delivered:
+        if row["id"] == 2:
+            assert row["big"] == 1e17
+            assert type(row["big"]) is float
+    if quarantined:
+        rows = [json.loads(line) for line in (tmp_path / "quarantine.jsonl").read_text().splitlines()]
+        assert rows == [{"id": 2, "big": 1e17}]
+        assert type(rows[0]["big"]) is float
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        completed = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars().all()
+        tokens = conn.execute(select(tokens_table.c.token_id)).scalars().all()
+    assert len(tokens) == 3
+    assert sorted(completed) == sorted(tokens)
+
+
+def test_a_database_sink_effect_plan_carrying_an_integral_double_beyond_2_53_is_read_back_as_that_double(tmp_path: Any) -> None:
+    """review-codexfix-handoffs-r2: the durable sink-effect plan is canonical text holding the member rows.
+
+    The database sink puts each member row in its plan's ``safe_evidence``, and
+    the coordinator re-reads ``plan_json`` before it executes the prepared
+    effect. A plain ``json.loads`` read 1e17 back as an int beyond
+    ±(2**53-1), which the plan refused AFTER the rows were committed to the
+    target: the run failed with a traceback while every token was already
+    terminal. The canonical reader returns the double; the run completes.
+    """
+    from sqlalchemy import Column, Float, Integer, MetaData, Table, create_engine
+
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+    from elspeth.plugins.sinks.database_sink import database_effect_ledger_table
+
+    target_url = f"sqlite:///{tmp_path / 'target.db'}"
+    engine = create_engine(target_url)
+    metadata = MetaData()
+    target = Table("t", metadata, Column("id", Integer, nullable=False), Column("x", Float))
+    database_effect_ledger_table(metadata, "_elspeth_sink_effects")
+    metadata.create_all(engine)
+    (tmp_path / "input.jsonl").write_text('{"id": 1, "x": 1.5}\n{"id": 2, "x": 1e17}\n{"id": 3, "x": 3.5}\n')
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: db
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: fixed
+        fields: ["id: int", "x: float"]
+sinks:
+  db:
+    plugin: database
+    on_write_failure: discard
+    options:
+      url: {target_url}
+      table: t
+      if_exists: append
+      schema:
+        mode: fixed
+        fields: ["id: int", "x: float"]
+      effect_ledger:
+        table: _elspeth_sink_effects
+        schema_version: 1
+        permissions: [select, insert]
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code == cli_completion_for(RunStatus.COMPLETED)[1], cli.output
+    assert "Traceback" not in cli.output
+    with engine.connect() as conn:
+        written = conn.execute(select(target.c.id, target.c.x).order_by(target.c.id)).all()
+    engine.dispose()
+    assert [tuple(row) for row in written] == [(1, 1.5), (2, 1e17), (3, 3.5)]
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    with db.engine.connect() as conn:
+        completed = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars().all()
+        tokens = conn.execute(select(tokens_table.c.token_id)).scalars().all()
+    assert len(tokens) == 3
+    assert sorted(completed) == sorted(tokens)
+
+
+def test_a_source_that_skips_its_schema_ends_the_run_at_ingest_naming_the_source_row(tmp_path: Any) -> None:
+    """The backstop: a VALID source row the ingest hash refuses is the source's contract breach.
+
+    ListSource wraps rows as valid without validating them, so the unsafe
+    integer in its SECOND row reaches the ingest transaction, whose hash
+    refuses it and ends the run (C3 fix round 1). The violation locates the row
+    by its source row index — it used to say "emitted row 0" for every row,
+    because it located the row inside a one-row list — withholds the undeclared
+    field name, and carries neither the value nor a chained cause.
+    """
+    from elspeth.contracts.errors import PluginContractViolation
+
+    source_name = "list_src"
+    source = ListSource([{"value": 1}, {"value": _NON_CANONICAL_SOURCE_INT}], name="list_source", on_success="output")
+    source_settings = SourceSettings(plugin=source.name, on_success="output", options={})
+    sinks = {"output": CollectSink("output")}
+    graph = ExecutionGraph.from_plugin_instances(
+        sources={source_name: as_source(source)},
+        source_settings_map={source_name: source_settings},
+        transforms=[],
+        sinks={name: as_sink(sink) for name, sink in sinks.items()},
+        aggregations={},
+        gates=[],
+    )
+    config = PipelineConfig(
+        sources={source_name: as_source(source)}, transforms=[], sinks={name: as_sink(sink) for name, sink in sinks.items()}
+    )
+    db = make_landscape_db()
+
+    with pytest.raises(PluginContractViolation) as exc_info:
+        Orchestrator(db=db).run(config, graph=graph, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
+
+    message = str(exc_info.value)
+    assert message.startswith(
+        "Source 'list_source' emitted a valid row with non-canonical data at source row 1, "
+        "in a field its output schema does not declare (IntegerDomainError)."
+    ), message
+    assert str(_NON_CANONICAL_SOURCE_INT) not in message
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+    # Positive control: the violation text reaches the source operation's error.
+    assert ("operations", "error_message") in _audit_cells_containing(db, "emitted a valid row with non-canonical data at source row 1")
     assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == []
 
 

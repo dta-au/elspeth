@@ -5249,7 +5249,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ffdb0616b1c68213",
         1,
         None,
-        line=539,
+        line=542,
         connection_escape=True,
     ),
     # open_export_read_transaction acquires twice: engine.connect()
@@ -5262,7 +5262,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9d39978e72854dca",
         1,
         None,
-        line=544,
+        line=547,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/scheduler/leases.py",
@@ -5285,7 +5285,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "3e92055687329a54",
         1,
         None,
-        line=426,
+        line=500,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5296,7 +5296,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "cb69520a77f4030e",
         1,
         None,
-        line=839,
+        line=913,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -5307,7 +5307,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "a1ed0f32c96a6da4",
         1,
         None,
-        line=859,
+        line=933,
         connection_escape=True,
     ),
     # ``with LandscapeDB.from_url(...) as database`` then ``database.engine
@@ -18255,7 +18255,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         "ffdb0616b1c68213",
         1,
         None,
-        line=539,
+        line=542,
         connection_escape=True,
     )
     assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 49

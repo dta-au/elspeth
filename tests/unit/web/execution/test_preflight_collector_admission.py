@@ -142,7 +142,8 @@ def test_the_retired_refusal_has_no_catalogue_entry() -> None:
 
 def test_the_retired_kernel_survives_only_in_history() -> None:
     """Negative pin for the lift: no live source, test, doc, config or
-    frontend text still states the refusal — only the WS2 plan's history.
+    frontend text still states the refusal — only history (the WS2 plan, and
+    point-in-time architecture analyses).
     A plain file walk (not git grep) so the pin holds in a `git archive`
     export too."""
     hits: list[str] = []
@@ -152,4 +153,7 @@ def test_the_retired_kernel_survives_only_in_history() -> None:
                 continue
             if _RETIRED_KERNEL in path.read_text(encoding="utf-8", errors="ignore"):
                 hits.append(str(path.relative_to(_REPO_ROOT)))
-    assert sorted(hit for hit in hits if not hit.startswith("docs/plans/")) == [str(Path(__file__).relative_to(_REPO_ROOT))]
+    # docs/plans/ and docs/arch-analysis-*/ are history: plans and point-in-time
+    # analyses may quote the retired refusal verbatim.
+    history = ("docs/plans/", "docs/arch-analysis-")
+    assert sorted(hit for hit in hits if not hit.startswith(history)) == [str(Path(__file__).relative_to(_REPO_ROOT))]

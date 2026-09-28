@@ -933,7 +933,18 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the R2 branch):
 # the R2 json_explode pin above joins the lane's chain; digest re-captured from
 # the merged tree.
-EXPECTED_CASE_REGISTRY_SHA256 = "104886128377b61f4611a95b993b1cb1dcef2a65e795521b415ae7450ac3895a"
+# Rotated 2026-09-28 (elspeth-5887fb7928, CSV inference width cap): a PLUGIN
+# PROVENANCE rotation. csv_source refuses a header wider than the 1024-field
+# inference cap at header read, so its source_file_hash moved
+# 040ed5b1c21f4dae -> 678589d6b1a6bf62 (scripts/cicd/plugin_hash). Order: (1)
+# the manifest's 15 csv literals; (2) reopen-resume's
+# resumed_full_projection_sha256 cab4aab8... -> f57c9c95..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — setting only the csv pin (code and manifest) back to
+# 040ed5b1c21f4dae with the new code reproduces cab4aab8... exactly, so the
+# move is plugin provenance, not runtime semantics; (3) this digest, captured
+# from this file's parity failure. No oracle_freeze snapshot moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "7d9bebc6bdb3ca946d71a64d420b03b1c4bda1bb5f6f5dd11211a3e0ab8962af"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

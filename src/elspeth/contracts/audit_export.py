@@ -23,7 +23,7 @@ from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChun
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.hashing import canonical_json, canonical_json_loads
 from elspeth.contracts.sink_effects import AuditExportFormat, AuditExportSigningMode
 
 if TYPE_CHECKING:
@@ -1060,9 +1060,12 @@ def _detached_record(record: Mapping[str, object]) -> dict[str, ClosedAuditExpor
         raise ValueError("audit export input records must not contain a manifest")
     # Round-tripping through the committed canonical encoder proves the value
     # tree is detached JSON data and rejects datetimes/bytes/custom authority.
+    # The decoder is the encoder's inverse: an integral double beyond 2**53 is
+    # printed in integer notation and must come back as that double, not as
+    # an int the encoder refuses when the record is signed and framed.
     try:
         encoded = canonical_json(record)
-        value = json.loads(encoded)
+        value = canonical_json_loads(encoded)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise TypeError("audit export record is not closed canonical JSON") from exc
     if type(value) is not dict:

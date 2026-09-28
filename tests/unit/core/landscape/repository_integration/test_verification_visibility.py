@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy import update
@@ -22,7 +23,9 @@ from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape import bind_budget
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import call_verifications_table
 from elspeth.mcp.analyzer import LandscapeAnalyzer
 from elspeth.mcp.server import _TOOLS, _validate_tool_args
@@ -186,3 +189,153 @@ def test_explain_cli_propagates_corrupt_verification(tmp_path: Path, output_flag
     assert isinstance(result.exception, AuditIntegrityError)
     assert "verification differences_json must encode an object" in str(result.exception)
     assert "verification_decisions" not in result.output
+
+
+def _persist_two_token_verdicts(db_path: Path) -> tuple[list[str], list[CallVerification]]:
+    """Record one mismatching verdict per token for two tokens of the verify run."""
+    db = LandscapeDB.from_url(f"sqlite:///{db_path}")
+    try:
+        setup = make_recorder_with_run(db=db, run_id="source", source_node_id="source-node")
+        factory = setup.factory
+        factory.run_lifecycle.begin_run(
+            config={}, canonical_version="v1", run_id="current", run_mode=RunMode.VERIFY, replay_from_run_id="source"
+        )
+        register_test_node(factory.data_flow, "current", "source-node", node_type=NodeType.SOURCE)
+        calls: dict[str, list[Any]] = {}
+        token_ids: list[str] = []
+        for run_id in ("source", "current"):
+            leader = leader_coordination_token(factory, run_id)
+            register_test_node(factory.data_flow, run_id, "transform")
+            member = leader_member_token(factory, run_id)
+            for index in range(2):
+                _, token = factory.data_flow.create_row_with_token(
+                    coordination_token=leader,
+                    source_node_id="source-node",
+                    row_index=index,
+                    data={"value": index},
+                    source_row_index=index,
+                    ingest_sequence=index,
+                )
+                work = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id="transform")
+                state = factory.execution.begin_node_state(token.token_id, "transform", 0, {"value": index}, member_token=member)
+                call = factory.execution.record_call(
+                    state.state_id,
+                    0,
+                    CallType.HTTP,
+                    CallStatus.SUCCESS,
+                    request_data=RawCallPayload({"url": "https://example.test", "row": index}),
+                    response_data=RawCallPayload({"status": 200 if run_id == "source" else 201}),
+                    member_token=member,
+                    work_item=work,
+                )
+                calls.setdefault(run_id, []).append(call)
+                if run_id == "current":
+                    token_ids.append(token.token_id)
+        decisions = [
+            factory.execution.record_verification_decision(
+                current_run_id="current",
+                current_call_id=current.call_id,
+                source_run_id="source",
+                source_call_id=source.call_id,
+                is_match=False,
+                differences_json=json.dumps(
+                    {"reason": "response_hash_mismatch", "expected_hash": source.response_hash, "actual_hash": current.response_hash}
+                ),
+                coordination_token=leader_coordination_token(factory, "current"),
+            )
+            for source, current in zip(calls["source"], calls["current"], strict=True)
+        ]
+        return token_ids, decisions
+    finally:
+        db.close()
+
+
+def _corrupt_verdict(db_path: Path, current_call_id: str) -> None:
+    db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
+    try:
+        with db.write_connection() as conn:
+            conn.execute(
+                update(call_verifications_table)
+                .where(call_verifications_table.c.current_call_id == current_call_id)
+                .values(differences_json="[]")
+            )
+    finally:
+        db.close()
+
+
+def test_call_scoped_read_equals_run_wide_filter(tmp_path: Path) -> None:
+    db_path = tmp_path / "audit.db"
+    _, decisions = _persist_two_token_verdicts(db_path)
+    db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False, read_only=True)
+    try:
+        repositories = RecorderFactory.read_only(db)
+        run_wide = repositories.execution.get_verification_decisions_for_run("current")
+        assert {decision.current_call_id for decision in run_wide} == {decision.current_call_id for decision in decisions}
+        for requested in ({decisions[0].current_call_id}, {decisions[1].current_call_id}, {d.current_call_id for d in decisions}):
+            scoped = repositories.execution.get_verification_decisions_for_calls("current", requested)
+            assert scoped == [decision for decision in run_wide if decision.current_call_id in requested]
+        assert repositories.execution.get_verification_decisions_for_calls("current", set()) == []
+        assert repositories.execution.get_verification_decisions_for_calls("source", {decisions[0].current_call_id}) == []
+        assert repositories.execution.get_verification_decisions_for_calls("current", {"call-not-recorded"}) == []
+    finally:
+        db.close()
+
+
+def test_call_scoped_read_orders_across_bind_budget_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db_path = tmp_path / "audit.db"
+    _, decisions = _persist_two_token_verdicts(db_path)
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 1)
+    db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False, read_only=True)
+    try:
+        repositories = RecorderFactory.read_only(db)
+        requested = {decision.current_call_id for decision in decisions}
+        scoped = repositories.execution.get_verification_decisions_for_calls("current", requested)
+        assert scoped == repositories.execution.get_verification_decisions_for_run("current")
+    finally:
+        db.close()
+
+
+def test_call_scoped_read_skips_corrupt_verdicts_outside_the_requested_calls(tmp_path: Path) -> None:
+    db_path = tmp_path / "audit.db"
+    _, decisions = _persist_two_token_verdicts(db_path)
+    inside, outside = decisions
+    db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False, read_only=True)
+    try:
+        (stored_inside,) = RecorderFactory.read_only(db).execution.get_verification_decisions_for_calls("current", {inside.current_call_id})
+    finally:
+        db.close()
+    _corrupt_verdict(db_path, outside.current_call_id)
+    db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False, read_only=True)
+    try:
+        repositories = RecorderFactory.read_only(db)
+        assert repositories.execution.get_verification_decisions_for_calls("current", {inside.current_call_id}) == [stored_inside]
+        with pytest.raises(AuditIntegrityError, match="verification differences_json must encode an object"):
+            repositories.execution.get_verification_decisions_for_calls("current", {outside.current_call_id})
+        with pytest.raises(AuditIntegrityError, match="verification differences_json must encode an object"):
+            repositories.execution.get_verification_decisions_for_run("current")
+    finally:
+        db.close()
+
+
+def test_explain_reads_only_the_lineage_verdicts(tmp_path: Path) -> None:
+    """CLI and MCP explain never load a verdict outside the explained token's calls."""
+    db_path = tmp_path / "audit.db"
+    token_ids, decisions = _persist_two_token_verdicts(db_path)
+    _corrupt_verdict(db_path, decisions[1].current_call_id)
+
+    result = CliRunner().invoke(app, ["explain", "--run", "current", "--token", token_ids[0], "--database", str(db_path), "--json"])
+    assert result.exit_code == 0, result.output
+    records = json.loads(result.output)["verification_decisions"]
+    assert [record["current_call_id"] for record in records] == [decisions[0].current_call_id]
+    assert records[0]["differences_json"] == decisions[0].differences_json
+
+    analyzer = LandscapeAnalyzer(f"sqlite:///{db_path}")
+    try:
+        explained = analyzer.explain_token("current", token_id=token_ids[0])
+        assert "error" not in explained
+        assert [record["current_call_id"] for record in explained["verification_decisions"]] == [decisions[0].current_call_id]
+        assert explained["verification_decisions"][0]["differences_json"] == decisions[0].differences_json
+        with pytest.raises(AuditIntegrityError, match="verification differences_json must encode an object"):
+            analyzer.explain_token("current", token_id=token_ids[1])
+    finally:
+        analyzer.close()

@@ -1455,12 +1455,9 @@ def explain(
                     typer.echo("Token or row not found, or no terminal tokens exist yet.", err=True)
                 raise typer.Exit(1) from None
 
-            call_ids = {call.call_id for call in lineage_result.calls}
-            verification_decisions = [
-                decision
-                for decision in factory.execution.get_verification_decisions_for_run(resolved_run_id)
-                if decision.current_call_id in call_ids
-            ]
+            verification_decisions = factory.execution.get_verification_decisions_for_calls(
+                resolved_run_id, {call.call_id for call in lineage_result.calls}
+            )
 
             # Output based on mode
             if json_output:

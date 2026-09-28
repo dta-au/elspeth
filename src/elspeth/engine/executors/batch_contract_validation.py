@@ -83,6 +83,7 @@ from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.types import NodeID
 from elspeth.engine.executors.declared_input_miss import classify_declared_input_miss, declared_input_proof_entry
 from elspeth.engine.executors.declared_output_types import verify_created_output_types
+from elspeth.engine.executors.non_canonical_output import output_validation_violation
 
 
 def batch_declared_input_proof(
@@ -233,10 +234,11 @@ def validate_success_outputs(
         try:
             transform.output_schema.model_validate(row.to_dict(), strict=True)
         except ValidationError as exc:
-            raise PluginContractViolation(
-                f"{node_kind} transform '{transform.name}' output validation failed for emitted row {idx}: "
-                f"{safe_validation_error_text(exc, transform.output_schema)}. "
-                "This indicates a transform schema bug."
+            raise output_validation_violation(
+                producer=f"{node_kind} transform '{transform.name}'",
+                emitted_row_index=idx,
+                output_schema=transform.output_schema,
+                exc=exc,
             ) from exc
 
     verify_created_output_types(transform=transform, emitted_rows=emitted_rows)

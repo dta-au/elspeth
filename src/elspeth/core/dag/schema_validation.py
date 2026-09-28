@@ -1206,7 +1206,11 @@ def _sink_required_missing_fields(
 
 
 def upstream_name_resolution(graph: ExecutionGraph, node_id: str, cache: dict[str, FieldNameResolution]) -> FieldNameResolution:
-    """The field-name spelling rule's build-time resolution for the rows arriving at ``node_id``.
+    """The field-name spelling rule's build-time resolution for the rows arriving at ``node_id``, all predecessors united.
+
+    For the missing-field verdicts' header-spelling hints, which speak of the
+    node's whole input; the rule's refusal resolves each predecessor's vote
+    through that predecessor's own output (``validate_declared_field_spellings``).
 
     A declaration names what the upstream makes of its spelling, so the build
     resolves it the way the rows' own contract will: through the renames of
@@ -1818,9 +1822,12 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
     mirror makes, so the two surfaces cannot disagree about when a build may
     refuse. A declared name is resolved the way the upstream resolves it: its
     normalized form, renamed by the ``field_mapping`` of any source reaching the
-    node and by every transform rename on the way (``upstream_name_resolution``)
-    — so under ``field_mapping: {name: b}`` both ``Name`` and ``name`` are
-    spellings of ``b``, and behind a field_mapper ``{b: c}`` of ``c``. Soundness, per
+    predecessor and by every transform rename on the way to it
+    (``_output_name_resolution``) — so under ``field_mapping: {name: b}`` both
+    ``Name`` and ``name`` are spellings of ``b``, and behind a field_mapper
+    ``{b: c}`` of ``c``. Each predecessor's vote is checked through that
+    predecessor's OWN resolution: at a fan-in, an alias one arm's rename gives
+    a field is no spelling of a field another arm carries. Soundness, per
     predecessor vote:
 
     - a READ is refused only against a PARTICIPATING and CLOSED vote. Absence of
@@ -1872,7 +1879,6 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
         if declared.is_empty:
             continue
 
-        resolution = upstream_name_resolution(graph, node_id, name_resolution_cache)
         for predecessor_id in _live_predecessors(graph, node_id):
             vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
             spellings = header_spelled_declarations(
@@ -1881,7 +1887,10 @@ def validate_declared_field_spellings(graph: ExecutionGraph) -> None:
                 forwarded=vote.fields - info.removed_input_fields,
                 participated=vote.participated,
                 closed=vote.closed,
-                resolution=resolution,
+                # THIS predecessor's resolution, never the union over the
+                # node's whole reach: at a fan-in an alias one arm's rename
+                # gives a field says nothing of another arm's field.
+                resolution=_output_name_resolution(graph, predecessor_id, name_resolution_cache),
             )
             if not spellings:
                 continue

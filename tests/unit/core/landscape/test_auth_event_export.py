@@ -16,7 +16,7 @@ from elspeth.core.landscape.schema import auth_events_table
 from tests.unit.core.landscape.test_audit_export_read_model import COMPLETED_AT, _insert_run
 
 
-def _event(db: LandscapeDB, event_id: str, *, after: bool = False) -> None:
+def _event(db: LandscapeDB, event_id: str, *, after: bool = False, metadata: dict[str, object] | None = None) -> None:
     _, values = AuthAuditRepository._auth_event_values(
         event_type="role_granted",
         outcome="success",
@@ -27,7 +27,7 @@ def _event(db: LandscapeDB, event_id: str, *, after: bool = False) -> None:
         request_id=None,
         client_host=None,
         user_agent=None,
-        metadata={"role": "admin"},
+        metadata={"role": "admin"} if metadata is None else metadata,
         identity_id="target-identity",
     )
     values["event_id"] = event_id
@@ -96,6 +96,25 @@ def test_signed_deployment_export_includes_stored_history_and_empty_coverage() -
         assert "organisation_id" not in events[0]
         coverage = next(row for row in records if row["record_type"] == "auth_event_coverage")
         assert coverage["selected_count"] == 3
+        assert all("signature" in row for row in records)
+
+
+def test_signed_export_reads_auth_metadata_double_beyond_2_53_as_the_stored_double() -> None:
+    """Stored canonical metadata prints 1e17 as ``100000000000000000``; export reads the double back."""
+    with LandscapeDB.in_memory() as db:
+        _insert_run(db, run_id="run", status="completed", completed_at=COMPLETED_AT)
+        _event(db, "big", metadata={"quota": 1e17})
+        exporter = LandscapeExporter(
+            db,
+            signing_key=b"test-auth-export-key",
+            signer_key_id="test",
+            auth_events="deployment_snapshot",
+            compartment_id="research-a",
+        )
+        records = list(exporter.export_run("run", sign=True))
+        event = next(row for row in records if row["record_type"] == "auth_event")
+        assert type(event["metadata"]["quota"]) is float
+        assert event["metadata"]["quota"] == 1e17
         assert all("signature" in row for row in records)
 
 

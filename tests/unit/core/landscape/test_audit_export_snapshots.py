@@ -585,6 +585,28 @@ def test_bound_winner_reader_resolves_only_registered_store_content() -> None:
         db.close()
 
 
+@pytest.mark.parametrize("signed", [False, True])
+def test_reader_verifies_a_double_beyond_2_53_printed_in_integer_notation(signed: bool) -> None:
+    """RFC 8785 prints 1e17 as ``100000000000000000``; the reader must decode it as the double.
+
+    A plain ``json.loads`` reads the literal back as an ``int`` beyond 2**53,
+    which the canonical encoder refuses when the reader re-derives the frame.
+    """
+    from elspeth.core.landscape.execution.audit_export_snapshots import _verify_snapshot_graph
+
+    store = _MemoryContentStore()
+    candidate = _candidate(store, records=[{"record_type": "run", "settings": {"threshold": 1e17}}], signed=signed)
+    assert b'"threshold":100000000000000000' in store.content[candidate.chunks[0].content_ref]
+
+    _verify_snapshot_graph(
+        candidate.snapshot,
+        candidate.chunks,
+        resolve_registered=store.content.__getitem__,
+        signed_manifest_verifier=_signed_manifest_verifier if signed else (lambda _content, _descriptor: None),
+        record_signature_verifier=_record_signature_verifier if signed else None,
+    )
+
+
 def test_bound_winner_rejects_chunk_seal_not_derived_from_registered_bytes() -> None:
     db = LandscapeDB.in_memory()
     store = _MemoryContentStore()

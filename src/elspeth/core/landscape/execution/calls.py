@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from concurrent.futures import Future
 from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
@@ -28,6 +28,7 @@ from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.scheduler import TokenWorkItem
@@ -55,6 +56,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.core.landscape.verification_reads import (
     get_verification_decision,
+    get_verification_decisions_for_calls,
     get_verification_decisions_for_run,
     iter_verification_decisions_for_run,
 )
@@ -937,6 +939,10 @@ class CallAuditRepository:
         with self._db.read_only_connection() as conn:
             yield from iter_verification_decisions_for_run(conn, current_run_id, batch_size=batch_size)
 
+    def get_verification_decisions_for_calls(self, current_run_id: str, current_call_ids: Collection[str]) -> list[CallVerification]:
+        with self._db.read_only_connection() as conn:
+            return get_verification_decisions_for_calls(conn, current_run_id, current_call_ids)
+
     def find_call_by_request_hash(
         self,
         run_id: str,
@@ -1287,7 +1293,7 @@ class CallAuditRepository:
         except (PayloadIntegrityError, OSError) as exc:
             raise AuditIntegrityError(f"Call request payload retrieval failed for call_id={call_id}") from exc
         try:
-            decoded = json.loads(payload_bytes.decode("utf-8"), parse_constant=_reject_non_finite_json_constant)
+            decoded = canonical_json_loads(payload_bytes.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
             raise AuditIntegrityError(f"Corrupt call request payload for call_id={call_id}") from exc
         if type(decoded) is not dict:
@@ -1348,7 +1354,7 @@ class CallAuditRepository:
 
         # Everything below is Tier 1: our data, crash on anomaly
         try:
-            decoded = json.loads(payload_bytes.decode("utf-8"), parse_constant=_reject_non_finite_json_constant)
+            decoded = canonical_json_loads(payload_bytes.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as e:
             raise AuditIntegrityError(f"Corrupt call response payload for call_id={call_id} (ref={row.response_ref}): {e}") from e
         if type(decoded) is not dict:

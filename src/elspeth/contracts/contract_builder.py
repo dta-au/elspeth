@@ -110,6 +110,29 @@ class ContractBuilder:
         self._contract = updated
         return updated
 
+    def refuse_uninferable_width(self, field_names: tuple[str, ...], *, subject: str) -> None:
+        """Refuse, before any row is read, a record width inference cannot hold.
+
+        A locked contract (``mode: fixed``) infers nothing and has no cap. An
+        unlocked one (observed, flexible) infers every field of the first valid
+        row, so a record shape wider than the cap would otherwise fail there,
+        after earlier rows were already ingested. Only counts are named: the
+        message carries no field name or value.
+
+        Raises:
+            ContractFieldLimitExceeded: The unlocked contract would infer more
+                than the cap.
+        """
+        if self._contract.locked:
+            return
+        width = len({f.normalized_name for f in self._contract.fields} | set(field_names))
+        if width > _MAX_INFERRED_CONTRACT_FIELDS:
+            raise ContractFieldLimitExceeded(
+                f"{subject} has {width} fields; observed and flexible schemas infer at most "
+                f"{_MAX_INFERRED_CONTRACT_FIELDS}. Declare the schema with mode: fixed and list every one of "
+                f"the {width} fields (a fixed schema rejects undeclared fields), or remove fields before ingest."
+            )
+
     def process_first_row(
         self,
         row: dict[str, Any],

@@ -23,7 +23,7 @@ from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt, SinkEffectMem
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import CallType
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
-from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.hashing import canonical_json, canonical_json_loads, stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     MemberSinkEffectCapability,
@@ -1132,7 +1132,7 @@ class SinkEffectCoordinator:
         self._guard_external_effect()
         content = store.retrieve(durable.payload_hash)
         try:
-            row = json.loads(content)
+            row = canonical_json_loads(content)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("sink effect member payload is not canonical JSON") from exc
         if type(row) is not dict or canonical_json(row).encode("utf-8") != content:
@@ -1270,7 +1270,7 @@ class SinkEffectCoordinator:
         if effect.plan_json is None:
             raise LandscapeRecordError("prepared sink effect is missing its durable plan")
         try:
-            payload = json.loads(effect.plan_json)
+            payload = canonical_json_loads(effect.plan_json)
         except (TypeError, json.JSONDecodeError) as exc:
             raise LandscapeRecordError("prepared sink effect has invalid durable plan JSON") from exc
         if type(payload) is not dict:

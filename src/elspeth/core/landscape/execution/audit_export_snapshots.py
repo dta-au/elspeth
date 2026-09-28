@@ -33,7 +33,7 @@ from elspeth.contracts.audit_export import (
 )
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.hashing import canonical_json, canonical_json_loads
 from elspeth.contracts.sink_effects import (
     AuditExportSignedManifestInput,
     AuditExportSigningMode,
@@ -88,7 +88,9 @@ def _verify_snapshot_graph(
             if not frame.endswith(b"\n") or frame == b"\n":
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains an incomplete record frame")
             try:
-                emitted = json.loads(frame[:-1])
+                # Frames are canonical_json bytes; read them with its inverse so
+                # an integral double beyond 2**53 re-encodes byte-identically.
+                emitted = canonical_json_loads(frame[:-1])
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains invalid JSON") from exc
             if type(emitted) is not dict or ("record_type" in emitted and emitted["record_type"] == "manifest"):

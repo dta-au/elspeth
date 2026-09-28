@@ -6,7 +6,7 @@ Single place that wires up loaders, database operations, and repository instance
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
@@ -183,6 +183,9 @@ class ExecutionReadRepository:
 
     def get_verification_decisions_for_run(self, current_run_id: str) -> list[CallVerification]:
         return self._repo.get_verification_decisions_for_run(current_run_id)
+
+    def get_verification_decisions_for_calls(self, current_run_id: str, current_call_ids: Collection[str]) -> list[CallVerification]:
+        return self._repo.get_verification_decisions_for_calls(current_run_id, current_call_ids)
 
     def get_operations_for_run(self, run_id: str) -> list[Any]:
         return self._repo.get_operations_for_run(run_id)

@@ -19,6 +19,7 @@ from elspeth.contracts.audit import NodeStateFailed, ValidationErrorRecord
 from elspeth.contracts.enums import NodeType, RunMode, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, VerificationMismatchError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import sanitize_for_canonical, stable_hash
@@ -75,7 +76,7 @@ def replay_source_rows(audited: AuditedSource, ctx: PluginContext) -> Iterator[S
         if error.row_data_json is None:
             raise AuditIntegrityError(f"Source replay validation error {error.error_id}: payload missing")
         ctx.record_validation_error(
-            row=json.loads(error.row_data_json),
+            row=canonical_json_loads(error.row_data_json),
             error=error.error,
             schema_mode=error.schema_mode,
             destination=error.destination,
@@ -295,7 +296,7 @@ def prepare_audited_sources(
         ):
             raise AuditIntegrityError(f"Source replay validation error {error.error_id}: structured violation cannot be reconstructed")
         try:
-            restored_hash = stable_hash(json.loads(error.row_data_json))
+            restored_hash = stable_hash(canonical_json_loads(error.row_data_json))
         except (ValueError, TypeError) as exc:
             raise AuditIntegrityError(f"Source replay validation error {error.error_id}: discard payload cannot be reconstructed") from exc
         if restored_hash != error.row_hash:
@@ -328,7 +329,7 @@ def prepare_audited_sources(
                     errors = factory.data_flow.get_validation_errors_for_row(replay_from, row_id=row.row_id)
                     if len(errors) != 1 or errors[0].row_data_json is None:
                         raise AuditIntegrityError(f"Source replay row {row.row_id}: ambiguous _raw quarantine payload")
-                    original = json.loads(errors[0].row_data_json)
+                    original = canonical_json_loads(errors[0].row_data_json)
                     if original == data:
                         raw_data = data
                     elif original == data["_raw"]:

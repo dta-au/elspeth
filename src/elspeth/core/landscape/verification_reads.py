@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from typing import Any
 
-from sqlalchemy import Select, and_, or_, select, type_coerce
+from sqlalchemy import ColumnElement, Select, and_, or_, select, type_coerce
 from sqlalchemy.engine import Connection, Row
 from sqlalchemy.types import NullType
 
@@ -15,6 +15,7 @@ from elspeth.contracts import CallType
 from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.schema import call_verifications_table, calls_table, node_states_table, operations_table, runs_table
 
 type VerificationJSON = str | int | float | bool | None | list[VerificationJSON] | dict[str, VerificationJSON]
@@ -166,6 +167,39 @@ def get_verification_decision(conn: Connection, current_call_id: str) -> CallVer
     """Read and validate one decision in the caller's transaction."""
     row = conn.execute(_verification_query().where(call_verifications_table.c.current_call_id == current_call_id)).one_or_none()
     return None if row is None else _load(conn, row)
+
+
+def _attached_to_run(current_run_id: str) -> ColumnElement[bool]:
+    """A decision recorded for the run, or attached to one of the run's calls."""
+    return or_(
+        call_verifications_table.c.current_run_id == current_run_id,
+        node_states_table.c.run_id == current_run_id,
+        operations_table.c.run_id == current_run_id,
+    )
+
+
+def get_verification_decisions_for_calls(
+    conn: Connection, current_run_id: str, current_call_ids: Collection[str]
+) -> list[CallVerification]:
+    """Read and validate the run's decisions for the named current calls only.
+
+    The same rows, validation and order as filtering
+    :func:`iter_verification_decisions_for_run` to ``current_call_ids``, but
+    read by the ``call_verifications`` primary key in bind-budget chunks, so
+    the cost follows the requested calls rather than the size of the run.
+    """
+    rows = [
+        row
+        for chunk in bind_budget_chunks(sorted(set(current_call_ids)))
+        for row in conn.execute(
+            _verification_query()
+            .where(call_verifications_table.c.current_call_id.in_(chunk))
+            .where(_attached_to_run(current_run_id))
+            .order_by(call_verifications_table.c.recorded_at, call_verifications_table.c.current_call_id)
+        ).all()
+    ]
+    rows.sort(key=lambda row: (row.recorded_at, row.current_call_id))
+    return [_load(conn, row) for row in rows]
 
 
 def get_verification_decisions_for_run(conn: Connection, current_run_id: str) -> list[CallVerification]:

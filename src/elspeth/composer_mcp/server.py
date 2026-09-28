@@ -757,8 +757,10 @@ def create_server(
         except (ValueError, TypeError) as canon_exc:
             # Shared sentinel discipline (see web.composer.audit
             # build_canonicalization_sentinel docstring): captures
-            # type-name + ``str(exc)`` only for rfc8785 messages
-            # (value-free by spec) + sorted top-level argument keys.
+            # type-name + ``str(exc)`` only for the base rfc8785
+            # CanonicalizationError (its messages are type/rule strings;
+            # the domain subclasses echo the value) + sorted top-level
+            # argument keys.
             # Audit-trail forensic fingerprint without leak risk.
             sentinel = build_canonicalization_sentinel(canon_exc, arguments)
             arguments_canonical = canonical_json(sentinel)

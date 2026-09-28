@@ -249,6 +249,58 @@ def test_owned_database_marker_descriptor_metadata_requires_every_field(tmp_path
     engine.dispose()
 
 
+def test_sqlite_constraint_diversion_reasons_name_the_failure_kind_not_the_driver_message(tmp_path: Path) -> None:
+    """The SQLite half of review-C1C3-residuals-r1 F2 (the PostgreSQL half is a testcontainer test).
+
+    SQLite's own constraint messages name columns and constraints only
+    (``UNIQUE constraint failed: reasons.email``), but the reason is built the
+    same way on every dialect — from the driver's error code, never its message
+    — so no dialect's text can carry a row value into the audit trail.
+    """
+    url = f"sqlite:///{tmp_path / 'reasons.db'}"
+    engine = create_engine(url)
+    metadata = MetaData()
+    target = Table(
+        "reasons",
+        metadata,
+        Column("id", Integer, nullable=False, unique=True),
+        Column("email", Text, nullable=False, unique=True),
+        Column("qty", Integer, nullable=False),
+        CheckConstraint("qty >= 0", name="qty_non_negative"),
+    )
+    database_effect_ledger_table(metadata, "_elspeth_sink_effects")
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(insert(target), [{"id": 100, "email": "SNTL_SQLITE_DUP@example.com", "qty": 1}])
+    config = {
+        **_config(url),
+        "table": "reasons",
+        "schema": {"mode": "fixed", "fields": ["id: int", "email: str", "qty: int?"]},
+    }
+    sink = inject_write_failure(DatabaseSink(config))
+    plan = _prepare(
+        sink,
+        (
+            {"id": 1, "email": "ok-1@example.com", "qty": 1},
+            {"id": 2, "email": "SNTL_SQLITE_DUP@example.com", "qty": 1},
+            {"id": 3, "email": "SNTL_SQLITE_CHECK@example.com", "qty": -5},
+            {"id": 4, "email": "SNTL_SQLITE_NOTNULL@example.com", "qty": None},
+        ),
+    )
+
+    committed = sink.commit_effect(plan, _CTX)
+
+    assert committed.diverted_ordinals == (1, 2, 3)
+    reasons = [item.reason for item in sink._get_diversions()]
+    assert reasons == [
+        "Constraint violation: unique_violation (SQLITE_CONSTRAINT_UNIQUE)",
+        "Constraint violation: check_violation (SQLITE_CONSTRAINT_CHECK)",
+        "Constraint violation: not_null_violation (SQLITE_CONSTRAINT_NOTNULL)",
+    ]
+    assert not any("SNTL_SQLITE" in reason for reason in reasons)
+    engine.dispose()
+
+
 def test_marker_and_accepted_rows_commit_once_with_constraint_diversion(tmp_path: Path) -> None:
     url = f"sqlite:///{tmp_path / 'effect.db'}"
     _provision(url)

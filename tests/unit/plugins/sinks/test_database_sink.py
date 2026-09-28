@@ -370,3 +370,60 @@ class TestPerRowConstraintDiversion:
             result = [dict(r._mapping) for r in conn.execute(select(tbl))]
         engine.dispose()
         return result
+
+
+class _Diagnostics:
+    """Models the PostgreSQL drivers' ``diag`` object: the server's structured error fields."""
+
+    def __init__(self, constraint_name: object) -> None:
+        self.constraint_name = constraint_name
+
+
+class UniqueViolation(Exception):
+    """Models a psycopg/psycopg2 per-SQLSTATE error class (named after the SQLSTATE condition)."""
+
+    def __init__(self, message: str, constraint_name: object) -> None:
+        super().__init__(message)
+        self.diag = _Diagnostics(constraint_name)
+
+
+class InvalidTextRepresentation(Exception):
+    """A driver error without a ``diag`` attribute (a driver that exposes no structured fields)."""
+
+
+_ROW_SENTINEL = "SNTL_ROW_VALUE_M2"
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "expected_suffix"),
+    [
+        ("orders_email_key", " on constraint orders_email_key"),
+        # A quoted identifier is not printed: only a plain SQL identifier is.
+        (f'odd "{_ROW_SENTINEL}" name', ""),
+        (None, ""),
+        (7, ""),
+    ],
+    ids=["plain-identifier", "quoted-identifier-omitted", "absent", "non-str"],
+)
+def test_constraint_failure_reason_names_the_constraint_never_the_message(constraint_name: object, expected_suffix: str) -> None:
+    """review-codexfix-handoffs-r1 M2: the reason carries the constraint name the driver reports as a field."""
+    from sqlalchemy.exc import IntegrityError
+
+    from elspeth.plugins.sinks.database_sink import _constraint_failure_reason
+
+    driver_error = UniqueViolation(f"Key (email)=({_ROW_SENTINEL}) already exists", constraint_name)
+    reason = _constraint_failure_reason(IntegrityError("INSERT ...", {"email": _ROW_SENTINEL}, driver_error))
+
+    assert reason == "Constraint violation: unique_violation (UniqueViolation)" + expected_suffix
+    assert _ROW_SENTINEL not in reason
+
+
+def test_constraint_failure_reason_without_driver_diagnostics() -> None:
+    from sqlalchemy.exc import DataError
+
+    from elspeth.plugins.sinks.database_sink import _constraint_failure_reason
+
+    driver_error = InvalidTextRepresentation(f'invalid input syntax for type integer: "{_ROW_SENTINEL}"')
+    reason = _constraint_failure_reason(DataError("INSERT ...", {}, driver_error))
+
+    assert reason == "Constraint violation: data_error (InvalidTextRepresentation)"

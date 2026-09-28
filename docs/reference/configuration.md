@@ -809,6 +809,15 @@ on_validation_failure: quarantine  # quarantine or discard
 | `flexible` | At least these fields must be present (extras allowed) |
 | `observed` | Infer schema from data (no explicit field definitions) |
 
+An `observed` or `flexible` schema infers its contract from the first valid
+row and holds at most 1024 fields in total. A `csv` source whose header (or
+`columns`) is wider is refused at header read, before any row is ingested: the
+run fails with "CSV header has N fields; observed and flexible schemas infer
+at most 1024". To load it, declare
+the schema with `mode: fixed` and list every column (a fixed schema rejects
+undeclared columns, so it cannot list only the ones you need), or remove
+columns before ingest.
+
 ### Schema Contracts (DAG Validation)
 
 For observed schemas that still have field requirements, use contract fields:

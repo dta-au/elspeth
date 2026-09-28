@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from elspeth.contracts import NodeStateStatus
+from elspeth.contracts.audit import CallVerification
 from elspeth.contracts.hashing import repr_hash, stable_hash
 from elspeth.contracts.identity import path_branch_name, path_expand_group_id, path_fork_group_id
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
@@ -513,20 +514,21 @@ def get_operation_calls(db: LandscapeDB, factory: AnalyzerRepositories, operatio
     ]
 
 
+def _verification_decision_record(decision: CallVerification) -> VerificationDecisionRecord:
+    return {
+        "current_call_id": decision.current_call_id,
+        "current_run_id": decision.current_run_id,
+        "source_run_id": decision.source_run_id,
+        "source_call_id": decision.source_call_id,
+        "is_match": decision.is_match,
+        "differences_json": decision.differences_json,
+        "recorded_at": decision.recorded_at.isoformat(),
+    }
+
+
 def list_verification_decisions(db: LandscapeDB, factory: AnalyzerRepositories, run_id: str) -> list[VerificationDecisionRecord]:
     """Read persisted comparisons for state and operation calls in a verify run."""
-    return [
-        {
-            "current_call_id": decision.current_call_id,
-            "current_run_id": decision.current_run_id,
-            "source_run_id": decision.source_run_id,
-            "source_call_id": decision.source_call_id,
-            "is_match": decision.is_match,
-            "differences_json": decision.differences_json,
-            "recorded_at": decision.recorded_at.isoformat(),
-        }
-        for decision in factory.execution.get_verification_decisions_for_run(run_id)
-    ]
+    return [_verification_decision_record(decision) for decision in factory.execution.get_verification_decisions_for_run(run_id)]
 
 
 def explain_token(
@@ -557,9 +559,9 @@ def explain_token(
     if result is None:
         return None
     result_dict = cast(dict[str, Any], _dataclass_to_dict(result))
-    call_ids = {call.call_id for call in result.calls}
     result_dict["verification_decisions"] = [
-        decision for decision in list_verification_decisions(db, factory, run_id) if decision["current_call_id"] in call_ids
+        _verification_decision_record(decision)
+        for decision in factory.execution.get_verification_decisions_for_calls(run_id, {call.call_id for call in result.calls})
     ]
 
     # Annotate routing_events with flow_type convenience field

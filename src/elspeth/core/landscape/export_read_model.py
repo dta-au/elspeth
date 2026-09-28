@@ -17,6 +17,7 @@ from elspeth.contracts.audit_export import AuditExportTerminalWitness
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.export_records import AuthEventExportRecord
+from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence, decode_admission_decision
 from elspeth.core.landscape.model_loaders import (
@@ -174,7 +175,9 @@ class ConnectionBoundExportReadModel:
                 return
             for row in rows:
                 try:
-                    metadata = json.loads(row.metadata_json)
+                    # metadata_json is canonical_json of an open mapping: read it with the
+                    # encoder's inverse so a double beyond 2**53 comes back as that double.
+                    metadata = canonical_json_loads(row.metadata_json)
                 except (TypeError, ValueError) as exc:
                     raise AuditIntegrityError(f"Auth event {row.event_id} metadata is corrupt") from exc
                 if type(metadata) is not dict:

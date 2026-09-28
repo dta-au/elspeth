@@ -7494,8 +7494,16 @@ def _check_schema_contracts(
         declared: DeclaredSpellings,
         removed: frozenset[str],
         producer: ProducerEntry,
-        reach: tuple[str, ...],
+        delivered_by: tuple[ProducerEntry, ...],
     ) -> ValidationEntry | None:
+        """The spelling verdict for one consumer against one producer vote.
+
+        ``delivered_by`` is the live producers whose rows that vote describes:
+        the declared names resolve through THEIR renames only (the builder's
+        per-predecessor ``_output_name_resolution``), never the union over a
+        fan-in consumer's whole reach, where an alias one arm's rename gives a
+        field would match an unrelated field another arm carries.
+        """
         participates, vote_fields = _effective_producer_vote(producer)
         # An abstaining vote settles nothing (``header_spelled_declarations``),
         # so no source is probed for its renames.
@@ -7508,7 +7516,7 @@ def _check_schema_contracts(
             forwarded=vote_fields - removed,
             participated=participates,
             closed=producer_schema is not None and not producer_schema.allows_extra_fields,
-            resolution=_live_name_resolution(reach),
+            resolution=FieldNameResolution.union(_producer_name_resolution(entry) for entry in delivered_by),
         )
         if not spellings:
             return None
@@ -7586,7 +7594,7 @@ def _check_schema_contracts(
             declared=surfaces.declared,
             removed=surfaces.removed,
             producer=spelling_producer,
-            reach=_node_input_connections(node),
+            delivered_by=_live_producers_of(node.input),
         )
         if spelling_error is not None:
             errors.append(spelling_error)
@@ -7601,6 +7609,10 @@ def _check_schema_contracts(
             sink_spelling_producers = () if direct_producer is None else (direct_producer,)
         seen_spelling_producers: set[str] = set()
         for sink_producer in sink_spelling_producers:
+            # An ``on_error`` edge delivers an error envelope, not the
+            # producer's row: the builder's ``_live_predecessors`` skips it.
+            if not _publishes_live(sink_producer, output.name):
+                continue
             real_producer = _walk_producer_entry_to_real_producer(
                 sink_producer,
                 connection_name=output.name,
@@ -7618,7 +7630,7 @@ def _check_schema_contracts(
                 declared=sink_declared,
                 removed=frozenset(),
                 producer=real_producer,
-                reach=(output.name,),
+                delivered_by=(sink_producer,),
             )
             if spelling_error is not None:
                 errors.append(spelling_error)

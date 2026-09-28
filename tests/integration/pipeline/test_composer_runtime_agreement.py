@@ -8671,6 +8671,64 @@ class TestComposerRuntimeFieldNameSpellingAgreement:
             "and the source's field_mapping renames 'name' to 'b'. Declare 'b'",
         )
 
+    def _fan_in_state(self, tmp_path: Path, *, declared: str, second_source_renames: bool) -> CompositionState:
+        """Two sources fan in at the sink 'main', which declares an optional ``declared``.
+
+        Arm 'mapped' renames name -> b and then drops b (a select_only
+        field_mapper keeping 'id'); arm 'plain' carries a 'b' of its own —
+        renamed from its 'Name' header too when ``second_source_renames``.
+        """
+        plain_csv = tmp_path / "blobs" / _AGREEMENT_SESSION_ID / "plain.csv"
+        plain_csv.parent.mkdir(parents=True, exist_ok=True)
+        plain_csv.write_text("ID,Name\n2,y\n" if second_source_renames else "ID,B\n2,y\n", encoding="utf-8")
+        drop_b = replace(self._field_mapper({"id": "id"}), id="drop_b")
+        drop_b = replace(drop_b, options={**drop_b.options, "select_only": True})
+        mapped = self._mapped_state(tmp_path, node=drop_b, output_schema={"mode": "flexible", "fields": [f"{declared}: str?"]})
+        plain_options: dict[str, Any] = {"path": str(plain_csv), "schema": {"mode": "fixed", "fields": ["id: str", "b: str"]}}
+        if second_source_renames:
+            plain_options["field_mapping"] = {"name": "b"}
+        return CompositionState(
+            sources={
+                "mapped": mapped.sources["source"],
+                "plain": SourceSpec(plugin="csv", on_success="main", options=plain_options, on_validation_failure="discard"),
+            },
+            nodes=mapped.nodes,
+            edges=(),
+            outputs=mapped.outputs,
+            metadata=mapped.metadata,
+            version=1,
+        )
+
+    @pytest.mark.parametrize("declared", ["Name", "name"], ids=["the-header", "the-mapping-key"])
+    def test_both_resolve_each_fan_in_arm_through_its_own_renames(self, tmp_path: Path, declared: str) -> None:
+        """An alias one arm's rename gives 'b' does not match the 'b' another arm carries.
+
+        The 'mapped' arm no longer carries 'b' and the 'plain' arm cannot
+        resolve the name to its 'b', so neither surface refuses the optional
+        declaration. Resolving every arm's vote through the union of the sink's
+        whole reach refused it on both, against 'plain' (review P2, fan-in).
+        """
+        self._assert_both_accept(self._fan_in_state(tmp_path, declared=declared, second_source_renames=False), tmp_path)
+
+    @pytest.mark.parametrize("declared", ["Name", "name"], ids=["the-header", "the-mapping-key"])
+    def test_both_still_reject_the_fan_in_arm_whose_own_source_renames_the_field(self, tmp_path: Path, declared: str) -> None:
+        """Control: when 'plain' itself renames name -> b, its 'b' IS the field the declaration names."""
+        composer, runtime = self._both(self._fan_in_state(tmp_path, declared=declared, second_source_renames=True), tmp_path)
+        [entry] = [e for e in composer.errors if e.error_code == "field_name_header_spelling"]
+        assert f"'{declared}' is a header spelling of 'b'" in entry.message
+        assert "'source:plain' -> 'output:main'" in entry.message
+        assert not runtime.is_valid
+        assert any(f"'{declared}' is a header spelling of 'b'" in e.message for e in runtime.errors), runtime.errors
+
+    def test_both_skip_a_sink_producer_that_writes_only_on_error(self, tmp_path: Path) -> None:
+        """An ``on_error`` edge delivers an error envelope, not the producer's row: neither surface checks its vote."""
+        closed = {"mode": "fixed", "fields": ["id: str", "name: str"]}
+        node = replace(self._value_transform(target="total", schema=closed), on_success="other", on_error="main")
+        state = self._state(tmp_path, source_schema=closed, node=node, output_schema={"mode": "flexible", "fields": ["Name: str?"]})
+        other = replace(self._output(tmp_path), name="other")
+        other = replace(other, options={**other.options, "path": str(Path(other.options["path"]).with_name("other.jsonl"))})
+        self._assert_both_accept(replace(state, outputs=(*state.outputs, other)), tmp_path)
+
     # --- A headerless source renames each column AS WRITTEN (review-C1-alias-bypass-r1 F1) ---
     # resolve_field_names keys a headerless source's field_mapping by the column
     # as written: under columns [id, Name] + {Name: b} the literal 'Name' names

@@ -1272,6 +1272,43 @@ class TestGetCallResponseData:
         assert result.state == CallDataState.HASH_ONLY
         assert result.data is None
 
+    def test_an_integral_double_beyond_2_53_is_read_back_as_that_double(self):
+        """Call payloads are canonical JSON; replay reads back the double that was recorded.
+
+        RFC 8785 writes 1e17 as ``100000000000000000``: a plain ``json.loads``
+        handed replay an int beyond ±(2**53-1) — a different value type than
+        the live call returned, and one canonical hashing refuses
+        (review-codexfix-handoffs-r1 F1).
+        """
+        _db, factory, state_id = _setup()
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
+        call = factory.execution.record_call(
+            state_id,
+            idx,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            request_data=RawCallPayload({"filter": {"min": 1e17}}),
+            response_data=RawCallPayload({"total": -1e17, "items": [9.99e20]}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
+
+        request = factory.execution.get_call_request_data(call.call_id)
+        response = factory.execution.get_call_response_data(call.call_id)
+
+        assert request.state == CallDataState.AVAILABLE
+        assert response.state == CallDataState.AVAILABLE
+        assert request.data == {"filter": {"min": 1e17}}
+        assert response.data["total"] == -1e17
+        assert list(response.data["items"]) == [9.99e20]
+        assert type(request.data["filter"]["min"]) is float
+        assert type(response.data["total"]) is float
+        assert type(response.data["items"][0]) is float
+
     def test_returns_never_stored_for_call_without_response(self):
         _db, factory, state_id = _setup()
         idx = factory.execution.allocate_call_index(
