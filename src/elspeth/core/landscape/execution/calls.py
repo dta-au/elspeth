@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from concurrent.futures import Future
 from threading import Lock
 from typing import TYPE_CHECKING, NamedTuple
@@ -56,6 +56,7 @@ from elspeth.core.landscape.schema import (
 )
 from elspeth.core.landscape.verification_reads import (
     get_verification_decision,
+    get_verification_decisions_for_calls,
     get_verification_decisions_for_run,
     iter_verification_decisions_for_run,
 )
@@ -937,6 +938,10 @@ class CallAuditRepository:
     def iter_verification_decisions_for_run(self, current_run_id: str, *, batch_size: int) -> Iterator[CallVerification]:
         with self._db.read_only_connection() as conn:
             yield from iter_verification_decisions_for_run(conn, current_run_id, batch_size=batch_size)
+
+    def get_verification_decisions_for_calls(self, current_run_id: str, current_call_ids: Collection[str]) -> list[CallVerification]:
+        with self._db.read_only_connection() as conn:
+            return get_verification_decisions_for_calls(conn, current_run_id, current_call_ids)
 
     def find_call_by_request_hash(
         self,
