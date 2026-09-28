@@ -4,13 +4,10 @@ Applies expressions to compute new or modified field values.
 
 A computed value is written as evaluated, never coerced. Every operation
 target is DECLARED before the first row (ADR-050): a target the node's schema
-types (``fields: ["a: int"]`` with ``target: a``) carries that type, and every
-other target — created or overwritten — is ``any`` (nullable), because an
-expression's result type is not knowable from its text. The declaration is
-stamped on every emitted row's contract, so the node's recorded output
-contract is fixed from row 1 whatever the rows compute: an int on one row and
-a str on the next, a nested object or array (a field copy such as
-``row['meta']``, or a list/tuple/dict literal), a null — all are ``any``. A
+types (``fields: ["a: int"]`` with ``target: a``) carries that type. Otherwise
+the expression's provable result type over build-declared inputs becomes the
+plugin type; an unknown result stays nullable ``any``. The declaration is
+stamped on every emitted row's contract and fixed before row 1. A
 typed target is pinned: a row whose computed value does not satisfy the
 declared type is returned as a ``type_mismatch`` error naming the target and
 both type names, never the value. An expression whose value can be a set is
@@ -21,6 +18,7 @@ that fails to evaluate on a row returns that row as an error.
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -28,17 +26,20 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.field_spelling import header_spelling_canonical
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
-from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract, declared_type_name_admits
 from elspeth.contracts.type_normalization import classify_runtime_type
+from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
     ExpressionParser,
     ExpressionSecurityError,
     ExpressionSyntaxError,
 )
+from elspeth.core.expression_types import ResultKinds, declared_result, expression_kinds, input_kinds
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -362,7 +363,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:de648209de2ccdd6"
+    source_file_hash: str | None = "sha256:d96273a02341c8eb"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -394,6 +395,9 @@ class ValueTransform(BaseTransform):
         self._operations = cfg.operations
         self._configured_targets = frozenset(op.target for op in self._operations)
         self._schema_config = cfg.schema_config
+        self._input_types: dict[str, FieldDefinition] = {field.name: field for field in cfg.schema_config.fields or ()}
+        self._upstream_bound = False
+        self._process_started = False
 
         # declared_output_fields intentionally empty — we can't statically know which
         # targets are new vs overwrites, and overwrites are an intentional feature.
@@ -406,16 +410,7 @@ class ValueTransform(BaseTransform):
 
         self._output_schema_config = self._build_value_transform_output_schema_config(cfg)
 
-        # Every target's declared contract, from the ONE stamp table
-        # (operator type > this plugin's 'any'), so the pin checked below
-        # and the contract stamped on emission cannot disagree. validate()
-        # skips an 'any' field, so an untyped target pins nothing.
-        stamped = self._stamped_output_field_contracts()
-        self._target_contracts = SchemaContract(
-            mode="FLEXIBLE",
-            fields=tuple(stamped[target] for target in sorted(self._configured_targets)),
-            locked=True,
-        )
+        self._refresh_target_contracts()
 
         self.input_schema = create_schema_from_config(
             cfg.schema_config,
@@ -428,16 +423,85 @@ class ValueTransform(BaseTransform):
             allow_coercion=False,
         )
 
-    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
-        """Every operation target, declared ``any``: an expression's result type is not knowable from its text.
+    def _derived_kinds(self) -> dict[str, ResultKinds]:
+        """Type ordered expressions against the node's currently bound input types."""
+        previous: dict[str, ResultKinds] = {}
+        derived: dict[str, ResultKinds] = {}
 
-        The operator's ``schema.fields`` type takes precedence in the stamp
-        (ADR-050), so ``fields: ["a: int"]`` with ``target: a`` still pins
-        ``a`` to ``int``.
-        """
-        return tuple(
-            FieldDefinition(name=target, field_type="any", required=True, nullable=True) for target in sorted(self._configured_targets)
+        def lookup(name: str) -> ResultKinds:
+            for alias in _row_key_aliases(name):
+                if alias in previous:
+                    return previous[alias]
+            for field in self._input_types.values():
+                if _row_key_aliases(name) & _row_key_aliases(field.name):
+                    return input_kinds(field)
+            return None
+
+        for operation in self._operations:
+            kinds = expression_kinds(operation.get_parser(), lookup)
+            derived[operation.target] = kinds
+            for alias in _row_key_aliases(operation.target):
+                previous[alias] = kinds
+        return derived
+
+    def _derived_targets(self) -> dict[str, FieldDefinition]:
+        return {
+            target: FieldDefinition(
+                name=target,
+                field_type=declared_result(kinds)[0],
+                required=True,
+                nullable=declared_result(kinds)[1],
+            )
+            for target, kinds in self._derived_kinds().items()
+        }
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """Publish the one derived plugin tier; authored target types retain precedence."""
+        derived = self._derived_targets()
+        return tuple(derived[target] for target in sorted(derived))
+
+    def _refresh_target_contracts(self) -> None:
+        stamped = self._stamped_output_field_contracts()
+        self._target_contracts = SchemaContract(
+            mode="FLEXIBLE",
+            fields=tuple(stamped[target] for target in sorted(self._configured_targets)),
+            locked=True,
         )
+
+    def bind_upstream_input_types(self, fields: Mapping[str, FieldDefinition]) -> None:
+        """Complete the graph tier once before rows can be processed."""
+        if self._upstream_bound or self._process_started:
+            raise FrameworkBugError("value_transform input types can be bound only once before process")
+        for name, field in fields.items():
+            self._input_types.setdefault(name, field)
+        authored = {field.name: field for field in self._schema_config.fields or ()} if self._schema_config is not None else {}
+        derived_kinds = self._derived_kinds()
+        for operation in self._operations:
+            kinds = derived_kinds[operation.target]
+            declaration = authored.get(operation.target)
+            if declaration is None or declaration.field_type == "any" or not kinds:
+                continue
+            if any(
+                (kind == "none" and declaration.nullable)
+                or (kind in {"int", "float", "str", "bool"} and declared_type_name_admits(declaration.field_type, kind))
+                for kind in kinds
+            ):
+                continue
+            computed_type = "null" if kinds == {"none"} else declared_result(kinds)[0]
+            raise GraphValidationError(
+                f"Transform 'value_transform' target '{operation.target}' declares {declaration.field_type}, "
+                f"but its expression computes {computed_type}. Change the target declaration or expression.",
+                component_type="transform",
+            )
+        cfg = ValueTransformConfig.from_dict(self.config, plugin_name=self.name)
+        self._output_schema_config = self._build_value_transform_output_schema_config(cfg)
+        self.output_schema = create_schema_from_config(self._output_schema_config, "ValueTransformOutput", allow_coercion=False)
+        self._refresh_target_contracts()
+        self._upstream_bound = True
+
+    @property
+    def upstream_types_bound(self) -> bool:
+        return self._upstream_bound
 
     @property
     def self_created_input_fields(self) -> frozenset[str]:
@@ -480,14 +544,14 @@ class ValueTransform(BaseTransform):
 
         declared_fields = declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result)
         if declared_fields is not None:
-            # Every target is written, so its presence is guaranteed. A target
-            # the operator TYPED keeps that declaration: it is the output type
-            # the pin below enforces on the computed value (ADR-050, operator >
-            # plugin > any). Every other target is 'any' and nullable: an
-            # expression's result type is not knowable from its text, and an
-            # expression may compute None.
+            # Authored types, including authored ``any``, retain precedence.
+            # Placeholder target declarations take the derived plugin type.
+            derived = self._derived_targets()
+            authored = {field.name for field in cfg.schema_config.fields or ()}
             declared_fields = tuple(
-                replace(field, field_type="any", required=True, nullable=True)
+                derived[field.name]
+                if field.name in self._configured_targets and field.name not in authored
+                else replace(field, required=True, nullable=True)
                 if field.name in self._configured_targets and field.field_type == "any"
                 else field
                 for field in declared_fields
@@ -515,6 +579,7 @@ class ValueTransform(BaseTransform):
         Returns:
             TransformResult with computed field values, or error if any operation fails
         """
+        self._process_started = True
         # Work on a copy to support atomic rollback
         working_data = copy.deepcopy(row.to_dict())
         working_contract = row.contract
@@ -572,15 +637,18 @@ class ValueTransform(BaseTransform):
             pinned = self._target_contracts.get_field(violations[0].normalized_name)
             expected_name = pinned.python_type.__name__
             actual_name = classify_runtime_type(target_values[pinned.normalized_name]).__name__
+            declared_by = self.output_field_declared_by()[pinned.normalized_name]
+            declarer = "this node's schema" if declared_by == "operator" else "the plugin's expression type"
             return TransformResult.error(
                 {
                     "reason": "type_mismatch",
                     "field": pinned.normalized_name,
                     "expected": expected_name,
                     "actual": actual_name,
+                    "declared_by": declared_by,
                     "message": (
                         f"Operation target '{pinned.normalized_name}' computed a value of type {actual_name}, "
-                        f"but this node's schema declares it {expected_name}{'' if pinned.required and not pinned.nullable else ' (or None)'}. "
+                        f"but {declarer} declares it {expected_name}{'' if pinned.required and not pinned.nullable else ' (or None)'}. "
                         f"Declare the target 'any' (or the scalar type it computes) to store it."
                     ),
                 }
@@ -626,8 +694,8 @@ class ValueTransform(BaseTransform):
                     "A value_transform node's schema: block declares what ARRIVES at the node, and a target it types is "
                     "pinned to that type on output: a row whose computed value is another type goes to on_error. To change a "
                     "declared field's type, declare it 'any' there.",
-                    "A target the schema does not type guarantees presence, but its output type is 'any' (never inferred from "
-                    "a row). Before a typed consumer, use type_coerce to validate or normalize the computed field.",
+                    "A target the schema does not type uses the expression's provable output type over declared inputs; "
+                    "an unknown expression stays 'any'. Add a declaration or type_coerce before a typed consumer when needed.",
                     "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
                     "error-route the row. Conditional row filtering is a gate node, not this transform.",
                     "A result may be nested (row['meta'], or a list, tuple or dict literal); its field is typed 'any'. A set "

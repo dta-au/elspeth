@@ -15,7 +15,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict, get_args
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict, cast, get_args
 
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
@@ -78,6 +78,8 @@ from elspeth.core.config import (
 from elspeth.core.dag.bound_regions import BOUND_REGION_EXIT_RULE
 from elspeth.core.dag.coalesce_merge import merge_coalesce_schema, merge_guaranteed_fields
 from elspeth.core.dag.guarantees import ResolutionMode
+from elspeth.core.dag.models import GraphValidationError
+from elspeth.core.expression_types import SchemaFieldType
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.sources.field_normalization import (
@@ -98,6 +100,8 @@ from elspeth.web.composer._validation_probe import (
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
+    from elspeth.plugins.transforms.value_transform import ValueTransform
+
     # Runtime import would be circular: the resolver imports this module.
     from elspeth.web.composer._producer_resolver import ProducerEntry
 
@@ -4438,6 +4442,7 @@ def _check_schema_contracts(
             return _check_schema_contracts(sources, nodes, outputs, probe_cache=owned_cache)
 
     from elspeth.web.composer._producer_resolver import (
+        ProducerEntry,
         ProducerResolver,
         is_source_producer_id,
         published_success_connection,
@@ -4445,6 +4450,7 @@ def _check_schema_contracts(
     )
 
     errors: list[ValidationEntry] = []
+    value_transform_bind_errors: dict[str, str] = {}
     contract_warnings: list[ValidationEntry] = []
     edge_contracts: list[EdgeContract] = []
     parse_failed_producers: set[str] = set()
@@ -6462,6 +6468,37 @@ def _check_schema_contracts(
             if _is_config_probe_exception(exc):
                 return None
             raise
+        if transform.name == "value_transform":
+            value_transform = cast("ValueTransform", transform)
+        else:
+            value_transform = None
+        if value_transform is not None and not value_transform.upstream_types_bound:
+            input_producer = _value_producer_through_gates(producer_node.input)
+            bound_fields: dict[str, FieldDefinition] = {}
+            authored_schema = value_transform._schema_config
+            authored_names = {field.name for field in authored_schema.fields or ()} if authored_schema is not None else set()
+            if input_producer is not None:
+                reads = {name for operation in value_transform._operations for name in operation.get_parser().static_field_reads().fields}
+                for name in sorted(reads - authored_names):
+                    upstream = _resolved_producer_field_type(
+                        input_producer,
+                        name,
+                        source_map=source_map,
+                        mode="union_merge",
+                        visited=visited | {producer.producer_id},
+                    )
+                    if upstream is not None:
+                        bound_fields[name] = FieldDefinition(
+                            name=name,
+                            field_type=cast("SchemaFieldType", upstream.field_type),
+                            required=True,
+                            nullable=True,
+                        )
+            try:
+                value_transform.bind_upstream_input_types(bound_fields)
+            except GraphValidationError as exc:
+                value_transform_bind_errors[producer_node.id] = str(exc)
+                return None
         output_config = transform._output_schema_config
         config_declares_field = (
             output_config is not None
@@ -6469,6 +6506,12 @@ def _check_schema_contracts(
             and any(field.name == field_name for field in output_config.fields)
         )
         node_label = (f"{producer_node.node_type} '{producer_node.id}' ({producer_node.plugin})",)
+        if mode == "edge":
+            declaration = transform.output_field_declarations().get(field_name)
+            if declaration is not None:
+                if declaration.field_type == "any":
+                    return None
+                return KnownBranchFieldType(field_type=declaration.field_type, declared_by=node_label)
         if mode == "union_merge":
             declarations = transform.output_field_declarations()
             carried_sources = transform.carried_output_sources()
@@ -6665,6 +6708,29 @@ def _check_schema_contracts(
             "high",
             "edge_field_type_incompatible",
         )
+
+    # Every value_transform gets a graph-tier bind even when no typed consumer
+    # or union merge asks for its result. The same plugin predicate as the
+    # runtime builder then refuses a certain authored type contradiction.
+    for node in nodes:
+        if node.node_type != "transform" or node.plugin != "value_transform":
+            continue
+        try:
+            transform = probe_cache.transform(node.plugin, node)
+        except Exception as exc:
+            if _is_config_probe_exception(exc):
+                continue
+            raise
+        if cast("ValueTransform", transform).upstream_types_bound:
+            continue
+        for target in cast("ValueTransform", transform)._configured_targets:
+            _resolved_producer_field_type(
+                ProducerEntry(node.id, node.plugin, node.options),
+                target,
+                source_map=source_map,
+            )
+        if message := value_transform_bind_errors.get(node.id):
+            errors.append(_err(f"node:{node.id}", message, "high", "value_transform_result_type_incompatible"))
 
     # A union coalesce whose every row would fail the runtime merge (two
     # branches each guaranteeing a field and certainly typing it differently —

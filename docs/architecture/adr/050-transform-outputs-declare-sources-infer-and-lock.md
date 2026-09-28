@@ -62,13 +62,15 @@ first row, and the declaration is enforced on every emitted value. A source
 still infers and locks. Contracts are JOINED only where several producers'
 rows meet.**
 
-1. **Precedence, fixed at construction:** the operator's `schema.fields` type
+1. **Precedence, fixed before row 1:** the operator's `schema.fields` type
    for the created field, else the type the plugin declares in
    `created_output_fields()`, else `any`. `any` is nullable. The output
    config builders still add a required `any` placeholder for every
    guaranteed name they know only by name (`declare_missing_guaranteed_fields`,
    now `nullable=True`); that placeholder is not an operator declaration and
-   yields to the plugin's type.
+   yields to the plugin's type. A value_transform completes its plugin type
+   during the graph's topological build after upstream declarations are known;
+   a standalone instance uses its own authored input declarations only.
 2. **One stamp.** `BaseTransform._apply_declared_output_field_contracts` is
    the single authority that rewrites an emitted contract to the declared
    metadata (`source="declared"`, the declared type, required-if-guaranteed,
@@ -315,8 +317,9 @@ rows meet.**
     `group_by`'s group value, `top_k`'s `group_value`, json_explode's
     element), a list or mapping the DSL has no type for (index lists,
     confusion matrices, `top_values`, LLM `_usage`, extraction facets and
-    provider-shaped results), and value_transform's expression targets (the
-    B7 ruling). Each plugin's declaration table states the reason for every
+    provider-shaped results), and value_transform expression targets whose
+    result cannot be proved from declared inputs. A provable expression result
+    is typed and checked before a row is emitted. Each plugin's declaration table states the reason for every
     `any` beside it. The LLM transform's structured `output_fields` are
     BOUND: each `OutputFieldConfig.type` declares one row type (`integer` →
     `int`, `number` → `float`, `boolean` → `bool`, `string`/`enum` → `str`),
@@ -485,29 +488,28 @@ they agree with this ADR one implementation is kept; where they conflict the
 value-checked, the recorded contract never changes type).
 
 - **`63a2e1825` value_transform "preserve truthful computed output
-  contracts".**
-  - *Agrees, kept (upstream's code):* computed targets guarantee presence and
-    their type is not inferred from the expression — the projection declares
-    an untyped target `any`, required, nullable, and `output_schema` is built
-    from that projection rather than an observed model, so a typed consumer of
-    an untyped target is refused at the edge (the `type_coerce` teaching
-    hint stays).
+  contracts".** This was the initial reconciliation; the later T1 expression
+  typing amendment replaces its blanket `any` rule. Computed targets still
+  guarantee presence. The graph binds provable expression types from the node's
+  declarations and resolved upstream types; an unknown expression remains
+  nullable `any`. An authored target type, including authored `any`, keeps
+  operator precedence.
   - *Conflict 1, resolved for the ruling:* upstream kept each row's runtime
     type on the emitted contract (`_retype_contract_field`, and
     `with_field` typing a new target from its value; its test pinned
     `bool`/`NoneType`, `nullable = value is None`). That is per-emission
     inference: the node record would change type between rows (the
     `ContractMergeError` abort this ADR removes). Superseded by the stamp:
-    every target is `object`, `declared`, nullable on every row
-    (Decisions 1–2); `_retype_contract_field` stays deleted.
+    every target has one fixed declaration before row 1 (Decisions 1–2);
+    `_retype_contract_field` stays deleted.
   - *Conflict 2, resolved for the ruling:* upstream rewrote EVERY configured
     target to `any` in the projection, including one the operator typed
     (`fields: ["x: int"]`, `target: x`), reading the node's schema as
     input-only for targets. Under that builder the stamp sees no operator
     declaration and the value_transform pin (R3, a ruled prerequisite of S1)
     silently pins nothing — measured: re-applying upstream's loop turns 19
-    pin tests red. Resolved: only targets the operator left untyped (or typed
-    `any`) are rewritten; an operator-typed target keeps its type in the
+    pin tests red. Resolved: only targets the operator left untyped are
+    rewritten from the plugin's derived type; an operator-typed target keeps its type in the
     projection and is enforced per row as a routed `type_mismatch`. The
     typed edge therefore builds, and the proof is honest because it is
     enforced.
@@ -528,15 +530,11 @@ value-checked, the recorded contract never changes type).
     (both now use an untyped branch; an accepting twin covers the typed
     branch).
 - **`7fc149014` type_coerce "reconcile declared output presence
-  metadata".** Agrees: a transform's validated declaration of a field it
-  forwards or converts belongs to its output (`source="declared"`, the
-  declared presence and nullability, the converted type). Kept as upstream
-  wrote it, in type_coerce's own `_build_output_contract`; type_coerce does
-  not call the shared stamp. It creates no field, so the created-field sweep
-  of Decision 12 does not reach it: a converted field keeps the target type
-  its own contract builder sets (`source: inferred` in observed mode, so the
-  engine's value check does not re-check the conversion). Routing its
-  conversions through the one stamp is an open follow-up, not done here.
+  metadata".** A successful conversion emits its configured target type.
+  T1 publishes every conversion in the shared stamp table, including under an
+  observed output schema, so downstream graph type resolution sees the
+  converted value rather than an older upstream declaration. The existing
+  `_build_output_contract` still applies the conversion to each row.
 - **`93ad3e148` "preserve type proof across unchanged selected fields".**
   Orthogonal: a build-time type-resolution rule in `core/dag/guarantees.py`
   (a same-name field a transform selects, requires and guarantees keeps its

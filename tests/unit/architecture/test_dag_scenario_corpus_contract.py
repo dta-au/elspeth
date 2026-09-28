@@ -954,7 +954,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # 14a3a5cc..., captured from this file's parity failure. No oracle_freeze
 # snapshot moved (test_oracle_freeze green: the frozen surface carries no
 # scheduler_work or audit records).
-EXPECTED_CASE_REGISTRY_SHA256 = "14a3a5cc637cd12e512ce46a2b23e817a7696f5c51ba16012c9b5b130b4bc70c"
+# T1 expression typing: value_transform's three union-collision-fail
+# provenance pins changed to d96273a02341c8eb. The case outcome is unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "a00b0e42d775e48b9ece9684a57b55f7e3805df6004bac36cefaf844e26da0a8"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

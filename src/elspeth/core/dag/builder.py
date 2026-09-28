@@ -19,7 +19,7 @@ from elspeth.contracts import RouteDestination, RoutingMode, error_edge_label
 from elspeth.contracts.enums import NodeType, OutputMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.contracts.schema import SchemaConfig, get_raw_schema_config
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, get_raw_schema_config
 from elspeth.contracts.types import (
     AggregationName,
     BranchName,
@@ -55,6 +55,7 @@ from elspeth.core.dag.models import (
     _suggest_similar,
 )
 from elspeth.core.dag.schema_validation import compute_declared_input_proof
+from elspeth.core.expression_types import SchemaFieldType
 
 if TYPE_CHECKING:
     from elspeth.contracts import BatchTransformProtocol, SinkProtocol, SourceProtocol, TransformProtocol
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     from elspeth.core.dag.graph import ExecutionGraph
     from elspeth.core.dag.models import GraphValidationWarning, NodeConfig
     from elspeth.core.dag.wiring import WiredTransform
+    from elspeth.plugins.transforms.value_transform import ValueTransform
 
 
 @dataclass(frozen=True, slots=True)
@@ -1789,7 +1791,41 @@ def build_execution_graph(
         for label_name, label_node_id in label_ids.items():
             plugin_node_labels[label_node_id] = f"{label_kind} '{label_name}' ({graph.get_node_info(label_node_id).plugin_name})"
 
+    transforms_by_id = {transform_ids_by_name[wired.settings.name]: wired.plugin for wired in transforms}
     for pass_through_id in pipeline_nodes:
+        candidate_transform = transforms_by_id.get(pass_through_id)
+        if candidate_transform is not None and candidate_transform.name == "value_transform":
+            value_transform = cast("ValueTransform", candidate_transform)
+            authored_schema = value_transform._schema_config
+            authored = {field.name for field in authored_schema.fields or ()} if authored_schema is not None else set()
+            reads = frozenset(
+                field for operation in value_transform._operations for field in operation.get_parser().static_field_reads().fields
+            )
+            incoming = {
+                edge.from_node for edge in graph.get_incoming_edges(pass_through_id) if edge.mode in (RoutingMode.MOVE, RoutingMode.COPY)
+            }
+            bound_inputs: dict[str, FieldDefinition] = {}
+            for field_name in sorted(reads - authored):
+                resolved = [resolve_guaranteed_field_type(graph, predecessor, field_name) for predecessor in incoming]
+                if not resolved or resolved[0] is None:
+                    continue
+                first_type = resolved[0].field_type
+                if all(item is not None and item.field_type == first_type for item in resolved):
+                    bound_inputs[field_name] = FieldDefinition(
+                        name=field_name,
+                        field_type=cast("SchemaFieldType", first_type),
+                        required=True,
+                        nullable=True,
+                    )
+            value_transform.bind_upstream_input_types(bound_inputs)
+            if value_transform._output_schema_config is None or value_transform.output_schema is None:
+                raise FrameworkBugError("Bound value_transform has no output schema")
+            graph.set_node_bound_output(
+                pass_through_id,
+                schema=value_transform._output_schema_config,
+                output_schema=value_transform.output_schema,
+                declarations=_published_output_declarations(candidate_transform).output_field_declarations,
+            )
         if pass_through_id in deferred_gate_input_by_id:
             input_connection = deferred_gate_input_by_id[pass_through_id]
             producer_id, _producer_label = producers[input_connection]

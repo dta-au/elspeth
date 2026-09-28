@@ -340,7 +340,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3c9c3dabe268dad2"
+    source_file_hash: str | None = "sha256:f18bc419ef56c5f3"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -384,6 +384,10 @@ class TypeCoerce(BaseTransform):
             "TypeCoerceOutput",
             allow_coercion=False,
         )
+
+    def created_output_fields(self) -> tuple[FieldDefinition, ...]:
+        """Publish successful conversions to the runtime and graph stamp table."""
+        return tuple(FieldDefinition(name=spec.field, field_type=spec.to, required=True, nullable=False) for spec in self._conversions)
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -495,8 +499,8 @@ class TypeCoerce(BaseTransform):
         recursed past this node to a stale upstream declaration, producing both
         a false accept and a false reject on the same root cause
         (elspeth-85e8afa2f5 panel review). ``value_transform`` already declares
-        its operation targets (as ``any``, since expression result types are
-        uninferable); a conversion target's type is exactly ``spec.to``, so the
+        its operation targets (from expressions over declared inputs); a
+        conversion target's type is exactly ``spec.to``, so the
         declaration here is concrete. ``required=True, nullable=False`` is
         truthful for the success stream: a conversion field is a declared input
         the engine requires before ``process()``, and a ``None`` one errors the

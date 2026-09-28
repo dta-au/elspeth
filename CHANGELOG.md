@@ -524,8 +524,9 @@ drained and repair this release forward.
 - **A union coalesce whose branches certainly disagree on a field's type is
   refused at build.** When every branch merges on every row (`require_all`)
   and two branches each carry a field whose type is fixed before the first
-  row but differs — an untyped `value_transform` rewrite or `field_mapper`
-  dotted extraction (`any`) beside a source's declared `price: int`, carried
+  row but differs — a `value_transform` rewrite whose expression remains
+  untyped or `field_mapper` dotted extraction (`any`) beside a source's
+  declared `price: int`, carried
   through a passthrough or a rename — every row failed the merge with
   `contract_type_conflict`, yet `elspeth validate` and the composer admitted
   the pipeline whenever the branches were observed. `elspeth validate`, the
@@ -534,6 +535,15 @@ drained and repair this release forward.
   schema (`mode: flexible`) or write the computed value under a new name.
   A type known only from the rows (an observed upstream) still fails each row
   at the merge, and that reason now names `any` rather than `object`.
+- **Expression targets carry provable types before row 1.** A
+  `value_transform` expression over declared inputs now publishes its result
+  type and derived nullability; unknown results remain nullable `any`, and an
+  authored target type still takes precedence. An observed-mode `type_coerce`
+  also publishes each successful conversion type. Typed downstream consumers
+  can therefore build from either result, and a union coalesce accepts equal
+  branch types it previously refused. A target declaration certainly at odds
+  with its expression is refused at build; a data-dependent mismatch still
+  routes the row with a value-free reason naming the declarer.
 - **`union_collision_policy: fail` no longer ends the run on a collision.**
   A field name two arriving branches both carried raised
   `CoalesceCollisionError` out of the run at the first colliding row (exit 4,

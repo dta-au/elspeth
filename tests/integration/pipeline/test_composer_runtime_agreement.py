@@ -9342,7 +9342,7 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         return {
             "rewrite": (
                 self._yaml(source=self._CSV, branch_a=self._rewrite("price", "row['price'] + 1"), branch_b=self._PASSTHROUGH),
-                "price",
+                None,
             ),
             "literal": (self._yaml(source=self._CSV, branch_a=self._rewrite("price", "'x'"), branch_b=self._PASSTHROUGH), "price"),
             "dotted": (self._yaml(source=self._JSON, branch_a=self._mapper({"meta.p": "q"}), branch_b=self._mapper({"r": "q"})), "q"),
@@ -9433,7 +9433,8 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
         [entry] = composer_entries
         assert entry.coalesce_union_type is not None
         assert entry.coalesce_union_type.field == refused_field
-        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == {"any", "int"}
+        expected_types = {"str", "int"} if case == "literal" else {"any", "int"}
+        assert {entry.coalesce_union_type.type_a, entry.coalesce_union_type.type_b} == expected_types
         # One predicate, one message: the composer's text is the build's text with the node label.
         assert entry.message == runtime_refusal.replace(runtime_refusal.split("'")[1], "merge_results")
 
@@ -9458,5 +9459,12 @@ class TestComposerRuntimeCertainUnionTypeConflictAgreement:
                 probe = probe_cache.transform(node.plugin, node)
                 runtime = runtime_by_name[node.id]
                 node_info = graph.get_node_info(transform_ids[node.id])
-                assert probe.output_field_declarations() == runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+                assert runtime.output_field_declarations() == dict(node_info.output_field_declarations)
+                if node.plugin == "value_transform" and case == "rewrite":
+                    # A probe without a graph sees the local tier. Runtime and
+                    # NodeInfo see the completed upstream-bound table.
+                    assert probe.output_field_declarations()["price"].field_type == "any"
+                    assert runtime.output_field_declarations()["price"].field_type == "int"
+                else:
+                    assert probe.output_field_declarations() == runtime.output_field_declarations()
                 assert probe.carried_output_sources() == runtime.carried_output_sources() == dict(node_info.carried_output_sources)

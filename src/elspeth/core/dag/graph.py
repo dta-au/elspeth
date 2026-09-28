@@ -341,6 +341,24 @@ class ExecutionGraph:
         info = self.get_node_info(node_id)
         self._graph.nodes[node_id]["info"] = replace(info, output_schema_config=schema)
 
+    def set_node_bound_output(
+        self,
+        node_id: str,
+        *,
+        schema: SchemaConfig,
+        output_schema: type[PluginSchema],
+        declarations: Mapping[str, OutputFieldDeclaration],
+    ) -> None:
+        """Publish a plugin's completed graph-bound output declarations."""
+        self._assert_build_metadata_mutable()
+        info = self.get_node_info(node_id)
+        self._graph.nodes[node_id]["info"] = replace(
+            info,
+            output_schema_config=schema,
+            output_schema=output_schema,
+            output_field_declarations=declarations,
+        )
+
     def finalize_node_configs(self) -> None:
         """Deep-freeze mutable node configs after construction is complete."""
         for node_id, attrs in self._graph.nodes(data=True):
