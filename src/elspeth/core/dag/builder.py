@@ -1793,6 +1793,7 @@ def build_execution_graph(
             plugin_node_labels[label_node_id] = f"{label_kind} '{label_name}' ({graph.get_node_info(label_node_id).plugin_name})"
 
     transforms_by_id = {transform_ids_by_name[wired.settings.name]: wired.plugin for wired in transforms}
+    transform_names_by_id = {node_id: name for name, node_id in transform_ids_by_name.items()}
     for pass_through_id in pipeline_nodes:
         candidate_transform = transforms_by_id.get(pass_through_id)
         if candidate_transform is not None and candidate_transform.name == "value_transform":
@@ -1818,7 +1819,7 @@ def build_execution_graph(
                         required=True,
                         nullable=True,
                     )
-            value_transform.bind_upstream_input_types(bound_inputs)
+            value_transform.bind_upstream_input_types(bound_inputs, component_id=transform_names_by_id[pass_through_id])
             if value_transform._output_schema_config is None or value_transform.output_schema is None:
                 raise FrameworkBugError("Bound value_transform has no output schema")
             graph.set_node_bound_output(

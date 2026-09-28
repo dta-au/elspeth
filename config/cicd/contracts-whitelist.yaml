@@ -283,7 +283,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/infrastructure/validation.py:validate_schema_config:schema_config"
 
   # CLI - plugin instantiation from configuration
-  # NOTE: _build_resume_graphs, _orchestrator_context, _execute_pipeline_with_instances,
+  # NOTE: _build_resume_graph, _orchestrator_context, _execute_pipeline_with_instances,
   # _execute_resume_with_instances, and instantiate_plugins_from_config:return were removed
   # as part of T11 (PluginBundle extraction) — dict[str, Any] replaced with frozen dataclass.
   - "src/elspeth/cli.py:_load_raw_yaml:return"

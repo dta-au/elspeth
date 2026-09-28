@@ -959,7 +959,9 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # S-02 source spelling: the csv/json plugin hashes and the reopen-resume
 # projection changed with their source bytes. This registry digest is derived
 # from the merged manifest through the canonical corpus loader.
-EXPECTED_CASE_REGISTRY_SHA256 = "1813b97297194feaad57b2368cbc3e27046ca6688b765dffabd6b971330a23be"
+# B3 runtime attribution: value_transform's three union-collision-fail pins
+# moved with its source hash; the reopen-resume case does not use that plugin.
+EXPECTED_CASE_REGISTRY_SHA256 = "24d0cdbacc2ce67ad8046905e4e50bbc7870370d53ef0251dfc19869fc055005"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

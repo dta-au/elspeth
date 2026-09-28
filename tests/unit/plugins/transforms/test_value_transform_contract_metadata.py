@@ -329,8 +329,10 @@ def test_typed_computed_target_is_the_output_proof_the_pin_enforces(tmp_path):
 
     Direct plugin invocation still pins and routes the mismatched row value.
     """
-    with pytest.raises(GraphValidationError, match=r"target 'x' declares int.*computes bool"):
+    with pytest.raises(GraphValidationError, match=r"target 'x' declares int.*computes bool") as raised:
         _graph(tmp_path, normalize=False)
+    assert raised.value.component_id == "calculate"
+    assert raised.value.component_type == "transform"
 
     transform = ValueTransform(_calculate_options(_TYPED_TARGET_FIELDS))
     row = PipelineRow(

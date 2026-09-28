@@ -982,7 +982,7 @@ class TestJoinCommand:
 
         with (
             patch("elspeth.plugins.infrastructure.runtime_factory.instantiate_plugins_from_config", return_value=plugins),
-            patch("elspeth.cli._build_resume_graphs", return_value=(object(), execution_graph)),
+            patch("elspeth.cli._build_resume_graph", return_value=execution_graph),
             patch("elspeth.engine.orchestrator.follower.build_follower_processor") as mock_build_follower,
         ):
             result = runner.invoke(

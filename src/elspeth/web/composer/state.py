@@ -4605,7 +4605,7 @@ def _bind_composer_value_transforms(
                     previous[alias] = kinds
             unresolved_targets[node.id] = frozenset(unresolved)
             try:
-                transform.bind_upstream_input_types(bound)
+                transform.bind_upstream_input_types(bound, component_id=node.id)
             except GraphValidationError as exc:
                 bind_errors[node.id] = str(exc)
         except Exception as exc:

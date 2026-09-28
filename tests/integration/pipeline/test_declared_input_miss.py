@@ -274,7 +274,7 @@ _PA_PASSTHROUGH: dict[str, Any] = {
 }
 
 
-def _lost_branch_settings(tmp_path: Path, pa_transform: dict[str, Any]) -> Path:
+def _lost_branch_settings(tmp_path: Path, pa_transform: dict[str, Any], *, source_schema: dict[str, Any] = _OBSERVED) -> Path:
     """fork → (pa: ``pa_transform`` | pb: value_transform creating y) → best_effort union → type_coerce on y.
 
     The row whose pb branch fails (a=3: floor division by zero) merges as the
@@ -286,7 +286,12 @@ def _lost_branch_settings(tmp_path: Path, pa_transform: dict[str, Any]) -> Path:
             "src": {
                 "plugin": "json",
                 "on_success": "rows",
-                "options": {"path": str(tmp_path / "in.jsonl"), "format": "jsonl", "on_validation_failure": "discard", "schema": _OBSERVED},
+                "options": {
+                    "path": str(tmp_path / "in.jsonl"),
+                    "format": "jsonl",
+                    "on_validation_failure": "discard",
+                    "schema": source_schema,
+                },
             }
         },
         "concurrency": {"max_workers": 1},
@@ -366,8 +371,9 @@ def test_following_the_remedy_every_branch_guarantees_the_field(tmp_path: Path) 
     """Review-R2 r2 F1: the routed text's coalesce remedy yields a working pipeline.
 
     Following it, the pa branch creates y on every row too (value_transform
-    guarantees its target), so every branch guarantees y, the build proves it
-    at the tail, and nothing routes as missing_field: the a=3 row's pb failure
+    guarantees its target). Declaring source a:int lets both branches publish
+    y:int, so the union also agrees on its type. The build proves y at the
+    tail, and nothing routes as missing_field: the a=3 row's pb failure
     is still routed by tb (its own error), and the pa-only merged row — now
     carrying y — reaches the sink with the a=1 row.
     """
@@ -381,7 +387,12 @@ def test_following_the_remedy_every_branch_guarantees_the_field(tmp_path: Path) 
     }
     # The build's proof of y at the tail for this shape is pinned by
     # TestLostBranchIsARowFact.test_every_branch_guaranteeing_the_field_proves_it.
-    result = _cli("run", "-s", str(_lost_branch_settings(tmp_path, pa_creates_y)), "--execute")
+    result = _cli(
+        "run",
+        "-s",
+        str(_lost_branch_settings(tmp_path, pa_creates_y, source_schema={"mode": "flexible", "fields": ["a: int"]})),
+        "--execute",
+    )
 
     assert "Traceback" not in result.output
     assert result.exit_code == 1, result.output

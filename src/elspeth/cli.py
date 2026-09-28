@@ -2920,29 +2920,27 @@ def _execute_resume_with_instances(
         )
 
 
-def _build_resume_graphs(
+def _build_resume_graph(
     settings_config: ElspethSettings,
     plugins: PluginBundle,
-) -> tuple[ExecutionGraph, ExecutionGraph]:
-    """Build both validation and execution graphs for resume from pre-instantiated plugins.
+) -> ExecutionGraph:
+    """Build one validated graph for resume admission and execution.
 
-    Returns:
-        Tuple of (validation_graph, execution_graph):
-        - validation_graph: Uses original source for topology hash matching
-        - execution_graph: Uses the same original topology/source IDs and
-          plugin identities; resume reads row data from stored payloads
+    Resume reads row data from stored payloads. Both phases use the original
+    source topology and plugin identities without binding the same one-shot
+    plugin input types twice.
     """
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
     row_union_settings = list(settings_config.row_unions) if settings_config.row_unions else None
     scope_settings = list(settings_config.scopes) if settings_config.scopes else None
 
-    # Both resume graphs use the ORIGINAL source topology to match the topology
+    # The resume graph uses the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
     # Source instances also remain original for implementation compatibility;
     # the resume lifecycle does not reopen or invoke those sources.
     execution_sinks = _execution_sinks_for_graph(settings_config, plugins.sinks)
-    validation_graph = ExecutionGraph.from_plugin_instances(
+    graph = ExecutionGraph.from_plugin_instances(
         sources=plugins.sources,
         source_settings_map=plugins.source_settings_map,
         transforms=plugins.transforms,
@@ -2956,25 +2954,8 @@ def _build_resume_graphs(
         scope_settings=scope_settings,
         max_bound_region_depth=settings_config.max_bound_region_depth,
     )
-    validation_graph.validate()
-
-    execution_graph = ExecutionGraph.from_plugin_instances(
-        sources=plugins.sources,
-        source_settings_map=plugins.source_settings_map,
-        transforms=plugins.transforms,
-        sinks=execution_sinks,
-        aggregations=plugins.aggregations,
-        gates=gate_settings,
-        coalesce_settings=coalesce_settings,
-        queues=settings_config.queues,
-        row_union_settings=row_union_settings,
-        collectors=plugins.collectors,
-        scope_settings=scope_settings,
-        max_bound_region_depth=settings_config.max_bound_region_depth,
-    )
-    execution_graph.validate()
-
-    return validation_graph, execution_graph
+    graph.validate()
+    return graph
 
 
 def _emit_interrupted_resume_guidance(db: LandscapeDB, run_id: str) -> None:
@@ -3409,9 +3390,9 @@ def resume(
         checkpoint_manager = CheckpointManager(db)
         recovery_manager = RecoveryManager(db, checkpoint_manager)
 
-        # Build both graphs from the same plugin instances
+        # Use the validated graph for admission and execution.
         try:
-            validation_graph, execution_graph = _build_resume_graphs(settings_config, plugins)
+            execution_graph = _build_resume_graph(settings_config, plugins)
         except contract_errors.TIER_1_ERRORS:
             raise  # Tier 1 errors must crash with full traceback, not Exit(1)
         except Exception as e:
@@ -3419,14 +3400,14 @@ def resume(
             raise typer.Exit(1) from None
 
         # Check if run can be resumed (with topology validation)
-        check = recovery_manager.can_resume(run_id, validation_graph)
+        check = recovery_manager.can_resume(run_id, execution_graph)
 
         if not check.can_resume:
             assert check.reason is not None and check.cause is not None
             raise NonResumableRunError(run_id, check.reason, cause=check.cause)
 
         # Get resume point information
-        resume_point = recovery_manager.get_resume_point(run_id, validation_graph)
+        resume_point = recovery_manager.get_resume_point(run_id, execution_graph)
 
         # Resume re-drives the run's durable scheduler work; it never
         # re-derives a source row.
@@ -4439,7 +4420,7 @@ def join(
         # Build the execution graph for the follower (needed to recognise
         # barrier / sink nodes for hand-off routing).
         try:
-            _validation_graph, execution_graph = _build_resume_graphs(settings_config, plugins)
+            execution_graph = _build_resume_graph(settings_config, plugins)
         except contract_errors.TIER_1_ERRORS:
             raise
         except Exception as e:

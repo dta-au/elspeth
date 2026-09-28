@@ -1134,7 +1134,7 @@ def _run_real_follower(
     """Run one real follower through CLI graph/lifecycle and FollowerProcessor."""
 
     from elspeth.cli import (
-        _build_resume_graphs,
+        _build_resume_graph,
         _instantiate_plugins_for_runtime_preflight,
         _preflight_execution_sinks,
         _start_follower_plugin_lifecycle,
@@ -1192,7 +1192,7 @@ def _run_real_follower(
         follower_plugins,
         purpose=SinkEffectExecutionPurpose.FOLLOWER,
     )
-    _validation_graph, execution_graph = _build_resume_graphs(settings, follower_plugins)
+    execution_graph = _build_resume_graph(settings, follower_plugins)
     follower_config = assemble_and_validate_pipeline_config(
         sources=follower_plugins.sources,
         transforms=follower_plugins.transforms,

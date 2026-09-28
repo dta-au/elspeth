@@ -363,7 +363,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1a8ad03e147600d0"
+    source_file_hash: str | None = "sha256:fa5e67e927f88255"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -468,8 +468,12 @@ class ValueTransform(BaseTransform):
             locked=True,
         )
 
-    def bind_upstream_input_types(self, fields: Mapping[str, FieldDefinition]) -> None:
-        """Complete the graph tier once before rows can be processed."""
+    def bind_upstream_input_types(self, fields: Mapping[str, FieldDefinition], *, component_id: str | None = None) -> None:
+        """Complete the graph tier once before rows can be processed.
+
+        A graph or Composer caller supplies its configured node ID for a
+        contradiction; a standalone plugin probe has no graph node to name.
+        """
         if self._upstream_bound or self._process_started:
             raise FrameworkBugError("value_transform input types can be bound only once before process")
         for name, field in fields.items():
@@ -491,6 +495,7 @@ class ValueTransform(BaseTransform):
             raise GraphValidationError(
                 f"Transform 'value_transform' target '{operation.target}' declares {declaration.field_type}, "
                 f"but its expression computes {computed_type}. Change the target declaration or expression.",
+                component_id=component_id,
                 component_type="transform",
             )
         cfg = ValueTransformConfig.from_dict(self.config, plugin_name=self.name)

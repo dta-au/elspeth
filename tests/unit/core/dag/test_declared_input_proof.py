@@ -465,9 +465,9 @@ class TestPublishedOnTheFinalGraph:
 
         assert dict(_build(yaml_text).get_declared_input_proof()) == dict(_build(yaml_text).get_declared_input_proof())
 
-    def test_the_resume_graphs_carry_the_same_proof_as_the_run(self, tmp_path: Path) -> None:
-        """Systems C2: a resumed run rebuilds its graphs through the same builder, so a miss is classified identically."""
-        from elspeth.cli import _build_resume_graphs
+    def test_the_resume_graph_carries_the_same_proof_as_the_run(self, tmp_path: Path) -> None:
+        """Systems C2: a resumed run rebuilds its graph through the same builder, so a miss is classified identically."""
+        from elspeth.cli import _build_resume_graph
 
         input_path = tmp_path / "in.csv"
         input_path.write_text("a,b\n1,2\n")
@@ -475,9 +475,8 @@ class TestPublishedOnTheFinalGraph:
         run_proof = dict(_build(yaml_text).get_declared_input_proof())
         settings = load_settings_from_yaml_string(yaml_text)
 
-        validation_graph, execution_graph = _build_resume_graphs(settings, instantiate_plugins_from_config(settings, preflight_mode=True))
+        execution_graph = _build_resume_graph(settings, instantiate_plugins_from_config(settings, preflight_mode=True))
 
-        assert dict(validation_graph.get_declared_input_proof()) == run_proof
         assert dict(execution_graph.get_declared_input_proof()) == run_proof
         assert frozenset({"b"}) in run_proof.values()
 
