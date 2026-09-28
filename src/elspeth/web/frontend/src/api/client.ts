@@ -1,4 +1,4 @@
-import { authFetch, responseOwnsCredential } from "./authSession";
+import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
 //
@@ -95,6 +95,74 @@ export function authHeaders(contentType?: string): HeadersInit {
     headers["Content-Type"] = contentType;
   }
   return headers;
+}
+
+// Review decisions and validation both acquire a backend session lease. Queue
+// these calls per session so rapid decisions across cards, or validation after
+// a decision, do not race each other into a lease-conflict response. Nginx's
+// production read timeout is 360s; a slightly longer client deadline also
+// bounds this queue when a direct/local connection loses its response.
+const REVIEW_MUTATION_TIMEOUT_MS = 370_000;
+const REVIEW_MUTATION_RECOVERY_MESSAGE =
+  "The request outcome is uncertain. Refresh the page to reload this session before making another review decision.";
+const reviewMutationTails = new Map<string, Promise<void>>();
+const ambiguousReviewMutations = new Set<string>();
+
+function isDefinitiveReviewRejection(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error)) {
+    return false;
+  }
+  const status = error.status;
+  // A 4xx other than request timeout means the server rejected this action.
+  // A 5xx, malformed success, or transport failure may follow a committed
+  // decision, so later queued actions must wait for a fresh session reload.
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 408;
+}
+
+function serializeReviewMutation<T>(
+  sessionId: string,
+  action: (signal: AbortSignal) => Promise<T>,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  const authGeneration = currentAuthGeneration();
+  const token = getToken();
+  const key = `${authGeneration}:${sessionId}`;
+  const previous = reviewMutationTails.get(key) ?? Promise.resolve();
+  const result = previous.then(async () => {
+    if (!isCurrentAuthGeneration(authGeneration) || getToken() !== token) {
+      throw { status: 0, detail: "Authentication changed before request dispatch" } satisfies ApiError;
+    }
+    if (ambiguousReviewMutations.has(key)) {
+      throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+    }
+    if (externalSignal?.aborted) {
+      throw { status: 0, detail: "Request cancelled before dispatch" } satisfies ApiError;
+    }
+    const deadline = new AbortController();
+    const signal = externalSignal === undefined
+      ? deadline.signal
+      : AbortSignal.any([externalSignal, deadline.signal]);
+    const timer = setTimeout(() => deadline.abort(), REVIEW_MUTATION_TIMEOUT_MS);
+    try {
+      return await action(signal);
+    } catch (error) {
+      if (deadline.signal.aborted || externalSignal?.aborted || !isDefinitiveReviewRejection(error)) {
+        ambiguousReviewMutations.add(key);
+        throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  const tail = result.then(() => undefined, () => undefined);
+  reviewMutationTails.set(key, tail);
+  void tail.then(() => {
+    if (reviewMutationTails.get(key) === tail) {
+      reviewMutationTails.delete(key);
+    }
+  });
+  return result;
 }
 
 // ── Response Parsing ────────────────────────────────────────────────────────
@@ -1185,13 +1253,17 @@ export async function validatePipeline(
     params.set("state_id", stateId);
   }
   const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
+  const { result, status } = await serializeReviewMutation(sessionId, async (signal) => {
+    const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      signal,
+    });
+    const result = await parseResponse<ValidationResult>(response);
+    return { result, status: response.status };
   });
-  const result = await parseResponse<ValidationResult>(response);
   if (typeof result !== "object" || result === null || !isValidationReadiness(result.readiness)) {
-    throw { status: response.status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
+    throw { status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
   }
   return result;
 }
@@ -1640,16 +1712,18 @@ export async function resolveInterpretation(
   body: InterpretationResolveRequest,
   signal?: AbortSignal,
 ): Promise<InterpretationResolveResponse> {
-  const response = await authFetch(
-    `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
-    {
-      method: "POST",
-      headers: authHeaders("application/json"),
-      body: JSON.stringify(body),
-      signal,
-    },
-  );
-  return parseResponse<InterpretationResolveResponse>(response);
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        body: JSON.stringify(body),
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationResolveResponse>(response);
+  }, signal);
 }
 
 /**
@@ -1666,19 +1740,21 @@ export async function optOutOfInterpretations(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<InterpretationOptOutResponse> {
-  const response = await authFetch(
-    `/api/sessions/${sessionId}/interpretations/opt_out`,
-    {
-      method: "POST",
-      headers: authHeaders("application/json"),
-      // The route accepts an empty body; sending "{}" rather than omitting
-      // body entirely so the Content-Type: application/json header has a
-      // matching payload (some HTTP intermediaries reject the inverse).
-      body: "{}",
-      signal,
-    },
-  );
-  return parseResponse<InterpretationOptOutResponse>(response);
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/opt_out`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        // The route accepts an empty body; sending "{}" rather than omitting
+        // body entirely so the Content-Type: application/json header has a
+        // matching payload (some HTTP intermediaries reject the inverse).
+        body: "{}",
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationOptOutResponse>(response);
+  }, signal);
 }
 
 /**

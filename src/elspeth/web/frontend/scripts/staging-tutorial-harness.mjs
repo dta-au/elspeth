@@ -348,6 +348,8 @@ async function runOne(browser, token, index) {
 
   const apiFailures = [];
   const consoleErrors = [];
+  const httpConflicts = [];
+  const conflictReads = [];
   let rejectBlockingFailure = null;
   let blockingFailureSettled = false;
   const blockingFailurePromise = new Promise((_, reject) => {
@@ -410,6 +412,17 @@ async function runOne(browser, token, index) {
   page.on("response", (response) => {
     const method = response.request().method();
     const url = response.url();
+    if (response.status() === 409) {
+      const conflict = { method, url, body: null };
+      httpConflicts.push(conflict);
+      conflictReads.push(
+        readResponseBody(response)
+          .then((body) => {
+            conflict.body = body;
+          })
+          .catch(() => undefined),
+      );
+    }
     const isSessionCreate = method === "POST" && url === `${baseURL}/api/sessions`;
     const compose = isComposeRequest(url, method);
     const run = isRunRequest(url, method);
@@ -522,6 +535,7 @@ async function runOne(browser, token, index) {
     const landed = completion.landed_session_id === sessionId;
 
     const evidence = sessionId === null ? null : await fetchSessionEvidence(token, sessionId);
+    await Promise.all(conflictReads);
     const ok =
       landed &&
       [steps.compose, steps.run, steps.audit].every(
@@ -548,6 +562,7 @@ async function runOne(browser, token, index) {
       steps,
       api_failures: apiFailures,
       console_errors: consoleErrors,
+      http_conflicts: httpConflicts,
       screenshot,
       evidence,
       diagnostic,
@@ -565,6 +580,7 @@ async function runOne(browser, token, index) {
       steps,
       api_failures: apiFailures,
       console_errors: consoleErrors,
+      http_conflicts: httpConflicts,
       screenshot,
       error: error instanceof Error ? error.message : String(error),
     };
