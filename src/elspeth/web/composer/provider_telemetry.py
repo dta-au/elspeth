@@ -15,10 +15,10 @@ from opentelemetry import metrics
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 
-ComposerTelemetrySurface = Literal["freeform", "guided"]
+ComposerTelemetrySurface = Literal["freeform"]
 ComposerRequestTerminalStatus = Literal["completed", "failed", "timed_out", "cancelled"]
 
-_SURFACES = frozenset({"freeform", "guided"})
+_SURFACES = frozenset({"freeform"})
 _REQUEST_STATUSES = frozenset({"completed", "failed", "timed_out", "cancelled"})
 _PROVIDER_CALL_STATUSES = frozenset(status.value for status in ComposerLLMCallStatus)
 _METER = metrics.get_meter(__name__)

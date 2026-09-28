@@ -183,7 +183,7 @@ class ComposerProgressRegistry:
     ) -> ComposerProgressSnapshot | None:
         """Publish a restart replay only when no live/newer request owns the session.
 
-        Completed guided operations can be replayed after an app restart, when
+        Completed operations can be replayed after an app restart, when
         the in-memory registry is empty and owes the caller a terminal
         snapshot. A replay of an older operation in a live process must not
         displace a newer request that already claimed or published progress.
@@ -209,8 +209,8 @@ class ComposerProgressRegistry:
     ) -> ComposerProgressSink:
         """Claim latest-request progress custody and return its guarded sink.
 
-        A guided full-plan releases the per-session compose lock while its
-        provider call runs, so two distinct operations can overlap. The newer
+        A provider call can outlive a per-session compose lock, so two distinct
+        operations can overlap. The newer
         operation must remain the progress owner even if the older operation
         settles later. The captured generation makes every late publication
         from that superseded operation a no-op without retaining an unbounded

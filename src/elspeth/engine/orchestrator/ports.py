@@ -171,7 +171,12 @@ class CoalesceCompletionPort(Protocol):
         *,
         group_losses: tuple[GroupLossSpec, ...] = (),
     ) -> int:
-        """Mark durable scheduler work consumed by a barrier as terminal."""
+        """Mark durable scheduler work consumed by a barrier as terminal.
+
+        Returns exactly the number of distinct ``token_ids``: the scheduler
+        repository raises ``AuditIntegrityError`` inside its transaction on
+        an empty, duplicated, not-BLOCKED or short-terminalized set, so
+        callers do not re-check the count."""
         ...
 
     def complete_coalesce_merge(

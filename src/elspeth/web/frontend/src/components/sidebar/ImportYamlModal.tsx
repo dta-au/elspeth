@@ -24,24 +24,13 @@ export const IMPORT_YAML_CONFIRM_TITLE = "Replace current pipeline";
 export const IMPORT_YAML_CONFIRM_CONFIRM_LABEL = "Replace pipeline";
 export const IMPORT_YAML_CONFIRM_CANCEL_LABEL = "Keep current pipeline";
 
-/**
- * Confirm-step message. The history note always applies (the backend
- * always creates a new version rather than overwriting); the guided note
- * is appended only while guided is genuinely ACTIVE (a guided_session
- * exists and its own `.terminal` is null) -- the same predicate
- * `isGuidedBuildActive` (components/chat/guided/guidedBuildActive.ts) uses
- * to decide whether SideRail itself is on screen. A terminal guided_session
- * (completed / exited_to_freeform) means the user already left guided; the
- * sentence must not claim a switch that already happened.
- */
-export function buildImportConfirmMessage(guidedActive: boolean): string {
-  const base =
+/** The existing version remains available after import. */
+export function buildImportConfirmMessage(): string {
+  return (
     "Importing will replace the current pipeline with the one in this YAML. " +
     "The version you have now stays in your version history, and you can " +
-    "revert to it afterwards.";
-  return guidedActive
-    ? `${base} This session is in guided mode; importing will switch it to freeform.`
-    : base;
+    "revert to it afterwards."
+  );
 }
 
 /** Success copy -- pinned as a helper so tests assert the exact string. */
@@ -644,11 +633,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
   const compositionStateLoaded = useSessionStore((s) => s.compositionStateLoaded);
-  const guidedSession = useSessionStore((s) => s.guidedSession);
   const selectSession = useSessionStore((s) => s.selectSession);
-  // Mirrors isGuidedBuildActive's own null-session / null-terminal check --
-  // see buildImportConfirmMessage's doc comment for why terminal excludes.
-  const guidedActive = guidedSession !== null && guidedSession.terminal === null;
 
   const [yamlText, setYamlText] = useState("");
   const [phase, setPhase] = useState<ImportPhase>("draft");
@@ -924,7 +909,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       });
       setPhase("success");
       // Reuse the existing session-load refetch to sync the full canonical
-      // state (messages, compositionState, guided reset to null, proposals,
+              // state (messages, compositionState, proposals,
       // versions) -- the same mechanism selectSession already provides for
       // any session-context change. There is no dedicated "refresh current
       // session" action to call instead; growing one was out of this
@@ -1081,7 +1066,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
           {phase === "confirming" && (
             <ConfirmDialog
               title={IMPORT_YAML_CONFIRM_TITLE}
-              message={buildImportConfirmMessage(guidedActive)}
+              message={buildImportConfirmMessage()}
               confirmLabel={IMPORT_YAML_CONFIRM_CONFIRM_LABEL}
               cancelLabel={IMPORT_YAML_CONFIRM_CANCEL_LABEL}
               onConfirm={() => void doImport()}

@@ -106,7 +106,7 @@ Analytics evidence replaces the Landscape audit record.
 - Azure CLI with the `containerapp` extension, the pinned Bicep CLI
   (facts §1.1), `jq`, `curl`, `psql`, `cosign`, Node 24/npm 11 and Playwright
   Chromium installed from reviewed locks before mutation.
-- The epoch-68 image (session epoch 68, Landscape epoch 48) in the registry.
+- The epoch-71 image (session epoch 71, Landscape epoch 48) in the registry.
   The epoch literals in this runbook are byte-bound to the live constants by
   `tests/unit/web/test_azure_container_apps_runbook_contract.py`.
 - 6b-2's membership writer merged, or P3 is recorded as unreachable rather
@@ -245,7 +245,7 @@ tracked placeholder example to a deployment.
 | `WORKLOAD_A_PARAMETERS`, `WORKLOAD_B_PARAMETERS` | Local role-specific workload ARM parameters with pinned secret versions |
 | `COMPATIBILITY_RECORD` | Candidate-bound compatibility record; the driver produces `TESTCONTAINER_RECEIPT` against the provisioned Flexible Server |
 | `ELSPETH_ACCEPTANCE_PYTHON` | Existing venv Python; bind both worktree source roots with `PYTHONPATH` |
-| `P1_TRIAL_REQUESTS` | JSON file of at least 20 unique `{session_id, body}` guided requests, each with its freshly minted turn token |
+| `P1_TRIAL_REQUESTS` | JSON file of at least 20 unique `{session_id, body}` freeform message requests, each with a fresh `client_request_id` |
 | `P2_SESSION_IDS` | JSON array of at least 20 unique fresh executable session IDs, one per trial |
 | `P4_SESSION_ID` | Prepared executable session for cross-replica progress |
 | `P3_SESSION_ID` | Prepared long-running session when running the probes stage separately |
@@ -255,7 +255,7 @@ tracked placeholder example to a deployment.
 | `PROBE_YAML`, `P3_YAML` | Local executable P2/P4 YAML and a long-running CSV-sink P3 YAML for the `prepare` stage |
 | `PROBE_SOURCE_BLOB`, `PROBE_SOURCE_NAME` | Local CreateInlineBlobRequest JSON (`filename`, `content`, `mime_type`) and source mapping name (default `input`) |
 | `P4_MESSAGE_BODY` | Valid Composer message JSON asking for an explanation without changing pipeline structure |
-| `P1_INTENT`, `P1_BODY` | Initial guided intent and valid action template; `prepare` merges each fresh server turn token and a new operation ID |
+| `P1_BODY` | JSON template with nonempty `content`; `prepare` creates a fresh session and adds a new `client_request_id` for each trial |
 | `ACCEPTANCE_SECRET_DIR` | Private directory of the bootstrap password and application-secret files listed below |
 | `PGSSLROOTCERT` | Operator-host CA bundle for Flexible Server TLS verification |
 | `BOOTSTRAP_PRINCIPAL_ID`, `BOOTSTRAP_PRINCIPAL_TYPE` | Explicit operator object ID and `User` or `ServicePrincipal`, granted Key Vault Secrets Officer on both disposable vaults |
@@ -448,7 +448,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   `/mnt/elspeth/data`, `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads`
   owned `1654:1654`, mode `0700`.
 - `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-  with the schema-owner URLs and initializes both schemas at session epoch 68
+  with the schema-owner URLs and initializes both schemas at session epoch 71
   and Landscape epoch 48.
 - `doctor-runtime-a` / `doctor-runtime-b` run `elspeth doctor deployment --json`
   with each runtime role's URLs; `session_schema`, `landscape_schema`,
@@ -461,7 +461,7 @@ RUNTIME_B_EXECUTION=$(run_job_to_completion doctor-runtime-b)
   where the process runs.
 
 > **LIVE:** for 0.8.1 acceptance, run the Jobs with the candidate digest and
-> require both schema checks to pass after initialization at session epoch 68
+> require both schema checks to pass after initialization at session epoch 71
 > and Landscape epoch 48. Record the execution names. Any no-schema dry run
 > against a `release/0.8.0` image is predecessor-only wiring evidence; it
 > cannot establish the candidate's schema compatibility or acceptance.
@@ -506,7 +506,7 @@ proof of rollout above (exactly one active revision carrying the candidate
 digest) is what makes the custody serialisation claim hold.
 
 > **LIVE:** the public-behaviour pass (Playwright tutorial through the
-> ingress, a fork and a guided convert, the two seams Phase 3 trialled) and
+> ingress, a fork and a freeform Composer turn) and
 > the WebSocket behaviour at the 240 s request timeout.
 
 ---
@@ -535,7 +535,7 @@ parity test feeds one corpus through both).
   "rollback_doctor_job_sha256": "",
   "previous_package_version": "",
   "schema_facts": {
-    "candidate": {"session_epoch": 68, "landscape_epoch": 48, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 71, "landscape_epoch": 48, "run_web_plugin_policy_present": true},
     "previous": null,
     "structural_changes": "initial_create",
     "semantics_only_changes": "none",
@@ -631,7 +631,7 @@ tree proves, and overclaiming is a schema violation rather than a convention.
 
 | probe | action | passing evidence | `mechanism` |
 |---|---|---|---|
-| **P1** concurrent guided ops from two replicas | 20 trials; the same `POST /api/sessions/{id}/guided/respond` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; the fence's `operation_epoch` advances by exactly one; exactly one `guided_operations` row; two distinct `owner_instance_id` values across the run | `session_operation_fence` |
+| **P1** concurrent freeform turns from two replicas | 20 trials in fresh sessions; the same `POST /api/sessions/{id}/messages` body with nonempty `content` and canonical UUID `client_request_id` fired at `LABEL_A_URL` and `LABEL_B_URL` within 5 ms | per trial exactly one 2xx and one 409 `"Session operation is already active"`; `session_operation_fences.operation_epoch` advances by exactly one, `owner_instance_id` equals the winner, and exactly one `message_ingress_receipts` row exists for `(session_id, client_request_id)` | `session_operation_fence` |
 | **P2** run-start coordination | 20 trials; `POST /api/sessions/{id}/execute` from both labels concurrently | exactly one `runs` row and one Landscape run per trial; one 202 and one 409. This legacy receipt does not measure durable permit admission or handoff; its field set records run-start contention only | `session_operation_fence_execute` |
 | **P4** cross-replica progress | session and run created via `LABEL_A_URL`; status, outputs, messages and a blob written by `rA` read via `LABEL_B_URL` | **P4a (must pass):** all DB-backed state visible from `rB` within one poll interval; blob bytes identical through NFS; terminal status observed on `rB`. **P4b (recorded, cannot pass):** the legacy v2 receipt conservatively retains its owner-affine result and records production sticky sessions; it does not measure the new durable ticket/event replay mechanisms | `postgresql_and_nfs` (P4a); `owner_affine` (P4b) |
 | **P3** lease takeover after a partitioned owner | long run started via `LABEL_A_URL` (owner `rA`); partition `rA` by role revocation (below); observe the survivor before and after the session-operation and membership lease deadlines; restore the role afterwards | before expiry `LABEL_B_URL` gets 409; after expiry the survivor's sweep cancels the run with the orphan reason and `rB` acquires the session; `rA`'s `web_instances` row is still `state='active'` with an expired lease; no duplicate sink effect; the fence's `owner_instance_id` becomes `rB`'s | `role_revocation_lease_expiry`; downgraded to `graceful_stop` if a `stopped` row landed |
@@ -650,17 +650,17 @@ affinity.
 
 `scripts/acceptance.sh all` restores the partitioned runtime roles, then deploys
 `r<sha12>-single` in `Single` mode with `sticky` affinity and exactly two
-replicas. It creates fresh guided trial sessions and a fresh executable P4a
+replicas. It creates fresh freeform trial sessions and a fresh executable P4a
 session through the default ingress. Two persistent cookie clients discover
 distinct process UUIDs, and `/api/system/status` binds their revision and
 platform replica names to the live Azure inventory. P1 still requires at least
-20 fresh turn-token requests; P4a checks fresh messages, run status, output
+20 fresh client-request-ID requests; P4a checks fresh messages, run status, output
 metadata and uploaded blob bytes across those clients.
 
 To run only this final stage before cleanup, retain the same `EVIDENCE_DIR`,
 inventory, verified Job reports, resolved workload parameter files and private
 `parameters/acceptance-env.json`. Set the common driver inputs above plus an
-existing `ELSPETH_ACCEPTANCE_BEARER_TOKEN`, `P1_INTENT`, `P1_BODY`, `PROBE_YAML`,
+existing `ELSPETH_ACCEPTANCE_BEARER_TOKEN`, `P1_BODY`, `PROBE_YAML`,
 `PROBE_SOURCE_BLOB` and `P4_MESSAGE_BODY`:
 
 ```bash

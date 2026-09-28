@@ -7,26 +7,9 @@ import { TutorialTurn4Run } from "./TutorialTurn4Run";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
-import type { GuidedSession } from "@/types/guided";
-
-function tutorialGuidedState(kind: "completed" | "exited_to_freeform" | null): GuidedSession {
-  return {
-    step: "step_4_wire", history: [], chat_history: [], chat_turn_seq: 0,
-    reviewed_components: { sources: [], outputs: [] }, profile: null,
-    terminal: kind === null ? null : kind === "completed"
-      ? { kind, reason: null, pipeline_yaml: "sources: {}" }
-      : { kind, reason: "user_pressed_exit", pipeline_yaml: null },
-  };
-}
 
 beforeEach(() => {
   resetStore(useSessionStore);
-  useSessionStore.setState({
-    exitToFreeform: vi.fn().mockImplementation(async () => {
-      useSessionStore.setState({ guidedSession: tutorialGuidedState("exited_to_freeform") });
-      return { status: "applied" };
-    }),
-  });
 });
 
 vi.mock("@/api/client", () => ({
@@ -56,7 +39,7 @@ vi.mock("@/api/client", () => ({
   }),
   // TutorialTurn4Run reaches the real api.runTutorialPipeline in the relocated
   // StrictMode dedup test below, so it must be mocked even though the staged
-  // flow tests stop at the mocked guided shell.
+  // flow tests stop at the mocked freeform Build shell.
   runTutorialPipeline: vi.fn().mockResolvedValue({
     run_id: "run-1",
     output: {
@@ -69,30 +52,11 @@ vi.mock("@/api/client", () => ({
   // The chrome "Exit tutorial" control abandons an in-flight run via
   // TutorialTurn4Run's abandonTutorialRun, which fires this.
   cancelTutorialRun: vi.fn().mockResolvedValue({ cancelled: true }),
-  // A RESUMED run stage re-binds the store to the tutorial session and
-  // hydrates it through the read-only GET /guided (sessionStore.startGuided)
-  // so the pipeline pane can show the committed graph. Returns the persisted
-  // completed session — no wizard, no provider call, no write.
-  getGuided: vi.fn().mockResolvedValue({
-    guided_session: {
-      step: "step_4_wire",
-      history: [],
-      terminal: { kind: "completed", reason: null },
-      chat_history: [],
-      chat_turn_seq: 0,
-      reviewed_components: { sources: [], outputs: [] },
-      profile: null,
-    },
-    next_turn: null,
-    terminal: { kind: "completed", reason: null },
-    composition_state: null,
-  }),
   // The tutorial-persistence slice (elspeth-918f4434b3): the component
   // persists stage transitions through preferencesStore, which calls this.
   // Body-aware echo mirroring the backend upsert (supplied fields land in
   // the response; completion clears progress server-side).
   updateUserComposerPreferences: vi.fn(async (body: Record<string, unknown>) => ({
-    default_mode: body.default_mode ?? "freeform",
     freeform_intro_dismissed_at: null,
     show_advanced: false,
     tutorial_completed_at: body.tutorial_completed_at ?? null,
@@ -120,77 +84,43 @@ vi.mock("@/api/client", () => ({
   }),
 }));
 
-// Replace the embedded guided surface with a one-button stub that fires the
-// completion callback; the real ChatPanel guided behaviour is covered by
-// TutorialGuidedShell.test.tsx.
+// Replace the embedded freeform surface with a one-button stub that fires the
+// completion callback; TutorialFreeformShell.test.tsx covers real Build behavior.
 // When set, the stub fires onSessionMissing TWICE on mount with its session
-// id — simulating the live race where the shell's guided/start 404 handler
+// id — simulating the live race where the shell's sample-load 404 handler
 // and the mount-time membership check both detect the same dead resume.
 let stubShellReportsSessionMissing = false;
-// Per-test session id the stub hands to onCompleted/onExited. The run turn's
+// Per-test session id the stub hands to onCompleted. The run turn's
 // StrictMode dedupe cache is module-level and keyed by sessionId, so tests
 // that exercise the run step with a bespoke runTutorialPipeline mock must use
 // a distinct id or they replay a previous test's cached run.
-let stubGuidedSessionId = "sess-new";
-let lastExitRequestedRef: { current: boolean } | null = null;
-vi.mock("./TutorialGuidedShell", async () => {
+let stubBuildSessionId = "sess-new";
+
+vi.mock("./TutorialFreeformShell", async () => {
   const { useEffect } = await import("react");
   return {
-    TutorialGuidedShell: ({
-      sessionId,
-      onCompleted,
-      onExited,
-      onSessionMissing,
-      exitRequestedRef,
-    }: {
+    TutorialFreeformShell: ({ sessionId, onCompleted, onSessionMissing }: {
       sessionId: string;
-      onCompleted: (s: string) => void;
-      onExited?: (s: string) => void;
-      onSessionMissing?: (deadSessionId: string) => void;
-      exitRequestedRef?: { current: boolean };
+      onCompleted: (id: string) => void;
+      onSessionMissing?: (id: string) => void;
     }) => {
-      lastExitRequestedRef = exitRequestedRef ?? null;
       useEffect(() => {
-        // Mirror the real shell's store binding (resetForTutorialSession):
-        // the run stage that follows reads activeSessionId to decide whether
-        // the session is already loaded or must be re-bound after a reload,
-        // and the dead-resume recovery unbinds exactly this id.
-        useSessionStore.setState({ activeSessionId: sessionId });
+        useSessionStore.setState({ activeSessionId: sessionId, compositionStateLoaded: true });
         if (stubShellReportsSessionMissing) {
           onSessionMissing?.(sessionId);
           onSessionMissing?.(sessionId);
         }
-        // Mount-only, mirroring the real shell's start effect.
+        // The test stub mirrors the real shell's mount-time session binding.
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, []);
       return (
-        <>
-          <button
-            type="button"
-            onClick={() => {
-              // The real shell hands off the session it is bound to. Tests
-              // vary the hand-off id only to isolate the run turn's
-              // module-level cache (see the note above), so re-bind to it
-              // here — otherwise the run stage would read the mismatch as
-              // an unbound store and re-hydrate.
-              useSessionStore.setState({
-                activeSessionId: stubGuidedSessionId,
-                guidedSession: tutorialGuidedState("completed"),
-              });
-              onCompleted(stubGuidedSessionId);
-            }}
-          >
-            finish-guided
-          </button>
-          <button type="button" onClick={() => {
-            useSessionStore.setState({
-              guidedSession: tutorialGuidedState("exited_to_freeform"),
-            });
-            onExited?.(stubGuidedSessionId);
-          }}>
-            exit-guided
-          </button>
-        </>
+        <button type="button" onClick={() => {
+          useSessionStore.setState({
+            activeSessionId: stubBuildSessionId,
+            compositionStateLoaded: true,
+          });
+          onCompleted(stubBuildSessionId);
+        }}>finish-build</button>
       );
     },
   };
@@ -198,7 +128,7 @@ vi.mock("./TutorialGuidedShell", async () => {
 
 // The run stage keeps the workspace frame (pipeline pane with the committed
 // graph) mounted around the run card. The frame's real panes are covered by
-// TutorialGuidedShell.test.tsx / the workspace suites; here it is a labelled
+// TutorialFreeformShell.test.tsx / the workspace suites; here it is a labelled
 // passthrough so the run card's own behaviour is what these tests exercise.
 vi.mock("./TutorialWorkspaceFrame", () => ({
   TutorialWorkspaceFrame: ({
@@ -224,18 +154,24 @@ describe("HelloWorldTutorial staged flow", () => {
     vi.clearAllMocks();
     resetStore(usePreferencesStore);
     stubShellReportsSessionMissing = false;
-    stubGuidedSessionId = "sess-new";
-    lastExitRequestedRef = null;
+    stubBuildSessionId = "sess-new";
+  });
+
+  it("enters freeform Build after Welcome", async () => {
+    const user = userEvent.setup();
+    render(<HelloWorldTutorial />);
+    await user.click(screen.getByRole("button", { name: "Let's go" }));
+    expect(await screen.findByRole("button", { name: "finish-build" })).toBeInTheDocument();
   });
 
   it("the run step waits for an explicit Run click — mounting it runs nothing", async () => {
     const api = await import("@/api/client");
-    stubGuidedSessionId = "sess-explicit-run";
+    stubBuildSessionId = "sess-explicit-run";
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
 
     // The run card sits inside the workspace frame so the pipeline pane
@@ -247,9 +183,8 @@ describe("HelloWorldTutorial staged flow", () => {
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
     expect(api.runTutorialPipeline).not.toHaveBeenCalled();
-    // The store was bound by the guided shell; the run stage must not
+    // The store was bound by the Build shell; the run stage must not
     // re-hydrate a session that is already loaded.
-    expect(api.getGuided).not.toHaveBeenCalled();
 
     await clickRun(user);
     expect(await screen.findByText("bold")).toBeInTheDocument();
@@ -272,10 +207,10 @@ describe("HelloWorldTutorial staged flow", () => {
       created_at: "2026-05-19T12:00:00Z", updated_at: "2026-05-19T12:00:00Z",
     }));
     expect(screen.getByRole("heading", { name: "You're ready to use the composer." })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "finish-guided" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "finish-build" })).toBeNull();
     expect(useSessionStore.getState().activeSessionId).toBeNull();
-    expect(api.updateUserComposerPreferences).not.toHaveBeenCalledWith(expect.objectContaining({ tutorial_stage: "guided" }));
-    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith(expect.objectContaining({ default_mode: "freeform", tutorial_completed_via: "skip" }));
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalledWith(expect.objectContaining({ tutorial_stage: "build" }));
+    expect(api.updateUserComposerPreferences).toHaveBeenCalledWith(expect.objectContaining({ tutorial_completed_via: "skip" }));
   });
 
   it("renders the welcome bookend first", () => {
@@ -286,8 +221,7 @@ describe("HelloWorldTutorial staged flow", () => {
   });
 
   it("labels the tutorial progress row visibly so it reads as a different hierarchy from the build stepper", async () => {
-    // elspeth-d75756fa2c: the 5 unlabeled dots sat directly above the guided
-    // 5-chip build stepper and read as a broken duplicate of it. The visible
+    // The visible
     // "Tutorial · <stage>" label is aria-hidden — the existing sr-only "Step N
     // of M" line stays the AT signal (the ARIA was already right).
     const user = userEvent.setup();
@@ -307,40 +241,36 @@ describe("HelloWorldTutorial staged flow", () => {
     expect(api.deleteTutorialOrphans).toHaveBeenCalledTimes(1);
   });
 
-  it("advances welcome -> guided -> run on guided completion", async () => {
+  it("advances welcome -> freeform Build -> run on Build completion", async () => {
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "finish-guided" }),
+        screen.getByRole("button", { name: "finish-build" }),
       ).toBeInTheDocument(),
     );
-    await user.click(screen.getByRole("button", { name: "finish-guided" }));
+    await user.click(screen.getByRole("button", { name: "finish-build" }));
     await waitFor(() =>
       expect(
-        screen.queryByRole("button", { name: "finish-guided" }),
+        screen.queryByRole("button", { name: "finish-build" }),
       ).toBeNull(),
     );
   });
 
-  it("renders no Back affordance on the run turn (consumed guided wizard is non-returnable)", async () => {
-    // previousStep(run) is null, so HelloWorldTutorial passes no onBack to the
-    // run turn and TutorialTurn4Run renders no Back button. This is the wiring
-    // half of the fix: Back from run must not remount the completed guided
-    // wizard (which would re-fire onCompleted and bounce the user back to run).
+  it("allows Back to freeform Build before Run but not after a result", async () => {
     // Distinct id: this test clicks Run, which populates the module-level
     // run cache for its session id.
-    stubGuidedSessionId = "sess-no-back";
+    stubBuildSessionId = "sess-no-back";
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
-    // No Back on the pre-run card either.
+    // A pre-run pipeline can still be amended in freeform Build.
     await screen.findByRole("button", { name: "Run" });
-    expect(screen.queryByRole("button", { name: /^Back/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /^Back/ })).toBeInTheDocument();
     // After the Run click the run turn fetches via the mocked
     // runTutorialPipeline and renders its result row ("bold" rationale) plus
     // the primary "continue" button.
@@ -349,7 +279,7 @@ describe("HelloWorldTutorial staged flow", () => {
     expect(screen.queryByRole("button", { name: /^Back/ })).toBeNull();
   });
 
-  it("tags the created tutorial session before entering guided", async () => {
+  it("tags the created tutorial session before entering Build", async () => {
     const api = await import("@/api/client");
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
@@ -378,13 +308,13 @@ describe("HelloWorldTutorial staged flow", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "session service down",
     );
-    // Still on welcome — the guided shell never mounted.
+    // Still on welcome — the Build shell never mounted.
     expect(
       screen.getByRole("heading", { name: /welcome/i }),
     ).toBeInTheDocument();
   });
 
-  it("preflights composer availability before creating a guided tutorial session", async () => {
+  it("preflights composer availability before creating a tutorial session", async () => {
     const api = await import("@/api/client");
     render(
       <HelloWorldTutorial
@@ -456,8 +386,7 @@ describe("HelloWorldTutorial — abandon beacon (F4)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(usePreferencesStore);
-    stubGuidedSessionId = "sess-new";
-    lastExitRequestedRef = null;
+    stubBuildSessionId = "sess-new";
   });
 
   it("does not fire the abandon beacon on pagehide while still on the welcome bookend", async () => {
@@ -475,7 +404,7 @@ describe("HelloWorldTutorial — abandon beacon (F4)", () => {
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "finish-guided" }),
+        screen.getByRole("button", { name: "finish-build" }),
       ).toBeInTheDocument(),
     );
 
@@ -510,7 +439,7 @@ describe("HelloWorldTutorial — abandon beacon (F4)", () => {
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: "finish-guided" }),
+        screen.getByRole("button", { name: "finish-build" }),
       ).toBeInTheDocument(),
     );
 
@@ -525,19 +454,17 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(usePreferencesStore);
-    stubGuidedSessionId = "sess-new";
-    lastExitRequestedRef = null;
+    stubBuildSessionId = "sess-new";
   });
 
-  it("persists the exit opt-out with the exit discriminator when guided exits to freeform", async () => {
+  it("persists the exit opt-out from freeform Build", async () => {
     const api = await import("@/api/client");
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
-    await user.click(await screen.findByRole("button", { name: "exit-guided" }));
+    await user.click(await screen.findByRole("button", { name: "Exit tutorial" }));
     await waitFor(() =>
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        default_mode: "freeform",
         tutorial_completed_at: expect.any(String),
         tutorial_completed_via: "exit",
       }),
@@ -550,14 +477,11 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     );
   });
 
-  it("renders an Exit tutorial control on the guided step that persists the same opt-out", async () => {
+  it("renders an Exit tutorial control on freeform Build", async () => {
     const api = await import("@/api/client");
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
-    useSessionStore.setState({
-      guidedSession: tutorialGuidedState("exited_to_freeform"),
-    });
     await user.click(
       await screen.findByRole("button", { name: "Exit tutorial" }),
     );
@@ -576,12 +500,12 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
 
   it("renders the Exit tutorial control on the run step", async () => {
     // Distinct id: this test clicks Run (module-level run cache, see stub note).
-    stubGuidedSessionId = "sess-exit-control-run";
+    stubBuildSessionId = "sess-exit-control-run";
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
     // Present on the pre-run card and after the run.
     await screen.findByRole("button", { name: "Run" });
@@ -635,55 +559,22 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     expect(screen.queryByRole("button", { name: "Exit tutorial" })).toBeNull();
   });
 
-  it("Exit tutorial during Build terminates the live guided session", async () => {
-    // Without this hand-off the non-terminal guidedSession survives the
-    // shell unmount inside sessionStore, and the freeform ChatPanel's
-    // discriminator re-renders the guided workspace — the learner has to
-    // exit guided a second time instead of landing in freeform as promised.
-    const exitToFreeform = vi.fn().mockResolvedValue({ status: "applied" });
-    const originalExit = useSessionStore.getState().exitToFreeform;
-    useSessionStore.setState({
-      guidedSession: { terminal: null } as unknown as GuidedSession,
-      exitToFreeform,
-    });
-    try {
-      const user = userEvent.setup();
-      render(<HelloWorldTutorial />);
-      await user.click(screen.getByRole("button", { name: "Let's go" }));
-      await user.click(
-        await screen.findByRole("button", { name: "Exit tutorial" }),
-      );
-      expect(exitToFreeform).toHaveBeenCalledTimes(1);
-    } finally {
-      useSessionStore.setState({
-        exitToFreeform: originalExit,
-        guidedSession: null,
-      });
-    }
-  });
-
-  it("Exit tutorial during Build queues a startup exit before guided state loads", async () => {
-    useSessionStore.setState({ guidedSession: null });
+  it("Exit tutorial during a freeform compose waits for the operation", async () => {
+    const api = await import("@/api/client");
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
-    const exit = await screen.findByRole("button", { name: "Exit tutorial" });
-    expect(useSessionStore.getState().guidedSession).toBeNull();
-    expect(lastExitRequestedRef?.current).toBe(false);
+    useSessionStore.setState({ isComposing: true });
 
-    await user.click(exit);
+    await user.click(await screen.findByRole("button", { name: "Exit tutorial" }));
 
-    expect(lastExitRequestedRef?.current).toBe(true);
-    const api = await import("@/api/client");
-    expect(api.updateUserComposerPreferences).not.toHaveBeenCalledWith(expect.objectContaining({ tutorial_completed_via: "exit" }));
-    expect(usePreferencesStore.getState().tutorialCompleted).toBe(false);
-    await user.click(screen.getByRole("button", { name: "exit-guided" }));
-    await waitFor(() => expect(usePreferencesStore.getState().tutorialCompleted).toBe(true));
-    expect(useSessionStore.getState().activeSessionId).toBe("sess-new");
-    expect(useSessionStore.getState().guidedSession?.terminal?.kind).toBe("exited_to_freeform");
+    expect(await screen.findByRole("alert")).toHaveTextContent("current Composer operation");
+    expect(api.updateUserComposerPreferences).not.toHaveBeenCalledWith(
+      expect.objectContaining({ tutorial_completed_via: "exit" }),
+    );
   });
 
-  it("adds the renamed tutorial session to the header session list before guided starts", async () => {
+  it("adds the renamed tutorial session to the header session list before Build", async () => {
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
 
@@ -701,71 +592,10 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     });
   });
 
-  it("Exit tutorial leaves an already-exited-to-freeform guided session alone", async () => {
-    // The wizard-path hand-off (onExited) reaches the same handler with the
-    // terminal already set to exited_to_freeform — firing the control signal
-    // again would be a duplicate respond POST that the backend 409s (only
-    // kind=COMPLETED is exempt from the terminal-rejection; guided.py:1190).
-    const exitToFreeform = vi.fn().mockResolvedValue({ status: "applied" });
-    const originalExit = useSessionStore.getState().exitToFreeform;
-    useSessionStore.setState({
-      guidedSession: {
-        terminal: { kind: "exited_to_freeform", reason: "user_pressed_exit" },
-      } as unknown as GuidedSession,
-      exitToFreeform,
-    });
-    try {
-      const user = userEvent.setup();
-      render(<HelloWorldTutorial />);
-      await user.click(screen.getByRole("button", { name: "Let's go" }));
-      await user.click(
-        await screen.findByRole("button", { name: "Exit tutorial" }),
-      );
-      expect(exitToFreeform).not.toHaveBeenCalled();
-    } finally {
-      useSessionStore.setState({
-        exitToFreeform: originalExit,
-        guidedSession: null,
-      });
-    }
-  });
-
-  it("Exit tutorial after the guided wizard COMPLETED hands off to freeform", async () => {
-    // elspeth-e2c3dba6b5 review P2: a COMPLETED guided session survives the
-    // shell unmount, and ChatPanel's discriminator checks `completed` FIRST —
-    // so without this hand-off the learner lands on CompletionSummary and must
-    // click "Open freeform editor" (which itself just calls exitToFreeform) to
-    // reach freeform, contradicting the Exit control's "freeform NOW" promise.
-    // The backend accepts exit_to_freeform from kind=COMPLETED (guided.py:1222),
-    // transitioning it to exited_to_freeform so the surface falls through.
-    const exitToFreeform = vi.fn().mockResolvedValue({ status: "applied" });
-    const originalExit = useSessionStore.getState().exitToFreeform;
-    useSessionStore.setState({
-      guidedSession: {
-        terminal: { kind: "completed", reason: null },
-      } as unknown as GuidedSession,
-      exitToFreeform,
-    });
-    try {
-      const user = userEvent.setup();
-      render(<HelloWorldTutorial />);
-      await user.click(screen.getByRole("button", { name: "Let's go" }));
-      await user.click(
-        await screen.findByRole("button", { name: "Exit tutorial" }),
-      );
-      expect(exitToFreeform).toHaveBeenCalledTimes(1);
-    } finally {
-      useSessionStore.setState({
-        exitToFreeform: originalExit,
-        guidedSession: null,
-      });
-    }
-  });
-
   it("Exit tutorial during an in-flight run aborts the fetch and fires the server-side cancel", async () => {
     const api = await import("@/api/client");
     // Distinct session id: the run cache is module-level (see the stub note).
-    stubGuidedSessionId = "sess-exit-mid-run";
+    stubBuildSessionId = "sess-exit-mid-run";
     // A run that never settles — the exit must not depend on it finishing.
     vi.mocked(api.runTutorialPipeline).mockImplementationOnce(
       () => new Promise(() => {}),
@@ -774,7 +604,7 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
     await clickRun(user);
     await user.click(screen.getByRole("button", { name: "Exit tutorial" }));
@@ -792,12 +622,12 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
     // so Exit always sends it from the run stage: a no-op here, and the only
     // thing that stops a leaked run after a reload (red-team F3, 2026-09-02).
     const api = await import("@/api/client");
-    stubGuidedSessionId = "sess-exit-pre-run";
+    stubBuildSessionId = "sess-exit-pre-run";
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
     await screen.findByRole("button", { name: "Run" });
     await user.click(screen.getByRole("button", { name: "Exit tutorial" }));
@@ -811,12 +641,12 @@ describe("HelloWorldTutorial — exit to freeform (elspeth-61591e64bb)", () => {
 
   it("Exit tutorial after the run completes does not cancel the finished run", async () => {
     const api = await import("@/api/client");
-    stubGuidedSessionId = "sess-exit-after-run";
+    stubBuildSessionId = "sess-exit-after-run";
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
     await clickRun(user);
     expect(await screen.findByText("bold")).toBeInTheDocument();
@@ -830,17 +660,17 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(usePreferencesStore);
-    stubGuidedSessionId = "sess-new";
+    stubBuildSessionId = "sess-new";
   });
 
-  it("persists the guided stage + session on Start", async () => {
+  it("persists the Build stage + session on Start", async () => {
     const api = await import("@/api/client");
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await waitFor(() =>
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        tutorial_stage: "guided",
+        tutorial_stage: "build",
         tutorial_session_id: "sess-new",
         tutorial_run_id: null,
         tutorial_source_data_hash: null,
@@ -848,13 +678,13 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     );
   });
 
-  it("persists the run stage when guided completes", async () => {
+  it("persists the run stage when Build completes", async () => {
     const api = await import("@/api/client");
     const user = userEvent.setup();
     render(<HelloWorldTutorial />);
     await user.click(screen.getByRole("button", { name: "Let's go" }));
     await user.click(
-      await screen.findByRole("button", { name: "finish-guided" }),
+      await screen.findByRole("button", { name: "finish-build" }),
     );
     await waitFor(() =>
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith(
@@ -875,7 +705,6 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     // "Take me to the composer" click (which is never made here).
     await waitFor(() =>
       expect(api.updateUserComposerPreferences).toHaveBeenCalledWith({
-        default_mode: "freeform",
         tutorial_completed_at: expect.any(String),
         tutorial_completed_via: "skip",
       }),
@@ -893,17 +722,17 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     ).toBeInTheDocument();
   });
 
-  it("resumes at guided with the persisted session — no orphan sweep, no restart", async () => {
+  it("resumes at freeform Build with the persisted session — no orphan sweep, no restart", async () => {
     const api = await import("@/api/client");
     usePreferencesStore.setState({
       loaded: true,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-resume",
     });
     render(<HelloWorldTutorial />);
-    // The guided shell (stubbed) mounts directly — not the Welcome bookend.
+    // The Build shell (stubbed) mounts directly — not the Welcome bookend.
     expect(
-      screen.getByRole("button", { name: "finish-guided" }),
+      screen.getByRole("button", { name: "finish-build" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: /welcome/i })).toBeNull();
     // The resumable session must NOT be renamed "abandoned-..." on reload:
@@ -915,7 +744,7 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
 
   it("falls back to a fresh Welcome when the resumed session no longer exists", async () => {
     // The persisted resume fields can outlive their session (orphan sweep,
-    // archive, prerelease wipe). Without recovery the guided stage dead-ends
+    // archive, prerelease wipe). Without recovery the Build stage dead-ends
     // on "Session not found" with NO affordance (skip/exit are suppressed
     // past Welcome) — the operator-observed blank-page failure.
     const api = await import("@/api/client");
@@ -925,15 +754,15 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     vi.mocked(api.fetchSessions).mockResolvedValueOnce([]);
     usePreferencesStore.setState({
       loaded: true,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-resume",
     });
     render(<HelloWorldTutorial />);
-    // Recovery lands on the Welcome bookend, not the guided shell.
+    // Recovery lands on the Welcome bookend, not the Build shell.
     expect(
       await screen.findByRole("heading", { name: /welcome/i }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "finish-guided" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "finish-build" })).toBeNull();
     // And the stale server-side resume fields are cleared (welcome → all-null).
     await waitFor(() => {
       const bodies = vi
@@ -950,7 +779,7 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
 
   it("recovery is idempotent per dead id and releases the app-level session binding", async () => {
     // Live-observed residue of the dead-resume recovery: the shell's
-    // guided/start 404 handler and the mount-time membership check RACE and
+    // sample-load 404 handler and the mount-time membership check RACE and
     // both detect the same dead session — the warning double-logged — and
     // activeSessionId stayed bound to the corpse, so InlineRunResults kept
     // polling /runs (404) while the user sat at Welcome.
@@ -962,7 +791,7 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     useSessionStore.setState({ activeSessionId: "sess-resume" });
     usePreferencesStore.setState({
       loaded: true,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-resume",
     });
     render(<HelloWorldTutorial />);
@@ -1006,11 +835,13 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     // A reload before the Run click (or mid-run — the persisted fields
     // cannot tell the two apart) lands back on the pre-run card: the run
     // must never auto-start on the learner's behalf (I-1). The store is
-    // empty after a reload, so the run stage re-binds it to the tutorial
-    // session and hydrates through the read-only GET /guided so the
-    // pipeline pane can show the committed graph.
+    // empty after a reload, so the run stage re-binds it through ordinary
+    // session selection, without replaying the Build prompt.
     const api = await import("@/api/client");
-    useSessionStore.setState({ activeSessionId: null });
+    const selectSession = vi.fn(async (id: string) => {
+      useSessionStore.setState({ activeSessionId: id, compositionStateLoaded: true });
+    });
+    useSessionStore.setState({ activeSessionId: null, selectSession });
     usePreferencesStore.setState({
       loaded: true,
       tutorialStage: "run",
@@ -1022,16 +853,9 @@ describe("HelloWorldTutorial — server-persisted resume (elspeth-918f4434b3)", 
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
     expect(api.runTutorialPipeline).not.toHaveBeenCalled();
-    // Bound and hydrated for the graph pane — read-only, no guided start.
+    // Bound and hydrated for the graph pane — read-only, no prompt or run.
     expect(useSessionStore.getState().activeSessionId).toBe("sess-resume");
-    await waitFor(() =>
-      expect(api.getGuided).toHaveBeenCalledWith("sess-resume"),
-    );
-    await waitFor(() =>
-      expect(useSessionStore.getState().guidedSession?.terminal?.kind).toBe(
-        "completed",
-      ),
-    );
+    expect(selectSession).toHaveBeenCalledWith("sess-resume");
     // No stage write: the persisted `run` stage already matches.
     expect(api.updateUserComposerPreferences).not.toHaveBeenCalled();
   });

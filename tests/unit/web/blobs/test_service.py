@@ -46,8 +46,6 @@ from elspeth.web.blobs.protocol import (
     BlobForkFenceLostError,
     BlobForkPlanEntry,
     BlobForkWriteFence,
-    BlobGuidedOperationFenceLostError,
-    BlobGuidedOperationWriteFence,
     BlobInProgressForkError,
     BlobIntegrityError,
     BlobNotFoundError,
@@ -66,7 +64,7 @@ from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
     composition_proposals_table,
-    guided_operations_table,
+    session_operation_receipts_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import CompositionValidationError
@@ -74,7 +72,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -2125,129 +2123,6 @@ class TestInlineCustody:
         importlib.import_module("elspeth.web.blobs.replacement")
         self._operation_context = compose_context
 
-    @staticmethod
-    def _guided_operation_write_fence(
-        db_engine,
-        session_id: UUID,
-        *,
-        kind: str = "guided_plan",
-    ) -> BlobGuidedOperationWriteFence:
-        operation_id = str(uuid4())
-        lease_token = uuid4().hex
-        now = datetime.now(UTC)
-        with db_engine.begin() as conn:
-            conn.execute(
-                guided_operations_table.insert().values(
-                    session_id=str(session_id),
-                    operation_id=operation_id,
-                    kind=kind,
-                    status="in_progress",
-                    request_hash="a" * 64,
-                    lease_token=lease_token,
-                    lease_expires_at=now + timedelta(hours=1),
-                    attempt=1,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-        return BlobGuidedOperationWriteFence(
-            session_id=session_id,
-            operation_id=operation_id,
-            lease_token=lease_token,
-            attempt=1,
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("kind", ["guided_plan", "guided_respond"])
-    async def test_guided_inline_custody_accepts_closed_planning_operation_kinds(
-        self,
-        db_engine,
-        session_id: UUID,
-        tmp_path: Path,
-        kind: str,
-    ) -> None:
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        request = _custody_request(db_engine, session_id)
-        fence = self._guided_operation_write_fence(db_engine, session_id, kind=kind)
-
-        record = await service.reserve_inline_custody(request, write_fence=fence, session_operation_context=self._operation_context)
-
-        assert record.status == "ready"
-        assert Path(record.storage_path).read_bytes() == request.content
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("invalidity", ["wrong_kind", "wrong_token", "wrong_attempt"])
-    async def test_guided_inline_custody_requires_live_fence_at_reservation(
-        self,
-        db_engine,
-        session_id: UUID,
-        tmp_path: Path,
-        invalidity: str,
-    ) -> None:
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        request = _custody_request(db_engine, session_id)
-        fence = self._guided_operation_write_fence(
-            db_engine,
-            session_id,
-            kind="guided_chat" if invalidity == "wrong_kind" else "guided_plan",
-        )
-        if invalidity == "wrong_token":
-            fence = replace(fence, lease_token="wrong-token")
-        elif invalidity == "wrong_attempt":
-            fence = replace(fence, attempt=2)
-
-        with pytest.raises(BlobGuidedOperationFenceLostError):
-            await service.reserve_inline_custody(request, write_fence=fence, session_operation_context=self._operation_context)
-
-        with db_engine.connect() as conn:
-            assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
-        assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "takeover_values",
-        [
-            {"kind": "guided_chat"},
-            {"lease_token": "takeover-lease"},
-            {"attempt": 2},
-        ],
-        ids=["wrong-kind", "wrong-token", "wrong-attempt"],
-    )
-    async def test_guided_inline_custody_rechecks_fence_at_ready_write(
-        self,
-        db_engine,
-        session_id: UUID,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        takeover_values: dict[str, object],
-    ) -> None:
-        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
-        request = _custody_request(db_engine, session_id)
-        fence = self._guided_operation_write_fence(db_engine, session_id)
-        original_write = blob_service_module._atomic_write_blob
-
-        def _write_after_takeover(path: Path, content: bytes, *, write_guard: Callable[[], None]) -> None:
-            original_write(path, content, write_guard=write_guard)
-            with db_engine.begin() as conn:
-                changed = conn.execute(
-                    guided_operations_table.update()
-                    .where(guided_operations_table.c.session_id == str(session_id))
-                    .where(guided_operations_table.c.operation_id == fence.operation_id)
-                    .where(guided_operations_table.c.lease_token == fence.lease_token)
-                    .where(guided_operations_table.c.attempt == fence.attempt)
-                    .values(**takeover_values, updated_at=datetime.now(UTC))
-                ).rowcount
-            assert changed == 1
-
-        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _write_after_takeover)
-
-        with pytest.raises(BlobGuidedOperationFenceLostError):
-            await service.reserve_inline_custody(request, write_fence=fence, session_operation_context=self._operation_context)
-
-        with db_engine.connect() as conn:
-            row = conn.execute(select(blobs_table.c.status).where(blobs_table.c.session_id == str(session_id))).one()
-        assert row.status == "pending"
-
     @pytest.mark.asyncio
     async def test_nonidempotent_duplicate_does_not_delete_existing_ready_file(
         self,
@@ -2662,7 +2537,6 @@ class TestInlineCustody:
                 conn,
                 staged=staged,
                 max_storage_per_session=100,
-                write_fence=None,
             )
             raise RuntimeError("rollback caller-owned transaction")
 
@@ -2702,7 +2576,6 @@ class TestInlineCustody:
                 conn,
                 staged=staged,
                 max_storage_per_session=100,
-                write_fence=None,
             )
             raise RuntimeError("simulate process death")
 
@@ -2744,7 +2617,6 @@ class TestInlineCustody:
                 conn,
                 staged=staged,
                 max_storage_per_session=100,
-                write_fence=None,
             )
         custody_root = tmp_path / "blobs"
         parked_root = tmp_path / "parked-blobs"
@@ -2801,7 +2673,6 @@ class TestInlineCustody:
                 conn,
                 staged=staged,
                 max_storage_per_session=100,
-                write_fence=None,
             )
 
         assert events.index("mkdir-root") < events.index("fsync-data-dir")
@@ -2847,7 +2718,6 @@ class TestInlineCustody:
                 conn,
                 staged=staged,
                 max_storage_per_session=100,
-                write_fence=None,
             )
 
         assert target_events[:2] == ["failed", "succeeded"]
@@ -3243,13 +3113,13 @@ class TestCopyBlobsForFork:
                     attempt=1,
                 )
             operation = conn.execute(
-                select(guided_operations_table.c.operation_id).where(
-                    guided_operations_table.c.session_id == str(source_session_id),
-                    guided_operations_table.c.operation_id == operation_id,
+                select(session_operation_receipts_table.c.operation_id).where(
+                    session_operation_receipts_table.c.session_id == str(source_session_id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
                 )
             ).one_or_none()
         if operation is None:
-            session_service = DualFencedSessionServiceHarness(
+            session_service = FencedSessionServiceHarness(
                 service._engine,
                 telemetry=build_sessions_telemetry(),
                 log=structlog.get_logger("test.blob-fork-custody"),
@@ -3294,7 +3164,7 @@ class TestCopyBlobsForFork:
             conn.execute(sessions_table.update().where(sessions_table.c.id == str(target_session_id)).values(archived_at=now))
             if operation is None:
                 conn.execute(
-                    guided_operations_table.insert().values(
+                    session_operation_receipts_table.insert().values(
                         session_id=str(source_session_id),
                         operation_id=operation_id,
                         kind="session_fork",
@@ -3322,11 +3192,11 @@ class TestCopyBlobsForFork:
         now = datetime.now(UTC)
         with service._engine.begin() as conn:
             changed = conn.execute(
-                guided_operations_table.update()
+                session_operation_receipts_table.update()
                 .where(
-                    guided_operations_table.c.session_id == str(source_session_id),
-                    guided_operations_table.c.operation_id == operation_id,
-                    guided_operations_table.c.status == "in_progress",
+                    session_operation_receipts_table.c.session_id == str(source_session_id),
+                    session_operation_receipts_table.c.operation_id == operation_id,
+                    session_operation_receipts_table.c.status == "in_progress",
                 )
                 .values(
                     status="failed",
@@ -3679,12 +3549,12 @@ class TestCopyBlobsForFork:
             now = datetime.now(UTC)
             with db_engine.begin() as conn:
                 changed = conn.execute(
-                    guided_operations_table.update()
-                    .where(guided_operations_table.c.session_id == str(session_id))
-                    .where(guided_operations_table.c.operation_id == stale_fence.operation_id)
-                    .where(guided_operations_table.c.status == "in_progress")
-                    .where(guided_operations_table.c.lease_token == stale_fence.lease_token)
-                    .where(guided_operations_table.c.attempt == stale_fence.attempt)
+                    session_operation_receipts_table.update()
+                    .where(session_operation_receipts_table.c.session_id == str(session_id))
+                    .where(session_operation_receipts_table.c.operation_id == stale_fence.operation_id)
+                    .where(session_operation_receipts_table.c.status == "in_progress")
+                    .where(session_operation_receipts_table.c.lease_token == stale_fence.lease_token)
+                    .where(session_operation_receipts_table.c.attempt == stale_fence.attempt)
                     .values(
                         lease_token=takeover_token,
                         lease_expires_at=now + timedelta(hours=1),
@@ -3831,14 +3701,13 @@ class TestCopyBlobsForFork:
         elif fork_status == "completed":
             values.update(
                 settled_at=now,
-                result_kind="session",
                 result_session_id=str(target_session_id),
                 response_hash="b" * 64,
             )
         else:
             values.update(settled_at=now, failure_code="operation_failed")
         with db_engine.begin() as conn:
-            conn.execute(guided_operations_table.insert().values(**values))
+            conn.execute(session_operation_receipts_table.insert().values(**values))
 
         if fork_status == "in_progress":
             with pytest.raises(BlobInProgressForkError, match=operation_id):
@@ -4073,10 +3942,10 @@ class TestCopyBlobsForFork:
         before = await blob_service.list_blobs(target_session_id, limit=None)
         with db_engine.begin() as conn:
             conn.execute(
-                guided_operations_table.update()
+                session_operation_receipts_table.update()
                 .where(
-                    guided_operations_table.c.session_id == str(session_id),
-                    guided_operations_table.c.operation_id == write_fence.operation_id,
+                    session_operation_receipts_table.c.session_id == str(session_id),
+                    session_operation_receipts_table.c.operation_id == write_fence.operation_id,
                 )
                 .values(lease_token="replacement-lease", attempt=write_fence.attempt + 1)
             )
@@ -4127,12 +3996,12 @@ class TestCopyBlobsForFork:
             if finalize_calls == 1:
                 with db_engine.begin() as conn:
                     changed = conn.execute(
-                        guided_operations_table.update()
+                        session_operation_receipts_table.update()
                         .where(
-                            guided_operations_table.c.session_id == str(session_id),
-                            guided_operations_table.c.operation_id == stale_fence.operation_id,
-                            guided_operations_table.c.lease_token == stale_fence.lease_token,
-                            guided_operations_table.c.attempt == stale_fence.attempt,
+                            session_operation_receipts_table.c.session_id == str(session_id),
+                            session_operation_receipts_table.c.operation_id == stale_fence.operation_id,
+                            session_operation_receipts_table.c.lease_token == stale_fence.lease_token,
+                            session_operation_receipts_table.c.attempt == stale_fence.attempt,
                         )
                         .values(
                             lease_token=winner_lease_token,
@@ -4307,7 +4176,7 @@ class TestCopyBlobsForFork:
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
         before = await blob_service.list_blobs(target_session_id, limit=None)
-        session_service = DualFencedSessionServiceHarness(
+        session_service = FencedSessionServiceHarness(
             blob_service._engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
@@ -4339,7 +4208,7 @@ class TestCopyBlobsForFork:
         await blob_service.create_blob(session_id, "source.csv", b"source", "text/csv", session_operation_context=compose_context)
         await self._copy(blob_service, session_id, target_session_id)
         operation_id = self._fail_fork(blob_service, session_id, target_session_id)
-        session_service = DualFencedSessionServiceHarness(
+        session_service = FencedSessionServiceHarness(
             blob_service._engine,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.blob-fork-custody"),
@@ -5486,7 +5355,7 @@ class TestReadBlobContentPrefixVerifiedStreaming:
     the full blob in memory, mirroring read_blob_content's guards exactly.
 
     Finding B (memory half): a 100 MiB blob was fully materialized in RAM
-    per guided selection just to serve an 8 KiB bounded preview, because the
+    per selection just to serve an 8 KiB bounded preview, because the
     only way to verify the full-content hash was `storage.read_bytes()`.
     This method reads and hashes in bounded chunks instead.
     """

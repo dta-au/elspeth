@@ -727,7 +727,7 @@ def _insert_session_fork_operation(engine: Any, session_id: str, *, status: str)
     """Persist one valid session-fork operation in the requested lifecycle state."""
     from datetime import UTC, datetime, timedelta
 
-    from elspeth.web.sessions.models import guided_operations_table
+    from elspeth.web.sessions.models import session_operation_receipts_table
 
     operation_id = str(uuid4())
     now = datetime.now(UTC)
@@ -761,14 +761,13 @@ def _insert_session_fork_operation(engine: Any, session_id: str, *, status: str)
             )
         values.update(
             settled_at=now,
-            result_kind="session",
             result_session_id=target_session_id,
             response_hash="e" * 64,
         )
     else:
         raise AssertionError(f"unsupported test fork status {status!r}")
     with engine.begin() as conn:
-        conn.execute(guided_operations_table.insert().values(**values))
+        conn.execute(session_operation_receipts_table.insert().values(**values))
     return operation_id
 
 
@@ -11882,7 +11881,7 @@ class TestExplainValidationError:
     def test_unknown_error_teaches_closed_codes(self) -> None:
         """Unmatched text returns the closed-code catalogue, not a shrug.
 
-        Live guided sessions (bad64533-08a1, 2026-07-22) called the tool with
+        A planner can call the tool with
         exactly ``{"error_text": "ValidationError"}`` — the error_class from
         repair feedback, not a message or code — and got a generic non-answer
         mid-repair. The fallback now teaches usage: name the closed codes and
@@ -12154,9 +12153,7 @@ class TestExplainValidationCode:
         resolved = explain_validation_code("interpretation_requirements_invalid")
         assert resolved is not None
         explanation, fix = resolved
-        # The guided step skills carry no interpretation_requirements exemplar,
-        # so this guidance is the ONLY place the staged planner learns the
-        # authorable row shape after a rejection.
+        # The guidance teaches the planner an authorable row shape after a rejection.
         assert "user_term" in fix
         assert "kind" in fix and "draft" in fix
         # Escape valve is load-bearing: the shield review is advisory, so
@@ -18302,6 +18299,26 @@ class TestPreviewProofStep:
             )
 
             assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in [d["code"] for d in diagnostics]
+
+    def test_batch_rank_numeric_value_field_blocks_behind_observed_csv(self) -> None:
+        """batch_rank ranks a numeric value_field: an observed CSV string there fails every batch, so the proof fires."""
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            diagnostics = self._proof_codes(
+                authority,
+                context,
+                self._batch_barrier_behind_expand_opener(
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                    barrier_node_type="aggregation",
+                    plugin="batch_rank",
+                    options={"schema": {"mode": "observed"}, "value_field": "price"},
+                ),
+            )
+
+            mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
+            assert mismatch, [d["code"] for d in diagnostics]
+            assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
+            assert mismatch[0]["evidence_locator"]["field"] == "price"
 
     # -- declared-input-type mismatch against observed CSV (elspeth-e6e552ce34) --
 

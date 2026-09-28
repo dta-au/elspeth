@@ -112,6 +112,10 @@ def test_postgres_call_mode_lineage_and_verdict_are_durable_and_run_bound() -> N
         assert run == ("verify", "source")
         assert call == source_call.call_id
         assert verdict == (source_call.call_id, True)
+        decision = factory.execution.get_verification_decision(current_call.call_id)
+        assert decision is not None and decision.source_call_id == source_call.call_id
+        assert factory.execution.get_verification_decisions_for_run("current") == [decision]
+        assert list(factory.execution.iter_verification_decisions_for_run("current", batch_size=1)) == [decision]
         assert {item.call_id for item in factory.execution.get_all_calls_for_run("source")} == {
             source_call.call_id,
             source_second_call.call_id,

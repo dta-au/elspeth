@@ -40,9 +40,10 @@ def _run_real_csv_gate_pipeline(
     *,
     on_error: str | object = _OMIT_POLICY,
     condition: str = "row['id'] == '2' or row['amount'] > 500",
+    csv_text: str = "id,amount\n1,not-a-number\n2,750.00\n",
 ):
     input_path = tmp_path / "rows.csv"
-    input_path.write_text("id,amount\n1,not-a-number\n2,750.00\n")
+    input_path.write_text(csv_text)
     high_path = tmp_path / "high.jsonl"
     standard_path = tmp_path / "standard.jsonl"
     error_path = tmp_path / "gate-errors.jsonl"
@@ -349,3 +350,51 @@ def test_real_csv_string_gate_error_without_policy_aborts_before_later_row(tmp_p
 
     assert _read_jsonl(tmp_path / "high.jsonl") == []
     assert _read_jsonl(tmp_path / "standard.jsonl") == []
+
+
+_FORMAT_KEY_SENTINEL = "CUSTOMER_PRIVATE_739"
+_FORMAT_KEY_CSV = f"id,amount\n1,%({_FORMAT_KEY_SENTINEL})s\n2,750.00\n"
+_FORMAT_KEY_CONDITION = "(row['amount'] % {'a': 1}) == 'x'"
+
+
+def test_real_csv_format_key_miss_routes_as_missing_key_without_the_key(tmp_path: Path) -> None:
+    """``str % mapping`` raises KeyError with the row-derived key as its text (C3 review r2).
+
+    It is a handled missing-key evaluation error: the bad row routes, the later
+    row continues, and no audit text names the key.
+    """
+    result, graph, db, store, _high_path, standard_path, error_path = _run_real_csv_gate_pipeline(
+        tmp_path,
+        on_error="gate_errors",
+        condition=_FORMAT_KEY_CONDITION,
+        csv_text=_FORMAT_KEY_CSV,
+    )
+
+    assert result.rows_processed == 2
+    assert result.rows_failed == 1
+    assert _read_jsonl(error_path) == [{"amount": f"%({_FORMAT_KEY_SENTINEL})s", "id": "1"}]
+    assert _read_jsonl(standard_path) == [{"amount": "750.00", "id": "2"}]
+
+    recorder = RecorderFactory(db, payload_store=store)
+    outcomes = recorder.query.get_all_token_outcomes_for_run(result.run_id)
+    assert sorted(outcome.path for outcome in outcomes) == sorted([TerminalPath.ON_ERROR_ROUTED, TerminalPath.GATE_ROUTED])
+    failure = next(outcome for outcome in outcomes if outcome.path == TerminalPath.ON_ERROR_ROUTED)
+    gate_node_id = graph.get_config_gate_id_map()[GateName("threshold")]
+    failed_state = next(state for state in recorder.query.get_node_states_for_token(failure.token_id) if state.node_id == gate_node_id)
+    assert failed_state.error_json is not None
+    assert json.loads(failed_state.error_json) == {
+        "exception": "gate expression evaluation failed: missing key",
+        "type": "ExpressionEvaluationError",
+    }
+    for event in recorder.query.get_routing_events(failed_state.state_id):
+        assert event.reason_ref is not None
+        assert _FORMAT_KEY_SENTINEL not in store.retrieve(event.reason_ref).decode()
+
+
+def test_real_csv_format_key_miss_without_policy_aborts_without_the_key(tmp_path: Path) -> None:
+    with pytest.raises(ExpressionEvaluationError) as exc_info:
+        _run_real_csv_gate_pipeline(tmp_path, condition=_FORMAT_KEY_CONDITION, csv_text=_FORMAT_KEY_CSV)
+
+    assert str(exc_info.value) == "%-format key not found in dict (Mod operation)"
+    assert exc_info.value.kind == "missing_key"
+    assert exc_info.value.__cause__ is None

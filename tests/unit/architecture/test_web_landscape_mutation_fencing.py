@@ -634,11 +634,21 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # returns an outcomeless FAILED item to READY), and SchedulerDispositionRepository.
 # _transition_on's FailedImage UPDATE (a FAILED item purges its row payload only when
 # its token is decided). Measured by scripts/fencing_inventory.py --baseline HEAD.
-# QR (lane 5887, fenced source-quarantine ingest): 163 -> 164. Arrived:
+# elspeth-5887 X2 (no statement binds a list that grows with a batch): 163 -> 164,
+# +1 identity, write set UNCHANGED (72/72). SchedulerLeaseRepository.
+# _rotate_expired_leases now rotates in two statements: a predicate UPDATE ...
+# RETURNING for sink-redrive items (no per-item binds) and one executemany of a
+# fixed-size UPDATE for transform items. Measured by scripts/fencing_inventory.py
+# --baseline against a git archive of 55dbdf290: arrived 6, departed 5, moved 0.
+# QR (lane 5887, fenced source-quarantine ingest), on its own branch 163 -> 164. Arrived:
 # NodeStateRepository.record_failed_source_quarantine_state_on insert node_states (the
 # step-0 FAILED source state, written on the ingest's one fenced connection). Measured
 # by scripts/fencing_inventory.py against a git-archive of 2d1406077.
-_EXPECTED_DML_COUNT = 164
+# QR merged with release/0.8.1 (both 164s above): 164 -> 165, write set UNCHANGED
+# (72/72). Against release a375d7f13: arrived 1 (the QR node_states insert above),
+# departed 0, moved 0. Measured by scripts/fencing_inventory.py --baseline against a
+# git archive of a375d7f13.
+_EXPECTED_DML_COUNT = 165
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -747,9 +757,29 @@ _EXPECTED_DML_COUNT = 164
 # K063 run accounting adds one collector_group_failures INSERT to the fenced
 # ExecutionRepository.complete_collector_failure verdict. The site records a
 # failed group even when no members arrived; all prior identities remain.
-# E3: b3c42f08… -> the value below, the two arrivals named at _EXPECTED_DML_COUNT.
-# QR: 802297e6… -> the value below, the one arrival named at _EXPECTED_DML_COUNT.
-_EXPECTED_DML_INVENTORY_SHA256 = "9d27cf24dc7aa752cf883937f2b2a3c26189e6591b68b41245745fcc6b33e838"
+# E3: b3c42f08… -> 802297e6…, the two arrivals named at _EXPECTED_DML_COUNT.
+# X1 fix round 2 (barrier release bound per statement): 802297e6… -> the value
+# below at count 163, write shapes 72/72 unchanged. Three token_work_items UPDATE
+# fingerprints move, identity otherwise unchanged: the terminalize and passthrough
+# hand-off UPDATEs in BarrierJournalRepository (d2312155f176d54b -> 927506072e2afba0,
+# 50e196dfb9f9d75c -> 93df40a0d0632b6f) and reset_adoption_marker_to_pending
+# (8f538e40a9a91999 -> a9ddef5f73955d39) each became one executemany of a per-row
+# statement in place of IN lists and CASE maps whose binds grew with the batch.
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 4fa8e7451: arrived 3, departed 3, moved 0.
+# elspeth-5887 X2: 7ff0f6ac… -> the value below at count 164, write shapes 72/72
+# unchanged. Five UPDATEs whose IN lists or CASE maps bound per row became one
+# executemany of a per-row statement (dispositions mark_pending_sink_terminal_many
+# and terminalize_pending_sinks_with_terminal_outcomes, leases
+# requeue_undecided_failed_work, group_losses adopt_group_losses) and
+# _rotate_expired_leases split into two statements (see _EXPECTED_DML_COUNT).
+# Measured by scripts/fencing_inventory.py --baseline against a git archive of
+# 55dbdf290: arrived 6, departed 5, moved 0.
+# QR (on its own branch): 802297e6… -> 9d27cf24…, the one arrival named at
+# _EXPECTED_DML_COUNT.
+# QR merged with release/0.8.1: 6a08f651… (release) -> the value below, the one
+# arrival named at _EXPECTED_DML_COUNT.
+_EXPECTED_DML_INVENTORY_SHA256 = "e36c8c4358dc70992a98c6b6209b37c2d958aac25f8bd39ac615e9c2a9d16032"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -866,6 +896,20 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # (the plugin arms' verdict; complete_collector_failure is listed in _MUTATION_APIS).
 # Source replay restores discarded source decisions through the existing fenced
 # PluginContext.record_validation_error API (one new caller, none removed).
+# G1 (elspeth-5887fb7928): 290 -> 289. Departed:
+# BarrierIntakeCoordinator._adopt_row_union_row -> self._scheduler.mark_blocked_barrier_terminal#2
+# (the row_union intake group-failure arm, deleted as unreachable: accept() returns only
+# held / late-arrival / release). G1b moved, not added: the row_union sweep's
+# processor.mark_blocked_barrier_terminal#1 now sits in _handle_failed_row_union_outcome
+# (the deleted _mark_barrier_tokens_terminal re-checked what the repository enforces).
+# R2 fix round 1 (0365b84eb): 289 -> 290. Moved: RowProcessor._record_flush_violation ->
+# self._data_flow.record_token_outcome_leader#1 is now
+# batch_violation_outcomes.record_batch_violation_failures -> data_flow.record_token_outcome_leader#1,
+# the one per-token recorder both batch seams call. Arrived:
+# CollectorExecutor._execute_flush -> self._execution.complete_node_state#3, the collector's
+# Tier-1 declared-input miss closing each member's hold FAILED before the run ends.
+# Attributed by row identity from this gate's scanner on the release 63b050f39 export,
+# the lane parent ae2f320f7 export and the landing tree (lane parent == landing tree).
 # QR (lane 5887): the base tree 2d1406077 measures 289 against the 290 pin (a drift
 # that predates QR); QR moves 289 -> 285. Departed: QuarantineRouter.route ->
 # factory.execution.begin_node_state / complete_node_state / record_routing_event and
@@ -876,7 +920,15 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # counted). QR replay deletion: 286 -> 285. Departed: TokenManager.create_token_for_existing_row
 # -> self._data_flow.create_token (source-row replay deleted). Measured by
 # scripts/fencing_inventory.py on a git snapshot of 874fdb7c7 and on this tree.
-_EXPECTED_CALL_COUNT = 285
+# QR merged with release/0.8.1: 290 (release, after G1 and R2 fix round 1 above) -> 286.
+# Against release a375d7f13: arrived 1 (ingest_source_quarantine ->
+# scheduler.ingest_quarantine_row_with_pending_sink), departed 5 (QuarantineRouter.route
+# -> begin_node_state / complete_node_state / record_routing_event,
+# TokenManager.create_quarantine_token -> create_quarantine_row_with_token,
+# TokenManager.create_token_for_existing_row -> create_token), moved 0 — the QR arrival
+# and departures named above. Measured by scripts/fencing_inventory.py --baseline
+# against a git archive of a375d7f13.
+_EXPECTED_CALL_COUNT = 286
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -887,9 +939,13 @@ _EXPECTED_CALL_COUNT = 285
 # Re-derived for the combined K063/K056 tree after the caller exchange.
 # K063 run accounting adds CollectorExecutor.notify_empty_group's direct
 # complete_collector_failure call for a zero-arrival group.
-# QR: 7683d3e0… -> 853145e4… (commit 1's committed tree) -> the value below (the
-# arrival and departures named at _EXPECTED_CALL_COUNT).
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "a00408f8bf0645a4a7cecd06626d460c28b01fe72d02bd65a98ff81a7f7d282b"
+# G1 + G1b: 7683d3e0… -> e74265fd…, the departure and the move above.
+# R2 fix round 1: e74265fd… -> 72e3db35…, the move and the arrival above.
+# QR (on its own branch): 7683d3e0… -> 853145e4… (commit 1's committed tree) ->
+# a00408f8… (the arrival and departures named at _EXPECTED_CALL_COUNT).
+# QR merged with release/0.8.1: 72e3db35… (release) -> the value below, the arrival
+# and departures named at _EXPECTED_CALL_COUNT.
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "2be2a394f3d500e08b4af400dd259c4f56720894d7692789d9c35c4c66f76f6c"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,
@@ -911,7 +967,21 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "a00408f8bf0645a4a7cecd06626d460c28b01fe72d
 # Arrived: SchedulerLeaseRepository.requeue_undecided_failed_work ->
 # SchedulerEventStore.record_many (the resume_requeue_failed events, on the verb's
 # one fenced connection). Measured by scripts/fencing_inventory.py --baseline HEAD.
-# QR (lane 5887): 147 -> 153, 1e0222f8… -> the value below. Departed: the two edges of
+# X1 fix round 2: 1e0222f8… -> cc66a10d… at count 147. Two edges keep their
+# endpoints and move fingerprint: _terminalize_consumed_barrier_rows and
+# _transition_passthrough_pending_sink -> SchedulerEventStore.record_many
+# (ff73b28faf6e6c8f -> c9cd14d8ac48f958, 437ff52f30dcf19a -> 6a488448bf78ff07); each
+# now records an event for every candidate row after its exact-count check instead
+# of filtering on a RETURNING image. Measured by scripts/fencing_inventory.py
+# --baseline against a git archive of 4fa8e7451: moved 2, arrived 0, departed 0.
+# elspeth-5887 X2: cc66a10d… -> 9c79b610… at count 147. Two edges keep their
+# endpoints and move fingerprint: mark_pending_sink_terminal_many and
+# terminalize_pending_sinks_with_terminal_outcomes -> SchedulerEventStore.record_many;
+# each UPDATE is now one executemany with an exact-count check, so the events cover
+# every selected row instead of filtering on a RETURNING image. Measured by
+# scripts/fencing_inventory.py --baseline against a git archive of 55dbdf290:
+# moved 2, arrived 0, departed 0.
+# QR (lane 5887, on its own branch): 147 -> 153, 1e0222f8… -> 8bddd1d2…. Departed: the two edges of
 # DataFlowRepository.create_quarantine_row_with_token (deleted). Arrived: the fenced
 # SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink -> the data-flow
 # insert_row_with_token_on, ErrorAuditRepository.link_validation_error_to_row_on,
@@ -919,12 +989,16 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "a00408f8bf0645a4a7cecd06626d460c28b01fe72d
 # and its own _park_source_quarantine_on; _park_source_quarantine_on -> insert_work_items
 # and SchedulerEventStore.record_many; record_failed_source_quarantine_state_on ->
 # verify_and_extend_leader_fence. Measured by scripts/fencing_inventory.py.
-# QR H2 (resume coverage check): 153 -> 154, 8bddd1d2… -> the value below. Arrived:
+# QR H2 (resume coverage check): 153 -> 154, 8bddd1d2… -> 932a286b…. Arrived:
 # SchedulerLeaseRepository.verify_resume_coverage -> record_coordination_event (the
 # value-free resume_refused event, on the verb's one leader-fenced connection, run
 # subject coordination_token.run_id). Measured by scripts/fencing_inventory.py.
+# QR merged with release/0.8.1 (X1 + X2 above): 147 -> 154, 9c79b610… (release) -> the
+# value below. Against release a375d7f13: arrived 9, departed 2, moved 0 — exactly the
+# QR arrivals and departures named above. Measured by scripts/fencing_inventory.py
+# --baseline against a git archive of a375d7f13.
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "932a286b18763e20e8f1ebfcc883d704947960894a636f6e147ce1e422b9277a"
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "1241860a5c22bd0a007e83bb935481d2d86e9cd680bb6db6c3f71ac4a4017667"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93
@@ -7876,7 +7950,14 @@ _REVIEWED_REGISTRY_MODULES = {
     # _REQUIRED_CHECK_CONSTRAINTS (the collector group-failure reason CHECK
     # folded into epoch 45); the diff is that tuple row alone, so construction,
     # guard installation and clock issuance are unchanged.
-    "src/elspeth/core/landscape/database.py": "5c51a6e6fbfd1b7009180f4db671f4aaf474b3df22a1f3345f6f5d626777caa0",
+    # 5c51a6e6… -> the value below (elspeth-5887 X2): every create_engine call
+    # passes hide_parameters=LANDSCAPE_HIDE_BOUND_PARAMETERS (one new module
+    # constant) so a database error's text never carries bound row values;
+    # the diff is that keyword and the constant, so construction order, guard
+    # installation and clock issuance are unchanged.
+    # 964378989 added ix_node_states_run to _REQUIRED_INDEXES; the deadline
+    # guard, journal installation, and database clock path remain unchanged.
+    "src/elspeth/core/landscape/database.py": "2f6b0183b95b876071f1a89238754ae73bd40e43f63b6f3fc4ab4c9706ee3756",
 }
 
 
@@ -8962,7 +9043,14 @@ def _deadline_executed_writes(function, resolver):
             yield write, call, callee.value, table[1], values
             continue
         payload = _deadline_binding(parameters[0], resolver, call)
-        rows = payload.elts if isinstance(payload, (ast.List, ast.Tuple)) else [payload]
+        # A list comprehension of dict displays is as static as a literal list:
+        # every row it yields carries the display's own keys.
+        if isinstance(payload, (ast.List, ast.Tuple)):
+            rows = payload.elts
+        elif isinstance(payload, ast.ListComp) and isinstance(payload.elt, ast.Dict):
+            rows = [payload.elt]
+        else:
+            rows = [payload]
         for row in rows:
             parameter_call = ast.Call(func=ast.Name(id="parameters", ctx=ast.Load()), args=[row], keywords=[])
             supplied = _deadline_write_values(parameter_call, resolver)
@@ -9318,7 +9406,7 @@ def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id
                 existing = self._observe_permitted_run_on(conn, run_start_permit, config_hash=config_hash, canonical_version=canonical_version, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, web_plugin_policy_evidence=web_plugin_policy_evidence)
                 if existing is not None:
                     return existing
-        raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}: {exc}') from exc
+        raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}') from exc
     return run
 """,
 }
@@ -10480,7 +10568,7 @@ def insert_work_items_idempotent(conn: Connection, *, values: list[dict[str, obj
         raise LandscapeRecordError(f'Scheduler {operation} failed; database rejected audit write') from exc
     if len(inserted) != len(set(inserted)) or not set(inserted).issubset(by_id):
         raise LandscapeRecordError(f'Scheduler {operation} returned unexpected work_item_id')
-    existing_rows = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id.in_(tuple(by_id)))).mappings().all()
+    existing_rows = [row for chunk in bind_budget_chunks(tuple(by_id)) for row in conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id.in_(chunk))).mappings().all()]
     if len(existing_rows) != len(by_id):
         raise LandscapeRecordError(f'Scheduler {operation} failed; no matching row could be read back')
     for row in existing_rows:
@@ -10551,7 +10639,7 @@ def _transition_with_ready_children(self, *, work_item_id: str, emitted_ready: S
         inserted_ids = insert_work_items_idempotent(conn, values=[values for values, _event in children], operation=f'atomic child enqueue for parent work_item_id={work_item_id!r}')
         events_by_id = {event.work_item_id: event for _values, event in children}
         self._events.record_many(conn, records=[event for identity, event in events_by_id.items() if identity in inserted_ids])
-        persisted_children = conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == member_token.run_id, token_work_items_table.c.work_item_id.in_(tuple(events_by_id)))).mappings().all()
+        persisted_children = [row for chunk in bind_budget_chunks(tuple(events_by_id)) for row in conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == member_token.run_id, token_work_items_table.c.work_item_id.in_(chunk))).mappings().all()]
         rows_by_id = {row['work_item_id']: row for row in persisted_children}
         child_rows = tuple((rows_by_id[event.work_item_id] for _values, event in children))
         parent_row = self._transition_on(conn, work_item_id=work_item_id, status=status, image=image, expected_lease_owner=expected_lease_owner, group_losses=group_losses, member_token=member_token, require_complete_pending_sink_bundle=require_complete_pending_sink_bundle)
@@ -10621,10 +10709,11 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
     with fenced_write(self._engine, coordination_token=coordination_token, verb='complete_barrier') as conn:
         database_now = read_landscape_transaction_time(conn)
         if terminal_outcome_token_ids:
-            locked_tokens = conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(sorted(terminal_outcome_token_ids))).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()
+            sorted_terminal_token_ids = sorted(terminal_outcome_token_ids)
+            locked_tokens = [row for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(chunk)).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()]
             if {(str(row.token_id), str(row.run_id)) for row in locked_tokens} != {(token_id, run_id) for token_id in terminal_outcome_token_ids}:
                 raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received a terminal outcome for a missing or foreign token.')
-            existing_terminal_rows = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(terminal_outcome_token_ids)).where(token_outcomes_table.c.completed == 1)).all()
+            existing_terminal_rows = [row for chunk in bind_budget_chunks(sorted_terminal_token_ids, binds_per_item=1) for row in conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(chunk)).where(token_outcomes_table.c.completed == 1)).all()]
             if existing_terminal_rows:
                 raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} would duplicate terminal outcomes for token_ids={sorted((str(row.token_id) for row in existing_terminal_rows))!r}.')
         blocked_rows = conn.execute(select(token_work_items_table.c.work_item_id, token_work_items_table.c.token_id, token_work_items_table.c.node_id, token_work_items_table.c.attempt, token_work_items_table.c.lease_owner, token_work_items_table.c.lease_expires_at).where(*blocked_predicates).order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.step_index, token_work_items_table.c.work_item_id)).mappings().all()
@@ -10641,7 +10730,7 @@ def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str
             unknown_snapshot_token_ids = intake_snapshot_token_ids - durable_token_ids
             if unknown_snapshot_token_ids:
                 if scope_row_id is not None:
-                    cross_group_rows = conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(sorted(unknown_snapshot_token_ids)))).all()
+                    cross_group_rows = [row for chunk in bind_budget_chunks(sorted(unknown_snapshot_token_ids), binds_per_item=1) for row in conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(chunk))).all()]
                     cross_group = {row.token_id: row.row_id for row in cross_group_rows if row.row_id != scope_row_id}
                     if cross_group:
                         raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} scope_row_id={scope_row_id!r} received intake snapshot token(s) whose durable BLOCKED rows belong to a DIFFERENT row group: {dict(sorted(cross_group.items()))!r}; the flush caller built its firing-group snapshot across row groups (ADR-030 §E.3 scope validation).')
@@ -10740,6 +10829,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.contracts.freeze', names=[alias(name='freeze_fields')], level=0)",
         "ImportFrom(module='elspeth.contracts.hashing', names=[alias(name='canonical_json')], level=0)",
         "ImportFrom(module='elspeth.contracts.sink_effects', names=[alias(name='SINK_EFFECT_PROTOCOL_VERSION'), alias(name='AuditExportSignedManifestInput'), alias(name='AuditExportSigningMode'), alias(name='SinkEffectInputKind'), alias(name='SinkEffectMember'), alias(name='SinkEffectReservationRequest'), alias(name='SinkEffectState')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='LandscapeDB')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.model_loaders', names=[alias(name='SinkEffectLoader')], level=0)",
@@ -10759,6 +10849,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='LineageFrame'), alias(name='lineage_path_from_json'), alias(name='lineage_path_to_json')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventRecord')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='nodes_table'), alias(name='rows_table'), alias(name='token_work_items_table'), alias(name='tokens_table')], level=0)",
@@ -10787,11 +10878,12 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='collections.abc', names=[alias(name='Sequence')], level=0)",
         "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
         "ImportFrom(module='typing', names=[alias(name='ClassVar')], level=0)",
-        "ImportFrom(module='sqlalchemy', names=[alias(name='and_'), alias(name='case'), alias(name='select'), alias(name='update')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='and_'), alias(name='bindparam'), alias(name='case'), alias(name='select'), alias(name='update')], level=0)",
         "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
         "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken'), alias(name='WorkerMembershipToken')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction'), alias(name='fenced_member_transaction')], level=0)",
@@ -10807,14 +10899,17 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='collections.abc', names=[alias(name='Mapping'), alias(name='Sequence')], level=0)",
         "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
         "ImportFrom(module='datetime', names=[alias(name='UTC'), alias(name='datetime'), alias(name='timedelta')], level=0)",
-        "ImportFrom(module='sqlalchemy', names=[alias(name='case'), alias(name='func'), alias(name='select'), alias(name='update')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='bindparam'), alias(name='func'), alias(name='select'), alias(name='update')], level=0)",
         "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
+        "ImportFrom(module='sqlalchemy.exc', names=[alias(name='SQLAlchemyError')], level=0)",
         "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken')], level=0)",
         "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='BarrierTerminalOutcomeSpec'), alias(name='BatchMembershipSpec'), alias(name='BlockedPendingSinkHandoff'), alias(name='BufferedOutcomeSpec'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.data_flow.outcomes', names=[alias(name='record_buffered_outcome_guarded'), alias(name='record_terminal_outcomes_guarded')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.execution.batches', names=[alias(name='add_batch_member_guarded')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventRecord'), alias(name='SchedulerEventStore')], level=0)",
@@ -15505,6 +15600,59 @@ def test_deadline_issuance_requires_locked_sample_and_exact_registration(before:
     assert any("deadline" in finding for finding in _transaction_order_violations(mutant_units, scan_dml_identities(mutant_units)))
 
 
+def _executemany_comprehension_fixture() -> SourceUnit:
+    """A non-issuing token_work_items UPDATE executed once over a comprehension of dict rows (X1 fix round 2)."""
+    return _parse_source(
+        "src/elspeth/core/landscape/scheduler/leases.py",
+        textwrap.dedent(
+            """\
+            from sqlalchemy import bindparam, update
+            from elspeth.contracts.coordination import WorkerMembershipToken
+            from elspeth.core.landscape.run_coordination_repository import fenced_member_transaction
+            from elspeth.core.landscape.schema import token_work_items_table
+
+            def park_items(*, member_token: WorkerMembershipToken, work_item_ids):
+                with fenced_member_transaction(engine, member_token=member_token, verb='park_items') as conn:
+                    result = conn.execute(update(token_work_items_table).where(
+                        token_work_items_table.c.work_item_id == bindparam('b_work_item_id'),
+                        token_work_items_table.c.run_id == member_token.run_id,
+                    ).values(lease_expires_at=None), [{'b_work_item_id': work_item_id} for work_item_id in work_item_ids])
+                    if result.rowcount != len(work_item_ids):
+                        raise RuntimeError('park refused')
+            """
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        # A row key that overrides a fluent value is not static any more.
+        ("[{'b_work_item_id': work_item_id}", "[{'b_work_item_id': work_item_id, 'lease_expires_at': work_item_id}"),
+        # A row built by a call rather than a dict display has unknown keys.
+        ("[{'b_work_item_id': work_item_id}", "[dict(b_work_item_id=work_item_id)"),
+        # A generator is not a list display the resolver reads.
+        (
+            "[{'b_work_item_id': work_item_id} for work_item_id in work_item_ids]",
+            "({'b_work_item_id': work_item_id} for work_item_id in work_item_ids)",
+        ),
+    ],
+)
+def test_deadline_write_values_resolve_comprehension_rows_only_when_static(before: str, after: str) -> None:
+    baseline = _executemany_comprehension_fixture()
+    baseline_units = _deadline_fixture_units(baseline)
+    assert not [
+        finding for finding in _transaction_order_violations(baseline_units, scan_dml_identities(baseline_units)) if "deadline" in finding
+    ]
+    assert before in baseline.source
+    mutant = _parse_source(baseline.path, baseline.source.replace(before, after))
+    mutant_units = _deadline_fixture_units(mutant)
+    assert any(
+        "deadline table has unresolved write values" in finding
+        for finding in _transaction_order_violations(mutant_units, scan_dml_identities(mutant_units))
+    )
+
+
 def test_deadline_issuance_rejects_sampling_before_the_target_lock() -> None:
     baseline = _deadline_issuance_fixture()
     before_lock = baseline.source.replace("        database_now = read_landscape_decision_time(conn)\n", "").replace(
@@ -15524,6 +15672,7 @@ def test_deadline_issuance_rejects_sampling_before_the_target_lock() -> None:
         "transaction_without_registration",
         "mapping_without_registration",
         "executemany_without_registration",
+        "executemany_comprehension_without_registration",
         "split_stamp",
         "prelock_eligibility",
         "foreign_key_factory",
@@ -15552,6 +15701,10 @@ def test_deadline_registration_rejects_reviewed_provenance_and_control_flow_bypa
         "executemany_without_registration": missing.replace(
             ".values(lease_expires_at=expires_at, updated_at=database_now))",
             ", [{'lease_expires_at': expires_at, 'updated_at': database_now}])",
+        ),
+        "executemany_comprehension_without_registration": missing.replace(
+            ".values(lease_expires_at=expires_at, updated_at=database_now))",
+            ", [{'lease_expires_at': expires_at, 'updated_at': database_now} for _row in (work_item_id,)])",
         ),
         "split_stamp": baseline.source.replace("updated_at=database_now", "updated_at=read_landscape_decision_time(conn)"),
         "prelock_eligibility": baseline.source.replace(

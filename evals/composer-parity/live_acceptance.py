@@ -100,7 +100,7 @@ REASON_FIELDS: tuple[str, ...] = ("blue_reason", "red_reason")
 BLUE_BRANCH_FIELDS: frozenset[str] = frozenset({"blue_amount", "blue_confidence", "blue_reason"})
 RED_BRANCH_FIELDS: frozenset[str] = frozenset({"red_amount", "red_confidence", "red_reason"})
 
-ALLOWED_SURFACES: frozenset[str] = frozenset({"freeform", "guided_full", "guided_staged"})
+ALLOWED_SURFACES: frozenset[str] = frozenset({"freeform"})
 
 #: Reserved LLM-transform output suffixes (see
 #: ``src/elspeth/plugins/transforms/llm/__init__.py``): raw response text lives

@@ -24,24 +24,14 @@ import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
-from uuid import UUID, uuid4
 
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
-from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.composer.pipeline_planner import PipelinePlannerError, PlannerOriginatingMessage
-from elspeth.web.composer.pipeline_proposal import PresentBase
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments
 from elspeth.web.config import WebSettings
-from elspeth.web.sessions.protocol import GuidedOperationFence
-from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -52,8 +42,6 @@ from tests.unit.web.composer._helpers import (
     _composer_service_with_session,
     _mock_catalog,
 )
-from tests.unit.web.composer.test_pipeline_planner import _response
-from tests.unit.web.conftest import _make_session
 
 _OPENROUTER_PLANNER = "openrouter/deepseek/deepseek-v4.1-flash"
 _STRICT = ToolContractDialect.OPENAI_STRICT
@@ -63,15 +51,15 @@ _NONE = ToolContractDialect.NONE
 @pytest.fixture(autouse=True)
 def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """The END advisor gate is not under test; make it a CLEAN no-op."""
-    monkeypatch.setattr(ComposerServiceImpl, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
 
 
 @pytest.fixture(autouse=True)
 def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 def _settings(**overrides: Any) -> WebSettings:
@@ -162,104 +150,6 @@ async def test_a_freeform_compose_turn_makes_the_same_provider_calls_on_both_dia
     assert counts["strict"] == counts["off"] == 2
 
 
-@pytest.fixture
-def _tutorial_authority(composer_service_with_real_sessions: ComposerServiceImpl) -> Any:
-    sessions = composer_service_with_real_sessions._require_sessions_service()
-    session_id = uuid4()
-    with sessions._engine.begin() as conn:
-        _make_session(conn, session_id=str(session_id), user_id="test-user")
-    with fenced_operation_context(sessions._engine, session_id) as context:
-        yield session_id, context
-
-
-def _tutorial_session() -> GuidedSession:
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    return GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        profile=TUTORIAL_PROFILE,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_tutorial_entry_planner_turn_makes_the_same_provider_calls_on_both_dialects(
-    composer_service_with_real_sessions: ComposerServiceImpl,
-    _tutorial_authority: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The tutorial runs the same backend (ADR-031); the strict route adds no call to it.
-
-    The scripted provider answers every request with the same discovery call,
-    so the run ends on the planner's own budget; the count of provider calls
-    must not depend on the dialect. Control: a second provider call on the
-    strict path turns this red.
-    """
-    session_id, operation_context = _tutorial_authority
-    sessions = composer_service_with_real_sessions._require_sessions_service()
-    base_settings = composer_service_with_real_sessions._settings
-    counts: dict[str, int] = {}
-    for label, strict_setting in (("strict", "preferred"), ("off", "off")):
-        settings = base_settings.model_copy(update={"composer_model": _OPENROUTER_PLANNER, "composer_strict_tools": strict_setting})
-        service = ComposerServiceImpl.for_trained_operator(
-            composer_service_with_real_sessions._catalog, settings, sessions_service=sessions, session_engine=sessions._engine
-        )
-        requests: list[dict[str, Any]] = []
-
-        async def completion(
-            *,
-            _requests: list[dict[str, Any]] = requests,
-            _dialect: ToolContractDialect = service._planner_dialect,
-            **kwargs: Any,
-        ) -> Any:
-            _requests.append(kwargs)
-            return _response(("list_sources", encode_semantic_arguments("list_sources", _dialect, {})))
-
-        monkeypatch.setattr("litellm.acompletion", completion)
-        with pytest.raises(PipelinePlannerError):
-            await service.plan_guided_pipeline(
-                session_operation_context=operation_context,
-                intent="Build the reviewed pipeline.",
-                current_state=_empty_state(),
-                guided=_tutorial_session(),
-                originating_message=PlannerOriginatingMessage(
-                    session_id=str(session_id), message_id=None, content="Build the reviewed pipeline.", user_id="test-user"
-                ),
-                base=PresentBase(state_id=UUID("55555555-5555-4555-8555-555555555555"), composition_content_hash="0" * 64),
-                user_id="test-user",
-                supersedes_draft_hash=None,
-                recorder=BufferingRecorder(),
-                operation_fence=GuidedOperationFence(session_id=session_id, operation_id=str(uuid4()), lease_token=uuid4().hex, attempt=1),
-            )
-        planner_flags = _strict_flags(requests[0]["tools"])
-        assert (True in planner_flags) is (label == "strict")
-        counts[label] = len(requests)
-
-    assert counts["strict"] == counts["off"]
-    assert counts["strict"] > 1
-
-
 # ---------------------------------------------------------------- openai_strict counterparts of NONE-only pins
 
 # ``test_tool_schema_contract.py`` and ``test_provider_cache_markers.py`` pin
@@ -272,7 +162,7 @@ def test_openai_strict_set_pipeline_keeps_the_envelope_and_an_explicit_strict_fa
 
     Control: stamp every tool ``strict: true`` in ``wire_tool_definitions`` and this goes red.
     """
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     none_tools = {tool["function"]["name"]: tool["function"] for tool in composer_loop_tool_definitions(_NONE)}
     strict_tools = {tool["function"]["name"]: tool["function"] for tool in composer_loop_tool_definitions(_STRICT)}
@@ -288,7 +178,7 @@ def test_openai_strict_list_keeps_registry_order_and_cache_marker_placement() ->
     D8 means no production route carries both; this pins the function only.
     """
     from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
     from elspeth.web.composer.tools import get_tool_definitions
 
     tools = composer_loop_tool_definitions(_STRICT)

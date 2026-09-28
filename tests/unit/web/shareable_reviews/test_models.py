@@ -529,9 +529,8 @@ def test_scope_name_is_admitted_because_the_public_yaml_consumer_requires_it() -
     block from the SAME public dict and refuses to lower without the name
     (yaml_generator ``_require_node_key(c, "scope_name", ...)``). Stripping
     it would trade the share 500 for a public-YAML download failure on every
-    collector pipeline. The guided ``_CollectorBehavior`` privacy ruling
-    governs the stable-id'd proposal projection, which this surface is not —
-    node ids are already public here."""
+    collector pipeline. Proposal projection is a separate surface; node ids
+    are already public here."""
     public_yaml = generate_public_pipeline_dict(_collector_composition_state())
 
     assert public_yaml["scopes"] == [

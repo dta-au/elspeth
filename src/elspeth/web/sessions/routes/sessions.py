@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from elspeth.contracts import errors as contract_errors
+from elspeth.contracts.blobs import BLOB_REF_PATH_PREFIX
 from elspeth.web.blobs.protocol import (
     BlobContentMissingError,
     BlobError,
@@ -17,9 +18,8 @@ from elspeth.web.blobs.protocol import (
     BlobIntegrityError,
     BlobQuotaExceededError,
     BlobRecord,
+    BlobServiceProtocol,
 )
-from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
-from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.coordination.composer_progress_authority import ComposerProgressIdentityInactive
@@ -30,33 +30,30 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.sessions.fork_custody import _free_text_embeds_parent_blob, _value_references_parent_blob
+from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
-    GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS,
-    GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH,
-    GuidedForkSettlementCommand,
-    GuidedOperationFailureCode,
-    GuidedOperationFence,
-    GuidedOperationFenceLostError,
-    GuidedSessionResult,
+    OperationReceiptFailureCode,
+    OperationReceiptFence,
+    OperationReceiptFenceLostError,
     SessionForkParentAuthority,
-    SessionGuidedOperationInProgressError,
+    SessionForkReceiptResult,
+    SessionForkSettlementCommand,
     SessionNotFoundError,
+    SessionReceiptInProgressError,
     serialize_composition_validation_errors,
 )
-from elspeth.web.sessions.routes.guided_operations import (
-    GuidedOperationLease,
-    guided_response_hash,
-    raise_guided_operation_failure,
-    reserve_or_replay_guided_operation,
+from elspeth.web.sessions.routes.operation_receipts import (
+    OperationReceiptLease,
+    raise_operation_receipt_failure,
+    reserve_or_replay_operation_receipt,
 )
-from elspeth.web.sessions.service import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.titles import mint_default_session_title
 
 from ._helpers import (
     UUID,
     APIRouter,
     AuditIntegrityError,
-    BlobServiceProtocol,
     ComposerProgressSnapshot,
     CompositionStateData,
     CreateSessionRequest,
@@ -84,41 +81,30 @@ from ._helpers import (
 
 # Upper bound on consecutive fence-loss rejoin attempts in the session-fork
 # settlement loop; repeated losses are pathological lease churn and terminate
-# in AuditIntegrityError instead of an unbounded retry (mirrors the guided
-# START loop's bound in routes/composer/guided.py).
+# in AuditIntegrityError instead of an unbounded retry.
 _FORK_FENCE_REJOIN_ATTEMPTS = 5
+_FORK_FAILURE_DIAGNOSTIC_MAX_ITEMS = 32
+_FORK_FAILURE_DIAGNOSTIC_MAX_LENGTH = 512
 
 # Only these application-authored literals may cross from exception text to
 # durable diagnostics. Other exceptions may contain SQL parameters or secrets.
 _FORK_STATIC_DIAGNOSTICS = frozenset(
     {
-        "Guided fork settlement requires exactly one retained frozen blob plan",
-        "Guided fork settlement child blob ids do not exactly match the frozen plan",
-        "Guided fork settlement child blob status, hash, or size does not match the frozen plan",
-        "Guided fork settlement parent blob custody no longer matches the frozen plan",
-        "Guided fork settlement state retains parent blob custody",
-        "Guided fork settlement child is not bound to the exact operation fence",
-        "Guided fork settlement parent is missing",
-        "Guided fork settlement child failed staged custody validation",
-        "Guided fork settlement staged current state changed",
-        "Guided fork settlement child checkpoint is malformed",
-        "Guided fork settlement edited message failed staged custody validation",
-        "Guided fork settlement lost edited-message compare-and-swap",
-        "Guided fork settlement could not remove superseded staged state",
-        "Guided fork settlement could not bind replacement state",
-        "Guided fork settlement lost archived-to-active compare-and-swap",
-        "Guided fork start authority has no final child state",
-        "fork guided metadata is not an exact schema-10 object",
-        "fork guided schema-10 authority is malformed",
-        "fork guided proposal reference/history coupling is malformed",
-        "fork guided message maps have different source keysets",
-        "fork guided root_intent_message_id references a message outside copied slice",
-        "fork guided deferred_intents.originating_message_id references a message outside copied slice",
-        "fork guided correction_messages.message_id references a message outside copied slice",
-        "fork guided planner lineage must identify user messages",
-        "fork guided deferred intent message content hash mismatch",
-        "fork guided correction message content hash mismatch",
-        "fork guided topology rewind has malformed unanswered history",
+        "Fork settlement requires exactly one retained frozen blob plan",
+        "Fork settlement child blob ids do not exactly match the frozen plan",
+        "Fork settlement child blob status, hash, or size does not match the frozen plan",
+        "Fork settlement parent blob custody no longer matches the frozen plan",
+        "Fork settlement state retains parent blob custody",
+        "Fork settlement child is not bound to the exact operation fence",
+        "Fork settlement parent is missing",
+        "Fork settlement child failed staged custody validation",
+        "Fork settlement staged current state changed",
+        "Fork settlement child checkpoint is malformed",
+        "Fork settlement edited message failed staged custody validation",
+        "Fork settlement lost edited-message compare-and-swap",
+        "Fork settlement could not remove superseded staged state",
+        "Fork settlement could not bind replacement state",
+        "Fork settlement lost archived-to-active compare-and-swap",
     }
 )
 
@@ -132,12 +118,12 @@ def _fork_failure_diagnostic(exc: Exception, *, phase: str) -> str:
 
 def _bounded_fork_diagnostics(notes: list[str]) -> tuple[str, ...]:
     """Keep primary evidence first and explicitly account for omitted residue."""
-    if len(notes) > GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS:
-        retained = GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS - 1
+    if len(notes) > _FORK_FAILURE_DIAGNOSTIC_MAX_ITEMS:
+        retained = _FORK_FAILURE_DIAGNOSTIC_MAX_ITEMS - 1
         notes = [*notes[:retained], f"DiagnosticsOmitted: {len(notes) - retained} additional notes"]
     marker = "... [truncated]"
     return tuple(
-        note if len(note) <= GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH else note[: GUIDED_FAILURE_DIAGNOSTIC_MAX_LENGTH - len(marker)] + marker
+        note if len(note) <= _FORK_FAILURE_DIAGNOSTIC_MAX_LENGTH else note[: _FORK_FAILURE_DIAGNOSTIC_MAX_LENGTH - len(marker)] + marker
         for note in notes
     )
 
@@ -433,93 +419,6 @@ def _rebase_known_parent_refs(
     return value, False
 
 
-def _rewrite_guided_blob_custody(
-    composer_meta: Mapping[str, Any] | None,
-    blob_map: dict[UUID, BlobRecord],
-    source_blob_path_map: dict[str, BlobRecord],
-    *,
-    data_dir: Path,
-    parent_session_id: UUID,
-    child_session_id: UUID,
-) -> tuple[dict[str, Any] | None, bool]:
-    if composer_meta is None:
-        return None, False
-    if "guided_session" not in composer_meta:
-        return dict(composer_meta), False
-    guided_raw = composer_meta["guided_session"]
-    if type(guided_raw) is not dict:
-        raise AuditIntegrityError("Tier 1 audit anomaly: composer_meta.guided_session must be an exact dict")
-    # Parse first and again after reconstruction: reviewed and pending sources
-    # are schema-owned objects, not arbitrary JSON dictionaries.
-    guided = GuidedSession.from_dict(guided_raw)
-    rebuilt = guided.to_dict()
-    rewritten = False
-    for stable_id, reviewed in rebuilt["reviewed_sources"].items():
-        reviewed["options"], changed = _rewrite_source_blob_options(
-            reviewed["options"],
-            blob_map,
-            source_blob_path_map,
-            field_path=f"guided_session.reviewed_sources[{stable_id!r}].options",
-        )
-        rewritten = rewritten or changed
-    for stable_id, pending in rebuilt["pending_source_intents"].items():
-        if pending["options"] is not None:
-            pending["options"], changed = _rewrite_source_blob_options(
-                pending["options"],
-                blob_map,
-                source_blob_path_map,
-                field_path=f"guided_session.pending_source_intents[{stable_id!r}].options",
-            )
-            rewritten = rewritten or changed
-        inspection = pending["inspection_facts"]
-        if inspection is not None:
-            identity = inspection["redacted_identity"]
-            # ``_redacted_identity`` writes ``blob_id`` only for blob-backed
-            # inspections, so absence is a real state; presence is a UUID
-            # string by construction. Membership form mirrors the same read in
-            # ``composer/guided/stage_transitions.py::_inspection_blob_id``.
-            if "blob_id" in identity:
-                old_ref = identity["blob_id"]
-                try:
-                    old_blob_id = UUID(old_ref)
-                except (TypeError, ValueError) as exc:
-                    raise AuditIntegrityError("Tier 1 audit anomaly: pending source inspection blob_id is not a UUID string") from exc
-                try:
-                    copied = blob_map[old_blob_id]
-                except KeyError:
-                    raise AuditIntegrityError(
-                        "Tier 1 audit anomaly: pending source inspection blob_id was absent from the frozen fork plan"
-                    ) from None
-                identity["blob_id"] = str(copied.id)
-                rewritten = True
-    for stable_id, reviewed in rebuilt["reviewed_outputs"].items():
-        reviewed["options"], changed = _rewrite_session_owned_sink_options(
-            reviewed["options"],
-            data_dir=data_dir,
-            parent_session_id=parent_session_id,
-            child_session_id=child_session_id,
-            field_path=f"guided_session.reviewed_outputs[{stable_id!r}].options",
-        )
-        rewritten = rewritten or changed
-    for stable_id, pending in rebuilt["pending_output_intents"].items():
-        if pending["options"] is not None:
-            pending["options"], changed = _rewrite_session_owned_sink_options(
-                pending["options"],
-                data_dir=data_dir,
-                parent_session_id=parent_session_id,
-                child_session_id=child_session_id,
-                field_path=f"guided_session.pending_output_intents[{stable_id!r}].options",
-            )
-            rewritten = rewritten or changed
-    rebuilt = GuidedSession.from_dict(rebuilt).to_dict()
-    source_ids = frozenset(str(blob_id) for blob_id in blob_map)
-    if _value_references_parent_blob(rebuilt, source_ids):
-        raise AuditIntegrityError("Tier 1 audit anomaly: forked guided metadata retained a parent blob id")
-    result = dict(composer_meta)
-    result["guided_session"] = rebuilt
-    return result, rewritten
-
-
 def _rewrite_fork_state_blob_custody(
     state: Any,
     blob_map: dict[UUID, BlobRecord],
@@ -605,15 +504,6 @@ def _rewrite_fork_state_blob_custody(
             )
             or rewritten
         )
-    composer_meta, guided_rewritten = _rewrite_guided_blob_custody(
-        composer_meta,
-        blob_map,
-        source_blob_path_map,
-        data_dir=data_dir,
-        parent_session_id=parent_session_id,
-        child_session_id=child_session_id,
-    )
-    rewritten = rewritten or guided_rewritten
     # ``implicit_decisions`` is not authored state: it is a pure PROJECTION of the
     # composition state, regenerated unconditionally on every save via
     # ``merge_implicit_decisions_meta``. A fork mints a NEW state row, so carrying
@@ -954,10 +844,10 @@ def register_session_routes(router: APIRouter) -> None:
 
             try:
                 await service.archive_session(session.id)
-            except SessionGuidedOperationInProgressError as exc:
+            except SessionReceiptInProgressError as exc:
                 raise HTTPException(
                     status_code=409,
-                    detail="Cannot archive a session while a guided operation is in progress.",
+                    detail="Cannot archive a session while a session operation is in progress.",
                 ) from exc
             # Archive is the durable boundary: preserve the live session's
             # ephemeral coordination state when it fails. Registry cleanup
@@ -1001,13 +891,13 @@ def register_session_routes(router: APIRouter) -> None:
             raise HTTPException(status_code=422, detail=str(InvalidForkTargetError(str(fork_target.id), fork_target.role)))
 
         async def _replay(result: object) -> ForkSessionResponse:
-            if type(result) is not GuidedSessionResult:
+            if type(result) is not SessionForkReceiptResult:
                 raise AuditIntegrityError("Session fork replay locator has the wrong result kind")
             return ForkSessionResponse(session_id=result.session_id)
 
         # Bounded fence-loss rejoin (was ``while True``): each iteration either
         # returns a durable result, raises, or observes a lost fence and
-        # rejoins through ``reserve_or_replay_guided_operation``. Repeated
+        # rejoins through ``reserve_or_replay_operation_receipt``. Repeated
         # losses are pathological lease churn and terminate in an explicit
         # integrity failure instead of an unbounded retry.
         for _fence_rejoin_attempt in range(_FORK_FENCE_REJOIN_ATTEMPTS):
@@ -1025,7 +915,7 @@ def register_session_routes(router: APIRouter) -> None:
             failure_phase = "reservation"
             try:
                 try:
-                    reserved = await reserve_or_replay_guided_operation(
+                    reserved = await reserve_or_replay_operation_receipt(
                         service=service,
                         session_id=session_id,
                         kind="session_fork",
@@ -1040,7 +930,7 @@ def register_session_routes(router: APIRouter) -> None:
                     raise HTTPException(status_code=404, detail="Session not found") from exc
                 if reserved is None:  # pragma: no cover - reservation is enabled
                     raise AuditIntegrityError("Session fork operation was not reserved")
-                if not isinstance(reserved, GuidedOperationLease):
+                if not isinstance(reserved, OperationReceiptLease):
                     return reserved
                 parent_lease = reserved.session_lease
                 active_parent_lease = parent_lease
@@ -1049,13 +939,13 @@ def register_session_routes(router: APIRouter) -> None:
 
                 async def _stage_and_adopt_child_authority(
                     parent_context: SessionOperationContext = active_parent_lease.context,
-                    guided_operation_fence: GuidedOperationFence = fence,
+                    receipt_fence: OperationReceiptFence = fence,
                 ) -> None:
                     nonlocal child_lease, staged
                     staged = await service.fork_session(
                         SessionForkParentAuthority(
                             parent_context=parent_context,
-                            guided_fence=guided_operation_fence,
+                            receipt_fence=receipt_fence,
                         ),
                         fork_message_id=body.from_message_id,
                         new_message_content=body.new_message_content,
@@ -1081,7 +971,7 @@ def register_session_routes(router: APIRouter) -> None:
                     nonlocal fence
                     parent_operation_lease.raise_if_lost()
                     child_operation_lease.raise_if_lost()
-                    fence = await service.renew_guided_operation(
+                    fence = await service.renew_operation_receipt(
                         fence,
                         actor="composer_route",
                         lease_seconds=300,
@@ -1131,14 +1021,14 @@ def register_session_routes(router: APIRouter) -> None:
                 response = ForkSessionResponse(session_id=staged.session.id)
                 await _checkpoint()
                 failure_phase = "settlement"
-                await service.settle_guided_fork_operation(
-                    GuidedForkSettlementCommand(
+                await service.settle_fork_operation_receipt(
+                    SessionForkSettlementCommand(
                         authority=staged.authority,
                         expected_current_state_id=staged.state.id if staged.state is not None else None,
                         edited_message_id=staged.messages[-1].id,
                         rewritten_state_id=uuid4() if rewritten_state is not None else None,
                         rewritten_state=rewritten_state,
-                        response_hash=guided_response_hash(response),
+                        response_hash=operation_receipt_response_hash(response),
                         actor="composer_route",
                     )
                 )
@@ -1147,7 +1037,7 @@ def register_session_routes(router: APIRouter) -> None:
                 await parent_lease.close()
                 return response
             except (
-                GuidedOperationFenceLostError,
+                OperationReceiptFenceLostError,
                 BlobForkFenceLostError,
                 SessionOperationFenceLost,
             ) as retry_error:
@@ -1157,7 +1047,7 @@ def register_session_routes(router: APIRouter) -> None:
             except Exception as primary_exc:
                 close_primary = primary_exc
                 failure_diagnostics = [_fork_failure_diagnostic(primary_exc, phase=failure_phase)]
-                failure_code: GuidedOperationFailureCode = (
+                failure_code: OperationReceiptFailureCode = (
                     "quota_exceeded"
                     if isinstance(primary_exc, BlobQuotaExceededError)
                     else "integrity_error"
@@ -1197,17 +1087,17 @@ def register_session_routes(router: APIRouter) -> None:
                     if parent_lease is None:
                         raise
                     try:
-                        failed = await service.fail_guided_operation(
+                        failed = await service.fail_operation_receipt(
                             fence,
                             failure_code=failure_code,
                             actor="composer_route",
                             session_operation_context=parent_lease.context,
                             failure_diagnostics=_bounded_fork_diagnostics(failure_diagnostics),
                         )
-                    except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
+                    except (OperationReceiptFenceLostError, SessionOperationFenceLost) as failure_fence_error:
                         close_primary = failure_fence_error
                         continue
-                    raise_guided_operation_failure(failed)
+                    raise_operation_receipt_failure(failed)
 
                 cleanup_integrity_exc: AuditIntegrityError | BlobContentMissingError | BlobIntegrityError | None = None
 
@@ -1257,7 +1147,7 @@ def register_session_routes(router: APIRouter) -> None:
                     except (BlobError, SQLAlchemyError, OSError) as cleanup_exc:
                         # The exception note alone is not a record: the tail
                         # below surfaces the PRIMARY failure through
-                        # raise_guided_operation_failure, which raises a new
+                        # raise_operation_receipt_failure, which raises a new
                         # HTTPException — FastAPI answers it without logging
                         # the chained context, so notes on primary_exc reach
                         # nobody. Leaked fork blobs are operator-actionable
@@ -1278,7 +1168,7 @@ def register_session_routes(router: APIRouter) -> None:
                         for error in cleanup.errors:
                             # Keep raw detail on the local exception only. Durable
                             # evidence uses the owned class and custody identifiers.
-                            if len(failure_diagnostics) < GUIDED_FAILURE_DIAGNOSTIC_MAX_ITEMS:
+                            if len(failure_diagnostics) < _FORK_FAILURE_DIAGNOSTIC_MAX_ITEMS:
                                 failure_diagnostics.append(
                                     f"RecoveryFailed[{error.exc_type}]: could not delete fork blob {error.blob_id} "
                                     f"from child {staged.session.id}"
@@ -1306,19 +1196,19 @@ def register_session_routes(router: APIRouter) -> None:
 
                 try:
                     # A staged fork settles through the fork authority, not the
-                    # bare guided fence: the parent context, the child context
-                    # and the guided fence must all still be live for the CAS
-                    # to win, and ``fail_guided_operation`` would settle under
-                    # the guided fence alone. ``SessionOperationFenceLost`` is
+                    # bare receipt fence: the parent context, the child context
+                    # and the receipt fence must all still be live for the CAS
+                    # to win, and ``fail_operation_receipt`` would settle under
+                    # the receipt fence alone. ``SessionOperationFenceLost`` is
                     # the second fence's loss signal and rejoins like the
                     # first: only the fail-CAS winner owns settlement.
-                    failed = await service.fail_guided_fork_operation(
+                    failed = await service.fail_fork_operation_receipt(
                         staged.authority,
                         failure_code=failure_code,
                         actor="composer_route",
                         failure_diagnostics=_bounded_fork_diagnostics(failure_diagnostics),
                     )
-                except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
+                except (OperationReceiptFenceLostError, SessionOperationFenceLost) as failure_fence_error:
                     close_primary = failure_fence_error
                     if cleanup_integrity_exc is not None:
                         raise cleanup_integrity_exc from failure_fence_error
@@ -1327,7 +1217,7 @@ def register_session_routes(router: APIRouter) -> None:
                 if cleanup_integrity_exc is not None:
                     raise cleanup_integrity_exc from primary_exc
 
-                raise_guided_operation_failure(failed)
+                raise_operation_receipt_failure(failed)
             finally:
                 await _close_fork_operation_leases(
                     child_lease,

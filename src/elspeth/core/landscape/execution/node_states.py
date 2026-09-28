@@ -233,7 +233,7 @@ class NodeStateRepository:
                 )
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"record_completed_node_state failed for state_id={state_id} — database rejected audit write: {type(exc).__name__}: {exc}"
+                f"record_completed_node_state failed for state_id={state_id} — database rejected audit write: {type(exc).__name__}"
             ) from exc
 
     def record_completed_node_state_on(
@@ -299,7 +299,7 @@ class NodeStateRepository:
             row = conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).fetchone()
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"record_completed_node_state failed for state_id={state_id} — database rejected audit write: {type(exc).__name__}: {exc}"
+                f"record_completed_node_state failed for state_id={state_id} — database rejected audit write: {type(exc).__name__}"
             ) from exc
 
         if row is None:
@@ -534,7 +534,7 @@ class NodeStateRepository:
                     )
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"begin_node_states_many failed for {len(values)} states — database rejected audit write: {type(exc).__name__}: {exc}"
+                f"begin_node_states_many failed for {len(values)} states — database rejected audit write: {type(exc).__name__}"
             ) from exc
         return states
 
@@ -660,7 +660,7 @@ class NodeStateRepository:
             row = conn.execute(select(node_states_table).where(node_states_table.c.state_id == state_id)).fetchone()
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"complete_node_state failed for state_id={state_id} — database rejected audit update: {type(exc).__name__}: {exc}"
+                f"complete_node_state failed for state_id={state_id} — database rejected audit update: {type(exc).__name__}"
             ) from exc
 
         if row is None:
@@ -832,7 +832,7 @@ class NodeStateRepository:
                 after_rows.extend(conn.execute(select(node_states_table).where(node_states_table.c.state_id.in_(chunk))).fetchall())
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"{verb} failed for {len(rows)} states — database rejected audit update: {type(exc).__name__}: {exc}"
+                f"{verb} failed for {len(rows)} states — database rejected audit update: {type(exc).__name__}"
             ) from exc
 
         if len(after_rows) != len(rows):

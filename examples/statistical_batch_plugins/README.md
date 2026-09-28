@@ -38,6 +38,7 @@ Audit databases are written under `examples/statistical_batch_plugins/runs/`.
 | `settings_top_k.yaml` | `batch_top_k` | Top predicted labels grouped by model |
 | `settings_threshold_summary.yaml` | `batch_threshold_summary` | Named quality threshold counts and rates |
 | `settings_effect_size.yaml` | `batch_effect_size` | Practical significance for treatment-vs-control score lift |
+| [`../batch_rank_passthrough/settings.yaml`](../batch_rank_passthrough/README.md) | `batch_rank` | Rank and percentile of a judge score within each batch, keeping every row; the batch plugin `output_mode: passthrough` accepts |
 
 These examples use pre-scored data rather than making an LLM call. To combine
 them with OpenRouter, run an upstream LLM evaluation pipeline that emits fields

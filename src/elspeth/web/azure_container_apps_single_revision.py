@@ -233,7 +233,7 @@ def run_fence_trials(
 ) -> ProbeResult:
     required = require_contention_trials(len(requests))
     if len({session for session, _ in requests}) != required:
-        raise AcceptanceInputError("guided contention trials require distinct fresh sessions")
+        raise AcceptanceInputError("freeform contention trials require distinct fresh sessions")
     first, second = clients
     if first.instance_id is None or second.instance_id is None:
         raise AcceptanceCheckError("single_revision_instances_unbound")
@@ -248,8 +248,7 @@ def run_fence_trials(
         pinned_clients=clients,
     )
     trials = [
-        driver.fence_conflict_trial(session, ProbeRequest("POST", f"/api/sessions/{session}/guided/respond", body))
-        for session, body in requests
+        driver.fence_conflict_trial(session, ProbeRequest("POST", f"/api/sessions/{session}/messages", body)) for session, body in requests
     ]
     return decide_fence_conflict(trials, required_trials=required)
 

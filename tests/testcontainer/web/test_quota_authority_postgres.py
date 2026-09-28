@@ -7,6 +7,7 @@ expression) are proven on the production dialect, not inferred from the unit run
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from threading import Event
 
 import pytest
+import structlog
 from sqlalchemy import insert, select, text
 from sqlalchemy.engine import make_url
 from tests.fixtures.identities import ensure_test_identity
@@ -28,8 +30,10 @@ from elspeth.contracts.chargeable_admission import (
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.coordination import chargeable_admission_authority
 from elspeth.web.coordination.chargeable_admission_authority import RepositoryChargeableAdmissionAuthority
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.mutation_connection_registry import (
     _register_mutation_connection,
     _resolve_mutation_connection,
@@ -41,12 +45,24 @@ from elspeth.web.coordination.quota_authority import (
     TokenUsageEntry,
     admit_storage_bytes_on_connection,
     begin_provider_attempt_on_connection,
+    cancel_undispatched_provider_attempt_on_connection,
 )
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
+from elspeth.web.sessions import service as session_service_module
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, quota_policies_table, sessions_table
+from elspeth.web.sessions.models import (
+    blobs_table,
+    chat_messages_table,
+    quota_policies_table,
+    quota_provider_attempts_table,
+    sessions_table,
+    token_usage_ledger_table,
+)
+from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 pytestmark = pytest.mark.testcontainer
 
@@ -97,6 +113,116 @@ def _record(fenced: FencedSession, prompt: int | None, completion: int | None, *
     )
 
 
+@pytest.mark.asyncio
+async def test_run_sync_quota_callbacks_hold_advisory_lock_until_receipt(pg_fenced: FencedSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    with pg_fenced.engine.begin() as conn:
+        seed_token_policies(conn, identity_id=pg_fenced.identity_id)
+    policy = ChargeableAdmissionPolicy(
+        identity_token_quota_configured=True,
+        secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash,
+    )
+    service = SessionServiceImpl(
+        pg_fenced.engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.run_quota_postgres"),
+        chargeable_admission_policy=policy,
+    )
+    session_id = uuid.UUID(pg_fenced.session_id)
+    async with await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    ) as compose_lease:
+        state = await service.save_composition_state(
+            session_id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=compose_lease.context,
+        )
+    async with await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    ) as execute_lease:
+        run = await service.create_run(session_id, state.id, session_operation_context=execute_lease.context)
+        entered = Event()
+        release = Event()
+        original = session_service_module.begin_provider_attempt_on_connection
+
+        def first(*args, **kwargs):
+            attempt = original(*args, **kwargs)
+            if not entered.is_set():
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("first transaction was not released")
+            return attempt
+
+        monkeypatch.setattr(session_service_module, "begin_provider_attempt_on_connection", first)
+        first_call = asyncio.create_task(
+            run_sync_in_worker(service.begin_run_provider_attempt_sync, session_operation_context=execute_lease.context, run_id=run.id)
+        )
+        try:
+            assert await run_sync_in_worker(entered.wait, 5)
+            # The first writer holds its transaction open. The peer must wait
+            # for the PostgreSQL session/identity lock, then get its own ID.
+            second = SessionServiceImpl(
+                pg_fenced.engine,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.run_quota_postgres_peer"),
+                chargeable_admission_policy=policy,
+            )
+            second_call = asyncio.create_task(
+                run_sync_in_worker(second.begin_run_provider_attempt_sync, session_operation_context=execute_lease.context, run_id=run.id)
+            )
+            await asyncio.sleep(0.2)
+            assert not first_call.done() and not second_call.done()
+        finally:
+            release.set()
+        first_attempt, second_attempt = await asyncio.gather(first_call, second_call)
+        assert first_attempt.attempt_id != second_attempt.attempt_id
+        first_entry = TokenUsageEntry(
+            model="test/model",
+            prompt_tokens=3,
+            completion_tokens=2,
+            cached_prompt_tokens=0,
+            reasoning_tokens=0,
+            call_id="pg-run-call-1",
+            recorded_at=datetime.now(UTC),
+        )
+        second_entry = TokenUsageEntry(
+            model="test/model",
+            prompt_tokens=4,
+            completion_tokens=1,
+            cached_prompt_tokens=0,
+            reasoning_tokens=0,
+            call_id="pg-run-call-2",
+            recorded_at=datetime.now(UTC),
+        )
+        await run_sync_in_worker(
+            service.settle_run_provider_attempt_sync,
+            session_operation_context=execute_lease.context,
+            attempt_id=first_attempt.attempt_id,
+            entry=first_entry,
+        )
+        await run_sync_in_worker(
+            second.settle_run_provider_attempt_sync,
+            session_operation_context=execute_lease.context,
+            attempt_id=second_attempt.attempt_id,
+            entry=second_entry,
+        )
+        with pg_fenced.engine.connect() as conn:
+            attempts = conn.execute(
+                select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.run_id == str(run.id))
+            ).all()
+            ledger = conn.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.run_id == str(run.id))).all()
+        assert len(attempts) == len(ledger) == 2
+        assert {row.ledger_entry_id for row in attempts} == {row.entry_id for row in ledger}
+
+
 def test_daily_total_window_and_unknown_measure_on_postgres(pg_fenced: FencedSession) -> None:
     _record(pg_fenced, 1000, 1000, at=DAY - timedelta(microseconds=1))
     _record(pg_fenced, 100, 50, at=DAY)
@@ -135,6 +261,67 @@ def test_daily_total_widens_before_adding_token_columns(pg_fenced: FencedSession
         RepositoryQuotaAuthority.daily_token_total(pg_fenced.connection_token, identity_id=pg_fenced.identity_id, day_start_utc=DAY)
         == 4_000_000_000
     )
+
+
+def test_undispatched_cancellation_is_atomic_and_idempotent_on_postgres(pg_fenced: FencedSession) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    conn = _resolve_mutation_connection(pg_fenced.connection_token)
+    context = SessionOperationContext(
+        fence=SessionOperationFence(session_id=pg_fenced.session_id, operation_id="operation", lease_token="lease", operation_epoch=1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+    policy = ChargeableAdmissionPolicy(secret_wiring_hash=EMPTY_SECRET_WIRING_POLICY.canonical_hash)
+    attempt = begin_provider_attempt_on_connection(conn, session_operation_context=context, source="composer", policy=policy)
+
+    def append_event(event_id: str, content: str, created_at: datetime) -> None:
+        conn.execute(
+            insert(chat_messages_table).values(
+                id=event_id,
+                session_id=pg_fenced.session_id,
+                role="audit",
+                content=content,
+                raw_content=None,
+                tool_calls=None,
+                sequence_no=1,
+                writer_principal="compose_loop",
+                composition_state_id=None,
+                tool_call_id=None,
+                parent_assistant_id=None,
+                created_at=created_at,
+            )
+        )
+
+    for _ in range(2):
+        cancel_undispatched_provider_attempt_on_connection(
+            conn,
+            session_operation_context=context,
+            attempt_id=attempt.attempt_id,
+            requested_model="test/model",
+            append_audit_event=append_event,
+        )
+    events = conn.execute(select(chat_messages_table)).all()
+    ledger = conn.execute(select(token_usage_ledger_table)).all()
+    stored_attempt = conn.execute(select(quota_provider_attempts_table)).one()
+    assert len(events) == len(ledger) == 1
+    assert events[0].tool_calls is None
+    assert (ledger[0].prompt_tokens, ledger[0].completion_tokens, ledger[0].cached_prompt_tokens, ledger[0].reasoning_tokens) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert events[0].created_at == ledger[0].recorded_at
+    assert stored_attempt.settled_at is not None
+    assert stored_attempt.ledger_entry_id == ledger[0].entry_id
+    with pytest.raises(AuditIntegrityError):
+        cancel_undispatched_provider_attempt_on_connection(
+            conn,
+            session_operation_context=context,
+            attempt_id=attempt.attempt_id,
+            requested_model="different/model",
+            append_audit_event=append_event,
+        )
 
 
 def test_pending_attempt_admission_serializes_on_identity_lock(pg_fenced: FencedSession) -> None:

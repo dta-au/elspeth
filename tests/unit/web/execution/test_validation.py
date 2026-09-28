@@ -1449,9 +1449,8 @@ class TestValidatePipelineEmptyComposition:
     stack trace leaking the internal model name to a user-facing UI. The
     short-circuit replaces that with a structured ``empty_pipeline`` error.
 
-    Surface that exercises this path: a guided session immediately after
-    ``exit_to_freeform`` (the wire response sets composition_state to a
-    version-bumped state with source=null nodes=[] outputs=[]).
+    This can be reached by a newly created session before the planner has
+    authored a source or sink.
     """
 
     def test_empty_pipeline_returns_structured_error(self) -> None:
@@ -3972,7 +3971,7 @@ class TestValidatePipelineExportNoResolverSecretRef:
         prompt_template = "Summarise: {{ row.text }}"
         model = "openai/gpt-4o-mini"
         # An LLM node with a prompt_template and a model carries resolved
-        # prompt-template and model-choice review requirements once the guided
+        # prompt-template and model-choice review requirements once the
         # composer has surfaced them — mirror that so interpretation_review
         # passes and validation reaches the plugin-instantiation step (where the
         # secret-marker bug lives).
@@ -4022,7 +4021,7 @@ class TestValidatePipelineExportNoResolverSecretRef:
                         "response_field": "summary",
                         "required_input_fields": ["text"],
                         # The credential is wired as a secret_ref marker, exactly
-                        # as the guided composer persists an LLM api_key.
+                        # as the composer persists an LLM api_key.
                         "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
                         "schema": {"mode": "observed", "guaranteed_fields": ["summary"]},
                         INTERPRETATION_REQUIREMENTS_KEY: interpretation_requirements,
@@ -6368,7 +6367,7 @@ class TestValidatePipelineStateShapeMaterialization:
     ``CompositionState.from_dict`` accepts persisted sessions whose node shapes
     Stage 1 would reject, and ``_validate_pipeline_impl`` runs no Stage-1 pass
     before materialization — so every rehydrate consumer (tutorial, sessions,
-    proposals, guided chat, execute) could reach ``generate_yaml`` with a state
+    proposals, execute) could reach ``generate_yaml`` with a state
     it refuses to lower. Those refusals are authoring defects and belong in the
     ledger; a genuine bug inside the generator must still surface as a 500.
     """

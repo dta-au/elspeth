@@ -32,10 +32,11 @@ from elspeth.contracts.errors import (
     RunWorkerEvictedError,
     SchedulerLeaseLostError,
 )
-from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.secret_scrub import scrub_payload_for_audit
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.operations import _render_exception
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -120,19 +121,16 @@ def _render_exception_message(exc_type: type[BaseException], exc_val: BaseExcept
     terminality outranks message fidelity: fall back to the exception type
     name (guaranteed non-empty) when the message is empty/whitespace or
     unrenderable. ``ExecutionError.exception`` and guard-raised
-    ``AuditIntegrityError`` messages reuse this rendered string, so scrub it
-    at the shared source.
+    ``AuditIntegrityError`` messages reuse this rendered string, so it is
+    rendered by the one audit exception renderer (secret scrub, raising
+    ``__str__`` and database-error text handled there).
     """
     if exc_val is None:
         return exc_type.__name__
-    try:
-        message = str(exc_val)
-    except BaseException:
-        # A raising __str__ must not abort terminality.
-        return exc_type.__name__
+    message = _render_exception(exc_val)
     if not message.strip():
         return exc_type.__name__
-    return scrub_text_for_audit(message)
+    return message
 
 
 class NodeStateGuard:

@@ -872,7 +872,9 @@ def test_web_scrape_extract_content_exception_returns_error(mock_ctx):
     assert result.reason["reason"] == "content_extraction_failed"
     assert "html2text internal error" in result.reason["error"]
     assert result.reason["error_type"] == "RuntimeError"
-    assert result.reason["url"] == "https://example.com/bad"
+    # The URL is row data: the reason never names it (C3).
+    assert "url" not in result.reason
+    assert "example.com" not in repr(result.reason)
 
 
 @respx.mock

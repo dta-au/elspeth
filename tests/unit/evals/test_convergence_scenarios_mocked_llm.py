@@ -54,6 +54,8 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.service import content_hash as _content_hash
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
@@ -120,7 +122,7 @@ class _FakeLLMResponse:
     choices: list[_FakeChoice]
 
 
-def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] | None = None) -> _FakeLLMResponse:
+def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] | None = None) -> _AdmittedLLMCompletion:
     fakes: list[_FakeTC] | None = None
     if tool_calls:
         fakes = [
@@ -133,7 +135,8 @@ def _llm_response(content: str | None = None, tool_calls: list[dict[str, Any]] |
             )
             for tc in tool_calls
         ]
-    return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMsg(content=content, tool_calls=fakes))])
+    response = _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMsg(content=content, tool_calls=fakes))])
+    return _admit_composer_llm_completion(response)
 
 
 # --------------------------------------------------------------------------
@@ -291,10 +294,10 @@ def _composer_available_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass real availability check (no API key needed in tests)."""
     from elspeth.web.composer.service import ComposerAvailability
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(**kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=str(kwargs["model"]), provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)
@@ -383,6 +386,7 @@ class TestCsvClassifierScenario:
                                     "provider": "openrouter",
                                     "model": "anthropic/claude-3.5-sonnet",
                                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                                    "system_prompt": "You classify support tickets by urgency. Return only the urgency label.",
                                     "prompt_template": "Classify {{ row['subject'] }}",
                                     "response_field": "urgency",
                                     "schema": {"mode": "observed"},
@@ -412,14 +416,22 @@ class TestCsvClassifierScenario:
         )
         # Turn 2: claim completion → proof gate fires
         turn2 = _llm_response(content="All set.", tool_calls=None)
-        # Turn 3: repair — switch source schema to observed mode
+        # Turn 3: repair — switch to observed mode while preserving the complete
+        # field guarantee verified from the seeded CSV's only row.
         turn3 = _llm_response(
             content=None,
             tool_calls=[
                 {
                     "id": "call_repair",
                     "name": "patch_source_options",
-                    "arguments": {"patch": {"schema": {"mode": "observed"}}},
+                    "arguments": {
+                        "patch": {
+                            "schema": {
+                                "mode": "observed",
+                                "guaranteed_fields": ["ticket_id", "customer_name", "subject", "body", "received_at"],
+                            }
+                        }
+                    },
                 },
             ],
         )
@@ -457,7 +469,7 @@ class TestCsvClassifierScenario:
         # patch would mask the truth that a model-bearing pipeline ends compose()
         # at is_valid=false (reviews surfaced, pending out-of-loop resolution).
         # The REAL preflight is what makes is_valid honest here.
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             # Six LLM calls / two forced repair turns (Branch B terminal state):
             #   1. set_pipeline (fixed schema omitting four observed columns)
             #   2. claim completion → REPAIR 1 (preflight: schema omits columns)
@@ -635,8 +647,8 @@ class TestNumericGateScenario:
         passing_preflight = _passing_preflight()
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2]
             result = await service.compose(
@@ -820,8 +832,8 @@ class TestNumericGateScenario:
         passing_preflight = _passing_preflight()
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3, turn4]
             result = await service.compose(
@@ -1000,8 +1012,8 @@ class TestUrlTextSmokeScenario:
         passing_preflight = _passing_preflight()
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2, turn3, turn4]
             result = await service.compose(
@@ -1175,10 +1187,10 @@ class TestPreflightRepairContinue:
 
         empty = _empty_state()
         with (
-            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
-            patch.object(service, "_runtime_preflight", side_effect=_content_aware_preflight),
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service._preflight, "runtime_preflight", side_effect=_content_aware_preflight),
             patch.object(
-                service,
+                service._advisor_checkpoint,
                 "_run_advisor_checkpoint",
                 new=_clean_advisor_checkpoint,
             ),

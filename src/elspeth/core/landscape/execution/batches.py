@@ -283,7 +283,7 @@ class BatchRepository:
                     raise AuditIntegrityError(f"Cannot update batch status: batch {batch_id} not found")
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"update_batch_status failed for batch_id={batch_id} — database rejected audit update: {type(exc).__name__}: {exc}"
+                f"update_batch_status failed for batch_id={batch_id} — database rejected audit update: {type(exc).__name__}"
             ) from exc
 
     def complete_batch(
@@ -383,7 +383,7 @@ class BatchRepository:
             row = conn.execute(select(batches_table).where(batches_table.c.batch_id == batch_id)).fetchone()
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(
-                f"complete_batch failed for batch_id={batch_id} — database rejected audit update: {type(exc).__name__}: {exc}"
+                f"complete_batch failed for batch_id={batch_id} — database rejected audit update: {type(exc).__name__}"
             ) from exc
 
         if row is None:

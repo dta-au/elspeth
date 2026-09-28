@@ -9,7 +9,9 @@ from types import SimpleNamespace
 import pytest
 import structlog
 
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer import service as service_module
+from elspeth.web.composer.advisor_checkpoint import _AdvisorCheckpointComposeDeadlineExpired
 from elspeth.web.composer.audit import BufferingRecorder, ComposerLLMCallStatus
 from tests.unit.web.composer import test_advisor_checkpoint as checkpoint_fixtures
 from tests.unit.web.composer.test_advisor_checkpoint import (
@@ -53,9 +55,11 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
             model="test-advisor",
         )
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
-    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, recorder=recorder, **_fenced_session(service))
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, recorder=recorder, **_fenced_session(service)
+    )
 
     assert verdict.ok and verdict.blocking
     assert [call.status for call in recorder.llm_calls] == [
@@ -71,9 +75,11 @@ async def test_end_checkpoint_retries_clean_content_with_tool_calls(make_service
 async def test_excessively_nested_json_exhausts_checkpoint_retry_as_malformed(make_service, simple_state):
     service = make_service()
     nested_json = "[" * 10_000 + "0" + "]" * 10_000
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=(nested_json, {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(nested_json, {}))
 
-    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, recorder=None, **_fenced_session(service))
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="end", state=simple_state, recorder=None, **_fenced_session(service)
+    )
 
     assert not verdict.ok
     assert verdict.failure_class == "malformed"
@@ -87,10 +93,10 @@ async def test_excessively_nested_json_exhausts_checkpoint_retry_as_malformed(ma
 @pytest.mark.parametrize("phase", ["early", "end"])
 async def test_structured_reply_records_counts_before_any_terminal_publication(make_service, simple_state, phase):
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
     fenced = _fenced_session(service)
     with structlog.testing.capture_logs() as events:
-        verdict = await service._run_advisor_checkpoint(phase=phase, state=simple_state, recorder=None, **fenced)
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase=phase, state=simple_state, recorder=None, **fenced)
     assert verdict.findings_text == "TECHNICAL_CANARY: rate needs page content."
     assert verdict.ok and verdict.blocking
     assert verdict.note is not None and "USER_CANARY" in verdict.note
@@ -112,7 +118,7 @@ async def test_structured_reply_records_counts_before_any_terminal_publication(m
         assert record[field] == value
         assert event[field] == value
     assert "TECHNICAL_CANARY" not in repr(record)
-    assert service._call_advisor_with_audit.calls[0].kwargs["structured_output"] is True
+    assert service._advisor_checkpoint._call_advisor_with_audit.calls[0].kwargs["structured_output"] is True
 
 
 @pytest.mark.asyncio
@@ -138,9 +144,9 @@ async def test_first_attempt_and_retry_conformance(
             raise reply
         return reply, {}
 
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=complete)
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=complete)
     fenced = _fenced_session(service)
-    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
     assert verdict.ok is final_ok
     assert verdict.failure_class == failure
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
@@ -167,13 +173,13 @@ async def test_first_attempt_and_retry_conformance(
 async def test_retry_wording_distinguishes_schema_from_contract_violation(make_service, simple_state, rejected, schema_valid):
     service = make_service()
     replies = iter([rejected, _reply(verdict="CLEAN", steps=[], findings="", note=None)])
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *args, **kwargs: (next(replies), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *args, **kwargs: (next(replies), {}))
     fenced = _fenced_session(service)
 
-    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
 
     assert verdict.ok and not verdict.blocking
-    first, retry = service._call_advisor_with_audit.calls
+    first, retry = service._advisor_checkpoint._call_advisor_with_audit.calls
     schema_reprompt = (
         "The previous reply did not satisfy the checkpoint schema. Return only the required JSON object, "
         "following the output contract in the system instructions."
@@ -200,9 +206,11 @@ async def test_deadline_before_format_retry_does_not_record_unsent_reprompt(make
     # Keep the event loop's actual clock untouched: only the checkpoint reads this view.
     loop_view = SimpleNamespace(time=lambda: next(clock))
     monkeypatch.setattr(service_module.asyncio, "get_running_loop", lambda: loop_view)
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=("invalid JSON", {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=("invalid JSON", {}))
     fenced = _fenced_session(service)
-    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, deadline=2.0, **fenced)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
+        phase="early", state=simple_state, recorder=None, deadline=2.0, **fenced
+    )
     assert verdict.failure_class == "malformed"
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert "provider_attempts" in record
@@ -231,9 +239,9 @@ async def test_empty_text_is_distinct_from_absent_text_at_real_call_boundary(
             model="test-advisor",
         )
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     fenced = _fenced_session(service)
-    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
     assert verdict.ok and not verdict.blocking
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert "provider_attempts" in record
@@ -248,13 +256,13 @@ async def test_empty_text_is_distinct_from_absent_text_at_real_call_boundary(
 @pytest.mark.asyncio
 async def test_initial_deadline_does_not_create_pass(make_service, simple_state):
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
     fenced = _fenced_session(service)
-    with pytest.raises(service_module._AdvisorCheckpointComposeDeadlineExpired):
-        await service._run_advisor_checkpoint(
+    with pytest.raises(_AdvisorCheckpointComposeDeadlineExpired):
+        await service._advisor_checkpoint._run_advisor_checkpoint(
             phase="early", state=simple_state, recorder=None, deadline=asyncio.get_running_loop().time() - 1, **fenced
         )
-    service._call_advisor_with_audit.assert_not_awaited()
+    service._advisor_checkpoint._call_advisor_with_audit.assert_not_awaited()
     service._sessions_service.add_message.assert_not_awaited()
 
 
@@ -290,13 +298,15 @@ async def test_initial_deadline_does_not_create_pass(make_service, simple_state)
 @pytest.mark.asyncio
 async def test_every_invalid_contract_uses_format_retry_then_malformed(make_service, simple_state, invalid):
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=(invalid, {}))
-    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, session_id=None)
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(invalid, {}))
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, session_id=None)
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
-    assert service._call_advisor_with_audit.await_count == 2
-    first, retry = service._call_advisor_with_audit.calls
-    reprompts = (service_module._ADVISOR_VERDICT_FORMAT_REPROMPT, service_module._ADVISOR_VERDICT_CONTRACT_REPROMPT)
+    assert service._advisor_checkpoint._call_advisor_with_audit.await_count == 2
+    first, retry = service._advisor_checkpoint._call_advisor_with_audit.calls
+    from elspeth.web.composer import advisor_policy
+
+    reprompts = (advisor_policy._ADVISOR_VERDICT_FORMAT_REPROMPT, advisor_policy._ADVISOR_VERDICT_CONTRACT_REPROMPT)
     assert all(reprompt not in first.args[0]["problem_summary"] for reprompt in reprompts)
     assert sum(reprompt in retry.args[0]["problem_summary"] for reprompt in reprompts) == 1
 
@@ -304,9 +314,9 @@ async def test_every_invalid_contract_uses_format_retry_then_malformed(make_serv
 @pytest.mark.asyncio
 async def test_prescan_conformance_is_not_applicable(make_service, simple_state):
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(return_value=(_reply(), {}))
     fenced = _fenced_session(service)
-    verdict = await service._run_advisor_checkpoint(
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
         phase="end",
         state=simple_state,
         recorder=None,
@@ -314,7 +324,7 @@ async def test_prescan_conformance_is_not_applicable(make_service, simple_state)
         **fenced,
     )
     assert verdict.ok and verdict.blocking and verdict.findings_backend_authored
-    service._call_advisor_with_audit.assert_not_awaited()
+    service._advisor_checkpoint._call_advisor_with_audit.assert_not_awaited()
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["provider_attempts"] == 0
     assert record["format_reprompt_sent"] is False
@@ -334,9 +344,9 @@ async def test_prescan_conformance_is_not_applicable(make_service, simple_state)
 async def test_rejected_attempt_does_not_contribute_final_counts(make_service, simple_state):
     service = make_service()
     replies = iter([_reply(findings=""), _reply(verdict="CLEAN", steps=[], findings="", note=None)])
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *args, **kwargs: (next(replies), {}))
+    service._advisor_checkpoint._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *args, **kwargs: (next(replies), {}))
     fenced = _fenced_session(service)
-    verdict = await service._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
+    verdict = await service._advisor_checkpoint._run_advisor_checkpoint(phase="early", state=simple_state, recorder=None, **fenced)
     assert verdict.ok and not verdict.blocking
     record = service._sessions_service.add_message.calls[0].kwargs["tool_calls"][0]["pass"]
     assert record["first_attempt_schema_valid"] is True
@@ -356,8 +366,9 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(m
     admissions = 0
     physical_calls = 0
 
-    async def admission():
+    async def admission(*, model: str):
         nonlocal admissions
+        assert model == service._settings.composer_advisor_model
         admissions += 1
         if scenario == "admission-timeout-then-clean" and admissions == 1:
             raise TimeoutError("quota admission timed out before dispatch")
@@ -375,10 +386,10 @@ async def test_conformance_counts_only_physical_dispatch_after_quota_admission(m
             model="test-advisor",
         )
 
-    monkeypatch.setattr(service_module, "admit_provider_attempt", admission)
+    monkeypatch.setattr(provider_gateway, "admit_provider_attempt", admission)
     monkeypatch.setattr(litellm, "acompletion", complete)
     with structlog.testing.capture_logs() as events:
-        verdict = await service._run_advisor_checkpoint(
+        verdict = await service._advisor_checkpoint._run_advisor_checkpoint(
             phase="early",
             state=simple_state,
             recorder=None,

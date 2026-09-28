@@ -80,7 +80,7 @@ def _llm_call(node_id: str, index: int, name: str, hex_value: str) -> dict[str, 
     }
 
 
-def build_valid_evidence(*, revision: str = REVISION, surface: str = "guided_full") -> dict[str, Any]:
+def build_valid_evidence(*, revision: str = REVISION, surface: str = "freeform") -> dict[str, Any]:
     """A complete, sanitized evidence document that satisfies every check."""
     identities = [{"color_name": name, "hex": hex_value} for name, hex_value in COLOURS]
     success_rows = [_business_row(i, name, hex_value) for i, (name, hex_value) in enumerate(COLOURS)]

@@ -30,7 +30,6 @@ from litellm.types.utils import Choices, Message, ModelResponse
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
 
 # Values litellm's ``Choices`` Literal accepts and passes through unchanged.
 # ``tool_calls`` is the one that matters most for truncation forensics: a turn
@@ -185,8 +184,8 @@ def _llm_call(
 class TestSurvivesToThePersistedProjection:
     """``_LLM_CALL_PUBLIC_AUDIT_FIELDS`` is an explicit whitelist.
 
-    Every drain site — ``routes/_helpers._persist_llm_calls``,
-    ``composer/service``, and ``sessions/guided_audit`` — persists through
+    Every remaining drain site — ``routes/_helpers._persist_llm_calls``
+    and ``composer/service`` — persists through
     ``llm_call_audit_envelope``, so pinning the envelope covers all three.
     """
 
@@ -211,38 +210,3 @@ class TestSurvivesToThePersistedProjection:
         envelope = llm_call_audit_envelope(record)
 
         assert envelope["call"]["finish_reason"] == "content_filter"  # type: ignore[index]
-
-    def test_guided_audit_row_preserves_finish_reason(self) -> None:
-        rows = prepare_guided_audit_rows(
-            invocations=(),
-            llm_calls=(_llm_call(finish_reason="length"),),
-            chat_turns=(),
-        )
-
-        (row,) = rows
-        assert row.kind == "llm"
-        assert row.envelope["call"]["finish_reason"] == "length"
-
-    def test_guided_failure_redaction_does_not_strip_finish_reason(self) -> None:
-        """The non-success branch rebuilds the payload and nulls named keys.
-
-        That rewrite is the one place ``finish_reason`` could be dropped by
-        construction rather than by the whitelist — and truncation evidence
-        matters most precisely on the calls that did not succeed.
-        """
-        rows = prepare_guided_audit_rows(
-            invocations=(),
-            llm_calls=(
-                _llm_call(
-                    finish_reason="length",
-                    status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
-                    error_class="MalformedResponse",
-                    error_message="truncated mid tool call",
-                ),
-            ),
-            chat_turns=(),
-        )
-
-        (row,) = rows
-        assert row.envelope["call"]["finish_reason"] == "length"
-        assert row.envelope["call"]["error_message"] is None

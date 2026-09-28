@@ -13,14 +13,11 @@ import json
 import re
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.capability_skill import render_with_pipeline_capabilities
-from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.prompts import build_mode_transition_system_prompt
-from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, build_schema_contract_evidence
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -36,9 +33,6 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.validation import _PROFILE_LOWERING_METADATA_OPTION_KEYS
-
-if TYPE_CHECKING:
-    from elspeth.web.composer.guided.state_machine import TerminalState
 
 # Load both static prompt sources and their individual hashes atomically.
 # Stateful services derive their instance hash after adding the deployment
@@ -110,7 +104,7 @@ def build_system_prompt(data_dir: str | None = None) -> str:
 #
 # ``build_context_string`` / ``build_messages`` advertise a
 # ``schemas_loaded`` kwarg whose production source is
-# ``ComposerServiceImpl._schemas_loaded_for_session`` — the per-session
+# ``SchemaDisclosureTracker.schemas_loaded_for_session`` — the per-session
 # tracker of which ``get_plugin_schema`` calls have already succeeded. If
 # the service ever stops threading that tracker (refactor regression,
 # missed call site, accidental removal of the kwarg), the prompt would
@@ -373,7 +367,7 @@ def build_context_string(
         schemas_loaded: Per-session set of ``(kind, plugin_name)`` pairs
             for which ``get_plugin_schema`` has returned successfully in
             this session. Sourced from
-            ``ComposerServiceImpl._schemas_loaded_for_session``. Surfaces
+            ``SchemaDisclosureTracker.schemas_loaded_for_session``. Surfaces
             in ``composer_progress`` as
             ``schemas_loaded_this_session`` (sorted list of
             ``"<kind>/<plugin>"``). These are historical identities, not
@@ -498,7 +492,6 @@ def build_messages(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
     rendered_skill: str | None = None,
-    guided_terminal: TerminalState | None = None,
     schemas_loaded: frozenset[tuple[str, str]] = _SCHEMAS_LOADED_UNSET,
 ) -> list[dict[str, Any]]:
     """Build the full message list for the LLM.
@@ -526,12 +519,6 @@ def build_messages(
     instructions), while the state message embeds user/LLM-authored strings
     and keeps the full UNTRUSTED labeling.
 
-    When ``guided_terminal`` is set, this is the first freeform turn after
-    a guided-mode exit.  The system prompt is replaced with a layered
-    prompt (freeform skill → transition header) per spec §8.2.
-    The caller is responsible for the gate logic and the ``transition_consumed``
-    flip; this function is pure (no state mutation).
-
     Args:
         chat_history: Chat history as dicts with role/content keys and an
             optional route-owned internal authorship marker. The marker is
@@ -546,13 +533,10 @@ def build_messages(
         rendered_skill: Exact service-instance rendering of the core plus
             deployment overlay. When supplied, this is used verbatim instead
             of reloading the deployment layer mid-service.
-        guided_terminal: When set, the resolved TerminalState from the
-            completed guided session; triggers the layered transition
-            prompt instead of the freeform-only prompt.
         schemas_loaded: Forwarded verbatim to ``build_context_string``.
             Defaults to the ``_SCHEMAS_LOADED_UNSET`` sentinel; the
             production caller (``ComposerServiceImpl._build_messages``)
-            always threads ``_schemas_loaded_for_session(session_id)``
+            always threads ``schemas_loaded_for_session(session_id)``
             (a real frozenset, possibly empty). Non-service callers
             wanting the "tracked, empty" reading must pass
             ``frozenset()`` explicitly.
@@ -563,45 +547,11 @@ def build_messages(
     messages: list[dict[str, Any]] = []
 
     # 1. Stable system prompt only.
-    # When guided_terminal is set, this is the first freeform turn after
-    # a guided-mode exit — use the layered transition prompt (spec §8.2).
-    # Otherwise fall through to the standard freeform-only prompt.
     # F1: route through build_system_prompt unconditionally so the
     # advisor-strip transformation applies consistently — the previous
     # ``data_dir is None → SYSTEM_PROMPT`` fast path bypassed it. The
     # @lru_cache on build_system_prompt makes repeat calls free.
-    if guided_terminal is not None:
-        if guided_terminal.kind is TerminalKind.COMPLETED:
-            reason_str = "completed_pipeline"
-        else:
-            # EXITED_TO_FREEFORM — reason must be non-None for this kind.
-            # Use InvariantError (server-bug sentinel) rather than RuntimeError
-            # so the send_message / recompose route handlers route this through
-            # the B1-sanitized static-500 path (slog event + _safe_frame_strings
-            # capture) rather than landing at FastAPI's default 500.
-            #
-            # The diagnostic value here is the invariant name; we deliberately
-            # drop the ``{guided_terminal!r}`` interpolation that would otherwise
-            # embed ``pipeline_yaml`` (Tier-1 — may contain source paths, plugin
-            # options, secret references) into the exception message. Same leak
-            # vector that B1 (commit eb30f669) and I1 (commit ba424ad9)
-            # sanitized at routes.py:4634/4696; this site was missed by the
-            # original PR sweep (obs-ae69e10e00).
-            if guided_terminal.reason is None:
-                raise InvariantError("EXITED_TO_FREEFORM terminal must have a reason")
-            reason_str = guided_terminal.reason.value
-        # Thread data_dir through the transition prompt so the first freeform
-        # turn after guided exit carries the same deployment overlay as all
-        # subsequent freeform turns (Codex #17). build_system_prompt is
-        # @lru_cache'd — this call hits the same cache entry as the
-        # non-transition branch below.
-        freeform_skill = rendered_skill if rendered_skill is not None else build_system_prompt(data_dir)
-        prompt = build_mode_transition_system_prompt(
-            terminal_reason=reason_str,
-            freeform_skill=freeform_skill,
-        )
-    else:
-        prompt = rendered_skill if rendered_skill is not None else build_system_prompt(data_dir)
+    prompt = rendered_skill if rendered_skill is not None else build_system_prompt(data_dir)
     messages.append({"role": "system", "content": prompt})
 
     # 2. Deployment-constant catalog context. Stored plugin-authored data,
@@ -614,7 +564,8 @@ def build_messages(
         }
     )
 
-    # 3. Chat history
+    # 3. Chat history. Persisted tool turns can have no assistant prose, but
+    # history has no tool-call blocks to accompany those empty messages.
     if chat_history:
         messages.extend(
             {
@@ -623,6 +574,7 @@ def build_messages(
                 if key not in {COMPOSER_HISTORY_USER_AUTHORED_KEY, COMPOSER_HISTORY_USER_MESSAGE_ID_KEY}
             }
             for history_message in chat_history
+            if not (history_message["role"] == "assistant" and history_message["content"] == "")
         )
 
     # 4. Session-varying state context — after history so per-turn state

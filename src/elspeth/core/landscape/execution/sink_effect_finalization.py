@@ -34,6 +34,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
@@ -458,12 +459,19 @@ class SinkEffectFinalization:
             if stream is None:
                 raise LandscapeRecordError("sink effect stream disappeared during finalization")
         effect_ids = tuple(sorted(set(linked_effect_ids) | {str(optimistic_effect.effect_id)}))
-        rows = conn.execute(
-            select(sink_effects_table)
-            .where(sink_effects_table.c.effect_id.in_(effect_ids))
-            .order_by(sink_effects_table.c.effect_id)
-            .with_for_update(of=sink_effects_table)
-        ).fetchall()
+        # Linked effects are caller-derived (every primary effect a member
+        # names), so the lock read runs in ascending chunks of the shared bind
+        # budget, which keeps the effect_id lock order.
+        rows = [
+            row
+            for chunk in bind_budget_chunks(effect_ids)
+            for row in conn.execute(
+                select(sink_effects_table)
+                .where(sink_effects_table.c.effect_id.in_(chunk))
+                .order_by(sink_effects_table.c.effect_id)
+                .with_for_update(of=sink_effects_table)
+            ).fetchall()
+        ]
         by_id = {str(row.effect_id): row for row in rows}
         if set(by_id) != set(effect_ids):
             raise LandscapeRecordError("linked sink effect set changed or disappeared during finalization")

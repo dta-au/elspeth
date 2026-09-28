@@ -83,6 +83,7 @@ class TestComposerProgressEvent:
             "plugin_crash",
             "runtime_preflight_failed",
             "service_setup_failed",
+            "accounting_unavailable",
             "client_cancelled",
             "composer_idle",
             "composer_complete",
@@ -187,17 +188,17 @@ class TestComposerProgressRegistry:
     @pytest.mark.parametrize(
         ("older_request_id", "newer_request_id"),
         (
-            ("freeform-older", "guided-newer"),
-            ("guided-older", "freeform-newer"),
+            ("compose-older", "compose-newer"),
+            ("request-a", "request-b"),
         ),
     )
     @pytest.mark.asyncio
-    async def test_shared_route_sink_rejects_late_cross_surface_publishers_in_either_direction(
+    async def test_shared_route_sink_rejects_late_publishers_across_requests(
         self,
         older_request_id: str,
         newer_request_id: str,
     ) -> None:
-        """Freeform and guided surfaces participate in one latest-request domain."""
+        """Every compose request for a session participates in one latest-request domain."""
         registry = ComposerProgressRegistry()
         older_request = Request({"type": "http"})
         older_request.state.composer_request_lease = await registry.start_request("session-1", "user-1")
@@ -403,7 +404,7 @@ class TestComposerProgressRegistry:
         await progress(
             ComposerProgressEvent(
                 phase="calling_model",
-                headline="The guided planner is active.",
+                headline="The planner is active.",
                 evidence=("A bounded request is running.",),
             )
         )
@@ -429,7 +430,7 @@ class TestComposerProgressRegistry:
         await replacement(
             ComposerProgressEvent(
                 phase="calling_model",
-                headline="A replacement guided planner is active.",
+                headline="A replacement planner is active.",
                 evidence=("A new bounded request owns the session.",),
             )
         )
@@ -611,11 +612,8 @@ def test_composer_progress_reason_typescript_mirror_is_complete() -> None:
     """The SPA's ``ComposerProgressReason`` union is a HAND-WRITTEN mirror with no pin — and it had drifted.
 
     Python carried ``tool_call_cap_exceeded``; the TypeScript union did not, so the type asserted a value the
-    server could send could not occur. It went unnoticed because the only surface reaching that code was the
-    guided one, and freeform hardcoded ``provider_unavailable`` over every planner outcome — fixing that
-    attribution (elspeth-ad5628ecda) made the missing member reachable on a second surface. The sibling
-    vocabulary (``GuidedOperationFailureCode``) is pinned both by a test and by a pre-commit mirror check
-    (``scripts/cicd/check_slot_type_cross_language.py``); this one was not.
+    server could send could not occur. Planner outcome attribution made the missing
+    member reachable in freeform. This union must stay aligned with the backend.
     """
     import re
     from pathlib import Path

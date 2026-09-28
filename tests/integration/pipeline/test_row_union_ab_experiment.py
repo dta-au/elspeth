@@ -278,7 +278,7 @@ sinks:
         mode: observed
 """
     )
-    # output_mode: passthrough admits no shipped batch plugin: the test-only identity plugin stands in.
+    # The test-only identity batch plugin stands in for passthrough: it adds no fields, unlike the shipped batch_rank.
     with passthrough_batch_plugins():
         bundle = instantiate_plugins_from_config(settings)
     with pytest.raises(GraphValidationError, match=r"Aggregation .* inside bound region") as exc_info:

@@ -29,7 +29,7 @@ export const TURN_7_PRIMARY_BUTTON = "Take me to the composer";
 export const HELLO_WORLD_SESSION_TITLE = "First-run tutorial";
 
 // Set immediately after createSession in HelloWorldTutorial.onStart (before the
-// guided shell's external POST /guided/start) so the backend orphan-cleanup
+// freeform shell's first authoring message) so the backend orphan-cleanup
 // scan (which matches this exact pending title — mirrored as
 // _TUTORIAL_PENDING_SESSION_TITLE in composer/tutorial_service.py; change BOTH
 // together) catches sessions abandoned mid-tutorial. Without this tag, a user
@@ -106,10 +106,9 @@ export const TURN_7_LEARNING_BULLETS = [
     // (elspeth-cc67815217). The trailing full stop is part of the literal, as
     // it is on every sibling bullet title.
     title: "Ask ELSPETH.",
-    // Guided/freeform parity guidance is folded into this existing chat-panel
-    // item and shared verbatim with the skip path.
+    // The final lesson points to the same conversational surface used in Build.
     body:
-      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. Guided and freeform can build the same pipelines: choose guided for structured prompts or freeform for a conversational, step-by-step exchange. That is an interaction preference, not a capability limit.",
+      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. You can keep shaping the pipeline in that same freeform conversation.",
   },
   {
     title: "LLMs are confident even when they're wrong.",

@@ -20,7 +20,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine
 
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -33,7 +33,7 @@ from tests.unit.web.composer.test_compose_loop_interpretation_review_dispatch im
     _ScriptedLLM,
     _seed_session_and_state,
 )
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _ORDINARY_ASK = "call request_interpretation_review with the listed affected_node_id"
 _FALLBACK_INSTRUCTION = "write the interpretation into options.prompt_template"
@@ -41,12 +41,12 @@ _FALLBACK_INSTRUCTION = "write the interpretation into options.prompt_template"
 
 @pytest.fixture(autouse=True)
 def _advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ComposerServiceImpl, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
+    monkeypatch.setattr(AdvisorCheckpointOwner, "_run_advisor_checkpoint", _clean_advisor_checkpoint, raising=True)
 
 
 @pytest.fixture
 def sessions_service(engine: Engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.sessions.rate_capped_repair_gate"),

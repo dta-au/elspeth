@@ -396,6 +396,19 @@ async def test_2xx_body_that_fails_strict_parse_raises_upstream_response_invalid
 
 
 @respx.mock
+async def test_oversized_integer_in_2xx_body_is_upstream_response_invalid(client):
+    _mock_tokens("tok-1")
+    raw = b'{"n":' + b"9" * 5000 + b"}"
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, content=raw))
+    transport = _transport(_config(), client)
+
+    with pytest.raises(GatewayError) as exc_info:
+        await transport.invoke(_plan())
+
+    assert exc_info.value.code == GatewayErrorCode.UPSTREAM_RESPONSE_INVALID
+
+
+@respx.mock
 async def test_deeply_nested_2xx_body_raises_upstream_response_invalid_not_500(client):
     """A 2xx body that is deeply nested but individually tiny (well under
     max_response_bytes) must be classified upstream_response_invalid, not

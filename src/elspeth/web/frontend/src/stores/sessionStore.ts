@@ -14,24 +14,10 @@ import type {
 } from "@/types/api";
 import { isComposerRecoveryError } from "@/types/recovery";
 import type {
-  GetGuidedResponse,
-  GuidedSession,
-  TurnPayload,
-  TerminalState,
-  GuidedRespondAction,
-  GuidedProposalReviewState,
-  GuidedProposalRetryAction,
-  GuidedRevisionMode,
-  GuidedRespondRequest,
-  GuidedRespondResponse,
-  GuidedStartOperationReconciliation,
-} from "@/types/guided";
-import type { GuidedRetryAcquisition, GuidedRetryHandle, GuidedRetryKind } from "./guidedOperationRetry";
-import {
-  EMPTY_GUIDED_REVIEWED_COMPONENTS,
-  selectGuidedReviewedComponents,
-  type GuidedReviewedComponents,
-} from "./guidedReviewedComponents";
+  SessionOperationRetryAcquisition,
+  SessionOperationRetryHandle,
+  SessionOperationRetryKind,
+} from "./sessionOperationRetry";
 import * as api from "@/api/client";
 import {
   COMPOSE_TIMEOUT_ABORT_REASON,
@@ -40,134 +26,24 @@ import {
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
-// Pure leaf (no React, no store) — see the constraint recorded in its header.
+import { isGenuineReply } from "@/components/chat/turns";
 import {
-  approvalStopReason,
-  type WiringApprovalClientBlockers,
-  type WiringApprovalOutcome,
-} from "@/components/chat/guided/wiringApproval";
-// Pure leaf (imports only types/guided): the ONE derivation of the token a
-// completed session chats under. The view binds to the same function.
-import { completedGuidedChatToken } from "@/components/chat/guided/completedChatToken";
-import { usePreferencesStore } from "./preferencesStore";
-import {
-  acquireGuidedRetry,
-  clearAllGuidedRetries,
-  clearGuidedRetry,
-  clearGuidedRetriesForSession,
-  clearOrphanedGuidedRetriesForSession,
-  findGuidedRetry,
-  isAmbiguousGuidedRetryFailure,
-  isGuidedRetryReplayable,
-} from "./guidedOperationRetry";
+  acquireSessionOperationRetry,
+  clearAllSessionOperationRetries,
+  clearSessionOperationRetry,
+  clearOrphanedSessionOperationRetriesForSession,
+  isAmbiguousSessionOperationRetryFailure,
+  isSessionOperationRetryReplayable,
+} from "./sessionOperationRetry";
 
-export type GuidedRespondOutcome =
-  | { status: "applied" }
-  | {
-      status: "not_applied";
-      reason:
-        | "no_active_session"
-        | "no_current_turn"
-        | "pending"
-        | "custody_conflict"
-        | "stale"
-        | "unsettled"
-        | "rejected"
-        | "refresh_required";
-      message: string;
-    };
 
 function getExecutionStore() {
   return useExecutionStore.getState();
 }
 
-type SettledGuidedResyncResult = "published" | "stale" | "failed";
 
-type GuidedStartReconciliationResult =
-  | "cleared"
-  | "completed"
-  | "in_progress"
-  | "unknown"
-  | "stale";
 
-async function reconcileGuidedStartRetry(
-  retry: GuidedRetryHandle,
-  publicationGeneration: number,
-): Promise<GuidedStartReconciliationResult> {
-  const reconciliationController = new AbortController();
-  let reconciliation: GuidedStartOperationReconciliation;
-  try {
-    reconciliation = await api.reconcileGuidedStartOperation(
-      retry.sessionId,
-      retry.operationId,
-      reconciliationController.signal,
-    );
-  } catch {
-    return "unknown";
-  }
-  if (typeof reconciliation !== "object" || reconciliation === null) {
-    return "unknown";
-  }
 
-  if (reconciliation.status === "failed") {
-    clearGuidedRetry(retry);
-    return "cleared";
-  }
-  if (reconciliation.status === "in_progress") {
-    return "in_progress";
-  }
-  if (!guidedPublicationIsCurrent(retry.sessionId, publicationGeneration)) {
-    return "stale";
-  }
-
-  try {
-    const refreshController = new AbortController();
-    const authoritative = await api.getGuided(
-      retry.sessionId,
-      refreshController.signal,
-    );
-    if (
-      authoritative.composition_state === null ||
-      authoritative.composition_state.id !== reconciliation.composition_state_id
-    ) {
-      return "unknown";
-    }
-    if (!guidedPublicationIsCurrent(retry.sessionId, publicationGeneration)) {
-      return "stale";
-    }
-    const applied = await useSessionStore.getState().applyGuidedResponse(
-      retry.sessionId,
-      authoritative,
-      publicationGeneration,
-    );
-    if (!applied) return "stale";
-    clearGuidedRetry(retry);
-    return "completed";
-  } catch {
-    return guidedPublicationIsCurrent(retry.sessionId, publicationGeneration)
-      ? "unknown"
-      : "stale";
-  }
-}
-
-async function resyncSettledGuidedResponse(
-  sessionId: string,
-  activeSessionId: () => string | null,
-  publish: (response: GuidedRespondResponse) => Promise<boolean>,
-): Promise<SettledGuidedResyncResult> {
-  if (activeSessionId() !== sessionId) {
-    return "stale";
-  }
-  try {
-    const authoritative = await api.getGuided(sessionId);
-    if (activeSessionId() !== sessionId) {
-      return "stale";
-    }
-    return await publish(authoritative) ? "published" : "stale";
-  } catch {
-    return activeSessionId() === sessionId ? "failed" : "stale";
-  }
-}
 
 const COMPOSER_PROGRESS_POLL_INTERVAL_MS = 1500;
 const LLM_UNAVAILABLE_MESSAGE =
@@ -258,51 +134,24 @@ function convergencePartialStatePatch(
     ...(nodeStillExists ? {} : { selectedNodeId: null }),
   };
 }
-const GUIDED_START_CLEARED_MESSAGE =
-  "Guided setup stopped or timed out before staging. You can revise your request and send it again.";
-const GUIDED_START_IN_PROGRESS_MESSAGE =
-  "Guided setup is still running. Wait for it to settle, then reload to recover the result.";
-const GUIDED_START_UNKNOWN_MESSAGE =
-  "Could not confirm whether guided setup settled. Reload to retry recovery before sending another request.";
-/**
- * Store-level guard for `enterGuided()` reaching a WORKED freeform session (the
- * documented GET 400) with no goal to root the conversion on.
- *
- * Unreachable from the UI — the mode-switch card requires a goal before Confirm
- * is enabled, and every other entry lands on the stub, not the 400 — but a
- * silent no-op here would be a dead button, and posting an intent-less convert
- * would 400 with server copy the user cannot act on. Kept as a plain error
- * string so the surface renders the same banner it renders for a convert
- * failure.
- */
-const GUIDED_GOAL_REQUIRED_MESSAGE =
-  "A goal is required to switch to guided. Describe what this pipeline should produce, then switch again.";
 // Human names for the pending action in a live custody conflict — the copy
 // must tell the user WHAT is unsettled, because "retry the same action" is
 // only actionable when they know which action it means (session 09cde460:
 // the anonymous copy left the operator guessing).
-const GUIDED_RETRY_KIND_LABELS: Record<GuidedRetryKind, string> = {
-  guided_start: "guided setup request",
-  guided_respond: "wizard answer",
-  guided_chat: "chat message",
-  guided_convert: "conversion request",
-  guided_reenter: "guided re-entry",
-  guided_plan: "planning request",
+const SESSION_OPERATION_RETRY_KIND_LABELS: Record<SessionOperationRetryKind, string> = {
   state_revert: "version revert",
   session_fork: "session fork",
 };
 
-function guidedRetryConflictState(kind: GuidedRetryKind): {
+function sessionOperationRetryConflictState(kind: SessionOperationRetryKind): {
   error: string;
   errorDetails: null;
-  guidedSelfHealNotice: null;
 } {
   return {
     error:
-      `Your earlier ${GUIDED_RETRY_KIND_LABELS[kind]} is unsettled. ` +
+      `Your earlier ${SESSION_OPERATION_RETRY_KIND_LABELS[kind]} is unsettled. ` +
       "Retry that same action to let it finish before choosing another.",
     errorDetails: null,
-    guidedSelfHealNotice: null,
   };
 }
 
@@ -310,40 +159,35 @@ function guidedRetryConflictState(kind: GuidedRetryKind): {
 // (session 09cde460: a reload mid-flight orphans the descriptor — the body
 // existed only in the previous page's memory — and every DIFFERENT action
 // then conflicted forever). An orphan has no custody value: clear it,
-// best-effort refresh the authoritative guided state (the orphaned op may
-// have settled server-side and advanced the wizard), and let the caller's
-// action proceed. A still-running server op is arbitrated by the admission
-// gate's coded 409 (guided_operation_conflict -> the retryable "still
-// settling" copy), not by an unresolvable client block. Live custody
+// best-effort refresh the authoritative state (the orphaned revert may
+// have settled server-side), and let the caller's action proceed. A
+// still-running server op is arbitrated by the backend admission gate, not
+// by an unresolvable client block. Live custody
 // (acquired by THIS page load, ambiguous-failure window) keeps today's
 // blocking behavior — the exact replay it protects is really available.
-async function reconcileOrphanedGuidedRetry(
-  existing: GuidedRetryHandle,
+async function reconcileOrphanedSessionOperationRetry(
+  existing: SessionOperationRetryHandle,
   requestedSessionId: string,
 ): Promise<boolean> {
-  if (isGuidedRetryReplayable(existing)) {
+  if (isSessionOperationRetryReplayable(existing)) {
     return false;
   }
-  clearGuidedRetry(existing);
+  clearSessionOperationRetry(existing);
   try {
-    const resynced = await api.getGuided(requestedSessionId);
+    const [compositionState, sessions] = await Promise.all([
+      api.fetchCompositionState(requestedSessionId),
+      api.fetchSessions(),
+    ]);
     if (useSessionStore.getState().activeSessionId === requestedSessionId) {
       useSessionStore.setState({
-        guidedSession: resynced.guided_session,
-        guidedNextTurn: resynced.next_turn,
-        guidedTerminal: resynced.terminal,
-        guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-        guidedReviewedComponents: selectGuidedReviewedComponents(
-          resynced.guided_session,
-        ),
-        compositionState: resynced.composition_state,
+        compositionState,
+        compositionStateLoaded: true,
+        sessions,
       });
+      getExecutionStore().clearValidation();
     }
   } catch {
-    // Best-effort: the cleared descriptor already unblocks the user, and the
-    // next action re-validates against the server regardless (a stale turn
-    // token takes the turn_not_emitted self-heal; a still-running op answers
-    // the coded admission conflict).
+    // Best-effort: the next action still revalidates against server authority.
   }
   return true;
 }
@@ -356,31 +200,17 @@ async function reconcileOrphanedGuidedRetry(
 // another action slipped in during the await (exactly one proceeds; the
 // other gets a genuine live conflict). A surviving conflict is a real
 // live-custody block the caller surfaces with named copy.
-async function reconcileGuidedRetryConflict(
-  existing: GuidedRetryHandle,
-  kind: GuidedRetryKind,
+async function reconcileSessionOperationRetryConflict(
+  existing: SessionOperationRetryHandle,
+  kind: SessionOperationRetryKind,
   sessionId: string,
   requestIdentity: readonly unknown[],
-): Promise<GuidedRetryAcquisition> {
-  if (!(await reconcileOrphanedGuidedRetry(existing, sessionId))) {
+): Promise<SessionOperationRetryAcquisition> {
+  if (!(await reconcileOrphanedSessionOperationRetry(existing, sessionId))) {
     return { status: "conflict", existing };
   }
-  return acquireGuidedRetry(kind, sessionId, requestIdentity);
+  return acquireSessionOperationRetry(kind, sessionId, requestIdentity);
 }
-const GUIDED_NO_ACTIVE_SESSION_MESSAGE =
-  "No active session is available for this guided response.";
-const GUIDED_NO_CURRENT_TURN_MESSAGE =
-  "There is no current guided turn to answer.";
-const GUIDED_RESPONSE_PENDING_MESSAGE =
-  "A guided response is already pending.";
-const GUIDED_RESPONSE_STALE_MESSAGE =
-  "The active session changed before the guided response could be applied.";
-const GUIDED_RESPONSE_REFRESH_REQUIRED_MESSAGE =
-  "The server accepted the response, but this view could not refresh. Refresh or re-enter the session before continuing.";
-const GUIDED_SOURCE_BLOB_LIFECYCLE_REJECTIONS = new Set([
-  "Selected source blob is no longer a ready upload for this session.",
-  "Selected source blob is not a ready upload for this session.",
-]);
 
 function isAbortError(err: unknown): boolean {
   // DOMException ('AbortError'/'TimeoutError') is not always an Error
@@ -482,49 +312,7 @@ function isHttpConflict(err: unknown): boolean {
   return (err as { status?: unknown }).status === 409;
 }
 
-function proposalReviewForTurn(
-  turn: TurnPayload | null,
-): GuidedProposalReviewState | null {
-  if (turn?.type !== "propose_pipeline") return null;
-  return {
-    status: "active",
-    proposal_id: turn.payload.proposal_id,
-    draft_hash: turn.payload.draft_hash,
-  };
-}
 
-function proposalRetryActionForBody(
-  body: GuidedRespondAction,
-): GuidedProposalRetryAction | null {
-  if (body.proposal_id === null) return null;
-  if (body.chosen !== null) {
-    return { kind: body.chosen[0] === "confirm_wiring" ? "confirm_wiring" : "review_wiring" };
-  }
-  if (body.control_signal === "reject") return { kind: "reject" };
-  const revisionInstruction = body.edited_values?.revision_instruction;
-  const revisionMode = body.edited_values?.revision_mode;
-  if (
-    typeof revisionInstruction === "string" &&
-    (revisionMode === "amend" || revisionMode === "replace")
-  ) {
-    return {
-      kind: "revise_instruction",
-      revision_instruction: revisionInstruction,
-      revision_mode: revisionMode,
-    };
-  }
-  if ("correction_feedback" in body) {
-    return {
-      kind: "revise",
-      edit_target: body.edit_target,
-      correction_feedback: body.correction_feedback,
-    };
-  }
-  if (body.edit_target !== null) {
-    return { kind: "revise", edit_target: body.edit_target };
-  }
-  return null;
-}
 
 let composerProgressPollTimer: ReturnType<typeof setInterval> | null = null;
 let composerProgressPollSessionId: string | null = null;
@@ -559,41 +347,26 @@ let composerProgressReadTicket = 0;
 let composerProgressAppliedTicket = 0;
 let inflightMessagesReadTicket = 0;
 let inflightMessagesAppliedTicket = 0;
-let guidedPublicationGeneration = 0;
-// Exact owner of guidedResponsePending. Session identity is insufficient: an
-// old request for A can settle after A -> B -> A and otherwise clear the flag
-// now owned by a newer request for A. Publication generations are monotonic,
-// so the request that raised pending can relinquish only its own generation.
-let guidedResponsePendingOwnerGeneration: number | null = null;
-// Retry custody has a different lifetime from the pending UI bit: navigation
-// clears pending, but an in-flight request still owns its descriptor until its
-// transport result is known. Same-action re-adoption transfers the operation
-// id to the newer publication generation, so only that generation may clear it.
-const guidedResponseRetryOwnerGenerations = new Map<string, number>();
+let sessionPublicationGeneration = 0;
 
-function advanceGuidedPublicationGeneration(): number {
-  guidedPublicationGeneration += 1;
+function advanceSessionPublicationGeneration(): number {
+  sessionPublicationGeneration += 1;
   proposalSnapshotSequence += 1;
-  return guidedPublicationGeneration;
+  return sessionPublicationGeneration;
 }
 
 /** Bind interpretation publication to the activation that displayed its card. */
 export function createInterpretationResolutionHandler(
   sessionId: string,
-  guided: boolean,
 ): (newState: CompositionState | null) => void {
-  const generation = guidedPublicationGeneration;
+  const generation = sessionPublicationGeneration;
   return (newState: CompositionState | null): void => {
     const store = useSessionStore.getState();
     if (
       store.activeSessionId !== sessionId ||
-      guidedPublicationGeneration !== generation
+      sessionPublicationGeneration !== generation
     ) return;
-    if (guided) {
-      if (newState !== null) useSessionStore.setState({ compositionState: newState });
-    } else {
-      store.applyResolvedInterpretation(newState);
-    }
+    store.applyResolvedInterpretation(newState);
   };
 }
 
@@ -634,12 +407,12 @@ async function reconcileProposalConflict(
   }
 }
 
-function guidedPublicationIsCurrent(
+function sessionPublicationIsCurrent(
   sessionId: string,
   generation: number,
 ): boolean {
   return (
-    guidedPublicationGeneration === generation &&
+    sessionPublicationGeneration === generation &&
     useSessionStore.getState().activeSessionId === sessionId
   );
 }
@@ -672,6 +445,16 @@ let inflightMessagesPollSessionId: string | null = null;
 // session has claimed the poller since — not whether the timer still runs.
 const inflightMessagesLatestClaimBySession = new Map<string, number>();
 
+// A session can become active again while its earlier POST is unresolved.
+// The poller's per-session claim also owns POST metadata and error publication;
+// stopping its timer on navigation does not invalidate an unsuperseded turn.
+function freeformComposeClaimIsCurrent(sessionId: string, generation: number): boolean {
+  return (
+    useSessionStore.getState().activeSessionId === sessionId &&
+    inflightMessagesLatestClaimBySession.get(sessionId) === generation
+  );
+}
+
 function clearInflightMessagesPollTimer(): void {
   if (inflightMessagesPollTimer !== null) {
     clearInterval(inflightMessagesPollTimer);
@@ -692,7 +475,7 @@ function formatProviderDiagnostic(apiErr: ApiError): string {
 }
 
 function formatLlmUnavailableError(apiErr: ApiError): string {
-  return `${LLM_UNAVAILABLE_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
+  return `${apiErr.guidance ?? LLM_UNAVAILABLE_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
 }
 
 function formatLlmAuthError(apiErr: ApiError): string {
@@ -717,33 +500,6 @@ function formatAuditIntegrityError(apiErr: ApiError): string {
   );
 }
 
-/**
- * Pull any interpretation events a compose action created into the
- * interpretationEventsStore.
- *
- * INVARIANT: every compose entry point that can mint interpretive decisions
- * (sendMessage, recompose, acceptCompositionProposal) MUST call this after a
- * successful turn. Interpretation events (invented_source / llm_prompt_template
- * / llm_model_choice / pipeline_decision) live in their own store, populated
- * only by listInterpretationEvents. In freeform mode there is no other trigger
- * to surface the inline review widgets — and their sign-off buttons — while the
- * run-gate blocks execution on unresolved pending rows. Guided mode delivers
- * review as a guided turn and the tutorial refreshes explicitly; this is the
- * freeform-surface equivalent. Only selectSession (session load / deep-link)
- * otherwise refreshes, so without this a mid-session compose deadlocks the user.
- *
- * Idempotent (the store keys by session_id and reconciles resolved events
- * across surfaces), so it is safe to call on any compose completion. A new
- * compose entry point that omits this call reintroduces the freeform deadlock.
- * Client-side aborts reach it through resyncAfterAbortedComposeTurn — a
- * cancelled turn can mint review cards before the cancel lands, and those
- * must surface too (elspeth-06a23adfcc).
- *
- * Returns the underlying refresh promise. The freeform callers fire it and
- * forget (each `void`s the result); guided `respondGuided` (P3.6/D12) must
- * `await` it so backend-surfaced pending cards land in the store before the
- * guided submit re-enables.
- */
 async function refreshInterpretationEventsForSession(
   sessionId: string,
 ): Promise<void> {
@@ -762,39 +518,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Block until the server side of a cancelled compose turn has settled.
- *
- * The client's abort rejects the fetch immediately, but the server is
- * still working once it owns the session's exact COMPOSE operation. The
- * dispatch+persist critical section is shielded (deferred cancellation —
- * see _await_tool_turn_with_deferred_cancellation in composer/service.py),
- * so the in-flight tool finishes and P4 publishes its results BEFORE the
- * CancelledError resumes. Resyncing before all of that lands misses
- * durable writes (user row, state advances) with no later refresh.
- *
- * Settlement is QUIESCENCE, not phase: `inflight_requests === 0` on the
- * progress snapshot. The server reconstructs this count from incomplete
- * durable request rows joined to their exact current, live COMPOSE fence;
- * `finish_request` completes the row before that fence is released. A route
- * waiting to acquire COMPOSE authority is deliberately not reported as live.
- * The narrative phase cannot carry the settlement signal because the latest
- * terminal snapshot remains visible independently of fenced request liveness.
- *
- * The wait ends on SEMANTIC conditions only, matching the server's own
- * unboundedness (a wall-clock budget would silently reopen the race for
- * any tool that outruns it):
- * - quiescence: zero in-flight compose requests — the normal exit;
- * - the user navigated to a different session — the resync is moot;
- * - a newer compose turn claimed the progress poller (`ownerGeneration`
- *   went stale) — its completion handler owns the state sync now. The
- *   generation is the mode-AGNOSTIC supersession signal: every compose
- *   entry point (sendMessage, retryMessage, chatGuided) claims the poller
- *   via startComposerProgressPolling, whereas store flags cannot see a
- *   guided turn (chatGuided sets guidedChatPending, not isComposing);
- * - the progress endpoint fails or predates the count field — progress is
- *   advisory, degrade to an immediate best-effort resync.
- */
 async function waitForCancelledComposeToSettle(
   sessionId: string,
   ownerGeneration: number,
@@ -848,14 +571,6 @@ async function resyncAfterAbortedComposeTurn(
   inflightOwnerGeneration: number,
   preTurnVersion: number | null,
 ): Promise<void> {
-  // inflightOwnerGeneration is the aborted turn's inflight-messages poller
-  // claim (a DIFFERENT counter from ownerGeneration); it lets the message
-  // sync below land even when a session switch has stopped that poller.
-  // ownerGeneration is the aborted turn's progress-poller claim (returned
-  // by its startComposerProgressPolling). It fences every stage of the
-  // resync: a newer compose turn in ANY mode — freeform or guided — claims
-  // the poller and thereby invalidates this resync, so a snapshot fetched
-  // here can never overwrite state a newer turn has since produced.
   const superseded = () =>
     useSessionStore.getState().activeSessionId !== sessionId ||
     composerProgressPollGeneration !== ownerGeneration;
@@ -944,6 +659,7 @@ async function resyncAfterAmbiguousComposeFailure(
   baselineMessageIds: ReadonlySet<string>,
   messageId: string,
   messageContent: string,
+  clientRequestId?: string,
 ): Promise<void> {
   const superseded = () =>
     useSessionStore.getState().activeSessionId !== sessionId ||
@@ -955,6 +671,18 @@ async function resyncAfterAmbiguousComposeFailure(
     .getState()
     .loadInflightMessages(sessionId, inflightOwnerGeneration);
   if (superseded()) return;
+  if (clientRequestId !== undefined) {
+    const accepted = freshMessages?.find((message) =>
+      message.role === "user" && message.client_request_id === clientRequestId
+    );
+    if (accepted) {
+      await reconcileAcceptedSend(
+        sessionId, messageId, clientRequestId, accepted.id,
+        inflightOwnerGeneration, ownerGeneration,
+      );
+      return;
+    }
+  }
 
   let state: CompositionState | null | undefined;
   let proposals: CompositionProposal[] | null | undefined;
@@ -971,18 +699,19 @@ async function resyncAfterAmbiguousComposeFailure(
       (message) =>
         !baselineMessageIds.has(message.id) &&
         message.role === "user" &&
-        message.content === messageContent,
+        (clientRequestId !== undefined
+          ? message.client_request_id === clientRequestId
+          : message.content === messageContent),
     ) ?? false;
-  const newAssistant =
-    freshMessages?.some(
-      (message) =>
-        !baselineMessageIds.has(message.id) && message.role === "assistant",
-    ) ?? false;
-  const stateAdvanced =
-    state?.version !== undefined &&
-    state.version !== null &&
-    state.version > (baselineVersion ?? 0);
-  const durableEvidence = newDurableUser || newAssistant || stateAdvanced;
+  const newAssistant = freshMessages?.some((message) =>
+    !baselineMessageIds.has(message.id) && message.role === "assistant"
+  ) ?? false;
+  const stateAdvanced = state?.version != null && state.version > (baselineVersion ?? 0);
+  // State advances and assistant rows can belong to another turn. The
+  // acceptance identity is the only proof that a new POST was saved.
+  const durableEvidence = clientRequestId !== undefined
+    ? newDurableUser
+    : newDurableUser || newAssistant || stateAdvanced;
 
   useSessionStore.setState((s) => {
     const previousVersion = s.compositionState?.version ?? null;
@@ -1024,62 +753,117 @@ async function resyncAfterAmbiguousComposeFailure(
   void refreshInterpretationEventsForSession(sessionId);
 }
 
-/**
- * Guided sibling of resyncAfterAbortedComposeTurn (elspeth-b2d9e4d084): an
- * aborted guided chat turn keeps running server-side until the disconnect
- * watcher cancels it, and everything it committed before the cancel
- * (chat_history turns, step results, composition-state advances from the
- * step-1 upload commit path) is durable. Guided state is
- * server-authoritative, so the resync is a single GET /guided refetch —
- * applied under the same quiescence wait and poller-generation fence as
- * the freeform resync, and best-effort for the same reasons.
- */
-async function resyncAfterAbortedGuidedTurn(
+/** Reconcile an ingress receipt without ever starting a second model call. */
+async function reconcileAcceptedSend(
   sessionId: string,
-  ownerGeneration: number,
+  localMessageId: string,
+  clientRequestId: string,
+  canonicalUserMessageId: string,
+  inflightGeneration: number,
+  progressGeneration: number,
 ): Promise<void> {
-  const superseded = () =>
-    useSessionStore.getState().activeSessionId !== sessionId ||
-    composerProgressPollGeneration !== ownerGeneration;
-  await waitForCancelledComposeToSettle(sessionId, ownerGeneration);
-  if (superseded()) {
-    return;
-  }
-  let guided: GetGuidedResponse | undefined;
+  const current = () =>
+    freeformComposeClaimIsCurrent(sessionId, inflightGeneration) &&
+    composerProgressPollGeneration === progressGeneration;
+  // Stop both periodic readers first. A progress tick that starts while a
+  // slow state/proposal read is pending would otherwise claim a later ticket
+  // and make the receipt's complete four-surface snapshot look stale.
+  useSessionStore.getState().stopInflightMessagesPolling(sessionId, inflightGeneration);
+  useSessionStore.getState().stopComposerProgressPolling(sessionId, progressGeneration);
+  const messageTicket = ++inflightMessagesReadTicket;
+  const progressTicket = ++composerProgressReadTicket;
+  const proposalSnapshot = beginProposalSnapshot();
+  const stateAtDispatch = useSessionStore.getState().compositionState;
+  const stateLoadedAtDispatch = useSessionStore.getState().compositionStateLoaded;
+  const acceptedDecisionAtDispatch = acceptedProposalDecisionSequence;
   try {
-    guided = await api.getGuided(sessionId);
-  } catch {
-    // Best-effort: the abort copy is already on screen.
-    return;
-  }
-  const resynced = guided;
-  if (resynced == null || superseded()) {
-    return;
-  }
-  useSessionStore.setState((s) => {
-    const previousVersion = s.compositionState?.version ?? null;
-    const newVersion = resynced.composition_state?.version ?? null;
-    // R4-H3 mirror of the compose branches: a new state version
-    // invalidates any validation verdict rendered against the old one.
-    if (newVersion !== null && newVersion !== previousVersion) {
-      getExecutionStore().clearValidation();
+    const [messages, state, proposals, progress] = await Promise.all([
+      api.fetchMessages(sessionId),
+      api.fetchCompositionState(sessionId),
+      api.fetchCompositionProposals(sessionId),
+      api.fetchComposerProgress(sessionId),
+    ]);
+    if (!current()) return;
+    if (!messages.some((message) =>
+      message.id === canonicalUserMessageId &&
+      message.role === "user" &&
+      message.client_request_id === clientRequestId
+    )) {
+      throw new Error("Accepted message is not yet visible in the transcript");
     }
-    return {
-      guidedSession: resynced.guided_session,
-      guidedNextTurn: resynced.next_turn,
-      guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-      guidedReviewedComponents: selectGuidedReviewedComponents(
-        resynced.guided_session,
-      ),
-      guidedTerminal: resynced.terminal ?? s.guidedTerminal,
-      compositionState: resynced.composition_state ?? s.compositionState,
-    };
-  });
-  // The cancelled turn may have created blobs (step-1 upload path) or
-  // minted interpretation reviews before the cancel landed.
-  useBlobStore.getState().loadBlobs(sessionId);
-  void refreshInterpretationEventsForSession(sessionId);
+    if (messageTicket <= inflightMessagesAppliedTicket || progressTicket <= composerProgressAppliedTicket) {
+      throw new Error("A newer session snapshot owns the display");
+    }
+    inflightMessagesAppliedTicket = messageTicket;
+    composerProgressAppliedTicket = progressTicket;
+    useSessionStore.setState((s) => {
+      if (!current()) return s;
+      const localIntent = s.messages.find((message) =>
+        message.id === localMessageId ||
+        (message.role === "user" && message.client_request_id === clientRequestId)
+      );
+      const acceptedIndex = messages.findIndex((message) => message.id === canonicalUserMessageId);
+      const isLastUser = !messages.slice(acceptedIndex + 1).some((message) => message.role === "user");
+      const hasReply = hasGenuineReplyForUser(messages, acceptedIndex);
+      const canDeliberatelyRetry = isLastUser && !hasReply &&
+        (progress.inflight_requests ?? 0) === 0 &&
+        (progress.phase === "idle" || TERMINAL_COMPOSER_PROGRESS_PHASES.has(progress.phase));
+      const reconciledMessages = canDeliberatelyRetry
+        ? messages.map((message) => message.id === canonicalUserMessageId
+          ? {
+              ...message,
+              local_status: "failed" as const,
+              local_error: "Your message was saved, but no reply is available. Retry to request a response.",
+              local_failure_code: localIntent?.local_failure_code,
+            }
+          : message)
+        : messages;
+      // A proposal acceptance can replace the pipeline while these four
+      // reads are pending. Its receipt and hydration own that newer state.
+      const stateSuperseded = acceptedProposalDecisionSequence !== acceptedDecisionAtDispatch ||
+        s.compositionState !== stateAtDispatch ||
+        s.compositionStateLoaded !== stateLoadedAtDispatch;
+      const nextState = stateSuperseded ? s.compositionState : state ?? s.compositionState;
+      const previousVersion = s.compositionState?.version ?? null;
+      if (!stateSuperseded && nextState?.version != null && nextState.version !== previousVersion) {
+        getExecutionStore().clearValidation();
+      }
+      const nodeStillExists = !s.selectedNodeId ||
+        nextState?.nodes.some((node) => node.id === s.selectedNodeId);
+      return {
+        messages: reconciledMessages,
+        compositionState: nextState,
+        compositionProposals: proposalSnapshot.reconcile(s.compositionProposals, proposals),
+        composerProgress: progress.phase === "idle" ? null : progress,
+        isComposing: false,
+        error: canDeliberatelyRetry
+          ? "Your message was saved without a reply. Retry the saved message to request a response."
+          : "Your message was saved. The latest session state is shown.",
+        ...(nodeStillExists ? {} : { selectedNodeId: null }),
+      };
+    });
+    useBlobStore.getState().loadBlobs(sessionId);
+    void useSessionStore.getState().loadSessions();
+    void refreshInterpretationEventsForSession(sessionId);
+  } catch {
+    if (!current()) return;
+    useSessionStore.setState((s) => ({
+      isComposing: false,
+      error: "Your message was saved, but the latest session state could not be confirmed. Retry to refresh it; this will not resend the message.",
+      messages: s.messages.map((message) =>
+        message.id === localMessageId ||
+        (message.role === "user" && message.client_request_id === clientRequestId)
+        ? {
+            ...message,
+            local_status: "failed",
+            local_error: "Message saved; retry to refresh the session without resending.",
+            local_accepted_user_message_id: canonicalUserMessageId,
+          }
+        : message),
+    }));
+  }
 }
+
 
 function mergeCompositionProposals(
   existing: CompositionProposal[],
@@ -1098,6 +882,19 @@ function mergeCompositionProposals(
 }
 
 let proposalSnapshotSequence = 0;
+let acceptedProposalDecisionSequence = 0;
+
+/** A tool-call row is narration; only the final answer closes this user turn. */
+function hasGenuineReplyForUser(messages: ChatMessage[], userIndex: number): boolean {
+  for (let index = userIndex + 1; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (message.role === "user") break;
+    if (message.role === "assistant" && message.content.length > 0 && isGenuineReply(message)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /** A list read may retire only proposals it knew about when dispatched. */
 function beginProposalSnapshot(): {
@@ -1118,187 +915,12 @@ function beginProposalSnapshot(): {
   };
 }
 
-// turn_not_emitted self-heal bookkeeping (C-3, composer first-principles
-// review 2026-07-04): counts consecutive turn_not_emitted rejections per
-// session so respondGuided's self-heal (refetch GET /guided, re-render the
-// current turn) cannot loop forever if the refetch doesn't actually resolve
-// the staleness. Deliberately module-scope, NOT store state — it is retry
-// bookkeeping the UI never reads, not reactive data; keeping it off `set`/
-// `get` keeps the public store surface unchanged. Reset on a successful
-// respond (see respondGuided's success branch) so a session that heals once
-// and later hits a genuinely new staleness gets a fresh budget.
-const turnNotEmittedSelfHealCounts = new Map<string, number>();
-const MAX_TURN_NOT_EMITTED_SELF_HEALS = 1;
 
-/**
- * The exit-to-freeform guided-respond body: sets control_signal and nulls
- * every choice field. Exported so it is a single literal shared by
- * exitToFreeform (below, sugar over respondGuided for the already-active
- * session) and TutorialGuidedShell's startup exit path, which cannot use
- * respondGuided/exitToFreeform for a session that is not yet the store's
- * active session (see applyGuidedResponse) and so must call the raw
- * api.respondGuided directly with the same body.
- */
-export const EXIT_TO_FREEFORM_ACTION = Object.freeze({
-  chosen: null,
-  edited_values: null,
-  custom_inputs: null,
-  proposal_id: null,
-  draft_hash: null,
-  edit_target: null,
-  control_signal: "exit_to_freeform",
-} satisfies GuidedRespondAction);
 
-// Resetting guided-mode state landed in five places: initialState plus
-// the four navigation actions that switch session context (createSession,
-// archiveSession's active-session branch, selectSession, forkFromMessage).
-// Phase A slice 4 grew this from three fields to four (added
-// guidedChatPending); a future per-step opener field would grow it again.
-// Pulling the literal into a single helper means adding a future field
-// updates one place — TypeScript exhaustiveness over the Pick<> return
-// then forces every call site through the type system instead of through
-// grep-and-edit discipline.  See elspeth-obs-01f85f94b5.
-function clearedGuidedState(): Pick<
-  SessionState,
-  | "guidedSession"
-  | "guidedNextTurn"
-  | "guidedTerminal"
-  | "guidedProposalReview"
-  | "guidedReviewedComponents"
-  | "guidedChatPending"
-  | "guidedResponsePending"
-  | "guidedSelfHealNotice"
-  | "guidedApprovalNotice"
-> {
-  // Nulling the owner generation is safe for every caller because none of them
-  // can run while a guided mutation is in flight. Most are full guided-context
-  // resets (initialisation or session navigation), where no in-flight respond
-  // retains ownership across the boundary. The one mid-session caller —
-  // exitToFreeform's pre-goal drop of the adopted stub — is not such a reset,
-  // so it carries the in-flight gate itself and reaches here only with both
-  // pending bits false.
-  guidedResponsePendingOwnerGeneration = null;
-  return {
-    guidedSession: null,
-    guidedNextTurn: null,
-    guidedTerminal: null,
-    guidedProposalReview: null,
-    guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
-    guidedChatPending: false,
-    guidedResponsePending: false,
-    guidedSelfHealNotice: null,
-    guidedApprovalNotice: null,
-  };
-}
 
-// C-4a (composer first-principles review 2026-07-04): resume guided state on
-// session select/reload, so a browser reload mid-guided-build no longer
-// strands the user in freeform with the stepper and current decision gone.
-//
-// There is no cheap client-side signal for "has this session ever touched
-// guided mode" — the session-list summary (types/index.ts Session) carries
-// no guided marker, and CompositionStateResponse's composer_meta (which DOES
-// carry a server-internal guided_session key — schemas.py:252) is never
-// exposed on the wire to the frontend (types/index.ts CompositionState has
-// no composer_meta field at all). So this is a fetch-and-tolerate probe, not
-// a conditional skip: GET /guided 400s with exactly one shape when the
-// session has no guided_session attached (a plain freeform session) — see
-// get_guided's single 400 raise in routes/composer/guided.py — so any
-// caught error here is treated as "this session is freeform-only", not
-// surfaced as a selectSession failure. Select-session callers tolerate a
-// non-400 failure because guided restoration is not load-bearing there;
-// mutation callers can request propagation so a multi-request action retains
-// its operation custody until every authoritative read has succeeded.
-/**
- * Three-way probe result (goal-first, elspeth-378cfa0e18).
- *
- * "stub" and "none" used to collapse into a single null. They cannot any more:
- * a guided-DEFAULT session that has not yet received its goal persists NOTHING
- * (`enterGuided()` adopts the in-memory stub instead of converting), so on
- * reload the ONLY signal that it belongs on the guided surface is the stub plus
- * the account's default-mode preference. Collapsing the two would land that
- * reload in freeform — the very defect convert's spurious rootless checkpoint
- * used to paper over. "none" still means a genuinely freeform-only session (the
- * successful null probe) or a probe that failed.
- */
-type GuidedSelectProbe =
-  | { kind: "state"; response: GetGuidedResponse }
-  | { kind: "stub"; response: GetGuidedResponse }
-  | { kind: "none" };
 
-async function fetchGuidedStateForSelect(
-  sessionId: string,
-  unexpectedFailure: "tolerate" | "throw" = "tolerate",
-): Promise<GuidedSelectProbe> {
-  try {
-    const response = await api.getGuided(sessionId, undefined, true);
-    if (response === null) return { kind: "none" };
-    // GET /guided is non-mutating on a session with NO persisted
-    // CompositionState record yet: get_guided's docstring documents that it
-    // returns a lazy in-memory stub GuidedSession + first turn with
-    // composition_state: null, so a user who deliberately clicks "Switch to
-    // guided" on a genuinely blank session gets an initial turn without
-    // writing a spurious empty version. That stub is NOT evidence this
-    // session was ever actually in guided mode — adopting it unconditionally
-    // here would flip a brand-new, freeform-preferring session straight into
-    // the guided surface on its very first load, for no reason the user asked
-    // for. Only a response with a non-null composition_state confirms a REAL,
-    // persisted guided_session (the probe returns null whenever the
-    // persisted state's guided_session key is unset, so a
-    // real composition_state here means it was genuinely set). The stub is
-    // reported separately so the ONE caller that has a reason to adopt it —
-    // selectSession under a guided default mode — can, and no other does.
-    return response.composition_state !== null
-      ? { kind: "state", response }
-      : { kind: "stub", response };
-  } catch (err) {
-    // Freeform is a successful null response. Failures (500 on corrupt
-    // guided state, 502 during a backend
-    // restart, a network blip) still degrades to freeform because guided
-    // restore is best-effort — but it is NOT the same as "never used guided",
-    // so surface it in the console so a genuinely stranded mid-build session
-    // is at least diagnosable rather than silently indistinguishable.
-    const status = (err as ApiError | undefined)?.status;
-    if (unexpectedFailure === "throw") {
-      throw err;
-    }
-    console.warn(
-      `[sessionStore] guided-state probe for session ${sessionId} failed (status ${status ?? "unknown"}); ` +
-        "falling back to freeform. If this session was mid-guided-build, its state was not restored.",
-    );
-    return { kind: "none" };
-  }
-}
 
-/**
- * The persisted-state arm of a probe, or null — the shape the two callers that
- * must NOT adopt a stub (fork hydration, version revert) consume. Both re-derive
- * the guided surface from what a version actually IS; a lazy stub says only that
- * the session could start guided, never that this version did.
- */
-function persistedGuidedState(
-  probe: GuidedSelectProbe,
-): GetGuidedResponse | null {
-  return probe.kind === "state" ? probe.response : null;
-}
 
-/**
- * True when the account's default composer mode is guided.
- *
- * Failure is NOT guided: `resolveDefaultMode` throws when the preferences
- * bootstrap could not produce a mode, and session selection must not become an
- * error (or silently flip surfaces) because a preferences read blipped. The
- * caller's fallback — freeform — is the same one createSession degrades to.
- */
-async function guidedDefaultModePreferred(): Promise<boolean> {
-  try {
-    return (
-      (await usePreferencesStore.getState().resolveDefaultMode()) === "guided"
-    );
-  } catch {
-    return false;
-  }
-}
 
 function mergeAuthoritativeForkChild(
   current: Session[],
@@ -1401,14 +1023,6 @@ interface SessionState {
   proposalActionPendingIds: string[];
   composerProgress: ComposerProgressSnapshot | null;
   isComposing: boolean;
-  /**
-   * The single reactive source of truth for "a known-good compose abort ceiling
-   * exists". Set true by App.checkHealth once GET /api/system/status supplies a
-   * valid backend compose wall clock (applyServerComposerTimeout applied). FALSE
-   * until then, gating every Send affordance (freeform, guided, side-rail Apply)
-   * so no compose request is scheduled against the stale default abort ceiling
-   * during the boot window (bootstrap race).
-   */
   composeTimeoutReady: boolean;
   setComposeTimeoutReady: (ready: boolean) => void;
   /**
@@ -1472,19 +1086,6 @@ interface SessionState {
   loadSessions: () => Promise<void>;
   createSession: () => Promise<void>;
   selectSession: (id: string) => Promise<void>;
-  /**
-   * Bind `activeSessionId` to `sessionId` and clear every field a stale
-   * previous session (including a completed guided/tutorial one) could
-   * leave behind — the same "start clean" fields `selectSession` clears,
-   * but WITHOUT its subsequent fetch-and-populate tail. Used by
-   * TutorialGuidedShell's mount effect, which must bind the session BEFORE
-   * calling startGuided/getTutorialSample and has no composition state of
-   * its own to fetch. Previously that mount effect hand-mirrored this
-   * field list in a raw `useSessionStore.setState()` call — a silent-drift
-   * seam where a new SessionState field added elsewhere would never be
-   * reflected there without someone remembering to touch the shell too.
-   * Routing it through this one action means the field list lives here.
-   */
   resetForTutorialSession: (sessionId: string) => void;
   /**
    * Release the active-session binding when `sessionId` turns out not to
@@ -1499,7 +1100,7 @@ interface SessionState {
   unbindMissingSession: (sessionId: string) => void;
   renameSession: (id: string, title: string) => Promise<void>;
   archiveSession: (id: string) => Promise<void>;
-  sendMessage: (content: string, signal?: AbortSignal) => Promise<void>;
+  sendMessage: (content: string, signal?: AbortSignal, retryLocalMessageId?: string) => Promise<void>;
   loadCompositionProposals: (sessionId?: string) => Promise<void>;
   acceptProposal: (proposalId: string) => Promise<void>;
   rejectProposal: (proposalId: string) => Promise<void>;
@@ -1550,153 +1151,6 @@ interface SessionState {
   revertToVersion: (stateId: string) => Promise<void>;
   applyResolvedInterpretation: (newState: CompositionState | null) => void;
 
-  // Guided-mode protocol state — all three are null when not in a guided session
-  guidedSession: GuidedSession | null;
-  guidedNextTurn: TurnPayload | null;
-  guidedTerminal: TerminalState | null;
-  /** Exact proposal/hash-bound lifecycle for the current proposal controls. */
-  guidedProposalReview: GuidedProposalReviewState | null;
-  /**
-   * Reviewed source/output ledger (elspeth-9f0873426a, server-projected by
-   * elspeth-f2a8550b3d): the settled components, so the Pipeline pane can
-   * draw them before a proposal exists — the pre-commit composition is empty
-   * by design.
-   *
-   * Read straight off the published `guided_session.reviewed_components`
-   * through `selectGuidedReviewedComponents`; it is NOT folded from turns any
-   * more, so a reload mid-build and a completed session (no `next_turn` to
-   * fold) both name what was agreed. Written wherever guidedSession is
-   * published — the same discipline as guidedProposalReview — and reset with
-   * the rest of the guided context. The one deliberate divergence from the
-   * published session is the refresh-required path below, which drops the
-   * ledger because this view has stopped being authoritative.
-   */
-  guidedReviewedComponents: GuidedReviewedComponents;
-  // Per-step chat (Phase A slice 5).  The history itself lives on
-  // `guidedSession.chat_history` (server-authoritative); only the in-flight
-  // pending flag is local state.  Slice 4 carried an in-memory
-  // guidedChatHistory array; slice 5 replaced it with the wire field.
-  guidedChatPending: boolean;
-  // In-flight wizard answer flag. Distinct from guidedChatPending: this blocks
-  // turn-answer buttons while the server-authoritative state machine advances.
-  guidedResponsePending: boolean;
-  /**
-   * Transient, non-alarming notice shown after a turn_not_emitted self-heal
-   * (C-3, composer first-principles review 2026-07-04): respondGuided's
-   * catch detected the client's view of the current turn was stale, silently
-   * refetched GET /guided, and re-rendered the (possibly new) current turn
-   * instead of leaving the raw protocol instruction ("Fetch GET
-   * /api/sessions/{id}/guided first") in the user's alert banner. Kept
-   * SEPARATE from `error` — ChatPanel renders this via role="status"
-   * (polite), not role="alert" like `error`/`errorDetails`: a resync is not
-   * a failure. Cleared at the start of the next guided respond/chat attempt
-   * and by clearError().
-   */
-  guidedSelfHealNotice: string | null;
-  /**
-   * Why a one-click "Approve wiring" stopped at the wire review instead of
-   * confirming (see `approveWiring`). Kept SEPARATE from `error` for the same
-   * reason `guidedSelfHealNotice` is: a refused shortcut is not a failure —
-   * ChatPanel renders it role="status" (polite). Null whenever the last
-   * approval confirmed or none has run. Same lifecycle as its sibling above:
-   * cleared at the start of the next guided respond/chat attempt and by
-   * clearError().
-   */
-  guidedApprovalNotice: string | null;
-  // Guided-mode actions
-  startGuided: (sessionId: string) => Promise<void>;
-  /**
-   * Programmatic POST /guided/start for a caller that already holds the
-   * session's root intent — today the tutorial shell, which seeds the frozen
-   * lesson prompt as the goal. `intent` is required for every profile: the
-   * server refuses an intent-less start, so a planner run can never be reached
-   * without a visible root. Retry custody is keyed on `[profileKind, intent]`,
-   * so a replayed descriptor can only ever re-fire the same start.
-   */
-  seedGuided: (
-    sessionId: string,
-    profileKind: "tutorial",
-    intent: string,
-  ) => Promise<void>;
-  respondGuided: (body: GuidedRespondAction) => Promise<GuidedRespondOutcome>;
-  /**
-   * Approve the proposed wiring without opening the wire review.
-   *
-   * Necessarily TWO dispatches: the server's step-3 action shape rejects a
-   * `confirm_wiring` outright (guided.py), and the wire verdict this must
-   * respect — `can_confirm`, `blockers`, `warnings` — is only computed
-   * server-side DURING the review_wiring transition. So this dispatches
-   * review_wiring, reads the wire turn that came back, and confirms only if
-   * `approvalStopReason` clears it. Both dispatches go through the ordinary
-   * `respondGuided`, so ownership, retry custody and audit are exactly what a
-   * user clicking through fast produces — this adds no new protocol action.
-   *
-   * `clientBlockers` is a CALLBACK, not a snapshot: the transition itself can
-   * create the pending acknowledgements that must stop the approval, so it is
-   * read after the review dispatch lands, never before. It stays a callback
-   * (rather than the store reading the events itself) because the single
-   * `isPendingAcknowledgement` predicate lives with the cards in components/,
-   * and duplicating it here is exactly the drift its docstring forbids.
-   *
-   * On a stop the user is left on the wire review the first dispatch already
-   * rendered, with `guidedApprovalNotice` explaining why.
-   */
-  approveWiring: (
-    reviewBody: GuidedRespondAction,
-    clientBlockers: () => WiringApprovalClientBlockers,
-  ) => Promise<WiringApprovalOutcome>;
-  /**
-   * Apply a GuidedRespondResponse to the store: atomically replace the 4 wire
-   * fields, await the B1/D12 interpretation-event refresh, and clear the C-3
-   * turn_not_emitted self-heal bookkeeping. Extracted from respondGuided's
-   * success path so TutorialGuidedShell's not-yet-active exit path — which
-   * must call the raw api.respondGuided directly with an explicit sessionId,
-   * since respondGuided/exitToFreeform both key off get().activeSessionId —
-   * applies the response through the SAME bookkeeping instead of a forked
-   * copy that silently drifts as this evolves. Takes sessionId explicitly
-   * (not get().activeSessionId) so it can no-op correctly if the session it
-   * belongs to is no longer active by the time it lands.
-   */
-  applyGuidedResponse: (
-    sessionId: string,
-    response: GuidedRespondResponse,
-    expectedPublicationGeneration?: number,
-  ) => Promise<boolean>;
-  reenterGuided: () => Promise<void>;
-  // Convert a WORKED freeform session into guided mode (POST /guided/convert).
-  // Unlike startGuided's GET, this works for a session whose persisted state
-  // carries no guided_session and which GET rejects with 400: it seeds a fresh
-  // wizard rooted on `intent` as a new version, leaving the freeform pipeline
-  // recoverable via version history. NOT idempotent any more: an already-guided
-  // session 409s rather than silently discarding the caller's goal, so this must
-  // be reached only through enterGuided's GET-first probe.
-  convertToGuided: (sessionId: string, intent: string) => Promise<void>;
-  // Unified entry point used by createSession's guided-default arm. GET-FIRST
-  // (elspeth-378cfa0e18): it probes GET /guided and branches on what came back,
-  // so no path writes a rootless wizard the user never asked for.
-  //   * terminal.kind === "exited_to_freeform"   => reenterGuided
-  //   * stub (200, composition_state null), no intent
-  //                                              => adopt the stub; the panel
-  //                                                 opens on the goal card and
-  //                                                 NOTHING is persisted
-  //   * stub, with an intent                     => POST /guided/start with it
-  //   * null (worked freeform), with an intent   => convertToGuided(intent)
-  //   * null, no intent                          => store guard (a goal is
-  //                                                 required); unreachable from
-  //                                                 the UI, which always
-  //                                                 collects one first
-  //   * 200 with persisted state                 => adopt it unchanged
-  // The button stays a single affordance with one label regardless of branch.
-  enterGuided: (intent?: string) => Promise<void>;
-  // `signal` aborts the underlying fetch (Stop button / client timeout) — the
-  // guided mirror of sendMessage's AbortController plumbing (useComposer).
-  chatGuided: (
-    message: string,
-    signal?: AbortSignal,
-    revisionMode?: GuidedRevisionMode,
-    retryTurnToken?: string,
-  ) => Promise<void>;
-  exitToFreeform: () => Promise<GuidedRespondOutcome>;
   clearError: () => void;
   injectSystemMessage: (content: string, stableId?: string) => void;
   reset: () => void;
@@ -1727,7 +1181,6 @@ const initialState = {
   errorDetails: null as string[] | null,
   selectedNodeId: null as string | null,
   authoringFocusRequested: false,
-  ...clearedGuidedState(),
   ...clearedRecoveryState(),
 };
 
@@ -1792,13 +1245,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async createSession() {
-    // Phase 1B Panel M1: the session-create and prefs-resolve calls live in
-    // SEPARATE try blocks so a preferences-bootstrap failure does NOT mask
-    // a successful session creation. The earlier single-try shape attributed
-    // a prefs-bootstrap rejection to "Failed to create session", which lied
-    // to the user: the session was created and is now their active session,
-    // but they were told it wasn't. We now surface a prefs-specific error
-    // for the second branch so the message matches the actual failure.
     let session;
     try {
       session = await api.createSession();
@@ -1808,7 +1254,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
-    advanceGuidedPublicationGeneration();
+    advanceSessionPublicationGeneration();
     useBlobStore.getState().activateSession(session.id);
     set((state) => ({
       sessions: [session, ...state.sessions],
@@ -1838,32 +1284,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // SWITCHES deliberately do not set it: revisiting an existing session
       // honours the standing collapsed preference.
       authoringFocusRequested: true,
-      ...clearedGuidedState(),
       ...clearedRecoveryState(),
     }));
-    // Phase 1B — honour the account-level default-mode preference.
-    // resolveDefaultMode() awaits the preferences bootstrap if it
-    // hasn't completed yet (Ctrl+N race: user hits "new session" before
-    // App.tsx's bootstrap effect has resolved). Guided users enter via
-    // enterGuided().
-    // A failure here surfaces a *prefs-specific* error; the session is
-    // already live and usable in freeform, so the message reflects only
-    // the secondary failure (couldn't honour your guided default).
-    try {
-      const mode = await usePreferencesStore.getState().resolveDefaultMode();
-      if (mode === "guided") {
-        if (get().activeSessionId !== session.id) {
-          return;
-        }
-        await get().enterGuided();
-      }
-    } catch {
-      set({
-        error:
-          "Session created, but couldn't apply your default mode. " +
-          "You're in freeform; set the default mode for new sessions in Preferences.",
-      });
-    }
   },
 
   async archiveSession(id: string) {
@@ -1873,7 +1295,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (wasActive) {
         clearComposerProgressPollTimer();
         clearInflightMessagesPollTimer();
-        advanceGuidedPublicationGeneration();
+        advanceSessionPublicationGeneration();
         useBlobStore.getState().activateSession(null);
       }
       set((state) => {
@@ -1895,7 +1317,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
                 stateVersions: [],
                 isComposing: false,
                 selectedNodeId: null,
-                ...clearedGuidedState(),
                 ...clearedRecoveryState(),
               }
             : {}),
@@ -1934,17 +1355,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async selectSession(id: string) {
-    // R4-H3: Clear validation when switching sessions to prevent
-    // stale validation from a previous session being visible
     getExecutionStore().clearValidation();
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
-    // Session activation is a load path: descriptors this page load cannot
-    // replay have no custody value here and must never block the surface
-    // (session 09cde460). The activation's own authoritative reads are the
-    // state reconciliation.
-    clearOrphanedGuidedRetriesForSession(id);
-    const selectionGeneration = advanceGuidedPublicationGeneration();
+    // Activation's authoritative reads supersede orphaned browser descriptors.
+    clearOrphanedSessionOperationRetriesForSession(id);
+    const selectionGeneration = advanceSessionPublicationGeneration();
 
     useBlobStore.getState().activateSession(id);
     set({
@@ -1961,134 +1377,31 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       stateVersions: [],
       isComposing: false,
       error: null,
-      selectedNodeId: null, // Clear selection when switching sessions
-      ...clearedGuidedState(),
+      selectedNodeId: null,
       ...clearedRecoveryState(),
     });
 
     try {
-      const [
-        messages,
-        compositionState,
-        compositionProposals,
-        composerPreferences,
-        guided,
-      ] = await Promise.all([
-        api.fetchMessages(id),
-        api.fetchCompositionState(id),
-        api.fetchCompositionProposals(id),
-        api.fetchComposerPreferences(id),
-        fetchGuidedStateForSelect(id),
-      ]);
-      // The user may switch sessions while these requests are in flight.
-      // Drop stale payloads so an older selection cannot overwrite the
-      // newly active session's messages or composition state.
-      if (!guidedPublicationIsCurrent(id, selectionGeneration)) {
-        return;
-      }
-      let restoredGuided = persistedGuidedState(guided);
-      // A goal-first guided session persists NOTHING until the user states a
-      // goal (enterGuided adopts the stub instead of converting), so on reload
-      // the probe returns that same stub and there is no composition state to
-      // recognise it by. Under a GUIDED default mode the stub is what the user
-      // asked for — re-adopt it so the session reopens on the goal card instead
-      // of falling into freeform. Under a freeform default it stays what it has
-      // always been: not evidence of anything, and ignored.
-      //
-      // The preference alone is NOT enough. The stub is not a per-session
-      // signal: GET /guided answers with it for any session that has no
-      // composition state, which includes a worked FREEFORM session whose
-      // conversation never produced one. Adopting those would hide a real
-      // transcript behind the goal card — the guided surface renders the
-      // guided chat_history, not `messages` — and would do it retroactively to
-      // every message-only session the moment the default flipped to guided.
-      // An untouched session (the case this adoption exists for) has no
-      // messages at all, and `messages` is already loaded above, so the
-      // evidence about THIS session costs nothing.
-      if (restoredGuided === null && guided.kind === "stub" && messages.length === 0) {
-        if (await guidedDefaultModePreferred()) {
-          restoredGuided = guided.response;
-        }
-        // The preference read can await a preferences bootstrap, so re-check
-        // the selection generation before letting its result reach the store.
-        if (!guidedPublicationIsCurrent(id, selectionGeneration)) {
-          return;
-        }
-      }
+      const [messages, compositionState, compositionProposals, composerPreferences] =
+        await Promise.all([
+          api.fetchMessages(id),
+          api.fetchCompositionState(id),
+          api.fetchCompositionProposals(id),
+          api.fetchComposerPreferences(id),
+        ]);
+      if (!sessionPublicationIsCurrent(id, selectionGeneration)) return;
       set({
         messages,
         compositionState,
         compositionStateLoaded: true,
         compositionProposals: compositionProposals ?? [],
         composerPreferences: composerPreferences ?? null,
-        // C-4a (fp-review 2026-07-04, elspeth-04d2757bf1): resume guided
-        // state when the session has one — a live in-progress build, a
-        // completed build, or an exited-to-freeform terminal all restore
-        // here; ChatPanel's discriminator decides the surface from there
-        // (falling through to freeform for the terminal case exactly as it
-        // already does mid-session). REPLACES the earlier "default-freeform,
-        // never auto-fetch /guided on select" decision — that left a browser
-        // reload mid-guided-build stranded in freeform with the stepper and
-        // current decision gone (guidedSession stayed null until the user
-        // manually clicked "Switch to guided", which then mis-routed:
-        // enterGuided() saw no terminal on a null session and took the
-        // startGuided/GET branch, which just re-observed the same terminal
-        // and landed back in freeform with zero feedback — see C-4b). A
-        // session that never touched guided mode still lands in freeform:
-        // the probe reports "none" (fetchGuidedStateForSelect's
-        // fetch-and-tolerate), and a stub is adopted only under a guided
-        // default (see restoredGuided above).
-        ...(restoredGuided !== null
-          ? {
-              guidedSession: restoredGuided.guided_session,
-              guidedNextTurn: restoredGuided.next_turn,
-              guidedTerminal: restoredGuided.terminal,
-              guidedProposalReview: proposalReviewForTurn(
-                restoredGuided.next_turn,
-              ),
-              // A resumed session gets the SERVER's ledger, not one folded
-              // from its current turn: the whole point of the projected
-              // field is that a reload mid-build (and a completed session,
-              // which has no turn at all) still names what was settled.
-              guidedReviewedComponents: selectGuidedReviewedComponents(
-                restoredGuided.guided_session,
-              ),
-            }
-          : {}),
       });
-
-      const guidedStartRetry = findGuidedRetry("guided_start", id);
-      if (guidedStartRetry !== null) {
-        const reconciliation = await reconcileGuidedStartRetry(
-          guidedStartRetry,
-          selectionGeneration,
-        );
-        if (!guidedPublicationIsCurrent(id, selectionGeneration)) return;
-        if (reconciliation === "in_progress") {
-          set({ error: GUIDED_START_IN_PROGRESS_MESSAGE, errorDetails: null });
-        } else if (reconciliation === "unknown") {
-          set({ error: GUIDED_START_UNKNOWN_MESSAGE, errorDetails: null });
-        }
-      }
-
-      // Fire-and-forget: refresh blob list for the newly selected session
       useBlobStore.getState().loadBlobs(id);
-
-      // Phase 5b Task 3 — rehydrate interpretation-event projection for
-      // the newly selected session.  Fire-and-forget: a failure on this
-      // route must not block session selection (the readiness panel will
-      // simply show stale/empty counts until the next refresh).  The
-      // store keys by session_id, so navigating back to a previously
-      // visited session preserves its prior pending events without a
-      // reset.  Tests #6 and #7 in interpretationEventsStore.test.ts
-      // cover the session-load and session-change behaviours.
       void useInterpretationEventsStore.getState().refreshAll(id);
     } catch (err) {
-      if (
-        (err as ApiError).status === 404 &&
-        guidedPublicationIsCurrent(id, selectionGeneration)
-      ) {
-        advanceGuidedPublicationGeneration();
+      if ((err as ApiError).status === 404 && sessionPublicationIsCurrent(id, selectionGeneration)) {
+        advanceSessionPublicationGeneration();
         useBlobStore.getState().activateSession(null);
         set({
           activeSessionId: null,
@@ -2104,16 +1417,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           isComposing: false,
           error: null,
           selectedNodeId: null,
-          ...clearedGuidedState(),
           ...clearedRecoveryState(),
         });
         return;
       }
-      if (guidedPublicationIsCurrent(id, selectionGeneration)) {
-        // The fetch settled (failed) — the composition state is as known as
-        // it will get without a retry. Marking loaded lets deferred
-        // consumers (the #/{id}/yaml gate) resolve to "no content" instead
-        // of waiting forever.
+      if (sessionPublicationIsCurrent(id, selectionGeneration)) {
         set({
           error: "Failed to load session. Please refresh the page.",
           compositionStateLoaded: true,
@@ -2123,7 +1431,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   resetForTutorialSession(sessionId: string) {
-    advanceGuidedPublicationGeneration();
+    advanceSessionPublicationGeneration();
     useBlobStore.getState().activateSession(sessionId);
     set({
       activeSessionId: sessionId,
@@ -2139,7 +1447,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isComposing: false,
       error: null,
       selectedNodeId: null,
-      ...clearedGuidedState(),
       ...clearedRecoveryState(),
     });
   },
@@ -2150,7 +1457,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
-    advanceGuidedPublicationGeneration();
+    advanceSessionPublicationGeneration();
     useBlobStore.getState().activateSession(null);
     set({
       activeSessionId: null,
@@ -2166,12 +1473,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isComposing: false,
       error: null,
       selectedNodeId: null,
-      ...clearedGuidedState(),
       ...clearedRecoveryState(),
     });
   },
 
-  async sendMessage(content: string, signal?: AbortSignal) {
+  async sendMessage(content: string, signal?: AbortSignal, retryLocalMessageId?: string) {
     const { activeSessionId, isComposing } = get();
     if (!activeSessionId) return;
     // Synchronous admission gate (elspeth-3f38ebb1b5): exactly one freeform
@@ -2186,11 +1492,21 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().compositionState?.version ?? null;
     const baselineMessageIds = new Set(get().messages.map((message) => message.id));
 
-    const optimisticMessage: ChatMessage = {
-      id: `local-${crypto.randomUUID()}`,
+    const retriedIntent = retryLocalMessageId
+      ? get().messages.find((message) => message.id === retryLocalMessageId && message.id.startsWith("local-"))
+      : undefined;
+    if (retryLocalMessageId && (!retriedIntent || !retriedIntent.client_request_id)) return;
+    const stateId = retriedIntent
+      ? retriedIntent.local_requested_state_id ?? null
+      : get().compositionState?.id ?? null;
+    const clientRequestId = retriedIntent?.client_request_id ?? crypto.randomUUID();
+    const optimisticMessage: ChatMessage = retriedIntent ?? {
+      id: `local-${clientRequestId}`,
       session_id: activeSessionId,
       role: "user",
       content,
+      client_request_id: clientRequestId,
+      local_requested_state_id: stateId,
       tool_calls: null,
       created_at: new Date().toISOString(),
       local_status: "pending",
@@ -2203,7 +1519,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // In flight the mutation verdict is unknown — a stale verdict from the
       // previous turn must not label this turn's completion badge.
       lastComposeChangedPipeline: null,
-      messages: [...state.messages, optimisticMessage],
+      messages: retriedIntent
+        ? state.messages.map((message) => message.id === optimisticMessage.id
+          ? { ...message, local_status: "pending", local_error: undefined }
+          : message)
+        : [...state.messages, optimisticMessage],
     }));
     const progressPollGeneration =
       get().startComposerProgressPolling(activeSessionId);
@@ -2211,9 +1531,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       get().startInflightMessagesPolling(activeSessionId);
 
     try {
-      const stateId = get().compositionState?.id;
-      const result = await api.sendMessage(activeSessionId, content, stateId, signal);
-      if (get().activeSessionId !== activeSessionId) {
+      const result = await api.sendMessage(activeSessionId, optimisticMessage.content, clientRequestId, stateId, signal);
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Sync the chat panel against the durable DB state before applying the
@@ -2224,9 +1543,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // isComposing) without re-appending the final assistant message that
       // the poll has already pulled in.
       await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
-      // Navigation can also happen during the post-completion message sync.
-      // Keep the compose response scoped to the session that initiated it.
-      if (get().activeSessionId !== activeSessionId) {
+      // Navigation or a newer turn can happen during this sync. The older
+      // response must not publish metadata over the newer turn's state.
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       const { message, state } = result;
@@ -2295,12 +1614,35 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // before send_message returns). Refreshing keeps the session switcher
       // title in step with the DB without a manual reload.
       void get().loadSessions();
-      // Surface any interpretation reviews this compose turn created (see the
-      // invariant on refreshInterpretationEventsForSession). Without this the
-      // freeform inline review widgets never render mid-session. Freeform is
-      // fire-and-forget (`void`); only guided respondGuided awaits the refresh.
       void refreshInterpretationEventsForSession(activeSessionId);
     } catch (err) {
+      const acceptedError = err as ApiError;
+      if (
+        acceptedError.status === 409 &&
+        acceptedError.error_type === "message_already_accepted" &&
+        acceptedError.client_request_id === clientRequestId &&
+        typeof acceptedError.user_message_id === "string"
+      ) {
+        if (freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
+          set((state) => ({
+            isComposing: false,
+            messages: state.messages.map((message) =>
+              message.id === optimisticMessage.id ||
+              (message.role === "user" && message.client_request_id === clientRequestId)
+              ? { ...message, local_accepted_user_message_id: acceptedError.user_message_id }
+              : message),
+          }));
+          await reconcileAcceptedSend(
+            activeSessionId,
+            optimisticMessage.id,
+            clientRequestId,
+            acceptedError.user_message_id,
+            inflightPollGeneration,
+            progressPollGeneration,
+          );
+        }
+        return;
+      }
       let errorMessage: string;
       // Client-side abort (the useComposer COMPOSE_TIMEOUT_MS guard or any
       // user-supplied signal) rejects with the raw abort-reason string, or a
@@ -2338,22 +1680,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // bit instead: saved, no reply.
       const auditIntegrityRefusal =
         !isComposeAbort(err) && apiErr.error_type === "audit_integrity_error";
-      // S1: thread the closed failure code onto the failed row so retry
-      // affordances can suppress themselves for permanent failures
-      // ("policy_blocked" — see the F13-D guided precedent below: a
-      // deployment policy refused the pipeline; retrying cannot succeed).
-      // Only set when the structured error actually carried one.
       const localFailureCode =
-        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
-          ? apiErr.failure_code
-          : undefined;
+        !isComposeAbort(err) && apiErr.error_type === "message_idempotency_conflict"
+          ? "message_idempotency_conflict"
+          : !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+            ? apiErr.failure_code
+            : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
             recoveryStartedCompositionVersion,
           }
         : {};
-      if (get().activeSessionId !== activeSessionId) {
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Applied AFTER recoveryPatch below so a salvaged draft rebaselines the
@@ -2365,7 +1704,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         isComposing: false,
         error: errorMessage,
         messages: state.messages.map((existing) =>
-          existing.id === optimisticMessage.id
+          existing.id === optimisticMessage.id ||
+          (existing.role === "user" && existing.client_request_id === clientRequestId)
             ? auditIntegrityRefusal
               ? {
                   ...existing,
@@ -2402,6 +1742,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           baselineMessageIds,
           optimisticMessage.id,
           content,
+          clientRequestId,
         );
       }
     } finally {
@@ -2422,8 +1763,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   async loadCompositionProposals(sessionId?: string) {
     const targetSessionId = sessionId ?? get().activeSessionId;
     if (!targetSessionId || targetSessionId !== get().activeSessionId) return;
-    const generation = guidedPublicationGeneration;
-    const isCurrent = () => get().activeSessionId === targetSessionId && guidedPublicationGeneration === generation;
+    const generation = sessionPublicationGeneration;
+    const isCurrent = () => get().activeSessionId === targetSessionId && sessionPublicationGeneration === generation;
 
     const snapshot = beginProposalSnapshot();
     try {
@@ -2439,10 +1780,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async acceptProposal(proposalId: string) {
     const { activeSessionId } = get();
-    const publicationGeneration = guidedPublicationGeneration;
+    const publicationGeneration = sessionPublicationGeneration;
     const isCurrent = () =>
       get().activeSessionId === activeSessionId &&
-      guidedPublicationGeneration === publicationGeneration;
+      sessionPublicationGeneration === publicationGeneration;
     if (!activeSessionId) {
       throw new Error("acceptProposal called without active session");
     }
@@ -2462,6 +1803,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           ?.pipeline_metadata?.draft_hash ?? null,
       );
       if (!isCurrent()) return;
+      acceptedProposalDecisionSequence += 1;
       getExecutionStore().clearValidation();
       // The write receipt remains authoritative even if read-model hydration fails.
       // Do not expose the pre-accept pipeline as the accepted composition.
@@ -2495,9 +1837,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           [proposal],
         ),
       }));
-      // Surface any interpretation reviews accepting this proposal created
-      // (see the invariant on refreshInterpretationEventsForSession). Freeform
-      // is fire-and-forget (`void`); only guided respondGuided awaits it.
       void refreshInterpretationEventsForSession(activeSessionId);
     } catch (err) {
       if (isHttpConflict(err)) {
@@ -2545,10 +1884,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   async rejectProposal(proposalId: string) {
     const { activeSessionId } = get();
-    const publicationGeneration = guidedPublicationGeneration;
+    const publicationGeneration = sessionPublicationGeneration;
     const isCurrent = () =>
       get().activeSessionId === activeSessionId &&
-      guidedPublicationGeneration === publicationGeneration;
+      sessionPublicationGeneration === publicationGeneration;
     if (!activeSessionId) {
       throw new Error("rejectProposal called without active session");
     }
@@ -2658,15 +1997,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       composerProgressAppliedTicket = readTicket;
       const isTerminal = TERMINAL_COMPOSER_PROGRESS_PHASES.has(progress.phase);
       if (options?.discardStaleTerminal && isTerminal && !composerProgressPollSeenNonTerminal) {
-        // Stale carry-over from the PREVIOUS turn's terminal snapshot,
-        // fetched before this compose's own "starting" event has landed in
-        // the registry — drop it rather than flash a "done" state at the
-        // start of a fresh compose. Callers outside the poll session (the
-        // explicit final load in sendMessage/retryMessage/chatGuided's
-        // finally, after stopComposerProgressPolling) don't pass
-        // discardStaleTerminal — that one-shot load runs strictly after the
-        // request settles, so the registry can only hold THIS turn's own
-        // terminal event by then, never stale data.
         return;
       }
       if (progress.phase !== "idle" && !isTerminal) {
@@ -2773,10 +2103,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const survivors = localOptimistic.filter(
           (local) =>
             !fresh.some(
-              (f) => f.role === local.role && f.content === local.content,
+              (f) => f.role === "user" &&
+                local.client_request_id != null &&
+                f.client_request_id === local.client_request_id,
             ),
         );
-        return { messages: [...fresh, ...survivors] };
+        const reconciled = fresh.map((message, index) => {
+          if (message.role !== "user" || !message.client_request_id) return message;
+          const prior = s.messages.find((existing) =>
+            existing.role === "user" &&
+            existing.client_request_id === message.client_request_id
+          );
+          if (!prior) return message;
+          const hasReply = hasGenuineReplyForUser(fresh, index);
+          return {
+            ...message,
+            local_requested_state_id: prior.local_requested_state_id,
+            local_accepted_user_message_id: prior.local_accepted_user_message_id,
+            ...(!hasReply && prior.local_status === "failed"
+              ? {
+                  local_status: "failed" as const,
+                  local_error: prior.local_error,
+                  local_failure_code: prior.local_failure_code,
+                }
+              : {}),
+          };
+        });
+        return { messages: [...reconciled, ...survivors] };
       });
       return fresh;
     } catch {
@@ -2827,6 +2180,26 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
     const message = messages.find((entry) => entry.id === messageId);
     if (!message || message.role !== "user") return;
+    if (message.client_request_id && message.local_accepted_user_message_id) {
+      set({ error: null });
+      const progressGeneration = get().startComposerProgressPolling(activeSessionId);
+      const inflightGeneration = get().startInflightMessagesPolling(activeSessionId);
+      try {
+        await reconcileAcceptedSend(
+          activeSessionId, message.id, message.client_request_id,
+          message.local_accepted_user_message_id, inflightGeneration, progressGeneration,
+        );
+      } finally {
+        get().stopInflightMessagesPolling(activeSessionId, inflightGeneration);
+        get().stopComposerProgressPolling(activeSessionId, progressGeneration);
+      }
+      return;
+    }
+    if (message.id.startsWith("local-")) {
+      if (!message.client_request_id) return;
+      await get().sendMessage(message.content, signal, message.id);
+      return;
+    }
     const baselineMessageIds = new Set(messages.map((entry) => entry.id));
 
     set((state) => ({
@@ -2850,14 +2223,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // Use recompose (not sendMessage) — the user message is already
       // persisted from the original send. Calling sendMessage again
       // would insert a duplicate user message.
-      const result = await api.recompose(activeSessionId, signal);
-      if (get().activeSessionId !== activeSessionId) {
+      const result = await api.recompose(activeSessionId, messageId, signal);
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Sync the chat panel against the DB state (see sendMessage for
       // rationale).
       await get().loadInflightMessages(activeSessionId, inflightPollGeneration);
-      if (get().activeSessionId !== activeSessionId) {
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       const { message: assistantMessage, state } = result;
@@ -2913,9 +2286,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
       // Fire-and-forget: refresh blob list in case the LLM created files
       useBlobStore.getState().loadBlobs(activeSessionId);
-      // Surface any interpretation reviews this recompose created (see the
-      // invariant on refreshInterpretationEventsForSession). Freeform is
-      // fire-and-forget (`void`); only guided respondGuided awaits it.
       void refreshInterpretationEventsForSession(activeSessionId);
     } catch (err) {
       let errorMessage: string;
@@ -2937,9 +2307,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // with a permanent code ("policy_blocked") must not re-render the
       // Retry invitation it just disproved.
       const localFailureCode =
-        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
-          ? apiErr.failure_code
-          : undefined;
+        !isComposeAbort(err) && apiErr.error_type === "recompose_user_message_mismatch"
+          ? "recompose_user_message_mismatch"
+          : !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+            ? apiErr.failure_code
+            : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -2947,7 +2319,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           }
         : {};
 
-      if (get().activeSessionId !== activeSessionId) {
+      if (!freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
         return;
       }
       // Mirror of the sendMessage catch: the shared 422 handler already
@@ -3013,18 +2385,18 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
-    let acquisition = acquireGuidedRetry("session_fork", activeSessionId, [
+    let acquisition = acquireSessionOperationRetry("session_fork", activeSessionId, [
       messageId,
       newContent,
     ]);
     if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "session_fork", activeSessionId, [
+      acquisition = await reconcileSessionOperationRetryConflict(acquisition.existing, "session_fork", activeSessionId, [
       messageId,
       newContent,
     ]);
     }
     if (acquisition.status === "conflict") {
-      set(guidedRetryConflictState(acquisition.existing.kind));
+      set(sessionOperationRetryConflictState(acquisition.existing.kind));
       return;
     }
     const retry = acquisition.handle;
@@ -3058,26 +2430,24 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         throw new Error("Fork result was not published to the session list");
       }
       if (get().activeSessionId !== activeSessionId) {
-        clearGuidedRetry(retry);
+        clearSessionOperationRetry(retry);
         return;
       }
 
-      const [messages, compositionState, compositionProposals, composerPreferences, guided] =
+      const [messages, compositionState, compositionProposals, composerPreferences] =
         await Promise.all([
           api.fetchMessages(result.session_id),
           api.fetchCompositionState(result.session_id),
           api.fetchCompositionProposals(result.session_id),
           api.fetchComposerPreferences(result.session_id),
-          fetchGuidedStateForSelect(result.session_id, "throw"),
         ]);
       if (!get().sessions.some((session) => session.id === result.session_id)) {
         throw new Error("Published fork result disappeared during hydration");
       }
       if (get().activeSessionId !== activeSessionId) {
-        clearGuidedRetry(retry);
+        clearSessionOperationRetry(retry);
         return;
       }
-      const forkedGuided = persistedGuidedState(guided);
       useBlobStore.getState().activateSession(result.session_id);
       let activatedChild = false;
       set((state) => {
@@ -3085,7 +2455,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           return {};
         }
         activatedChild = true;
-        advanceGuidedPublicationGeneration();
+        advanceSessionPublicationGeneration();
         getExecutionStore().clearValidation();
         return {
           activeSessionId: result.session_id,
@@ -3101,27 +2471,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           isComposing: false,
           error: null,
           selectedNodeId: null,
-          ...clearedGuidedState(),
-          // A fork hydrates from what the CHILD version actually is; a lazy
-          // stub says only that the child could start guided, so it is not
-          // adopted here (persistedGuidedState drops it).
-          ...(forkedGuided !== null
-            ? {
-                guidedSession: forkedGuided.guided_session,
-                guidedNextTurn: forkedGuided.next_turn,
-                guidedTerminal: forkedGuided.terminal,
-                guidedProposalReview: proposalReviewForTurn(
-                  forkedGuided.next_turn,
-                ),
-                guidedReviewedComponents: selectGuidedReviewedComponents(
-                  forkedGuided.guided_session,
-                ),
-              }
-            : {}),
           ...clearedRecoveryState(),
         };
       });
-      clearGuidedRetry(retry);
+      clearSessionOperationRetry(retry);
       if (!activatedChild) {
         return;
       }
@@ -3129,14 +2482,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       void useInterpretationEventsStore.getState().refreshAll(result.session_id);
     } catch (err) {
       if (childPublished && get().activeSessionId !== activeSessionId) {
-        clearGuidedRetry(retry);
+        clearSessionOperationRetry(retry);
       }
       if (
         !responseReceived &&
         !api.isForkCommittedResponseError(err) &&
-        !isAmbiguousGuidedRetryFailure(err)
+        !isAmbiguousSessionOperationRetryFailure(err)
       ) {
-        clearGuidedRetry(retry);
+        clearSessionOperationRetry(retry);
       }
       if (get().activeSessionId === activeSessionId) {
         set({
@@ -3204,1434 +2557,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set(clearedRecoveryState());
   },
 
-  // Guided-mode actions
-  async startGuided(sessionId: string) {
-    // Capture which session this fetch belongs to before the await.
-    // Mirrors the active-session guard in loadComposerProgress:
-    // if the user switches sessions while the request is in flight, the
-    // stale response is silently dropped rather than overwriting the newly
-    // active session's guided state.
-    const requestedSessionId = sessionId;
-    const publicationGeneration = advanceGuidedPublicationGeneration();
-    try {
-      const response = await api.getGuided(sessionId);
-      // Stale-fetch guard (Codex #3): drop the response if the active session
-      // changed while the request was in flight.
-      if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-        return;
-      }
-      if (response.composition_state !== null) {
-        clearGuidedRetriesForSession("guided_start", requestedSessionId);
-      }
-      // Atomically replace all 4 wire fields — server is authoritative (spec §7.3)
-      set({
-        guidedSession: response.guided_session,
-        guidedNextTurn: response.next_turn,
-        guidedTerminal: response.terminal,
-        guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: selectGuidedReviewedComponents(
-          response.guided_session,
-        ),
-        compositionState: response.composition_state,
-      });
-    } catch (err) {
-      if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-        return;
-      }
-      // Error path: set error string, leave existing guided state alone.
-      // Mirrors selectSession lines 207-209: set error, don't clobber fields
-      // that were already loaded. The caller can inspect error to decide whether
-      // to surface a retry prompt. Surface the backend's typed detail when
-      // present (mirroring respondGuided/chatGuided/convertToGuided) instead of
-      // flattening every failure to the generic banner — a 400 that names a
-      // recoverable mode-state boundary should reach the user (elspeth-e2c3dba6b5).
-      const apiErr = err as ApiError;
-      set({
-        error:
-          apiErr.detail ?? "Failed to load guided session. Please try again.",
-      });
-    }
-  },
 
-  async seedGuided(sessionId: string, profileKind: "tutorial", intent: string) {
-    const requestedSessionId = sessionId;
-    const publicationGeneration = advanceGuidedPublicationGeneration();
-    // Load path MUST NOT wedge on orphaned descriptors (session 09cde460:
-    // a cross-fingerprint orphan conflicted this acquire and bricked the
-    // surface at load, with the retry-same-action escape unreachable).
-    // Sweep every descriptor this page load cannot replay before acquiring;
-    // the seed's own authoritative response IS the state reconciliation.
-    clearOrphanedGuidedRetriesForSession(sessionId);
-    // Custody key carries the INTENT alongside the profile: the start is rooted
-    // on it, so two starts differing only in their goal are different
-    // operations and a replayed descriptor must not re-fire one as the other.
-    let acquisition = acquireGuidedRetry("guided_start", sessionId, [profileKind, intent]);
-    if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_start", sessionId, [profileKind, intent]);
-    }
-    if (acquisition.status === "conflict") {
-      set(guidedRetryConflictState(acquisition.existing.kind));
-      return;
-    }
-    const retry = acquisition.handle;
-    let responseReceived = false;
-    try {
-      const response = await api.startGuidedSession(
-        sessionId,
-        { profile: profileKind, intent, operationId: retry.operationId },
-      );
-      responseReceived = true;
-      if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-        clearGuidedRetry(retry);
-        return;
-      }
-      await get().applyGuidedResponse(
-        requestedSessionId,
-        response,
-        publicationGeneration,
-      );
-      clearGuidedRetry(retry);
-    } catch (err) {
-      // Once POST returned, any failure is in local response application or
-      // interpretation refresh. Keep the same id so retry exact-replays the
-      // already committed start instead of creating a second operation.
-      if (
-        !responseReceived &&
-        !(err instanceof api.GuidedResponseReceiptError) &&
-        !isAmbiguousGuidedRetryFailure(err)
-      ) {
-        clearGuidedRetry(retry);
-      }
-      if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-        return;
-      }
-      const apiErr = err as ApiError;
-      set({
-        error:
-          apiErr.detail ?? "Failed to start guided session. Please try again.",
-      });
-      throw err;
-    }
-  },
 
-  async convertToGuided(sessionId: string, intent: string) {
-    // Capture the session identity before the await (stale-fetch guard,
-    // mirroring startGuided). If the user switches sessions while the POST is in
-    // flight, the response is dropped rather than overwriting the newly active
-    // session's guided state.
-    const requestedSessionId = sessionId;
-    // Custody key carries the INTENT: the converted wizard is rooted on it, so a
-    // retained descriptor replays THAT conversion and never launders a different
-    // goal through an operation id acquired for the first one.
-    let acquisition = acquireGuidedRetry("guided_convert", sessionId, [intent]);
-    if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_convert", sessionId, [intent]);
-    }
-    if (acquisition.status === "conflict") {
-      set(guidedRetryConflictState(acquisition.existing.kind));
-      return;
-    }
-    const retry = acquisition.handle;
-    try {
-      const response = await api.convertToGuided(sessionId, intent, retry.operationId);
-      clearGuidedRetry(retry);
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      // Atomically replace all 4 wire fields — server is authoritative (spec §7.3).
-      set({
-        guidedSession: response.guided_session,
-        guidedNextTurn: response.next_turn,
-        guidedTerminal: response.terminal,
-        guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: selectGuidedReviewedComponents(
-          response.guided_session,
-        ),
-        compositionState: response.composition_state,
-        error: null,
-      });
-    } catch (err) {
-      if (!isAmbiguousGuidedRetryFailure(err)) {
-        clearGuidedRetry(retry);
-      }
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      // Surface the backend's typed detail when present, mirroring
-      // respondGuided/reenterGuided. Convert 400s are rare (ownership only), but
-      // an unbound catch would recreate the generic-banner defect this fix removes.
-      const apiErr = err as ApiError;
-      set({
-        error:
-          apiErr.detail ?? "Failed to switch to guided mode. Please try again.",
-      });
-    }
-  },
 
-  async respondGuided(body: GuidedRespondAction) {
-    const {
-      activeSessionId,
-      guidedNextTurn,
-      guidedTerminal,
-      guidedResponsePending,
-      guidedChatPending,
-    } = get();
-    if (activeSessionId === null) {
-      return {
-        status: "not_applied",
-        reason: "no_active_session",
-        message: GUIDED_NO_ACTIVE_SESSION_MESSAGE,
-      };
-    }
-    // The first caller owns the exact in-flight attempt. This synchronous gate
-    // prevents rapid clicks or distinct widgets from starting a second HTTP
-    // request before the authoritative response settles. A transport-uncertain
-    // retry happens only after the catch clears pending, at which point the
-    // retained descriptor reuses the original operation id and request body.
-    //
-    // Single in-flight-mutation gate (session 93edfc90): a guided CHAT in
-    // flight also blocks a respond — the two endpoints mutate the same
-    // guided session, and a respond racing a chat fires a second concurrent
-    // server mutation (the step-3 replan runs the planner in-request for
-    // minutes; a concurrent submit hung the server). chatGuided carries the
-    // mirror-image check.
-    if (guidedResponsePending || guidedChatPending) {
-      return {
-        status: "not_applied",
-        reason: "pending",
-        message: GUIDED_RESPONSE_PENDING_MESSAGE,
-      };
-    }
-    // Capture the session identity before the await (Codex #4 stale-fetch guard).
-    // Mirrors the active-session guard in loadComposerProgress.
-    const requestedSessionId = activeSessionId;
-    const blobOwnershipAtRequest = useBlobStore.getState();
-    const requestedBlobActivationEpoch =
-      blobOwnershipAtRequest.activeSessionId === requestedSessionId
-        ? blobOwnershipAtRequest.activationEpoch
-        : null;
-    const requestedTurnToken = guidedTerminal === null ? guidedNextTurn?.turn_token : null;
-    if (guidedTerminal === null && requestedTurnToken === undefined) {
-      return {
-        status: "not_applied",
-        reason: "no_current_turn",
-        message: GUIDED_NO_CURRENT_TURN_MESSAGE,
-      };
-    }
-    let acquisition = acquireGuidedRetry("guided_respond", requestedSessionId, [
-      requestedTurnToken ?? "terminal",
-      body,
-    ]);
-    if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_respond", requestedSessionId, [
-      requestedTurnToken ?? "terminal",
-      body,
-    ]);
-    }
-    if (acquisition.status === "conflict") {
-      const conflictState = guidedRetryConflictState(acquisition.existing.kind);
-      set(conflictState);
-      return {
-        status: "not_applied",
-        reason: "custody_conflict",
-        message: conflictState.error,
-      };
-    }
-    const retry = acquisition.handle;
-    const publicationGeneration = advanceGuidedPublicationGeneration();
-    guidedResponseRetryOwnerGenerations.set(
-      retry.operationId,
-      publicationGeneration,
-    );
-    const request: GuidedRespondRequest = {
-      ...body,
-      operation_id: retry.operationId,
-      turn_token: requestedTurnToken ?? null,
-    };
-    const proposalBinding = body.proposal_id === null
-      ? null
-      : {
-          proposal_id: body.proposal_id,
-          draft_hash: body.draft_hash,
-        };
-    const proposalRetryAction = proposalRetryActionForBody(body);
-    // Clear any stale self-heal notice at the start of the next attempt, per
-    // its documented lifecycle (the resync notice describes the PREVIOUS
-    // desync, not this one). The approval notice has the same lifecycle: it
-    // describes the wiring a refused shortcut left the user on, so acting on
-    // that turn by hand retires it. approveWiring sets it only AFTER its own
-    // review dispatch returns, so clearing here never races it.
-    guidedResponsePendingOwnerGeneration = publicationGeneration;
-    set({
-      guidedResponsePending: true,
-      guidedSelfHealNotice: null,
-      guidedApprovalNotice: null,
-      ...(proposalBinding === null
-        ? {}
-        : {
-            guidedProposalReview: {
-              status: "submitting",
-              ...proposalBinding,
-            },
-          }),
-    });
-    // Live phase text for the multi-minute planner respond (6996bdb38
-    // follow-up: the decision-submit path never started the poller, so the
-    // indicator had elapsed time and no phase). Started AFTER the gates and
-    // custody acquire (a blocked submit polls nothing) and generation-fenced
-    // like sendMessage/chatGuided so a newer turn's poll span wins.
-    const progressPollGeneration = get().startComposerProgressPolling(requestedSessionId);
-    // A generation-stale drop must still SETTLE the in-flight submit when the
-    // requested session is still active (a same-session generation advance —
-    // e.g. a seedGuided resync — published nothing on this submit's behalf):
-    // leaving guidedResponsePending true disables every primary and the Send
-    // forever, and a "submitting" proposal review pins "Submitting this
-    // proposal decision…". A cross-session drop is left to the
-    // clearedGuidedState() reset the session-switch actions apply.
-    const settleStaleSubmit = () => {
-      if (
-        get().activeSessionId !== requestedSessionId ||
-        guidedResponsePendingOwnerGeneration !== publicationGeneration
-      ) {
-        return;
-      }
-      const review = get().guidedProposalReview;
-      guidedResponsePendingOwnerGeneration = null;
-      set({
-        guidedResponsePending: false,
-        ...(proposalBinding !== null &&
-        review !== null &&
-        review.status === "submitting" &&
-        review.proposal_id === proposalBinding.proposal_id &&
-        review.draft_hash === proposalBinding.draft_hash
-          ? { guidedProposalReview: { status: "stale", ...proposalBinding } }
-          : {}),
-      });
-    };
-    const releaseSubmitOwnership = () => {
-      if (guidedResponsePendingOwnerGeneration === publicationGeneration) {
-        guidedResponsePendingOwnerGeneration = null;
-      }
-    };
-    const settleRetryCustody = () => {
-      if (
-        guidedResponseRetryOwnerGenerations.get(retry.operationId) !==
-        publicationGeneration
-      ) {
-        return false;
-      }
-      clearGuidedRetry(retry);
-      guidedResponseRetryOwnerGenerations.delete(retry.operationId);
-      return true;
-    };
-    const staleSubmitOutcome = () => {
-      settleStaleSubmit();
-      return {
-        status: "not_applied" as const,
-        reason: "stale" as const,
-        message: GUIDED_RESPONSE_STALE_MESSAGE,
-      };
-    };
-    let responseReceived = false;
-    try {
-      const response = await api.respondGuided(activeSessionId, request);
-      responseReceived = true;
-      settleRetryCustody();
-      // Stale-fetch guard (Codex #4): drop the response if the active session
-      // changed while the request was in flight.
-      if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-        return staleSubmitOutcome();
-      }
-      // Apply the response (atomic 4-field replace + B1/D12 interpretation
-      // refresh + C-3 self-heal bookkeeping) via the shared helper — see
-      // applyGuidedResponse below, also used by TutorialGuidedShell's
-      // not-yet-active exit path.
-      const applied = await get().applyGuidedResponse(
-        requestedSessionId,
-        response,
-        publicationGeneration,
-      );
-      if (!applied) {
-        return staleSubmitOutcome();
-      }
-      releaseSubmitOwnership();
-      return { status: "applied" };
-    } catch (err) {
-      // Once a transport response was received, custody was already settled
-      // above and this catch is exclusively response-application/resync work.
-      // Classify ambiguity only for failures thrown by the transport await.
-      const isAmbiguousFailure =
-        !responseReceived &&
-        (err instanceof api.GuidedResponseReceiptError ||
-          isAmbiguousGuidedRetryFailure(err));
-      // Fence the catch at entry, not merely at individual publication sites.
-      // A delayed rejection for A can arrive after A -> B -> A and a newer
-      // A request; session equality alone would let the old request refresh,
-      // publish its obsolete error, and clear the newer request's pending bit.
-      if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-        if (!isAmbiguousFailure) {
-          settleRetryCustody();
-        }
-        return staleSubmitOutcome();
-      }
-      if (responseReceived) {
-        const resync = await resyncSettledGuidedResponse(
-          requestedSessionId,
-          () => get().activeSessionId,
-          (authoritative) =>
-            get().applyGuidedResponse(
-              requestedSessionId,
-              authoritative,
-              publicationGeneration,
-            ),
-        );
-        if (resync === "published") {
-          return { status: "applied" };
-        }
-        if (resync === "stale") {
-          return staleSubmitOutcome();
-        }
-        if (resync === "failed") {
-          if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-            return staleSubmitOutcome();
-          }
-          releaseSubmitOwnership();
-          set({
-            guidedNextTurn: null,
-            // The reviewed-components ledger goes with the turn: this path
-            // tells the user to reload, and a reload re-reads the ledger from
-            // the wire. Leaving it would keep drawing the pre-failure
-            // source/output nodes beside the refresh-required banner.
-            //
-            // This is the one place the store's ledger deliberately diverges
-            // from the published `guidedSession.reviewed_components`, which
-            // stays put because the rest of the chat surface still renders
-            // from it — the transcript, and the stepper's settled ticks and
-            // the decision sheets they open (guidedDecisionStages.ts binds to
-            // the SESSION, not to this copy, and ChatPanel.test.tsx pins that
-            // in this exact state: at step_3_transforms the guided surface
-            // still renders with a null turn, so the two are on screen
-            // together). The divergence is about this VIEW's authority, not
-            // about what the server settled: the settlement succeeded, and
-            // only the refresh failed, so the held session is a stale-but-true
-            // snapshot the pane must stop drawing until it is re-fetched.
-            //
-            // The single-authority tidy-up — naming this field for the one
-            // view that reads it, or replacing the blanking with an explicit
-            // "projection suspended" flag — belongs to the graph-pane lane
-            // that owns GraphView.tsx, at rebase time.
-            guidedReviewedComponents: EMPTY_GUIDED_REVIEWED_COMPONENTS,
-            guidedProposalReview: null,
-            guidedResponsePending: false,
-            error: GUIDED_RESPONSE_REFRESH_REQUIRED_MESSAGE,
-            errorDetails: null,
-            guidedSelfHealNotice: null,
-          });
-        }
-        return {
-          status: "not_applied",
-          reason: "refresh_required",
-          message: GUIDED_RESPONSE_REFRESH_REQUIRED_MESSAGE,
-        };
-      }
-      if (!isAmbiguousFailure) {
-        settleRetryCustody();
-      }
-      const apiErr = err as ApiError;
 
-      // A source file can leave the ready lifecycle between the user's click
-      // and the authoritative guided response. Refresh the live blob rows so
-      // ChatPanel immediately invalidates that candidate, but preserve the
-      // backend rejection as the actionable error below. Match the two exact
-      // lifecycle details only: unrelated guided 400s must not churn files.
-      if (
-        apiErr.status === 400 &&
-        "source_blob_id" in body &&
-        typeof body.source_blob_id === "string" &&
-        apiErr.detail !== undefined &&
-        GUIDED_SOURCE_BLOB_LIFECYCLE_REJECTIONS.has(apiErr.detail)
-      ) {
-        if (requestedBlobActivationEpoch !== null) {
-          useBlobStore.getState().invalidateBlobForEpoch(
-            requestedSessionId,
-            requestedBlobActivationEpoch,
-            body.source_blob_id,
-          );
-        }
-        try {
-          await useBlobStore.getState().loadBlobs(requestedSessionId);
-        } catch {
-          // Blob refresh is corrective projection only. Its failure must not
-          // replace or hide the original guided lifecycle rejection.
-        }
-        if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-          return staleSubmitOutcome();
-        }
-      }
 
-      // C-3 self-heal: "turn_not_emitted" means the client's view of the
-      // current turn was stale (guided.py's respond handler couldn't find an
-      // emitted TurnRecord for the current step). Refetch GET /guided
-      // directly (NOT via startGuided — that action swallows its own
-      // failures into `error`, which would stomp the notice we're about to
-      // set; calling api.getGuided here keeps success/failure fully in this
-      // block's control) so the current turn re-renders, and surface a calm
-      // resync notice instead of a raw rejection — NOT the submitted body
-      // resent: the rejected answer was never confirmed against a real
-      // emitted turn, so blindly replaying it against whatever turn now
-      // exists could apply a stale response to the wrong question. The user
-      // re-submits manually against the refreshed turn. Capped at
-      // MAX_TURN_NOT_EMITTED_SELF_HEALS per session so a refetch that
-      // doesn't actually fix the staleness can't loop forever — a failed
-      // resync, or an exhausted budget, falls through to the plain error
-      // path below (whose `apiErr.detail` is already the backend's
-      // plain-language "out of sync" copy, not the old raw protocol string).
-      if (apiErr.error_type === "turn_not_emitted") {
-        const priorAttempts =
-          turnNotEmittedSelfHealCounts.get(requestedSessionId) ?? 0;
-        if (priorAttempts < MAX_TURN_NOT_EMITTED_SELF_HEALS) {
-          turnNotEmittedSelfHealCounts.set(requestedSessionId, priorAttempts + 1);
-          try {
-            const resynced = await api.getGuided(requestedSessionId);
-            if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-              return staleSubmitOutcome();
-            }
-            const selfHealMessage =
-              "The wizard had fallen out of sync with the server. We've refreshed to the current step — please try again.";
-            set({
-              guidedSession: resynced.guided_session,
-              guidedNextTurn: resynced.next_turn,
-              guidedTerminal: resynced.terminal,
-              guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-              guidedReviewedComponents: selectGuidedReviewedComponents(
-                resynced.guided_session,
-              ),
-              compositionState: resynced.composition_state,
-              guidedResponsePending: false,
-              error: null,
-              errorDetails: null,
-              guidedSelfHealNotice: selfHealMessage,
-            });
-            releaseSubmitOwnership();
-            return {
-              status: "not_applied",
-              reason: "rejected",
-              message: selfHealMessage,
-            };
-          } catch {
-            // The resync fetch itself failed — fall through to the plain
-            // error path below rather than pretending the self-heal
-            // succeeded. Re-check the active session first: the resync await
-            // invalidated the outer catch's entry guard, so without this a
-            // session switch mid-resync would stomp the newly selected
-            // session's UI with this (now-background) session's error.
-            if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-              return staleSubmitOutcome();
-            }
-          }
-        } else {
-          // Budget exhausted: stop self-healing silently and fall through to
-          // the plain error state below (no infinite loop).
-          turnNotEmittedSelfHealCounts.delete(requestedSessionId);
-        }
-      }
 
-      // A competing guided operation held the session admission lease past
-      // the server's bounded wait (dad8b8abd: 409 guided_operation_conflict /
-      // operation_in_progress). Transient by definition — the OTHER operation
-      // is still settling — so it is neither a proposal-authority conflict
-      // (nothing about the binding changed; no custody-discarding GET resync)
-      // nor the locked refresh-the-session error. Settle pending, re-arm the
-      // review retryable, and let the user re-press once the in-flight action
-      // lands. Checked BEFORE the proposal-authority discriminator, whose
-      // proposal_id !== null arm would otherwise misroute every
-      // proposal-bound conflict into the resync path.
-      if (isHttpConflict(err) && apiErr.error_type === "guided_operation_conflict") {
-        const conflictMessage =
-          "Another action on this session is still settling. Wait a moment, then try again.";
-        releaseSubmitOwnership();
-        set({
-          error: conflictMessage,
-          errorDetails: null,
-          guidedResponsePending: false,
-          guidedSelfHealNotice: null,
-          ...(proposalBinding !== null && proposalRetryAction !== null
-            ? {
-                guidedProposalReview: {
-                  status: "error",
-                  ...proposalBinding,
-                  message: conflictMessage,
-                  retryable: true,
-                  retry_action: proposalRetryAction,
-                },
-              }
-            : {}),
-        });
-        return {
-          status: "not_applied",
-          reason: "rejected",
-          message: conflictMessage,
-        };
-      }
 
-      // A proposal-authority conflict means the bound proposal changed before
-      // settlement (or the server now requires a binding). Discard operation
-      // custody and replace the actionable projection from GET; never replay
-      // the rejected body against whatever proposal is current now. Other
-      // 409s are actionable failures, not resync signals — notably a
-      // wire_confirm_rejected response must retain its structured validation
-      // details even when an authoritative GET would succeed.
-      const isProposalAuthorityConflict =
-        isHttpConflict(err) &&
-        (body.proposal_id !== null ||
-          apiErr.detail ===
-            "the active guided proposal requires proposal_id and draft_hash" ||
-          apiErr.detail ===
-            "proposal_id and draft_hash do not identify the active guided proposal");
-      if (isProposalAuthorityConflict) {
-        settleRetryCustody();
-        if (proposalBinding !== null) {
-          set({
-            guidedProposalReview: {
-              status: "reloading",
-              ...proposalBinding,
-            },
-          });
-        }
-        try {
-          const resynced = await api.getGuided(requestedSessionId);
-          if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-            return staleSubmitOutcome();
-          }
-          await useInterpretationEventsStore
-            .getState()
-            .refreshAll(requestedSessionId);
-          if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-            return staleSubmitOutcome();
-          }
-          const authoritativeReview = proposalReviewForTurn(resynced.next_turn);
-          const sameProposal =
-            proposalBinding !== null &&
-            authoritativeReview !== null &&
-            authoritativeReview.proposal_id === proposalBinding.proposal_id &&
-            authoritativeReview.draft_hash === proposalBinding.draft_hash;
-          releaseSubmitOwnership();
-          set({
-            guidedSession: resynced.guided_session,
-            guidedNextTurn: resynced.next_turn,
-            guidedTerminal: resynced.terminal,
-            guidedReviewedComponents: selectGuidedReviewedComponents(
-              resynced.guided_session,
-            ),
-            guidedProposalReview:
-              proposalBinding === null
-                ? authoritativeReview
-                : authoritativeReview !== null && !sameProposal
-                  ? authoritativeReview
-                  : { status: "stale", ...proposalBinding },
-            compositionState: resynced.composition_state,
-            error:
-              apiErr.detail ??
-              "The guided proposal changed. Review the refreshed step and try again.",
-            errorDetails: null,
-            guidedResponsePending: false,
-            guidedSelfHealNotice: null,
-          });
-          return {
-            status: "not_applied",
-            reason: "rejected",
-            message:
-              apiErr.detail ??
-              "The guided proposal changed. Review the refreshed step and try again.",
-          };
-        } catch {
-          if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-            return staleSubmitOutcome();
-          }
-          // Preserve the original conflict as the actionable failure when the
-          // authoritative reload is itself unavailable.
-          if (proposalBinding !== null) {
-            set({
-              guidedProposalReview: {
-                status: "error",
-                ...proposalBinding,
-                message:
-                  "The proposal changed, but its authoritative replacement could not be loaded. Refresh the session before taking another action.",
-                retryable: false,
-                retry_action: null,
-              },
-            });
-          }
-          releaseSubmitOwnership();
-          set({
-            error:
-              apiErr.detail ??
-              "The guided proposal changed, but its authoritative replacement could not be loaded.",
-            errorDetails: null,
-            guidedResponsePending: false,
-            guidedSelfHealNotice: null,
-          });
-          return {
-            status: "not_applied",
-            reason: "rejected",
-            message:
-              apiErr.detail ??
-              "The guided proposal changed, but its authoritative replacement could not be loaded.",
-          };
-        }
-      }
 
-      // Surface the backend's structured rejection when present — a wire-stage
-      // confirm against an invalid pipeline returns 409 with a nested detail
-      // ({code: "wire_confirm_rejected", detail, validation_errors}); showing
-      // only a blanket "failed" would recreate the silent no-op confirm this
-      // fix removes (elspeth-3b35abf148 variant 3). `validation_errors`
-      // entries are backend ValidationEntry payloads ({component, message,
-      // severity}) — read defensively so any shape still yields a line.
-      const rejectionDetails = (apiErr.validation_errors ?? [])
-        .map((entry) => {
-          const raw = entry as unknown as Record<string, unknown>;
-          const component =
-            typeof raw.component === "string" && raw.component !== ""
-              ? raw.component
-              : null;
-          const message = typeof raw.message === "string" ? raw.message : "";
-          return component !== null && message !== ""
-            ? `${component}: ${message}`
-            : message;
-        })
-        .filter((line) => line !== "");
-      const retainsRetryCustody = isAmbiguousFailure;
-      // F13-D: ``policy_blocked`` is permanent by construction — a deployment
-      // policy refused this pipeline, and its copy directs the user to CHANGE
-      // the highlighted component. Never render a retry invitation for it,
-      // and never lock the propose_pipeline controls behind a non-retryable
-      // error state (that would contradict the copy's own instruction): the
-      // review returns to active so the revise affordances stay live.
-      const policyBlocked =
-        !retainsRetryCustody && (apiErr.failure_code === "policy_blocked" || apiErr.failure_code === "admission_refused");
-      const proposalErrorReview: GuidedProposalReviewState | null =
-        proposalBinding === null
-          ? null
-          : retainsRetryCustody && proposalRetryAction !== null
-            ? {
-                status: "error",
-                ...proposalBinding,
-                message:
-                  apiErr.detail ??
-                  "The proposal response was not received. Retry the same action.",
-                retryable: true,
-                retry_action: proposalRetryAction,
-              }
-            : policyBlocked
-              ? {
-                  status: "active",
-                  ...proposalBinding,
-                }
-              : {
-                  status: "error",
-                  ...proposalBinding,
-                  message:
-                    apiErr.detail ??
-                    "The proposal response failed. Refresh the session before taking another action.",
-                  retryable: false,
-                  retry_action: null,
-                };
-      const responseErrorMessage =
-        apiErr.detail ?? "Failed to submit guided response. Please try again.";
-      releaseSubmitOwnership();
-      set({
-        error: responseErrorMessage,
-        errorDetails: rejectionDetails.length > 0 ? rejectionDetails : null,
-        guidedResponsePending: false,
-        guidedSelfHealNotice: null,
-        ...(proposalErrorReview === null
-          ? {}
-          : {
-              guidedProposalReview: proposalErrorReview,
-            }),
-      });
-      return {
-        status: "not_applied",
-        reason: retainsRetryCustody ? "unsettled" : "rejected",
-        message: responseErrorMessage,
-      };
-    } finally {
-      get().stopComposerProgressPolling(requestedSessionId, progressPollGeneration);
-      // One-shot terminal pickup — only while this turn still owns the
-      // poller; a newer turn's own polling handles it otherwise. Mirrors
-      // sendMessage/chatGuided's finally semantics, scoped to the session
-      // captured before the await, and re-checked inside the read itself.
-      if (progressPollGeneration === composerProgressPollGeneration) {
-        await get().loadComposerProgress(requestedSessionId, {
-          ownerGeneration: progressPollGeneration,
-        });
-      }
-    }
-  },
 
-  async approveWiring(
-    reviewBody: GuidedRespondAction,
-    clientBlockers: () => WiringApprovalClientBlockers,
-  ): Promise<WiringApprovalOutcome> {
-    // Clear the previous refusal before the new attempt: the old reason
-    // described the PREVIOUS wiring, exactly as respondGuided treats its own
-    // self-heal notice.
-    set({ guidedApprovalNotice: null });
-
-    const reviewOutcome = await get().respondGuided(reviewBody);
-    if (reviewOutcome.status !== "applied") {
-      // respondGuided has already published whatever the user needs to see
-      // (rejection banner, stale settle, pending message).
-      return { status: "not_applied" };
-    }
-
-    // Judge the turn the server actually emitted. A review_wiring that landed
-    // anywhere else — a self-heal resync, a re-plan — is not something this
-    // shortcut may confirm, and silence is the correct outcome: the user is
-    // looking at whatever did arrive.
-    const wireTurn = get().guidedNextTurn;
-    if (wireTurn === null || wireTurn.type !== "confirm_wiring") {
-      return { status: "not_applied" };
-    }
-    const wiring = wireTurn.payload;
-
-    // Read the client-side blockers HERE, not before the dispatch: the
-    // transition can itself create the acknowledgement cards that must stop
-    // the approval.
-    const stopReason = approvalStopReason(wiring, clientBlockers());
-    if (stopReason !== null) {
-      set({ guidedApprovalNotice: stopReason });
-      return { status: "stopped", reason: stopReason };
-    }
-
-    // The confirm is an ordinary respond: it picks up the wire turn's own
-    // turn_token from the store, so it can never carry the proposal turn's
-    // stale one.
-    const confirmOutcome = await get().respondGuided({
-      chosen: ["confirm_wiring"],
-      edited_values: null,
-      custom_inputs: null,
-      proposal_id: wiring.proposal_id,
-      draft_hash: wiring.draft_hash,
-      edit_target: null,
-      control_signal: null,
-    });
-    return confirmOutcome.status === "applied"
-      ? { status: "confirmed" }
-      : { status: "not_applied" };
-  },
-
-  async applyGuidedResponse(
-    sessionId: string,
-    response: GuidedRespondResponse,
-    expectedPublicationGeneration = guidedPublicationGeneration,
-  ) {
-    // Mirrors respondGuided's own stale-fetch guard: a response that arrives
-    // for a session that is no longer active must not clobber whatever the
-    // user has since switched to.
-    if (!guidedPublicationIsCurrent(sessionId, expectedPublicationGeneration)) {
-      return false;
-    }
-    // B1 (spec §5/D12): backend-surfaced pending interpretation cards must be
-    // in interpretationEventsStore before the new turn is published. If this
-    // refresh fails, the old token and retry custody stay aligned so the exact
-    // action remains replayable.
-    await refreshInterpretationEventsForSession(sessionId);
-    if (!guidedPublicationIsCurrent(sessionId, expectedPublicationGeneration)) {
-      return false;
-    }
-    // Publish the four authoritative fields atomically only after the
-    // interpretation projection is ready.
-    turnNotEmittedSelfHealCounts.delete(sessionId);
-    // This authoritative publication settles whichever respond owned the
-    // pending projection it replaces. A later request cannot already own it:
-    // that request would have advanced guidedPublicationGeneration and failed
-    // the currentness guard immediately above. The one mutation that clears
-    // the owner generation WITHOUT advancing the publication generation —
-    // exitToFreeform's pre-goal stub drop — cannot interleave with an
-    // in-flight request either, because its own in-flight gate refuses while
-    // one is pending.
-    guidedResponsePendingOwnerGeneration = null;
-    set({
-      guidedSession: response.guided_session,
-      guidedNextTurn: response.next_turn,
-      guidedTerminal: response.terminal,
-      guidedProposalReview: proposalReviewForTurn(response.next_turn),
-      guidedReviewedComponents: selectGuidedReviewedComponents(
-        response.guided_session,
-      ),
-      compositionState: response.composition_state,
-      guidedResponsePending: false,
-      error: null,
-      errorDetails: null,
-      guidedSelfHealNotice: null,
-    });
-    return true;
-  },
-
-  async reenterGuided() {
-    const { activeSessionId } = get();
-    if (activeSessionId === null) {
-      throw new Error("reenterGuided called without active session");
-    }
-    const requestedSessionId = activeSessionId;
-    let acquisition = acquireGuidedRetry("guided_reenter", activeSessionId, []);
-    if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_reenter", activeSessionId, []);
-    }
-    if (acquisition.status === "conflict") {
-      set(guidedRetryConflictState(acquisition.existing.kind));
-      return;
-    }
-    const retry = acquisition.handle;
-    try {
-      const response = await api.reenterGuided(activeSessionId, retry.operationId);
-      clearGuidedRetry(retry);
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      set({
-        guidedSession: response.guided_session,
-        guidedNextTurn: response.next_turn,
-        guidedTerminal: response.terminal,
-        guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: selectGuidedReviewedComponents(
-          response.guided_session,
-        ),
-        compositionState: response.composition_state,
-        error: null,
-      });
-    } catch (err) {
-      if (!isAmbiguousGuidedRetryFailure(err)) {
-        clearGuidedRetry(retry);
-      }
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      set({ error: "Failed to re-enter guided mode. Please try again." });
-    }
-  },
-
-  async enterGuided(intent?: string) {
-    // Unified "Switch to guided" / guided-default entry point, GET-FIRST
-    // (goal-first, elspeth-378cfa0e18).
-    //
-    // It used to route every non-exited case through convertToGuided, which was
-    // idempotent and therefore looked safe. It was not: createSession's
-    // guided-default arm called it on a brand-new session, and convert's
-    // "no persisted state" branch PERSISTS a fresh rootless wizard checkpoint.
-    // After that write compositionState is non-null, so the pre-start goal card
-    // could never render and the session carried a planner-reachable wizard with
-    // no intent behind it. The probe replaces the write: GET /guided is
-    // non-mutating and tells us which of the four entry states this session is
-    // in, so nothing is persisted until the user has actually stated a goal.
-    //
-    //   * terminal exited_to_freeform => reenterGuided (convert would return the
-    //     terminal state and leave the discriminator on freeform)
-    //   * stub, no intent  => adopt it; the panel opens on the goal card and
-    //                         NOTHING is written. A reload re-probes and
-    //                         re-adopts (selectSession), so the goal-less
-    //                         session reopens where it was.
-    //   * stub, intent     => the session is empty, so the goal starts it
-    //                         directly through chatGuided's canonical live-start
-    //                         branch (POST /guided/start) and the goal card is
-    //                         skipped.
-    //   * null, intent     => a WORKED freeform session. Convert it, rooted
-    //                         on the goal.
-    //   * null, no intent  => guard (see GUIDED_GOAL_REQUIRED_MESSAGE).
-    //   * persisted state  => adopt unchanged. A completed terminal comes back
-    //                         here too, so ChatPanel keeps rendering the
-    //                         completion summary; it is not re-entrable.
-    const { activeSessionId, guidedSession } = get();
-    if (activeSessionId === null) {
-      throw new Error("enterGuided called without active session");
-    }
-    if (guidedSession?.terminal?.kind === "exited_to_freeform") {
-      await get().reenterGuided();
-      return;
-    }
-    const requestedSessionId = activeSessionId;
-    let probe: GetGuidedResponse | null;
-    try {
-      probe = await api.getGuided(requestedSessionId, undefined, true);
-    } catch (err) {
-      const apiErr = err as ApiError;
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      set({
-        error:
-          apiErr?.detail ??
-          "Failed to switch to guided mode. Please try again.",
-      });
-      return;
-    }
-    if (probe === null) {
-      if (intent === undefined) {
-        if (get().activeSessionId !== requestedSessionId) {
-          return;
-        }
-        set({ error: GUIDED_GOAL_REQUIRED_MESSAGE });
-        return;
-      }
-      await get().convertToGuided(requestedSessionId, intent);
-      return;
-    }
-    if (get().activeSessionId !== requestedSessionId) {
-      return;
-    }
-    // Atomically replace all 4 wire fields — server is authoritative (spec §7.3).
-    set({
-      guidedSession: probe.guided_session,
-      guidedNextTurn: probe.next_turn,
-      guidedTerminal: probe.terminal,
-      guidedProposalReview: proposalReviewForTurn(probe.next_turn),
-      guidedReviewedComponents: selectGuidedReviewedComponents(
-        probe.guided_session,
-      ),
-      compositionState: probe.composition_state,
-      error: null,
-    });
-    if (probe.composition_state === null && intent !== undefined) {
-      // The adopted stub is exactly the state chatGuided's cold-start branch
-      // expects (non-null guidedSession, null compositionState), so the goal
-      // goes through the ONE live-start path in the store — the same one the
-      // goal card's Send uses — rather than a second POST /guided/start site
-      // with its own custody, receipt and reconciliation handling to drift.
-      await get().chatGuided(intent);
-    }
-  },
-
-  async chatGuided(
-    message: string,
-    signal?: AbortSignal,
-    revisionMode: GuidedRevisionMode = "amend",
-    retryTurnToken?: string,
-  ) {
-    const { activeSessionId, guidedSession, guidedNextTurn, compositionState } = get();
-    // Offensive guards: caller must not invoke without an active session
-    // or before guidedSession is loaded.  Per the engine-patterns-reference
-    // skill §Offensive Programming Examples, detect invalid states and throw
-    // meaningful exceptions — a silent ?. would mask a UI bug (ChatInput
-    // rendered with no guided session attached).
-    if (activeSessionId === null) {
-      throw new Error("chatGuided called without active session");
-    }
-    if (guidedSession === null) {
-      throw new Error("chatGuided called before guidedSession loaded");
-    }
-    // Single in-flight-mutation gate (session 93edfc90), mirror of
-    // respondGuided's: one guided mutation per session at a time, whichever
-    // endpoint carries it. A silent no-op, not an error — the affordances
-    // that reach here are already disabled/unmounted while a mutation is in
-    // flight (ChatInput disabled={guidedResponsePending}; the pending swap
-    // unmounts the input during a chat), so this is the store-level backstop
-    // against a race the UI gate missed.
-    if (get().guidedChatPending || get().guidedResponsePending) {
-      return;
-    }
-    if (compositionState === null) {
-      const requestedSessionId = activeSessionId;
-      const publicationGeneration = advanceGuidedPublicationGeneration();
-      const existingRetry = findGuidedRetry("guided_start", requestedSessionId);
-      if (existingRetry !== null) {
-        set({ guidedChatPending: true, guidedSelfHealNotice: null, guidedApprovalNotice: null });
-        const reconciliation = await reconcileGuidedStartRetry(
-          existingRetry,
-          publicationGeneration,
-        );
-        if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-          return;
-        }
-        if (reconciliation === "completed") {
-          set({ guidedChatPending: false });
-          return;
-        }
-        if (reconciliation === "in_progress" || reconciliation === "unknown") {
-          set({
-            guidedChatPending: false,
-            error:
-              reconciliation === "in_progress"
-                ? GUIDED_START_IN_PROGRESS_MESSAGE
-                : GUIDED_START_UNKNOWN_MESSAGE,
-            errorDetails: null,
-          });
-          return;
-        }
-        if (reconciliation === "stale") return;
-      }
-      let acquisition = acquireGuidedRetry("guided_start", requestedSessionId, [
-        "live",
-        message,
-      ]);
-    if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_start", requestedSessionId, [
-        "live",
-        message,
-      ]);
-    }
-      if (acquisition.status === "conflict") {
-        set({ ...guidedRetryConflictState(acquisition.existing.kind), guidedChatPending: false });
-        return;
-      }
-      const retry = acquisition.handle;
-      set({ guidedChatPending: true, guidedSelfHealNotice: null, guidedApprovalNotice: null });
-      let responseReceived = false;
-      try {
-        const response = await api.startGuidedSession(
-          requestedSessionId,
-          { profile: "live", intent: message, operationId: retry.operationId },
-          signal,
-        );
-        responseReceived = true;
-        if (response.composition_state === null) {
-          throw new api.GuidedResponseReceiptError(
-            new Error("Guided start returned without a durable checkpoint"),
-          );
-        }
-        if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-          clearGuidedRetry(retry);
-          return;
-        }
-        const applied = await get().applyGuidedResponse(
-          requestedSessionId,
-          response,
-          publicationGeneration,
-        );
-        clearGuidedRetry(retry);
-        if (!applied) return;
-        set({ guidedChatPending: false });
-      } catch (err) {
-        const composeAborted = isComposeAbort(err);
-        const retainsRetryCustody =
-          responseReceived ||
-          err instanceof api.GuidedResponseReceiptError ||
-          isAmbiguousGuidedRetryFailure(err) ||
-          composeAborted;
-        if (!retainsRetryCustody) {
-          clearGuidedRetry(retry);
-        }
-        if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-          if (responseReceived) {
-            clearGuidedRetry(retry);
-          }
-          return;
-        }
-        if (retainsRetryCustody) {
-          const reconciliation = await reconcileGuidedStartRetry(
-            retry,
-            publicationGeneration,
-          );
-          if (!guidedPublicationIsCurrent(requestedSessionId, publicationGeneration)) {
-            return;
-          }
-          if (reconciliation === "completed") {
-            set({ guidedChatPending: false });
-            return;
-          }
-          if (reconciliation === "cleared") {
-            set({
-              error: GUIDED_START_CLEARED_MESSAGE,
-              errorDetails: null,
-              guidedChatPending: false,
-            });
-            return;
-          }
-          if (reconciliation === "in_progress" || reconciliation === "unknown") {
-            set({
-              error:
-                reconciliation === "in_progress"
-                  ? GUIDED_START_IN_PROGRESS_MESSAGE
-                  : GUIDED_START_UNKNOWN_MESSAGE,
-              errorDetails: null,
-              guidedChatPending: false,
-            });
-            return;
-          }
-          if (reconciliation === "stale") return;
-        }
-        const apiErr = err as ApiError;
-        set({
-          error: composeAborted
-            ? GUIDED_START_CLEARED_MESSAGE
-            : apiErr.detail ?? "Failed to start guided session. Please try again.",
-          errorDetails: null,
-          guidedChatPending: false,
-        });
-      }
-      return;
-    }
-    // Occurrence binding, in precedence order (elspeth-ea80e34fdc + IA-6):
-    //   1. `retryTurnToken` — a Retry submits the token its message was
-    //      ORIGINALLY submitted under, never a current one.
-    //   2. `completedToken` — after Confirm wiring there is no unanswered
-    //      turn, so the channel is bound to the CONFIRMATION hash
-    //      (`history[-1].response_hash`), which is what the backend's
-    //      completed-chat admission arm re-derives and compares. Checked
-    //      before the live turn for the same reason ChatPanel checks the
-    //      completed branch first: a stale `guidedNextTurn` left beside a
-    //      completed terminal must not win.
-    //   3. the live unanswered turn's token.
-    // No token at all means there is nothing sound to submit against — the
-    // offensive guard fires here rather than letting the server reject it.
-    const completedToken = completedGuidedChatToken(guidedSession);
-    const requestedTurnToken =
-      retryTurnToken ??
-      completedToken ??
-      (guidedNextTurn === null ? null : guidedNextTurn.turn_token);
-    if (requestedTurnToken === null) {
-      throw new Error("chatGuided called without a current unanswered turn");
-    }
-    // Step-3 proposal revision. The 7.1 planner auto-stages a pipeline proposal
-    // at Output→Transforms, so step_3 now BEGINS with a propose_pipeline turn.
-    // A docked-composer Send there is a request to revise that proposal, not a
-    // /guided/chat message — and /guided/chat rejects at step_3/4 when there are
-    // no deferred intents to manage (the tutorial's deterministic 409). Route the
-    // instruction through the RESPOND action as a prose revision: it regenerates
-    // the whole pipeline following the instruction, reusing respondGuided's
-    // turn_token + operation-id custody. Deferred-intent management surfaces are
-    // unaffected — they are not propose_pipeline turns. (deferred_intents are not
-    // on the GuidedSessionResponse wire, so the gate is the proposal turn itself.)
-    if (
-      retryTurnToken === undefined &&
-      // A live unanswered turn is the whole premise of a proposal revision:
-      // the reroute reuses respondGuided's CURRENT turn_token custody. A
-      // completed session has no such turn (and never sits at step 3).
-      guidedNextTurn !== null &&
-      guidedSession.step === "step_3_transforms" &&
-      guidedNextTurn.type === "propose_pipeline"
-    ) {
-      // Never reroute a RETRY: this branch reuses respondGuided's CURRENT
-      // turn_token custody, which is exactly the stale-prose laundering an
-      // occurrence-bound retry exists to prevent (elspeth-ea80e34fdc). A
-      // retry whose occurrence has been superseded by a propose_pipeline
-      // turn must fall through to /guided/chat with its recorded token and
-      // draw the ordinary 409 resync.
-      await get().respondGuided({
-        proposal_id: guidedNextTurn.payload.proposal_id,
-        draft_hash: guidedNextTurn.payload.draft_hash,
-        chosen: null,
-        edited_values: {
-          revision_instruction: message,
-          revision_mode: revisionMode,
-        },
-        custom_inputs: null,
-        edit_target: null,
-        control_signal: null,
-      });
-      return;
-    }
-    // Capture session + step identity before the await (stale-fetch guard
-    // mirroring respondGuided / startGuided).  If the user switches
-    // session or the wizard advances mid-flight, the response is dropped.
-    const requestedSessionId = activeSessionId;
-    // `requestedTurnToken` was resolved above (retry → completed → live turn)
-    // so the reroute guard and the throw could both read it. Retry custody is
-    // keyed on it verbatim, unchanged: [turn_token, message].
-    let acquisition = acquireGuidedRetry("guided_chat", requestedSessionId, [
-      requestedTurnToken,
-      message,
-    ]);
-    if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "guided_chat", requestedSessionId, [
-      requestedTurnToken,
-      message,
-    ]);
-    }
-    if (acquisition.status === "conflict") {
-      set({
-        ...guidedRetryConflictState(acquisition.existing.kind),
-        guidedChatPending: false,
-      });
-      return;
-    }
-    const retry = acquisition.handle;
-
-    // Slice 5: chat history is server-authoritative — no optimistic local
-    // append.  The route handler appends both user + assistant turns to
-    // `guidedSession.chat_history` and returns the updated session.  Only
-    // `guidedChatPending` is local: it blocks rapid double-submits while
-    // the round-trip is in flight.  Slice 4's optimistic-append pattern
-    // produced visible drift if the server replied with a slightly
-    // different ts_iso / seq than the client guessed.
-    // Clear any stale self-heal notice at the start of the next attempt, per
-    // its documented lifecycle — a successful advisory chat must not leave a
-    // "we've refreshed — please try again" resync notice pinned above it.
-    set({ guidedChatPending: true, guidedSelfHealNotice: null, guidedApprovalNotice: null });
-    // Mirrors sendMessage/retryMessage: the backend guided-chat route (any
-    // step, not just step_2_sink — see post_guided_chat) now writes progress
-    // snapshots the same way freeform compose does, so start polling here
-    // too. Previously chatGuided never polled at all, which is why the
-    // tutorial's step-2 substep indicator (composerProgress-derived) never
-    // advanced in production (elspeth-a8eeebb3aa) — tests only ever passed
-    // because they injected composerProgress directly via setState.
-    const progressPollGeneration =
-      get().startComposerProgressPolling(requestedSessionId);
-
-    try {
-      const response = await api.chatGuided(
-        activeSessionId,
-        {
-          operation_id: retry.operationId,
-          turn_token: requestedTurnToken,
-          message,
-        },
-        signal,
-      );
-      clearGuidedRetry(retry);
-      // Stale-fetch guard: drop the response if session changed mid-flight.
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      set({
-        guidedSession: response.guided_session,
-        guidedNextTurn: response.next_turn,
-        guidedTerminal: response.terminal,
-        guidedProposalReview: proposalReviewForTurn(response.next_turn),
-        guidedReviewedComponents: selectGuidedReviewedComponents(
-          response.guided_session,
-        ),
-        compositionState: response.composition_state,
-        guidedChatPending: false,
-      });
-    } catch (err) {
-      const ambiguous = isAmbiguousGuidedRetryFailure(err);
-      if (!ambiguous) {
-        clearGuidedRetry(retry);
-      }
-      if (get().activeSessionId !== requestedSessionId) {
-        return;
-      }
-      const apiErr = err as ApiError;
-      if (isHttpConflict(err)) {
-        try {
-          const resynced = await api.getGuided(requestedSessionId);
-          if (get().activeSessionId !== requestedSessionId) {
-            return;
-          }
-          set({
-            guidedSession: resynced.guided_session,
-            guidedNextTurn: resynced.next_turn,
-            guidedTerminal: resynced.terminal,
-            guidedProposalReview: proposalReviewForTurn(resynced.next_turn),
-            guidedReviewedComponents: selectGuidedReviewedComponents(
-              resynced.guided_session,
-            ),
-            compositionState: resynced.composition_state,
-            error: apiErr.detail ?? "The guided turn changed. Review the refreshed step and try again.",
-            guidedChatPending: false,
-          });
-          return;
-        } catch {
-          if (get().activeSessionId !== requestedSessionId) {
-            return;
-          }
-          // Preserve the original conflict as the actionable failure when the
-          // best-effort authoritative reload is itself unavailable.
-        }
-      }
-      // Cancellation / client-timeout path (elspeth-fb4464cdf0): the guided
-      // ChatInput's Stop button (or the COMPOSE_TIMEOUT_MS guard) aborted the
-      // fetch. Reset the pending flag so the turn can be revised and re-sent,
-      // and surface the same cancelled/timeout copy freeform uses — the
-      // abort reason on the signal discriminates user-cancel from timeout.
-      if (isComposeAbort(err)) {
-        set({
-          error: composeAbortMessage(signal),
-          guidedChatPending: false,
-        });
-        // The turn ran (and was cancelled) server-side; pull its durable
-        // partial results into view (see resyncAfterAbortedGuidedTurn).
-        await resyncAfterAbortedGuidedTurn(
-          requestedSessionId,
-          progressPollGeneration,
-        );
-        return;
-      }
-      // HTTP-layer failure (network, 4xx/5xx).  Distinct from the
-      // backend's synthetic-message path, which returns 200 with an
-      // unavailable assistant message AND appends both turns to
-      // chat_history — that path completes the optimistic write
-      // server-side, so even a synthetic reply round-trips through this
-      // success branch.  This catch fires when the request itself failed
-      // (no response shape at all) OR the backend rejected with a 4xx/5xx.
-      //
-      // Surface the backend's `detail` when present: a 409 step-mismatch
-      // tells the user to retry, a 400 names the bad step — far more
-      // actionable than a blanket "failed", which forced the user to GUESS
-      // the cause. Backend details are egress-safe by construction (Tier-3
-      // row data is never placed in an HTTP detail — see guided.py); a bare
-      // network failure with no structured body falls back to the generic line.
-      set({
-        error: apiErr.detail ?? "Failed to send chat message. Please try again.",
-        guidedChatPending: false,
-      });
-    } finally {
-      // Real finally (not duplicated into the success/catch branches above)
-      // so polling stops on EVERY exit path, including the stale-session
-      // early returns — mirrors sendMessage/retryMessage's teardown. The
-      // extra loadComposerProgress picks up the backend's final
-      // complete/failed/cancelled snapshot for the brief window before
-      // guidedChatPending flips the pending strip away.
-      get().stopComposerProgressPolling(requestedSessionId, progressPollGeneration);
-      if (progressPollGeneration === composerProgressPollGeneration) {
-        await get().loadComposerProgress(requestedSessionId, {
-          ownerGeneration: progressPollGeneration,
-        });
-      }
-    }
-  },
-
-  async exitToFreeform() {
-    // Goal-first (elspeth-378cfa0e18): before the goal, NOTHING is persisted —
-    // the panel is showing the adopted GET /guided stub. Responding here would
-    // write the rootless wizard the whole change exists to prevent, and write
-    // it permanently: the settled checkpoint carries an `exited_to_freeform`
-    // terminal, so `compositionState` is non-null from then on, the goal card
-    // can never render again, and a later "Finish outputs" answers the 409
-    // that asks for a goal the session no longer has any way to state.
-    // Symmetric with the stub adoption itself — nothing is written before the
-    // goal, in either direction — so the exit is a local drop of the stub.
-    //
-    // Consequence, by design and not a bug: because nothing was written, a
-    // later selectSession of this same still-empty session re-adopts the stub
-    // under a guided default and reopens the goal card. The session leaves the
-    // goal card for good once it has something of its own — a freeform message
-    // (selectSession then sees `messages`, not an untouched session) or the
-    // goal itself. The alternative is writing a rootless wizard purely to
-    // remember a refusal, which is the thing goal-first removes.
-    const { guidedSession, compositionState, guidedChatPending, guidedResponsePending } = get();
-    if (guidedSession !== null && compositionState === null) {
-      // The pre-goal exit carries the same single in-flight-mutation gate as
-      // every other guided mutation (respondGuided, chatGuided) — it is not
-      // exempt for being local. The goal card's Send runs through chatGuided's
-      // start branch, a live planner-free but multi-second round trip, and
-      // that branch has already advanced guidedPublicationGeneration and holds
-      // a guided_start retry descriptor. Dropping the stub underneath it
-      // returned "applied" — a lie — and then the settling start passed
-      // `guidedPublicationIsCurrent` and republished the very session the user
-      // had just walked away from, checkpoint and all. A synchronous check
-      // before a synchronous `set` admits no interleaving.
-      //
-      // Advancing the publication generation instead would drop the response
-      // but orphan both the retained retry descriptor and the session the
-      // server has already started, so the gate is the answer: refuse while a
-      // mutation is in flight, exactly as the post-goal path does.
-      if (guidedChatPending || guidedResponsePending) {
-        return {
-          status: "not_applied",
-          reason: "pending",
-          message: GUIDED_RESPONSE_PENDING_MESSAGE,
-        };
-      }
-      set(clearedGuidedState());
-      return { status: "applied" };
-    }
-    // Sugar over respondGuided — sets control_signal and nulls all choice fields.
-    // All state mutation is handled by respondGuided (via applyGuidedResponse).
-    return get().respondGuided(EXIT_TO_FREEFORM_ACTION);
-  },
 
   async loadStateVersions() {
     const { activeSessionId } = get();
@@ -4650,12 +2584,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   async revertToVersion(stateId: string) {
     const { activeSessionId } = get();
     if (!activeSessionId) return;
-    let acquisition = acquireGuidedRetry("state_revert", activeSessionId, [stateId]);
+    let acquisition = acquireSessionOperationRetry("state_revert", activeSessionId, [stateId]);
     if (acquisition.status === "conflict") {
-      acquisition = await reconcileGuidedRetryConflict(acquisition.existing, "state_revert", activeSessionId, [stateId]);
+      acquisition = await reconcileSessionOperationRetryConflict(acquisition.existing, "state_revert", activeSessionId, [stateId]);
     }
     if (acquisition.status === "conflict") {
-      set(guidedRetryConflictState(acquisition.existing.kind));
+      set(sessionOperationRetryConflictState(acquisition.existing.kind));
       return;
     }
     const retry = acquisition.handle;
@@ -4670,49 +2604,25 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         stateId,
         retry.operationId,
       );
-      // Re-derive the guided surface from the reverted version. A revert can
-      // cross the guided/freeform boundary — most visibly the recoverability
-      // flow behind convertToGuided ("fresh wizard + consent",
-      // elspeth-e2c3dba6b5): convert a worked freeform session to guided, then
-      // revert to the prior freeform version to get the pipeline back. Patching
-      // only compositionState would leave the stale cached guidedSession
-      // rendering the guided wizard over restored freeform state (and the
-      // reverse — reverting to a guided version would keep freeform). Probe
-      // GET /guided?probe=true (non-mutating; null => freeform-only) and set the wire
-      // fields to what the reverted version actually is, mirroring
-      // selectSession's discriminator.
-      // A lazy stub is not a version's guided state, so it is dropped here as
-      // it always was: reverting to a freeform version must land in freeform.
-      const guided = persistedGuidedState(
-        await fetchGuidedStateForSelect(activeSessionId, "throw"),
-      );
-      // Stale-guard: drop the result if the active session changed while the
-      // revert + probe were in flight (mirrors startGuided/selectSession).
+      // Drop a result that settles after the user switches sessions.
       if (get().activeSessionId !== activeSessionId) {
-        clearGuidedRetry(retry);
+        clearSessionOperationRetry(retry);
         return;
       }
       // Clear selection — the reverted version may not contain the selected node
       set({
-        compositionState: guided?.composition_state ?? compositionState,
+        compositionState,
         selectedNodeId: null,
-        guidedSession: guided?.guided_session ?? null,
-        guidedNextTurn: guided?.next_turn ?? null,
-        guidedTerminal: guided?.terminal ?? null,
-        guidedProposalReview: proposalReviewForTurn(guided?.next_turn ?? null),
-        guidedReviewedComponents: selectGuidedReviewedComponents(
-          guided?.guided_session ?? null,
-        ),
       });
       // Revert is a state-producing route: restoring an older pending
       // interpretation requirement can mint fresh backend review events.
       // Pull them into the independent event store so execution does not stay
       // blocked behind an invisible card until a full session reload.
       void refreshInterpretationEventsForSession(activeSessionId);
-      clearGuidedRetry(retry);
+      clearSessionOperationRetry(retry);
     } catch (err) {
-      if (!isAmbiguousGuidedRetryFailure(err)) {
-        clearGuidedRetry(retry);
+      if (!isAmbiguousSessionOperationRetryFailure(err)) {
+        clearSessionOperationRetry(retry);
       }
       set({ error: "Failed to revert to version. Please try again." });
     }
@@ -4751,8 +2661,6 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set({
       error: null,
       errorDetails: null,
-      guidedSelfHealNotice: null,
-      guidedApprovalNotice: null,
     });
   },
 
@@ -4793,9 +2701,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   reset() {
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
-    clearAllGuidedRetries();
-    guidedResponseRetryOwnerGenerations.clear();
-    advanceGuidedPublicationGeneration();
+    clearAllSessionOperationRetries();
+    advanceSessionPublicationGeneration();
     useBlobStore.getState().activateSession(null);
     // composeTimeoutReady resets to false via initialState; App.checkHealth
     // re-latches it on re-authentication. The module ceiling (composeTimeoutMs)

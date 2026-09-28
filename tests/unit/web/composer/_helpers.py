@@ -77,7 +77,8 @@ import pytest
 
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
-from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
+from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner, AdvisorCheckpointVerdict
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 
@@ -125,14 +126,14 @@ def _composer_service_with_session(catalog: CatalogService, settings: WebSetting
     from elspeth.web.sessions.schema import initialize_session_schema
     from elspeth.web.sessions.telemetry import build_sessions_telemetry
     from tests.unit.web.conftest import _make_session
-    from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+    from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
     engine = create_session_engine("sqlite:///:memory:", poolclass=StaticPool, connect_args={"check_same_thread": False})
     initialize_session_schema(engine)
     session_id = str(uuid4())
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id="test-user")
-    sessions = DualFencedSessionServiceHarness(
+    sessions = FencedSessionServiceHarness(
         engine,
         data_dir=Path(settings.data_dir),
         telemetry=build_sessions_telemetry(),
@@ -164,7 +165,7 @@ def _stub_advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     Patching the *method* (not the inner ``_call_advisor_with_audit``) keeps
     the per-call ``llm_calls`` audit counts stable — the gate becomes a no-op
     that always returns CLEAN. Tests that legitimately exercise the gate
-    override ``service._run_advisor_checkpoint`` per-instance (instance attr
+    override ``service._advisor_checkpoint._run_advisor_checkpoint`` per-instance (instance attr
     wins over the class patch), so this default never weakens a real gate
     assertion.
 
@@ -173,7 +174,7 @@ def _stub_advisor_end_gate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     itself (``test_advisor_checkpoint.py``) deliberately do NOT import it.
     """
     monkeypatch.setattr(
-        ComposerServiceImpl,
+        AdvisorCheckpointOwner,
         "_run_advisor_checkpoint",
         _clean_advisor_checkpoint,
         raising=True,

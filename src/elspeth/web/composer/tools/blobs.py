@@ -491,51 +491,6 @@ def _blob_id_uuid_validation_error(blob_id: Any) -> str | None:
     return None
 
 
-def _sync_get_blob_by_storage_path(
-    engine: Engine,
-    storage_path: str,
-    session_id: str,
-) -> BlobToolRecord | None:
-    """Look up a blob by its canonical storage_path within a session.
-
-    Used by guided proposal preparation to detect whether a reviewed path
-    resolves to an already-uploaded blob.
-    When it does, the blob_id (= blob["id"]) can be injected as ``blob_ref``
-    into the reviewed source facts used by proposal custody.
-
-    Returns None if no blob row matches the path, which is the correct
-    representation for path-based sources that are not blob-backed.
-    """
-    with engine.connect() as conn:
-        query = select(blobs_table).where(blobs_table.c.session_id == session_id).where(blobs_table.c.storage_path == storage_path)
-        row = conn.execute(query).first()
-        if row is None:
-            return None
-        return _blob_row_to_tool_dict(row)
-
-
-def _sync_get_blob_by_id(
-    engine: Engine,
-    blob_id: str,
-    session_id: str,
-) -> BlobToolRecord | None:
-    """Look up a blob by its UUID within a session (authoritative DB query).
-
-    The inverse of :func:`_sync_get_blob_by_storage_path`: used to resolve a
-    ``blob:<ref>`` path sentinel
-    — emitted by ``build_step_1_schema_form_turn_from_resolved`` to keep the
-    absolute storage_path off the wire — back to the blob's real ``storage_path``
-    before the source is committed. Session-scoped so a blob ref cannot resolve
-    across sessions (project/tenant isolation). Returns None if no row matches.
-    """
-    with engine.connect() as conn:
-        query = select(blobs_table).where(blobs_table.c.session_id == session_id).where(blobs_table.c.id == blob_id)
-        row = conn.execute(query).first()
-        if row is None:
-            return None
-        return _blob_row_to_tool_dict(row)
-
-
 def _sync_list_blobs(engine: Engine, session_id: str) -> list[BlobInventoryPayload]:
     """Synchronous blob listing for use in the tool executor thread."""
     with engine.connect() as conn:
@@ -1253,8 +1208,7 @@ def _state_options_reference_blob(
     """Recursively inspect one component's options for references to a blob.
 
     Recognizes the UNION of the vocabularies the other blob walkers use
-    (``guided/stage_transitions._option_blob_ids``,
-    ``web/blobs/service._option_value_references_blob``,
+    (``web/blobs/service._option_value_references_blob``,
     ``web/coordination/repository._option_value_references_blob``,
     ``yaml_generator``'s public-YAML strip list) — no single one of them
     knows the whole set: ``blob_ref`` values (top-level source bindings and

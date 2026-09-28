@@ -19,9 +19,9 @@
 // ============================================================================
 
 import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { createRef, type ReactNode } from "react";
+import { createRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 import { axe } from "./axe-config";
 
@@ -49,12 +49,8 @@ const AUDITED_COMPONENTS = [
   "FilterChipStrip",
   "FreeformIntroduction",
   "ShortcutsHelp",
-  "WireStageTurn",
-  "SchemaFormTurn",
-  "ModeSwitchButton",
   "PipelineGloss",
   "PipelineValidationSummary",
-  "ProposePipelineTurn",
   // 2026-07-02 UX-review regression net (elspeth-adf5e679e7): the tutorial
   // surface, the acknowledgement cards it leans on, the auth surface, and
   // the chrome/run components the review epic touched. Added centrally by
@@ -73,41 +69,16 @@ const AUDITED_COMPONENTS = [
   "ProgressView",
   "RecoveryPanel",
   "RunsHistoryDrawer",
-  "TutorialGuidedShell",
+  "TutorialFreeformShell",
   "TutorialTurn1Welcome",
   "TutorialTurn4Run",
   "TutorialTurn5AuditStory",
   "TutorialTurn7Graduation",
-  // Tutorial workspace relayout (elspeth-16aa94c4bb): the two-column guided
-  // workspace ChatPanel renders under isTutorial. Until this entry the guided
-  // branch was never mounted by this suite — TutorialGuidedShell's audit
-  // deliberately holds startGuidedSession pending — so the workspace layout
-  // itself (landmark structure, live-region siblinghood, the named scroll
-  // group) had zero axe coverage.
-  "ChatPanelTutorialWorkspace",
-  // A completed guided session keeps its conversation (elspeth-986801d218):
-  // the completed branch grew a live transcript log, an Explain control, the
-  // pending strip and the docked composer alongside the completion summary.
-  // That is a NEW landmark/live-region arrangement — summary + announcer as
-  // siblings of a role=log inside a named scroll group — and the tutorial
-  // workspace entry above audits the ACTIVE branch only.
-  "ChatPanelCompletedSurface",
+  // The tutorial's Build step uses the ordinary freeform authoring surface.
+  "ChatPanelFreeformTutorialWorkspace",
   // Run-lifecycle feedback (elspeth-3a7b7c7b37): the app-level terminal-run
   // toast is the only completion surface mounted outside the Run panel.
   "RunOutcomeNotice",
-  // Goal-first entry (elspeth-378cfa0e18): before a session has stated its
-  // goal the guided branch REPLACES the current-decision card with a goal
-  // card. That is a distinct arrangement from both audited ChatPanel entries
-  // — the decision card's role=log live region and its Explain control are
-  // absent, and a heading + hint sit where the turn widget was — so the
-  // either/or has to be audited on its own rather than assumed from the
-  // active-branch entry.
-  "ChatPanelGoalCard",
-  // Decision sheets (elspeth-f2a8550b3d): the read-only record a settled
-  // stepper tick opens. A disclosure whose panel takes focus, names itself,
-  // and replays a settled transcript — none of which the in-situ ChatPanel
-  // entries can cover for more than one stage at a time.
-  "GuidedDecisionSheet",
 ] as const;
 
 const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
@@ -116,9 +87,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "AppHeader",
   "AuditReadinessPanel",
   "ChatInput",
-  "ChatPanelCompletedSurface",
-  "ChatPanelGoalCard",
-  "ChatPanelTutorialWorkspace",
+  "ChatPanelFreeformTutorialWorkspace",
   "CommandPalette",
   "ComposerPreferencesPanel",
   "CompletionBar",
@@ -128,34 +97,29 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "GraphMiniView",
   "GraphModal",
   "GraphView",
-  "GuidedDecisionSheet",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
   "HelloWorldTutorial",
   "InlineSourceCreatedTurn",
   "InlineSourceFallbackPrompt",
   "LoginPage",
-  "ModeSwitchButton",
   "PipelineGloss",
   "PipelineValidationSummary",
   "PluginCard",
   "ProgressView",
-  "ProposePipelineTurn",
   "ReadinessRowDetail",
   "RecoveryPanel",
   "RunOutcomeNotice",
   "RunsHistoryDrawer",
-  "SchemaFormTurn",
   "ShortcutsHelp",
   "FreeformIntroduction",
-  "TutorialGuidedShell",
+  "TutorialFreeformShell",
   "TutorialTurn1Welcome",
   "TutorialTurn4Run",
   "TutorialTurn5AuditStory",
   "TutorialTurn7Graduation",
   "UserMenu",
   "WorkspaceSeparator",
-  "WireStageTurn",
 ];
 
 describe("audit surface — coverage snapshot", () => {
@@ -203,7 +167,6 @@ vi.mock("@/api/client", async (importOriginal) => {
     deleteTutorialOrphans: vi.fn(),
     renameSession: vi.fn(),
     sendTutorialAbandonBeacon: vi.fn(),
-    startGuidedSession: vi.fn(),
     getTutorialSample: vi.fn(),
     runTutorialPipeline: vi.fn(),
     cancelTutorialRun: vi.fn(),
@@ -252,6 +215,9 @@ vi.mock("@xyflow/react", () => ({
   ),
   Background: () => <div data-testid="react-flow-background" />,
   Controls: () => <div data-testid="react-flow-controls" />,
+  ControlButton: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>{children}</button>
+  ),
   MiniMap: () => <div data-testid="minimap" />,
   // GraphView reaches MarkerType at render time (withDirectionMarkers), so it
   // must be mocked even though this file only exercises the accessible-name
@@ -272,9 +238,7 @@ vi.mock("@dagrejs/dagre", () => ({
         node() {
           return { x: 0, y: 0 };
         }
-        // ReadOnlyPipelineGraph (ProposePipelineTurn's DAG canvas) reads
-        // graph.graph().width/height to size the viewBox — the GraphView stub
-        // above never calls it, so the shared mock must still answer it.
+        // GraphView's graph layout can read dimensions from the stub.
         graph() {
           return { width: 480, height: 200 };
         }
@@ -308,13 +272,8 @@ import { PluginCard } from "@/components/catalog/PluginCard";
 import { FilterChipStrip, type CatalogFilters } from "@/components/catalog/FilterChipStrip";
 import { FreeformIntroduction } from "@/components/chat/FreeformIntroduction";
 import { ShortcutsHelp } from "@/components/common/ShortcutsHelp";
-import { WireStageTurn } from "@/components/chat/guided/WireStageTurn";
-import { SchemaFormTurn } from "@/components/chat/guided/SchemaFormTurn";
-import { ModeSwitchButton } from "@/components/chat/guided/ModeSwitchButton";
-import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
-import { PipelineValidationSummary } from "@/components/chat/guided/PipelineValidationSummary";
-import { ProposePipelineTurn } from "@/components/chat/guided/ProposePipelineTurn";
-import { GuidedDecisionSheet } from "@/components/chat/guided/GuidedDecisionSheet";
+import { PipelineGloss } from "@/components/chat/PipelineGloss";
+import { PipelineValidationSummary } from "@/components/chat/PipelineValidationSummary";
 import { AcknowledgementCard } from "@/components/chat/AcknowledgementCard";
 import { AcknowledgementStack } from "@/components/chat/AcknowledgementStack";
 import { ChatInput } from "@/components/chat/ChatInput";
@@ -331,7 +290,7 @@ import { GraphModal } from "@/components/sidebar/GraphModal";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { RecoveryPanel } from "@/components/recovery/RecoveryPanel";
 import { HelloWorldTutorial } from "@/components/tutorial/HelloWorldTutorial";
-import { TutorialGuidedShell } from "@/components/tutorial/TutorialGuidedShell";
+import { TutorialFreeformShell } from "@/components/tutorial/TutorialFreeformShell";
 import { TutorialTurn1Welcome } from "@/components/tutorial/TutorialTurn1Welcome";
 import { TutorialTurn4Run } from "@/components/tutorial/TutorialTurn4Run";
 import { TutorialTurn5AuditStory } from "@/components/tutorial/TutorialTurn5AuditStory";
@@ -356,14 +315,6 @@ import type {
   ValidationReadiness,
 } from "@/types/index";
 import type { ReadinessRow, AuditReadinessSnapshot } from "@/types/api";
-import type {
-  GuidedProposalReviewState,
-  GuidedSession,
-  ProposePipelinePayload,
-  SchemaFormPayload,
-  TurnPayload,
-  WireStageData,
-} from "@/types/guided";
 import type { InterpretationEvent } from "@/types/interpretation";
 import {
   compositionStateAuthorityFields,
@@ -383,7 +334,6 @@ function resetAllStores() {
   resetStore(usePreferencesStore);
   usePreferencesStore.setState({
     loaded: true,
-    defaultMode: "guided",
     writing: false,
     writeError: null,
     bootstrapError: null,
@@ -396,7 +346,7 @@ function resetAllStores() {
     compositionState: {
       version: 1,
       sources: {},
-      nodes: [{ id: "select_columns" }],
+      nodes: [{ id: "select_columns", node_type: "transform", plugin: "select_columns", options: {} }],
       edges: [],
       outputs: [],
     } as never,
@@ -541,119 +491,6 @@ describe("UserMenu", () => {
       <UserMenu onOpenSettings={() => {}} onSignOut={() => {}} />,
     );
     await userEvent.click(screen.getByRole("button", { name: /account/i }));
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("WireStageTurn", () => {
-  const wireBase: WireStageData = {
-    proposal_id: "00000000-0000-4000-8000-000000000001",
-    draft_hash: "d".repeat(64),
-    sources: [{ stable_id: "00000000-0000-4000-8000-000000000010", label: "source-1", plugin: "inline_blob", on_validation_failure: "discard", guaranteed_fields: ["body"], row_cardinality: { input: "none", output: "zero_or_many", expected_output_count: null } }],
-    nodes: [],
-    outputs: [{ stable_id: "00000000-0000-4000-8000-000000000020", label: "output-1", plugin: "json", on_write_failure: "discard", required_fields: ["body"], business_schema: { mode: "observed", fields: [], guaranteed_fields: [], required_fields: ["body"] } }],
-    connections: [{ stable_id: "00000000-0000-4000-8000-000000000030", from_endpoint: { kind: "source", stable_id: "00000000-0000-4000-8000-000000000010" }, to_endpoint: { kind: "output", stable_id: "00000000-0000-4000-8000-000000000020" }, flow: { kind: "source_success", branch: null }, schema_contract: null }],
-    semantic_contracts: [],
-    warnings: [
-      {
-        type: "prompt_shield",
-        message: "Prompt shield advisory: source text was reviewed.",
-      },
-    ],
-    blockers: [],
-    can_confirm: true,
-  };
-
-  // Initial confirm turn (no outcome): the bare "Confirm wiring" action area.
-  it("has no axe violations (initial confirm)", async () => {
-    const { container } = render(
-      <WireStageTurn data={wireBase} onConfirm={() => {}} confirmDisabled={false} />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations with the freeform exit available", async () => {
-    const { container } = render(
-      <WireStageTurn
-        data={wireBase}
-        onConfirm={() => {}}
-        confirmDisabled={false}
-        onExitToFreeform={() => {}}
-      />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations with an llm node's prompt summary and its Edit routed to the correction form", async () => {
-    // I-2: prompt block + expand toggle + Edit pre-selecting the node.
-    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
-    const nodeId = "00000000-0000-4000-8000-000000000015";
-    const { container } = render(
-      <WireStageTurn
-        data={{
-          ...wireBase,
-          nodes: [{
-            stable_id: nodeId,
-            label: "summarise",
-            node_type: "transform",
-            plugin: "llm",
-            behavior: { kind: "transform" },
-            required_fields: ["body"],
-            guaranteed_fields: ["summary"],
-            row_cardinality: { input: "one", output: "one", expected_output_count: null },
-            structured_output_fields: [],
-            node_options_summary: [
-              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
-              { key: "prompt_template", value: longPrompt, tier: "common" },
-            ],
-          }],
-        }}
-        onConfirm={() => {}}
-        confirmDisabled={false}
-        onCorrect={() => {}}
-      />,
-    );
-    screen.getByText("Model: anthropic/claude-sonnet-4");
-    expect(await axe(container)).toHaveNoViolations();
-    await userEvent.click(screen.getByRole("button", { name: "Show full user prompt for summarise" }));
-    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
-    expect(screen.getByLabelText("Component")).toHaveValue(nodeId);
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("SchemaFormTurn", () => {
-  // The guided decision surface now defaults to a read-only summary (<dl> rows +
-  // role=note caveat) with a non-tutorial Edit toggle that reveals the editable
-  // KnobFieldRenderer form. Audit all three states the redesign introduced: the
-  // default summary, the revealed edit form (newly axe-covered), and the
-  // tutorial summary (no Edit affordance).
-  const auditPayload: SchemaFormPayload = {
-    mode: "plugin_options",
-    plugin: "csv",
-    knobs: {
-      fields: [
-        { name: "encoding", label: "Encoding", kind: "text", required: false, nullable: false },
-        { name: "on_validation_failure", label: "On Validation Failure", kind: "text", required: true, nullable: false },
-        { name: "schema", label: "Schema", kind: "json-object", required: false, nullable: false },
-      ],
-    },
-    prefilled: { encoding: "utf-8", on_validation_failure: "discard", schema: { mode: "observed" } },
-  };
-
-  it("has no axe violations in the default summary view", async () => {
-    const { container } = render(<SchemaFormTurn payload={auditPayload} onSubmit={() => {}} />);
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations in the revealed edit form", async () => {
-    const { container } = render(<SchemaFormTurn payload={auditPayload} onSubmit={() => {}} />);
-    await userEvent.click(screen.getByRole("button", { name: "Edit" }));
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations in tutorial summary mode", async () => {
-    const { container } = render(<SchemaFormTurn payload={auditPayload} onSubmit={() => {}} isTutorial />);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -909,40 +746,6 @@ describe("ShortcutsHelp", () => {
   });
 });
 
-describe("ModeSwitchButton", () => {
-  it("has no axe violations (resting)", async () => {
-    const { container } = render(
-      <ModeSwitchButton target="guided" hasWork={false} />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations (confirm state)", async () => {
-    const { container } = render(
-      <ModeSwitchButton target="freeform" hasWork />,
-    );
-    // Reveal the two-step confirm (the new interactive surface).
-    await userEvent.click(
-      screen.getByRole("button", { name: "Exit to freeform" }),
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations on the guided confirm card's required goal field", async () => {
-    // Goal-first (elspeth-378cfa0e18) put a form control on this card. A
-    // placeholder is not an accessible name, so axe's `label` rule is the gate
-    // that keeps the question a real <label>.
-    const { container } = render(
-      <ModeSwitchButton target="guided" hasWork />,
-    );
-    await userEvent.click(
-      screen.getByRole("button", { name: "Switch to guided" }),
-    );
-    screen.getByRole("textbox", { name: "What should this pipeline produce?" });
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
 describe("PipelineGloss", () => {
   it("has no axe violations", async () => {
     const { container } = render(
@@ -979,276 +782,6 @@ describe("PipelineValidationSummary", () => {
   });
 });
 
-// --- Guided proposal review surface ------------------------------------------
-//
-// ProposePipelineTurn is the whole-DAG review turn the guided/freeform parity
-// work lands on: a read-only graph, the components/routes summary, blockers,
-// and the accept/reject/revise controls. It carries a
-// live-region status/alert whose focus moves on stale/error transitions and a
-// tutorial read-only variant. Audit every branch of that surface — the plain
-// active controls, the blocker-gated revise-required state, the stale and
-// error live regions (asserting the focus placement the useEffect performs),
-// and the passive tutorial render.
-
-describe("ProposePipelineTurn", () => {
-  const PROPOSAL_ID = "00000000-0000-4000-8000-0000000004a1";
-  const DRAFT_HASH = "d".repeat(64);
-  const SOURCE_ID = "00000000-0000-4000-8000-0000000004a2";
-  const NODE_ID = "00000000-0000-4000-8000-0000000004a3";
-  const OUTPUT_ID = "00000000-0000-4000-8000-0000000004a4";
-  const edge = (n: number): string => `00000000-0000-4000-8000-${String(4000 + n).padStart(12, "0")}`;
-
-  function proposalPayload(
-    overrides: Partial<ProposePipelinePayload> = {},
-  ): ProposePipelinePayload {
-    return {
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-      supersedes_draft_hash: null,
-      summary: "guided.proposal.summary.a11y.v1",
-      rationale: "guided.proposal.rationale.a11y.v1",
-      component_counts: { sources: 1, nodes: 1, edges: 5, outputs: 1 },
-      blockers: [],
-      graph: {
-        sources: [
-          { stable_id: SOURCE_ID, label: "pages", plugin: { kind: "source", id: "csv" } },
-        ],
-        edges: [
-          {
-            stable_id: edge(1),
-            from_endpoint: { kind: "source", stable_id: SOURCE_ID },
-            to_endpoint: { kind: "node", stable_id: NODE_ID },
-            flow: { kind: "source_success", branch: null },
-          },
-          {
-            stable_id: edge(2),
-            from_endpoint: { kind: "source", stable_id: SOURCE_ID },
-            to_endpoint: { kind: "discard" },
-            flow: { kind: "source_validation_failure" },
-          },
-          {
-            stable_id: edge(3),
-            from_endpoint: { kind: "node", stable_id: NODE_ID },
-            to_endpoint: { kind: "output", stable_id: OUTPUT_ID },
-            flow: { kind: "node_success", branch: null },
-          },
-          {
-            stable_id: edge(4),
-            from_endpoint: { kind: "node", stable_id: NODE_ID },
-            to_endpoint: { kind: "discard" },
-            flow: { kind: "node_error" },
-          },
-          {
-            stable_id: edge(5),
-            from_endpoint: { kind: "output", stable_id: OUTPUT_ID },
-            to_endpoint: { kind: "discard" },
-            flow: { kind: "output_write_failure" },
-          },
-        ],
-      },
-      nodes: [
-        {
-          stable_id: NODE_ID,
-          label: "summarise",
-          node_type: "transform",
-          plugin: { kind: "transform", id: "llm" },
-          behavior: { kind: "transform" },
-          node_options_summary: [],
-        },
-      ],
-      outputs: [
-        { stable_id: OUTPUT_ID, label: "results", plugin: { kind: "sink", id: "json" } },
-      ],
-      edit_targets: [
-        { kind: "node", stable_id: NODE_ID },
-        { kind: "source", stable_id: SOURCE_ID },
-        { kind: "output", stable_id: OUTPUT_ID },
-      ],
-      ...overrides,
-    };
-  }
-
-  it("has no axe violations in the default active review state", async () => {
-    const reviewState: GuidedProposalReviewState = {
-      status: "active",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-    };
-    const { container } = render(
-      <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
-    );
-    // Non-vacuous: the Graph-pane pointer (the DAG itself moved to the
-    // Pipeline pane — elspeth-9f0873426a), the accessible heading, and the
-    // enabled primary control must all be real.
-    screen.getByRole("button", { name: "Show graph" });
-    screen.getByRole("heading", { name: "Review pipeline proposal" });
-    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations with the llm prompt summary collapsed, expanded, and its Edit opened", async () => {
-    // I-2: the prompt block (label, pre-wrapped text, expand toggle) and the
-    // Edit that pre-targets the node revise are new default-view controls.
-    const longPrompt = Array.from({ length: 12 }, (_, i) => `Step ${i + 1}: read the passage.`).join("\n");
-    const reviewState: GuidedProposalReviewState = {
-      status: "active",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-    };
-    const base = proposalPayload();
-    const { container } = render(
-      <ProposePipelineTurn
-        payload={{
-          ...base,
-          nodes: [{
-            ...base.nodes[0],
-            node_options_summary: [
-              { key: "model", value: "anthropic/claude-sonnet-4", tier: "common" },
-              { key: "system_prompt", value: "You are a careful reviewer.", tier: "common" },
-              { key: "prompt_template", value: longPrompt, tier: "common" },
-            ],
-          }],
-        }}
-        reviewState={reviewState}
-        onSubmit={() => {}}
-      />,
-    );
-    screen.getByText("Model: anthropic/claude-sonnet-4");
-    expect(await axe(container)).toHaveNoViolations();
-    await userEvent.click(screen.getByRole("button", { name: "Show full user prompt for summarise" }));
-    await userEvent.click(screen.getByRole("button", { name: "Edit prompt for summarise" }));
-    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveFocus();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations in the blocker-gated revise-required state", async () => {
-    const reviewState: GuidedProposalReviewState = {
-      status: "active",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-    };
-    const { container } = render(
-      <ProposePipelineTurn
-        payload={proposalPayload({
-          blockers: [
-            {
-              code: "policy_review_required",
-              category: "policy",
-              summary: "guided.proposal.blocker.policy_review_required.v1",
-              edit_target: { kind: "node", stable_id: NODE_ID },
-            },
-          ],
-        })}
-        reviewState={reviewState}
-        onSubmit={() => {}}
-      />,
-    );
-    // Non-vacuous: the blocker list gates wiring review while the revise
-    // affordance stays reachable.
-    screen.getByText("A policy review is required before this pipeline can advance.");
-    expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /Revise summarise/ })).toBeEnabled();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations in the stale live-region state (focus moves to status)", async () => {
-    const reviewState: GuidedProposalReviewState = {
-      status: "stale",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-    };
-    const { container } = render(
-      <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
-    );
-    // Live-region behavior + focus placement: the stale transition surfaces a
-    // role=status announcement that receives focus, and locks the controls.
-    const status = screen.getByRole("status");
-    expect(status).toHaveTextContent(/stale/i);
-    expect(status).toHaveFocus();
-    expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations in the retryable error state (focus moves to alert)", async () => {
-    const reviewState: GuidedProposalReviewState = {
-      status: "error",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-      message: "The response was not received. Retry the same action.",
-      retryable: true,
-      retry_action: {
-        kind: "revise",
-        edit_target: { kind: "node", stable_id: NODE_ID },
-        correction_feedback: "Change the selected node mapping.",
-      },
-    };
-    const { container } = render(
-      <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
-    );
-    // Live-region behavior + focus placement: the error transition surfaces a
-    // role=alert that receives focus; only the retained revise action stays
-    // enabled.
-    const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent(/response was not received/i);
-    expect(alert).toHaveFocus();
-    expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /Revise summarise/ })).toBeDisabled();
-    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveValue(
-      "Change the selected node mapping.",
-    );
-    expect(screen.getByRole("button", { name: "Send revision request" })).toBeEnabled();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations in the tutorial revision render (live primary, off-script controls withheld)", async () => {
-    const reviewState: GuidedProposalReviewState = {
-      status: "active",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-    };
-    const { container } = render(
-      <ProposePipelineTurn
-        payload={proposalPayload({ supersedes_draft_hash: "e".repeat(64) })}
-        reviewState={reviewState}
-        onSubmit={() => {}}
-        isTutorial
-      />,
-    );
-    // Non-vacuous: the tutorial teaching note renders, the live "Review
-    // wiring" primary stays actionable (the tutorial proposal is a REAL
-    // planner proposal the learner must accept to advance), and the off-script
-    // reject/revise controls are withheld.
-    screen.getByText(/press Review wiring to continue/i);
-    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
-    expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
-    expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations on a tutorial FIRST proposal (null supersedes hash, same live primary)", async () => {
-    // The withheld-primary render this replaces is gone with the proposal it
-    // guarded (goal-first, elspeth-378cfa0e18): the frozen transforms prompt is
-    // the session's root intent now, so the step-2 finish plans once and its
-    // proposal — supersedes_draft_hash null — IS the one the learner reviews.
-    // Audited alongside the superseding case so the two hash states are pinned
-    // to render the same controls.
-    const reviewState: GuidedProposalReviewState = {
-      status: "active",
-      proposal_id: PROPOSAL_ID,
-      draft_hash: DRAFT_HASH,
-    };
-    const { container } = render(
-      <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} isTutorial />,
-    );
-    expect(proposalPayload().supersedes_draft_hash).toBeNull();
-    screen.getByText(/press Review wiring to continue/i);
-    expect(screen.getByRole("button", { name: "Review wiring" })).toBeEnabled();
-    expect(screen.queryByRole("button", { name: "Reject proposal" })).toBeNull();
-    expect(screen.queryByRole("button", { name: /Revise/ })).toBeNull();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
 // --- Tutorial surface (elspeth-adf5e679e7) -----------------------------------
 //
 // The tutorial is the surface being promoted to flagship; until this pass it
@@ -1277,12 +810,15 @@ describe("TutorialTurn1Welcome", () => {
   });
 });
 
-describe("TutorialGuidedShell", () => {
-  it("has no axe violations while preparing the guided session", async () => {
-    // A pending start keeps the shell on its own chrome (kicker + sr-only
-    // status + sample-loading line) without mounting the embedded ChatPanel,
-    // whose guided internals are audited via their own components above.
-    vi.mocked(apiClient.startGuidedSession).mockReturnValue(
+describe("TutorialFreeformShell", () => {
+  it("has no axe violations while preparing the freeform sample brief", async () => {
+    // Keep the sample request pending to audit the loading surface.
+    useSessionStore.setState({
+      activeSessionId: "00000000-0000-4000-8000-000000000999",
+      compositionStateLoaded: true,
+      error: null,
+    });
+    vi.mocked(apiClient.getTutorialSample).mockReturnValue(
       new Promise<never>(() => {}),
     );
     vi.stubGlobal(
@@ -1294,420 +830,30 @@ describe("TutorialGuidedShell", () => {
       },
     );
     const { container } = render(
-      <TutorialGuidedShell
+      <TutorialFreeformShell
         sessionId="00000000-0000-4000-8000-000000000999"
         onCompleted={() => {}}
       />,
     );
-    screen.getByText(/Preparing the tutorial's sample pages/);
+    screen.getByText(/Loading your example/);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
 
-describe("ChatPanelTutorialWorkspace", () => {
-  // The tutorial two-column workspace (elspeth-16aa94c4bb): conversation
-  // column (bubble transcript → run results → acknowledgements → current
-  // decision) over the docked composer, plus the artifact rail. Audited in
-  // its richest deterministic state — a transcript spanning two stages (so
-  // the stage dividers render), a prior decision in the rail's "Decisions so
-  // far", a schema_form current decision, and the "Sent" composer state —
-  // covering the landmark structure and the sibling (never nested) live
-  // regions the layout moved: transcript log, wizard-step log, the
-  // acknowledgement announcer, and the Sent status line.
-
-  function makeTutorialGuidedSession(): GuidedSession {
-    return {
-      step: "step_2_sink",
-      history: [
-        {
-          step: "step_1_source",
-          turn_type: "single_select",
-          payload_hash: "aabbcc001122",
-          response_hash: "ddeeff334455",
-          emitter: "server",
-          summary: "Source selected: web_scrape",
-        },
-      ],
-      terminal: null,
-      chat_history: [
-        {
-          role: "user",
-          content: "Summarise these pages:\nhttps://example.gov.au/page-1",
-          seq: 1,
-          step: "step_1_source",
-          ts_iso: "2026-07-03T00:00:00Z",
-          assistant_message_kind: null,
-          synthetic_failure_reason: null,
-          turn_token: null,
-        },
-        {
-          role: "assistant",
-          content: "**Source created** — reading the sample pages.",
-          seq: 2,
-          step: "step_1_source",
-          ts_iso: "2026-07-03T00:00:01Z",
-          assistant_message_kind: "assistant",
-          synthetic_failure_reason: null,
-          turn_token: null,
-        },
-        {
-          role: "user",
-          content: "Write the results out as JSONL.",
-          seq: 3,
-          step: "step_2_sink",
-          ts_iso: "2026-07-03T00:00:02Z",
-          assistant_message_kind: null,
-          synthetic_failure_reason: null,
-          turn_token: null,
-        },
-        {
-          role: "assistant",
-          content: "I set up a JSONL output for the summaries.",
-          seq: 4,
-          step: "step_2_sink",
-          ts_iso: "2026-07-03T00:00:03Z",
-          assistant_message_kind: "assistant",
-          synthetic_failure_reason: null,
-          turn_token: null,
-        },
-      ],
-      chat_turn_seq: 4,
-      reviewed_components: { sources: [], outputs: [] },
-      profile: null,
-    };
-  }
-
-  function makeSchemaFormNextTurn(): TurnPayload {
-    const payload: SchemaFormPayload = {
-      mode: "plugin_options",
-      plugin: "json",
-      knobs: {
-        fields: [
-          { name: "path", label: "Path", kind: "text", required: true, nullable: false },
-        ],
-      },
-      prefilled: { path: "results.jsonl" },
-    };
-    return { type: "schema_form", step_index: 1, turn_token: "a".repeat(64), payload };
-  }
-
-  it("has no axe violations on the two-column tutorial workspace", async () => {
-    // jsdom does not implement Element.prototype.scrollIntoView (the
-    // step-advance focus effect scrolls the just-built decision into view
-    // on mount) — same stub as CommandPalette above.
-    Element.prototype.scrollIntoView = vi.fn();
-    // InlineRunResults loads the session's runs on mount; jsdom has no
-    // backend, so seed an empty list.
-    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
+describe("ChatPanelFreeformTutorialWorkspace", () => {
+  it("has no axe violations in the tutorial's freeform Build surface", async () => {
     useSessionStore.setState({
-      compositionState: makeFullCompositionState(),
-      compositionProposals: [],
-      guidedSession: makeTutorialGuidedSession(),
-      guidedNextTurn: makeSchemaFormNextTurn(),
-    } as never);
-
-    const { container } = render(
-      <ChatPanel
-        isTutorial
-        lockedChatPrompt={{
-          step_1_source: "Summarise these pages:\nhttps://example.gov.au/page-1",
-          step_2_sink: "Write the results out as JSONL.",
-        }}
-      />,
-    );
-
-    // Guard against a vacuous pass: the named authoring scroll group, both
-    // role=log regions (transcript + wizard step), and the Sent composer state
-    // must all be mounted. Artifact and history content belongs to the common
-    // workspace/Inspector, not this authoring component.
-    screen.getByRole("group", { name: "Conversation" });
-    screen.getByRole("log", { name: "Step chat history" });
-    screen.getByRole("log", { name: "Guided wizard step" });
-    screen.getByText(/your request is in the transcript above/i);
-    expect(
-      screen.queryByRole("complementary", { name: "Pipeline summary" }),
-    ).toBeNull();
-    expect(screen.queryByRole("heading", { name: /decisions so far/i })).toBeNull();
-
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations while a guided chat is in flight (pending strip in conversation flow)", async () => {
-    // Placement pass 2026-07-23: while /guided/chat is in flight the
-    // GuidedPendingStrip (status region + Stop) rides in the conversation
-    // scroll region — the provisional reply slot — and the ChatInput keeps
-    // its place, disabled. chat_history holds only the PRIOR step's turns —
-    // the current step's user turn is server-emitted on response, so
-    // mid-flight the step is not "built" and both surfaces render.
-    Element.prototype.scrollIntoView = vi.fn();
-    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
-    const session = makeTutorialGuidedSession();
-    session.chat_history = session.chat_history.slice(0, 2);
-    useSessionStore.setState({
-      compositionState: makeFullCompositionState(),
-      compositionProposals: [],
-      guidedSession: session,
-      guidedNextTurn: makeSchemaFormNextTurn(),
-      guidedChatPending: true,
-    } as never);
-
-    const { container } = render(
-      <ChatPanel
-        isTutorial
-        lockedChatPrompt={{
-          step_1_source: "Summarise these pages:\nhttps://example.gov.au/page-1",
-          step_2_sink: "Write the results out as JSONL.",
-        }}
-      />,
-    );
-
-    // Non-vacuous: the strip rides in the conversation region, Stop is
-    // offered, and the composer landmark + input both survive (the input is
-    // no longer swapped out from under the typing area).
-    const strip = container.querySelector(".guided-pending-strip");
-    expect(strip).not.toBeNull();
-    const scroll = container.querySelector(".guided-authoring-scroll");
-    expect(scroll).not.toBeNull();
-    expect(scroll!.contains(strip)).toBe(true);
-    screen.getByRole("button", { name: "Stop composing" });
-    screen.getByRole("region", { name: "Describe what you want" });
-    expect(screen.getByLabelText("Message input")).toBeInTheDocument();
-
-    expect(await axe(container)).toHaveNoViolations();
-  });
-
-  it("has no axe violations with a settled tick expanded into its decision sheet", async () => {
-    // Decision sheets (elspeth-f2a8550b3d): a settled stepper tick becomes a
-    // disclosure BUTTON inside its <li>, and the panel it controls mounts
-    // between the band and the conversation group. That is a new arrangement
-    // inside an already-audited surface — a listitem with an interactive
-    // child, an aria-controls IDREF that must resolve, and a replayed
-    // transcript that must not become a second live region.
-    Element.prototype.scrollIntoView = vi.fn();
-    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
-    const session = makeTutorialGuidedSession();
-    session.reviewed_components = {
-      sources: [
-        {
-          stable_id: "00000000-0000-4000-8000-0000000009a1",
-          name: "pages",
-          plugin: "web_scrape",
-          status: "reviewed",
-        },
-      ],
-      outputs: [],
-    };
-    useSessionStore.setState({
-      compositionState: makeFullCompositionState(),
-      compositionProposals: [],
-      guidedSession: session,
-      guidedNextTurn: makeSchemaFormNextTurn(),
-    } as never);
-
-    const { container } = render(
-      <ChatPanel
-        isTutorial
-        lockedChatPrompt={{
-          step_1_source: "Summarise these pages:\nhttps://example.gov.au/page-1",
-          step_2_sink: "Write the results out as JSONL.",
-        }}
-      />,
-    );
-
-    await userEvent.click(screen.getByRole("button", { name: /^Source/ }));
-
-    // Non-vacuous: the disclosure is expanded, the panel it names is mounted
-    // and its aria-controls resolves, and the replayed turns are a static
-    // group rather than a second "Step chat history" log.
-    const tick = screen.getByRole("button", { name: "Source, completed" });
-    expect(tick).toHaveAttribute("aria-expanded", "true");
-    const sheet = screen.getByRole("region", { name: "Source — decided" });
-    expect(tick.getAttribute("aria-controls")).toBe(sheet.getAttribute("id"));
-    expect(
-      within(sheet).getByRole("group", { name: "Guided build conversation" }),
-    ).toBeInTheDocument();
-    expect(within(sheet).queryByRole("log")).toBeNull();
-
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("GuidedDecisionSheet", () => {
-  // The read-only record a settled stepper tick opens (elspeth-f2a8550b3d).
-  // Audited as a leaf too, not only in situ: it owns a named region that takes
-  // focus on open, a component list, and a replayed transcript, and the
-  // in-situ case above can only ever mount ONE stage's arrangement.
-  it("has no axe violations with components, a record and replayed turns", async () => {
-    const { container } = render(
-      <GuidedDecisionSheet
-        id="a11y-decision-sheet"
-        stage="step_4_wire"
-        rows={[
-          {
-            key: "00000000-0000-4000-8000-0000000009b1",
-            name: "pages",
-            plugin: "web_scrape",
-          },
-          { key: "fan_out", name: "Fan Out", plugin: null },
-        ]}
-        chatTurns={[
-          {
-            role: "user",
-            content: "does this wiring look right?",
-            seq: 1,
-            step: "step_4_wire",
-            ts_iso: "2026-09-03T00:00:00Z",
-            assistant_message_kind: null,
-            synthetic_failure_reason: null,
-            turn_token: null,
-          },
-        ]}
-        record="Guided pipeline wiring confirmed."
-        onClose={vi.fn()}
-      />,
-    );
-
-    screen.getByRole("region", { name: "Wire — decided" });
-    screen.getByRole("button", { name: "Close" });
-
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("ChatPanelCompletedSurface", () => {
-  // A completed guided session keeps its conversation (elspeth-986801d218).
-  // The arrangement this audits: the completion summary and the always-mounted
-  // acknowledgement announcer are SIBLINGS of the named "Conversation" scroll
-  // group, and the transcript's role=log lives INSIDE that group — one live
-  // region per event kind, never nested, with the docked composer below.
-  it("has no axe violations with a live transcript and the docked composer", async () => {
-    Element.prototype.scrollIntoView = vi.fn();
-    vi.mocked(apiClient.fetchRuns).mockResolvedValue([]);
-    const confirmationHash = "c".repeat(64);
-    useSessionStore.setState({
-      compositionState: makeFullCompositionState(),
-      compositionProposals: [],
-      guidedSession: {
-        step: "step_4_wire",
-        history: [
-          {
-            step: "step_4_wire",
-            turn_type: "confirm_wiring",
-            payload_hash: "aabbcc001122",
-            response_hash: confirmationHash,
-            emitter: "server",
-            summary: "Wiring confirmed",
-          },
-        ],
-        terminal: {
-          kind: "completed",
-          reason: null,
-          pipeline_yaml: "source:\n  plugin: csv\n",
-        },
-        chat_history: [
-          {
-            role: "user",
-            content: "Write the results out as JSONL.",
-            seq: 1,
-            step: "step_4_wire",
-            ts_iso: "2026-09-03T00:00:00Z",
-            assistant_message_kind: null,
-            synthetic_failure_reason: null,
-            turn_token: "a".repeat(64),
-          },
-          {
-            role: "assistant",
-            content: "Done — the output writes JSONL.",
-            seq: 2,
-            step: "step_4_wire",
-            ts_iso: "2026-09-03T00:00:01Z",
-            assistant_message_kind: "assistant",
-            synthetic_failure_reason: null,
-            turn_token: null,
-          },
-          {
-            role: "user",
-            content: "What does the transform step do?",
-            seq: 3,
-            step: "step_4_wire",
-            ts_iso: "2026-09-03T00:01:00Z",
-            assistant_message_kind: null,
-            synthetic_failure_reason: null,
-            turn_token: confirmationHash,
-          },
-        ],
-        chat_turn_seq: 4,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      },
-      guidedNextTurn: null,
-    } as never);
-
-    const { container } = render(<ChatPanel />);
-
-    // Guard against a vacuous pass: the audited arrangement must be mounted.
-    const scroll = screen.getByRole("group", { name: "Conversation" });
-    const log = screen.getByRole("log", { name: "Step chat history" });
-    expect(scroll.contains(log)).toBe(true);
-    screen.getByRole("region", { name: "Describe what you want" });
-    screen.getByRole("button", { name: "Explain this pipeline" });
-    screen.getByText("After confirmation");
-
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("ChatPanelGoalCard", () => {
-  // Goal-first entry (elspeth-378cfa0e18). Before the session has a goal the
-  // store has adopted the lazy GET /guided stub — a first turn and NO
-  // composition state — and the panel replaces the current-decision card with
-  // the goal card. Audited on its own because that arrangement drops the
-  // decision card's role=log live region and its Explain control; the risk
-  // being pinned is a second live region (or a duplicated heading id) landing
-  // inside the named conversation group.
-  it("has no axe violations on the pre-goal guided surface", async () => {
-    Element.prototype.scrollIntoView = vi.fn();
-    useSessionStore.setState({
-      activeSessionId: "sess-a11y-goal",
+      activeSessionId: "sess-a11y",
       messages: [],
-      composeTimeoutReady: true,
       compositionState: null,
-      guidedSession: {
-        step: "step_1_source",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      },
-      guidedNextTurn: {
-        type: "single_select",
-        step_index: 0,
-        turn_token: "a".repeat(64),
-        payload: {
-          question: "Which source plugin should we use?",
-          options: [{ id: "csv", label: "CSV", hint: null }],
-          allow_custom: false,
-        },
-      },
-    } as never);
+      compositionStateLoaded: true,
+    });
 
     const { container } = render(<ChatPanel />);
 
-    // Non-vacuous: the goal card is mounted inside the named conversation
-    // group, the composer landmark survives, and the decision card's log
-    // region and Explain control are BOTH absent — the goal card replaces
-    // that section rather than rendering beside it.
-    const scroll = screen.getByRole("group", { name: "Conversation" });
-    const heading = screen.getByRole("heading", {
-      name: "What should this pipeline produce?",
-    });
-    expect(scroll.contains(heading)).toBe(true);
-    screen.getByRole("region", { name: "Describe what you want" });
-    expect(screen.queryByRole("log", { name: "Guided wizard step" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Explain this step" })).toBeNull();
-
+    screen.getByRole("region", { name: "Chat panel" });
+    screen.getByRole("log", { name: "Conversation" });
+    screen.getByLabelText("Message input");
     expect(await axe(container)).toHaveNoViolations();
   });
 });

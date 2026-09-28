@@ -51,7 +51,7 @@ class ChatFunctionDef(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    name: str
+    name: str = Field(min_length=1, pattern=r"\S")
     description: str | None = None
     parameters: dict | None = None
 
@@ -79,7 +79,7 @@ class ChatToolCallFunction(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    name: str
+    name: str = Field(min_length=1, pattern=r"\S")
     arguments: str
 
     @model_validator(mode="after")
@@ -96,7 +96,7 @@ class ChatToolCall(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    id: str
+    id: str = Field(min_length=1, pattern=r"\S")
     type: Literal["function"]
     function: ChatToolCallFunction
 
@@ -106,9 +106,9 @@ class ChatMessage(BaseModel):
 
     Fail-closed cross-field rules: ``tool_calls`` may only be set on an
     ``assistant`` message; ``tool_call_id`` is required exactly when the
-    role is ``tool``; ``content`` must be an actual string (not ``None``)
-    for every role except ``assistant``, where a tool-calls-only message
-    may omit it.
+    role is ``tool``; ``content`` must be nonempty for every role except
+    ``assistant`` with one or more tool calls, where it may be empty or
+    omitted.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -116,7 +116,7 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
     content: str | None = None
     tool_calls: list[ChatToolCall] | None = None
-    tool_call_id: str | None = None
+    tool_call_id: str | None = Field(default=None, min_length=1, pattern=r"\S")
 
     @model_validator(mode="after")
     def _check_tool_calls_only_on_assistant(self) -> Self:
@@ -133,9 +133,9 @@ class ChatMessage(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_content_is_string_for_non_assistant(self) -> Self:
-        if self.role != "assistant" and self.content is None:
-            raise ValueError("content must be a string for non-assistant roles")
+    def _check_content_represents_message(self) -> Self:
+        if self.content in (None, "") and not (self.role == "assistant" and self.tool_calls):
+            raise ValueError("content must be nonempty unless an assistant message has tool calls")
         return self
 
 
@@ -144,7 +144,7 @@ class NamedToolChoiceFunction(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    name: str
+    name: str = Field(min_length=1, pattern=r"\S")
 
 
 class NamedToolChoice(BaseModel):
@@ -266,9 +266,32 @@ class ChatRequest(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _check_tool_conversation(self) -> Self:
+        pending: set[str] = set()
+        seen: set[str] = set()
+        for message in self.messages:
+            if message.role == "tool":
+                if message.tool_call_id not in pending:
+                    raise ValueError("tool result must match a pending assistant tool call")
+                pending.remove(message.tool_call_id)
+                continue
+            if pending:
+                raise ValueError("assistant tool calls must receive results before the next message")
+            for call in message.tool_calls or []:
+                if call.id in seen:
+                    raise ValueError("assistant tool call ids must be unique in a conversation")
+                seen.add(call.id)
+                pending.add(call.id)
+        if pending:
+            raise ValueError("assistant tool calls must receive results before the request ends")
+        return self
+
+    @model_validator(mode="after")
     def _check_string_tool_choice(self) -> Self:
         if isinstance(self.tool_choice, str) and self.tool_choice not in _VALID_STRING_TOOL_CHOICES:
             raise ValueError(f"tool_choice must be one of {sorted(_VALID_STRING_TOOL_CHOICES)}")
+        if self.tool_choice == "required" and not self.tools:
+            raise ValueError("tool_choice='required' requires declared tools")
         return self
 
     @model_validator(mode="after")

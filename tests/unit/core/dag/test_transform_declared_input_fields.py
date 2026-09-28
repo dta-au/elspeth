@@ -634,9 +634,10 @@ class TestFieldMapperMappingSourceBuildPath:
     """A mapping SOURCE is an asserted input field (elspeth-d4ae04b374).
 
     The reported defect: a planner authored ``mapping`` backwards, naming the
-    DESIRED OUTPUT name as the key. field_mapper's ``process`` skips a MISSING
-    source in non-strict mode, so the run completed with 10/10 rows succeeding
-    and the column simply absent from the CSV. Configuring the mapping IS the
+    DESIRED OUTPUT name as the key. field_mapper's ``process`` then skipped a
+    MISSING source in non-strict mode (the ``strict`` option is since retired),
+    so the run completed with 10/10 rows succeeding and the column simply absent
+    from the CSV. Configuring the mapping IS the
     assertion that the source arrives, so it must fail the BUILD.
     """
 

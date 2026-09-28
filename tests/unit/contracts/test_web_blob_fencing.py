@@ -3195,14 +3195,14 @@ def test_blob_read_vocabulary_is_present_in_epoch_51_without_protocol_bump() -> 
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
-    # Epoch 60 preserves guided fork failure diagnostics.
+    # Epoch 60 preserves fork failure diagnostics.
     # Epoch 63 tightens the inline blob resolution hash CHECK to lowercase hex.
     # Epoch 65: completion_gates.advisor_signoff.note became a required key
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
-    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
-    assert SESSION_SCHEMA_EPOCH == 68
+    # Epoch 68 adds proposal checkpoint rebase reasons.
+    assert SESSION_SCHEMA_EPOCH == 71
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

@@ -24,6 +24,7 @@ from elspeth.web.sessions.schemas import (
     ForkSessionRequest,
     ForkSessionResponse,
     MessageWithStateResponse,
+    RecomposeRequest,
     RevertStateRequest,
     RunResponse,
     SendMessageRequest,
@@ -79,44 +80,60 @@ class TestCreateSessionRequest:
 class TestSendMessageRequest:
     def test_rejects_empty_content(self) -> None:
         with pytest.raises(ValidationError, match="content"):
-            SendMessageRequest(content="")
+            SendMessageRequest(content="", client_request_id=uuid.uuid4())
 
     @pytest.mark.parametrize("content", ["   ", "\u200b", "\ufeff"])
     def test_rejects_blank_or_invisible_only_content(self, content: str) -> None:
-        with pytest.raises(ValidationError):
-            SendMessageRequest(content=content)
+        with pytest.raises(ValidationError, match="content"):
+            SendMessageRequest(content=content, client_request_id=uuid.uuid4())
 
     def test_accepts_nonempty_content(self) -> None:
-        req = SendMessageRequest(content="hello")
+        request_id = uuid.uuid4()
+        req = SendMessageRequest(content="hello", client_request_id=request_id)
         assert req.content == "hello"
+        assert req.client_request_id == request_id
+
+    def test_requires_client_request_id(self) -> None:
+        with pytest.raises(ValidationError, match="client_request_id"):
+            SendMessageRequest(content="hello")
+
+    def test_rejects_invalid_client_request_id(self) -> None:
+        with pytest.raises(ValidationError, match="client_request_id"):
+            SendMessageRequest(content="hello", client_request_id="not-a-uuid")
+
+    def test_accepts_string_client_request_id_as_uuid(self) -> None:
+        request_id = uuid.uuid4()
+        req = SendMessageRequest(content="hello", client_request_id=str(request_id))
+        assert req.client_request_id == request_id
 
     def test_rejects_invalid_state_id(self) -> None:
-        with pytest.raises(ValidationError):
-            SendMessageRequest(content="hello", state_id="not-a-uuid")
+        with pytest.raises(ValidationError, match="state_id"):
+            SendMessageRequest(content="hello", client_request_id=uuid.uuid4(), state_id="not-a-uuid")
 
     def test_accepts_valid_uuid_state_id(self) -> None:
         import uuid
 
         sid = uuid.uuid4()
-        req = SendMessageRequest(content="hello", state_id=sid)
+        req = SendMessageRequest(content="hello", client_request_id=uuid.uuid4(), state_id=sid)
         assert req.state_id == sid
 
     def test_accepts_string_uuid_state_id(self) -> None:
         req = SendMessageRequest(
             content="hello",
+            client_request_id=uuid.uuid4(),
             state_id="550e8400-e29b-41d4-a716-446655440000",
         )
         assert str(req.state_id) == "550e8400-e29b-41d4-a716-446655440000"
 
     def test_accepts_none_state_id(self) -> None:
-        req = SendMessageRequest(content="hello", state_id=None)
+        req = SendMessageRequest(content="hello", client_request_id=uuid.uuid4(), state_id=None)
         assert req.state_id is None
 
     def test_accepts_content_at_max_length(self) -> None:
         # Phase 5b.0.5 (F-3): max_length=65536 cap on chat message content.
         # Exact-boundary value must validate to confirm the cap is set at
         # 64 KiB rather than at an off-by-one neighbour.
-        req = SendMessageRequest(content="x" * 65536)
+        req = SendMessageRequest(content="x" * 65536, client_request_id=uuid.uuid4())
         assert len(req.content) == 65536
 
     def test_rejects_content_exceeding_max_length(self) -> None:
@@ -124,7 +141,21 @@ class TestSendMessageRequest:
         # against unbounded payload allocation before interpretation events
         # can be triggered.
         with pytest.raises(ValidationError, match="content"):
-            SendMessageRequest(content="x" * 65537)
+            SendMessageRequest(content="x" * 65537, client_request_id=uuid.uuid4())
+
+
+class TestRecomposeRequest:
+    def test_requires_expected_user_message_id(self) -> None:
+        with pytest.raises(ValidationError, match="expected_user_message_id"):
+            RecomposeRequest()
+
+    def test_accepts_expected_user_message_uuid(self) -> None:
+        message_id = uuid.uuid4()
+        assert RecomposeRequest(expected_user_message_id=message_id).expected_user_message_id == message_id
+
+    def test_rejects_invalid_expected_user_message_id(self) -> None:
+        with pytest.raises(ValidationError, match="expected_user_message_id"):
+            RecomposeRequest(expected_user_message_id="not-a-uuid")
 
 
 class TestForkSessionRequest:
@@ -175,6 +206,7 @@ class TestSessionRequestExtraFieldsRejected:
                 SendMessageRequest,
                 {
                     "content": "hello",
+                    "client_request_id": "00000000-0000-4000-8000-000000000001",
                     "stateId": "550e8400-e29b-41d4-a716-446655440000",
                 },
             ),
@@ -494,32 +526,6 @@ class TestSessionResponseHappyPath:
         assert resp.validation_errors[0].model_dump() == {"message": "boom", "error_code": None, "component": None}
         assert resp.validation_warnings is not None
         assert resp.validation_warnings[0].component == "c"
-
-
-def test_workflow_profile_response_wire_subset_and_strict() -> None:
-    from elspeth.web.sessions.schemas import WorkflowProfileResponse
-
-    model = WorkflowProfileResponse(coaching=True, bookends=True)
-    dumped = model.model_dump()
-    assert set(dumped.keys()) == {
-        "coaching",
-        "bookends",
-    }
-
-    import pydantic
-
-    with pytest.raises(pydantic.ValidationError):
-        WorkflowProfileResponse(
-            coaching=True,
-            bookends=True,
-            injected="leak",
-        )
-
-    with pytest.raises(pydantic.ValidationError):
-        WorkflowProfileResponse(
-            coaching="yes",
-            bookends=True,
-        )
 
 
 class TestResponseStrictnessTripwire:

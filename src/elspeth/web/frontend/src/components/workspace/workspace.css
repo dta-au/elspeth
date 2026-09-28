@@ -23,19 +23,6 @@
 .composer-workspace {
   --authoring-pane-width: 360px;
 
-  /* Inspector drawer measure, published alongside --authoring-pane-width so
-     the artifact pane can RESERVE the strip the drawer occupies instead of
-     being sliced by it. Before this, the drawer was an absolutely-positioned
-     overlay with no scrim over live, still-clickable controls: "Focus Graph"
-     vanished and the primary action was cut mid-word at the drawer's left
-     border (elspeth-4e54200207). Deliberately not a grid column — at 1280 a
-     360px authoring pane plus a 512px column leaves 408px, under the 640px
-     ARTIFACT_MIN the pane bounds are built on. It IS confined to the pane
-     row (elspeth-b4e88f0f8c): the drawer's slot is a grid item on row 1, so
-     the bottom bar keeps its full width beneath the drawer and only the
-     artifact pane reserves this measure. */
-  --workspace-inspector-width: 512px;
-
   /* Action-bar rhythm. ONE pair of values feeds every gap and standoff in the
      bottom bar — the bar's own gap, the status and overflow group gaps, the
      completion group's gap, and the collapse control's standoff across the
@@ -166,8 +153,8 @@
   gap: var(--space-sm);
   align-items: center;
   justify-content: space-between;
-  /* Shared band-height contract: this toolbar, .chat-panel-header, and the
-     guided stepper band meet across the pane seam and must end on one line,
+  /* Shared band-height contract: this toolbar and .chat-panel-header
+     meet across the pane seam and must end on one line,
      so every band derives its height from --size-workspace-band and centers
      its content (no vertical padding — asymmetric or per-band padding is how
      the bands drifted apart; see tokens.css). The short-screen density
@@ -401,7 +388,7 @@
      middle group is absent" — and an overflow pushed right by an auto margin
      delivers it better: status and completion stay one cluster, "More actions"
      holds the right edge, and the status/overflow arrangement is identical
-     whether or not guided mode renders a completion bar. */
+     whether or not a completion bar is present. */
   justify-content: flex-start;
   /* Block inset stays the shared --workspace-bar-inset (the collapse-control
      registration contract, elspeth-fca731fb28); the INLINE inset is the
@@ -837,134 +824,6 @@
   grid-column: 2;
 }
 
-/* The five raw stacking integers this file used to carry (2/3/3/4/5) were
-   written against a scale whose LOWEST rung is 10, so nothing here could be
-   tuned from tokens.css — and the literal 4 put this slot BELOW
-   .graph-a11y-list's var(--z-panel-controls), which is a live ordering bug:
-   neither .composer-workspace nor .artifact-workspace-panel opens a stacking
-   context, so the a11y list painted straight through the open drawer. What
-   is left on the rung all sits on --z-panel-controls with relative order
-   carried by tree order (separator < collapsed affordance < inspector), which
-   lifts the drawer over the a11y list. Two former members have left it: the
-   More-actions menu retired 2026-08-15, and the action bar left with
-   elspeth-9c94a58500 (it is an in-flow box now — see .workspace-action-bar),
-   which also retired the one-step-raised token the collapsed affordance
-   needed to out-paint it. Everything stays below --z-catalog (40) and
-   --z-overlay (100), as before (elspeth-cf4b08e271).
-
-   The slot is a GRID ITEM on the pane row — the artifact cell, over the
-   artifact slot — not an absolutely-positioned box over the whole workspace
-   (elspeth-b4e88f0f8c). Spanning the full height meant the drawer covered
-   the bottom bar's artifact cell too, so that cell reserved the drawer's
-   512px strip alongside the pane and the bar wrapped to three or four lines
-   under an open drawer at every width up to 1600 — a wrap the whole row then
-   paid for in height. On the pane row the drawer stops at the bar's rule,
-   the bar keeps its full width beneath it, and only the pane reserves. The
-   cell is the same region the old inset described (from the pane's edge to
-   the right, and from x=0 with the pane collapsed, because column 1 is 0px
-   then), so nothing horizontal changes; position: relative is what makes
-   the slot the drawer's containing block, or its inset: 0 0 0 auto would
-   resolve against the workspace root and span both rows again. Narrow mode
-   spans every row (tabs, view, bar), as the full-height inset did there,
-   because in narrow mode the drawer IS the view. */
-.workspace-inspector-slot {
-  position: relative;
-  z-index: var(--z-panel-controls);
-  grid-row: 1;
-  grid-column: 2;
-  min-width: 0;
-  min-height: 0;
-  pointer-events: none;
-}
-
-.workspace-inspector-slot > * {
-  pointer-events: auto;
-}
-
-.composer-workspace[data-layout-mode="narrow"] .workspace-inspector-slot {
-  grid-row: 1 / -1;
-  grid-column: 1;
-}
-
-/* Reserve the drawer's strip in the artifact column while it is open, so the
-   toolbar lays out inside the UNOCCLUDED region instead of being sliced by an
-   overlay with no scrim, from the one measure the drawer is drawn at. The
-   pane is the drawer's only neighbour: the drawer occupies the pane row and
-   the bottom bar runs full width beneath it (elspeth-b4e88f0f8c), so the bar
-   reserves nothing. Excluded in narrow mode, where the slot spans the full
-   width and the drawer is the view (elspeth-4e54200207). */
-.composer-workspace:not([data-layout-mode="narrow"]):has(
-    .workspace-inspector:not([hidden])
-  )
-  .workspace-artifact-pane {
-  padding-right: var(--workspace-inspector-width);
-}
-
-.workspace-inspector {
-  position: absolute;
-  inset: 0 0 0 auto;
-  display: flex;
-  flex-direction: column;
-  width: min(var(--workspace-inspector-width), 100%);
-  min-width: 0;
-  min-height: 0;
-  /* The drawer's only boundary against the canvas, so it takes the same
-     3:1 token as the pane separator rather than the 12%-alpha hairline
-     (elspeth-ffb96f0b95). */
-  border-left: 1px solid var(--color-input-border);
-  background: var(--color-surface, Canvas);
-}
-
-.workspace-inspector--overlay {
-  /* Left-cast drawer edge on its own directional token
-     (elspeth-6c3223c76e): dark value byte-identical to the old literal;
-     the light theme gets the tinted-navy base the other tiers use. */
-  box-shadow: var(--shadow-drawer-left);
-}
-
-/* Both drawer bands were hard-built from 8px padding plus a 36px control
-   (= 53px) instead of reading --size-workspace-band, so when the density
-   regime compressed the artifact toolbar beside them to 45px they stayed at
-   53 and opened an 8px seam offset exactly where vertical space is scarcest.
-   Deriving the height from the token — no vertical padding, content centred —
-   is the same construction .artifact-workspace-toolbar uses, so all of them
-   compress together (elspeth-7bd392c0dc). */
-.workspace-inspector-header {
-  display: flex;
-  flex: 0 0 auto;
-  gap: var(--space-sm);
-  align-items: center;
-  justify-content: space-between;
-  min-height: var(--size-workspace-band);
-  padding: 0 var(--artifact-gutter);
-  border-bottom: 1px solid var(--color-border, currentcolor);
-}
-
-/* The drawer's title had no rule anywhere and base.css carries no heading
-   reset, so it rendered at UA 24px with 19.92px block margins — off the type
-   scale entirely, inflating the header band to 93px against the 45px artifact
-   toolbar one seam away (elspeth-3e23bed130). Same recipe as
-   .graph-modal-header h2 / .yaml-modal-header h2 (common.css): type-scale
-   size, zero margins — band height stays owned by --size-workspace-band. */
-.workspace-inspector-header h2 {
-  margin: 0;
-  font-size: var(--font-size-lg);
-  line-height: var(--line-height-heading);
-}
-
-
-.workspace-inspector-body {
-  --scroll-owner: inspector;
-
-  flex: 1 1 auto;
-  min-width: 0;
-  min-height: 0;
-  padding: var(--space-sm);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-}
-
-
 .composer-workspace[data-layout-mode="narrow"] {
   /* Tabs, the selected view, the bar row. */
   grid-template-rows: auto minmax(0, 1fr) auto;
@@ -1050,8 +909,7 @@
 .composer-workspace .workspace-artifact-pane[hidden],
 .composer-workspace .workspace-action-bar-slot[hidden],
 .composer-workspace .workspace-collapse-control[hidden],
-.composer-workspace .workspace-action-bar-main[hidden],
-.composer-workspace .workspace-inspector[hidden] {
+.composer-workspace .workspace-action-bar-main[hidden] {
   display: none;
 }
 
@@ -1073,7 +931,7 @@
 
 @media (min-width: 961px) and (max-height: 800px) {
   /* Short-screen density: drop the shared band token so ALL header bands
-     (toolbar, chat-panel header, guided stepper) compress together and the
+     (toolbar and chat-panel header) compress together and the
      cross-pane seam stays on one line. 45px = the regime's historic toolbar
      height (4px + 36px compact control + 4px + 1px seam). Before the token,
      only the toolbar compressed here — leaving it 8px shorter than the

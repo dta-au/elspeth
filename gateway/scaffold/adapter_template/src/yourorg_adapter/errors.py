@@ -14,6 +14,7 @@ from elspeth_llm_gateway.sdk.protocol import ErrorClassification, UpstreamFailur
 # raise -- keep this as the fallback for every branch below that doesn't
 # match.
 _FALLBACK_CLASSIFICATION = ErrorClassification(code="upstream_response_invalid", retryable=False)
+_REQUEST_REJECTED_CLASSIFICATION = ErrorClassification(code="upstream_request_rejected", retryable=False)
 
 
 def classify_error(failure: UpstreamFailure) -> ErrorClassification:
@@ -22,6 +23,6 @@ def classify_error(failure: UpstreamFailure) -> ErrorClassification:
     # `failure.body` is the already-bounded parsed JSON body, or None if it
     # wasn't valid JSON. Every code you can plausibly emit needs
     # conformance/unit coverage of its own.
-    if failure.body is None:
-        return _FALLBACK_CLASSIFICATION
+    if failure.status in (400, 422):
+        return _REQUEST_REJECTED_CLASSIFICATION
     return _FALLBACK_CLASSIFICATION

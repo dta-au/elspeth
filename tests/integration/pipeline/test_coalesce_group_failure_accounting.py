@@ -11,13 +11,15 @@ never counted in the live ``rows_coalesce_failed`` at all.
 
 Each case runs the real CLI (``elspeth run --execute``) and records the live and
 audit counters handed to ``assert_terminal_counter_parity``: the strict fields
-must agree (else the run exits 4) and ``rows_coalesce_failed`` — tolerated and
-only logged on mismatch — must agree too.
+must agree (else the run exits 4) and ``rows_coalesce_failed`` — whose live count
+exceeding the audit's also exits 4, and whose audit exceeding live (one documented
+corner) is only logged — must agree too.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -321,6 +323,67 @@ def test_row_union_group_lost_after_two_arrivals_counts_every_held_member(tmp_pa
 # union_collision_policy: fail — certain collisions refused at build, observed
 # collisions routed per row (never a run abort).
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("barrier", ["coalesce", "row_union"])
+def test_two_failed_fork_groups_of_one_exploded_row_count_as_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, barrier: str
+) -> None:
+    """json_explode -> fork -> barrier: row 1 explodes into three members, and
+    two of them (p = 20) are lost on path_a, so two fork groups of ONE source
+    row fail at the barrier. The executors hold each group under its own
+    (barrier, fork_group_id) key and the live counter counts both; the audit
+    derive keyed on (barrier node, row_id) collapsed them to one — live 2,
+    audit 1, then a tolerated divergence (corner 2) and now a live > audit
+    parity refusal (exit 4). Keyed on the fork group, the audit derive
+    agrees: live == audit == 2, with no divergence warning."""
+    path = tmp_path / "in.jsonl"
+    path.write_text('{"id": 1, "items": [{"p": 20}, {"p": 20}, {"p": 5}]}\n{"id": 2, "items": [{"p": 7}]}\n')
+    source = {
+        "plugin": "json",
+        "on_success": "raw",
+        "options": {"path": str(path), "format": "jsonl", "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+    }
+    explode = {
+        "name": "explode",
+        "plugin": "json_explode",
+        "input": "raw",
+        "on_success": "exploded",
+        "on_error": "discard",
+        "options": {"array_field": "items", "output_field": "item", "schema": {"mode": "observed"}},
+    }
+    gate = {**_fork_gate(["path_a", "path_b"]), "input": "exploded"}
+    lose_p20 = _value_transform("vt_a", "path_a", "out_a", target="bonus", expression="100 // (row['item']['p'] - 20)")
+    branches = {"path_a": "out_a", "path_b": "out_b"}
+    if barrier == "coalesce":
+        body: dict[str, Any] = {
+            "gates": [gate],
+            "transforms": [explode, lose_p20, _passthrough("pt_b", "path_b", "out_b")],
+            "coalesce": [{"name": "merge_results", "branches": branches, "policy": "require_all", "merge": "union", "on_success": "out"}],
+        }
+    else:
+        body = {
+            "gates": [gate],
+            "transforms": [explode, lose_p20, _passthrough("pt_b", "path_b", "out_b"), _passthrough("pt_after", "unioned", "out")],
+            "row_unions": [{"name": "union_results", "branches": branches, "on_success": "unioned"}],
+        }
+
+    with caplog.at_level(logging.WARNING, logger="elspeth.engine.orchestrator.run_status"):
+        run = _run(tmp_path, monkeypatch, _settings(tmp_path, source=source, body=body))
+
+    # two quarantined path_a members + one failed path_b member per lost group
+    _assert_counted_once_per_token(run, exit_code=1, rows_failed=4, coalesce_failed=2)
+    # The CLI routes structlog through stdlib logging, so the tolerated
+    # audit-exceeds-live warning would land in caplog (measured under the
+    # row_id-keyed derive before live > audit became a refusal).
+    assert not [record for record in caplog.records if "divergence" in record.getMessage()]
+    with sqlite3.connect(run.db_path) as conn:
+        (failed_rows,) = conn.execute(
+            "SELECT count(DISTINCT t.row_id) FROM node_states ns JOIN nodes n ON n.node_id = ns.node_id AND n.run_id = ns.run_id "
+            "JOIN tokens t ON t.token_id = ns.token_id AND t.run_id = ns.run_id "
+            "WHERE n.node_type IN ('coalesce', 'row_union') AND ns.status = 'failed'"
+        ).fetchone()
+    assert failed_rows == 1, "precondition: both failed groups belong to ONE source row"
 
 
 def _collision_body(*, policy: str) -> dict[str, Any]:

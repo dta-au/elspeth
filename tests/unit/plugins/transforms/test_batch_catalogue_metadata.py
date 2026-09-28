@@ -30,6 +30,7 @@ EXPECTED_BATCH_TAGS = {
     "batch_experiment_compare": ("batch", "experiment", "comparison"),
     "batch_outlier_annotator": ("batch", "outlier", "annotation"),
     "batch_paired_preference": ("batch", "paired", "comparison"),
+    "batch_rank": ("batch", "rank", "annotation"),
     "batch_replicate": ("batch", "deaggregation", "row-expansion"),
     "batch_stats": ("batch", "aggregation", "statistics"),
     "batch_threshold_summary": ("batch", "threshold", "summary"),
@@ -79,6 +80,10 @@ _REQUIRED_GUIDANCE = {
     "batch_paired_preference": (
         ("pair id", "matched baseline", "candidate"),
         ("split-window pairs", "never join later"),
+    ),
+    "batch_rank": (
+        ("rank and percentile", "keeping every row", "output_mode: passthrough"),
+        ("ranks restart in every batch", "fail the batch"),
     ),
     "batch_replicate": (
         ("bounded", "per-row", "copy expansion"),
@@ -144,7 +149,9 @@ def test_batch_catalogue_reference_content_is_class_owned_specific_valid_and_tru
 
     node, aggregation = _declaring_aggregation(reference)
     assert node["plugin"] == plugin_cls.name
-    assert aggregation.output_mode == "transform"
+    # A plugin whose flush emits one row per buffered row shows the mode only
+    # it can run in; every other batch plugin shows the transform default.
+    assert aggregation.output_mode == ("passthrough" if plugin_cls.flush_emits_one_row_per_buffered_row else "transform")
     all_reference_text = (
         cast(str, plugin_cls.usage_when_to_use)
         + " "

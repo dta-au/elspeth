@@ -21,6 +21,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Literal
 
+from sqlalchemy.exc import SQLAlchemyError
+
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 
@@ -48,7 +50,16 @@ def _render_exception(exc: BaseException) -> str:
     format absent from its rule set can still slip through — mitigation, not a
     guarantee. If rendering *or* scrubbing fails, fall back to the (secret-free)
     exception type name rather than risk leaking an unscrubbed string.
+
+    A database error renders as its type name only. Its text is the failing
+    statement's SQL plus the driver's detail, which is not value-free by
+    construction (PostgreSQL's DETAIL echoes key values, a DataError echoes
+    the rejected input) and grows with the statement; Landscape engines
+    already withhold bound parameters (``LANDSCAPE_HIDE_BOUND_PARAMETERS``),
+    and a wrap that needs the detail keeps it on the exception chain.
     """
+    if isinstance(exc, SQLAlchemyError):
+        return type(exc).__name__
     try:
         message = scrub_text_for_audit(str(exc))
     except BaseException:

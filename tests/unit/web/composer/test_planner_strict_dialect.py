@@ -37,13 +37,11 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import (
     PLANNER_DISCOVERY_TOOL_NAMES,
     PlannerDiscoveryPolicy,
-    PlannerTerminalContract,
     _parse_response_tool_calls,
     _ParsedToolCall,
     planner_terminal_tool_definition,
     planner_tool_definitions,
 )
-from elspeth.web.composer.pipeline_proposal import PlannerSurface
 from elspeth.web.composer.tools._common import ToolContext
 from elspeth.web.composer.tools._dispatch import get_tool_definitions
 from elspeth.web.composer.tools.wire_projection import encode_semantic_arguments, stamp_planner_terminal
@@ -327,10 +325,9 @@ def test_policy_none_planner_list_is_19_strict_true_plus_a_strict_false_terminal
     "policy",
     [
         None,
-        PlannerDiscoveryPolicy.initial(PlannerSurface.FREEFORM),
-        PlannerDiscoveryPolicy.initial(PlannerSurface.TUTORIAL_PROFILE),
+        PlannerDiscoveryPolicy.initial(),
     ],
-    ids=["policy_none", "freeform", "tutorial_profile"],
+    ids=["policy_none", "policy_explicit"],
 )
 def test_none_planner_lists_carry_no_strict_key_and_equal_the_base_construction(policy: PlannerDiscoveryPolicy | None) -> None:
     tools = planner_tool_definitions(policy, dialect=_NONE)
@@ -338,20 +335,9 @@ def test_none_planner_lists_carry_no_strict_key_and_equal_the_base_construction(
     assert _same(tools, _base_planner_list(policy))
 
 
-def _non_default_terminal_contract() -> PlannerTerminalContract:
-    selected_schema = {
-        "type": "object",
-        "properties": {"route": {"type": "string"}},
-        "required": ["route"],
-        "additionalProperties": False,
-    }
-    return PlannerTerminalContract(schema=selected_schema, materialize=lambda delta: delta)
-
-
-@pytest.mark.parametrize("contract", [None, _non_default_terminal_contract()], ids=["default", "selected"])
-def test_terminal_stamping_keeps_todays_bytes_on_none_and_adds_only_strict_false(contract: PlannerTerminalContract | None) -> None:
-    none_terminal = planner_terminal_tool_definition(contract, dialect=_NONE)
-    strict_terminal = planner_terminal_tool_definition(contract, dialect=_STRICT)
+def test_terminal_stamping_keeps_todays_bytes_on_none_and_adds_only_strict_false() -> None:
+    none_terminal = planner_terminal_tool_definition(dialect=_NONE)
+    strict_terminal = planner_terminal_tool_definition(dialect=_STRICT)
     assert "strict" not in none_terminal["function"]
     assert _same(stamp_planner_terminal(none_terminal, _NONE), none_terminal)
     expected_strict = stamp_planner_terminal(none_terminal, _NONE)
@@ -433,10 +419,9 @@ async def test_a_list_stamped_for_another_dialect_is_refused_before_any_provider
         policy: PlannerDiscoveryPolicy | None = None,
         *,
         dialect: ToolContractDialect,
-        terminal_contract: PlannerTerminalContract | None = None,
     ) -> list[dict[str, Any]]:
         del dialect
-        return real_builder(policy, dialect=built, terminal_contract=terminal_contract)
+        return real_builder(policy, dialect=built)
 
     monkeypatch.setattr(planner_module, "planner_tool_definitions", mismatched)
     completion = _ScriptedCompletion(_response((_TERMINAL, {"pipeline": _pipeline(tmp_path)})))

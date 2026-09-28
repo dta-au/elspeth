@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import create_engine, insert, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
@@ -447,6 +449,48 @@ def test_complete_barrier_crash_atomicity() -> None:
     assert _statuses(engine, ["t1", "t2", "t3"]) == {TokenWorkStatus.BLOCKED.value}
     assert _row_for_token(engine, "t-dup")["status"] == TokenWorkStatus.READY.value
     # No event from the failed completion survives the rollback.
+    assert len(_events(engine)) == events_before
+
+
+def test_complete_barrier_refuses_when_durable_rows_outnumber_the_consumed_set() -> None:
+    """The repository is the ONE authority for a barrier's consumed-set count.
+
+    0806d6506 deleted the engine's post-commit copies of this check, so the
+    guard in ``_terminalize_consumed_barrier_rows`` is the only thing that
+    notices a consumed token backed by more than one durable BLOCKED row
+    (here: a second BLOCKED row for ``t1`` at the next attempt). Terminalizing
+    both would record one live consumption as two durable ones. The whole
+    completion must refuse and roll back: no status flips, no scheduler event,
+    no terminal outcome. Without the guard the completion commits (mutant
+    ``if False:`` at the count check -> this test goes red).
+    """
+    engine, repo = _make_repo()
+    _seed_three_blocked(engine, repo)
+    with engine.begin() as conn:
+        duplicate = dict(conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == "t1")).mappings().one())
+        duplicate["work_item_id"] = f"{duplicate['work_item_id']}-second"
+        duplicate["attempt"] = duplicate["attempt"] + 1
+        conn.execute(insert(token_work_items_table).values(**duplicate))
+    events_before = len(_events(engine))
+
+    with pytest.raises(AuditIntegrityError, match=r"live consumed 3 token\(s\), but durable scheduler terminalized 4"):
+        repo.complete_barrier(
+            barrier_key=BARRIER_KEY,
+            consumed_token_ids=["t1", "t2", "t3"],
+            emitted_pending_sink=[],
+            emitted_ready=[],
+            intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
+            coordination_token=COORD_TOKEN,
+            terminal_outcomes=tuple(
+                BarrierTerminalOutcomeSpec(token_id=token_id, outcome=TerminalOutcome.SUCCESS, path=TerminalPath.FILTER_DROPPED)
+                for token_id in ("t1", "t2", "t3")
+            ),
+        )
+
+    with engine.connect() as conn:
+        statuses = conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == RUN_ID)).scalars().all()
+        assert tuple(conn.execute(select(token_outcomes_table.c.token_id))) == ()
+    assert sorted(statuses) == [TokenWorkStatus.BLOCKED.value] * 4
     assert len(_events(engine)) == events_before
 
 
@@ -1280,3 +1324,262 @@ def test_complete_barrier_rejects_duplicate_ready_emissions() -> None:
         )
 
     assert _statuses(engine, ["t1", "t2", "t3"]) == {TokenWorkStatus.BLOCKED.value}
+
+
+# --- Bound-parameter budget (X1 fix round 2) ---------------------------------
+# One barrier releases a whole batch, so no statement in complete_barrier may
+# bind a list that grows with the batch: the per-token UPDATEs run as one
+# executemany and the per-token IN reads run in budget-sized chunks. These tests
+# run complete_barrier on a SQLite connection whose SQLITE_LIMIT_VARIABLE_NUMBER
+# is lowered, so a statement whose binds grow with the batch is refused by the
+# database itself. The engine's own multi-row INSERTs (scheduler events,
+# outcomes) already page themselves; their page size is set small here so that
+# only complete_barrier's statements are under test.
+
+
+def _make_bounded_repo(*, variable_limit: int):
+    """A scheduler repository whose SQLite connection refuses statements over ``variable_limit`` binds."""
+    from sqlalchemy import event
+
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+
+    raw_engine = create_engine("sqlite:///:memory:", echo=False, insertmanyvalues_page_size=3)
+
+    @event.listens_for(raw_engine, "connect")
+    def _lower_variable_limit(dbapi_connection: sqlite3.Connection, _record: object) -> None:
+        dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_limit)
+
+    LandscapeDB._configure_sqlite(raw_engine)
+    LandscapeDB._verify_sqlite_pragmas(raw_engine, "sqlite:///:memory:")
+    metadata.create_all(raw_engine)
+    engine = Tier1Engine(raw_engine)
+    raw = raw_engine.raw_connection()
+    try:
+        assert raw.driver_connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == variable_limit
+    finally:
+        raw.close()
+    return engine, TokenSchedulerRepository(engine)
+
+
+def _seed_blocked(engine: Tier1Engine, repo, *, count: int) -> tuple[list[str], str]:
+    token_ids = [f"t{index:04d}" for index in range(count)]
+    payload = _seed_run(
+        engine,
+        run_id=RUN_ID,
+        tokens=[(f"r{index:04d}", token_id, index) for index, token_id in enumerate(token_ids)],
+        now=NOW,
+    )
+    for index, token_id in enumerate(token_ids):
+        _enqueue_and_block(repo, token_id=token_id, row_id=f"r{index:04d}", ingest_sequence=index, payload=payload)
+    return token_ids, payload
+
+
+def _handoff(token_id: str, index: int, payload: str) -> BarrierEmission:
+    """Alternate the success arm and the on_error arm, whose handoff binds every pending_* column."""
+    if index % 2:
+        return BarrierEmission(
+            token_id=token_id,
+            row_payload_json=payload,
+            sink_name=f"failed-{index}",
+            outcome=TerminalOutcome.FAILURE.value,
+            path=TerminalPath.ON_ERROR_ROUTED.value,
+            error_hash=f"{index:016x}",
+            error_message=f"error {index}",
+        )
+    return BarrierEmission(
+        token_id=token_id,
+        row_payload_json=payload,
+        sink_name=f"out-{index}",
+        outcome=TerminalOutcome.SUCCESS.value,
+        path=TerminalPath.DEFAULT_FLOW.value,
+    )
+
+
+def test_complete_barrier_passthrough_handoff_fits_the_historical_sqlite_variable_limit() -> None:
+    """100 passthrough tokens: the pre-fix single CASE UPDATE bound ~1,500 parameters; the hand-off stays under 999."""
+    engine, repo = _make_bounded_repo(variable_limit=999)
+    token_ids, payload = _seed_blocked(engine, repo, count=100)
+    before = {token_id: _row_for_token(engine, token_id)["work_item_id"] for token_id in token_ids}
+    emissions = [_handoff(token_id, index, payload) for index, token_id in enumerate(token_ids)]
+
+    n = repo.complete_barrier(
+        barrier_key=BARRIER_KEY,
+        consumed_token_ids=[],
+        emitted_pending_sink=emissions,
+        emitted_ready=[],
+        coordination_token=COORD_TOKEN,
+    )
+
+    assert n == 0
+    for emission in emissions:
+        row = _row_for_token(engine, emission.token_id)
+        # Every token keeps its own work item and receives exactly its own
+        # hand-off bundle.
+        assert row["work_item_id"] == before[emission.token_id]
+        assert row["status"] == TokenWorkStatus.PENDING_SINK.value
+        assert (
+            row["row_payload_json"],
+            row["pending_sink_name"],
+            row["pending_outcome"],
+            row["pending_path"],
+            row["pending_error_hash"],
+            row["pending_error_message"],
+        ) == (
+            emission.row_payload_json,
+            emission.sink_name,
+            emission.outcome,
+            emission.path,
+            emission.error_hash,
+            emission.error_message,
+        )
+    handoff_events = [e for e in _events(engine) if e["event_type"] == SchedulerEventType.MARK_PENDING_SINK.value]
+    assert [e["token_id"] for e in handoff_events] == token_ids
+
+
+def test_complete_barrier_consumed_batch_with_outcomes_is_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lock read and the duplicate-outcome read run in budget-sized chunks; the terminalize UPDATE is one executemany."""
+    from elspeth.core.landscape import bind_budget
+
+    # Budget 60 under a 99-bind connection: 120 consumed tokens bind 120 (lock
+    # read) and 120 (duplicate check) parameters unchunked, and the pre-fix
+    # terminalize UPDATE bound 240.
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    engine, repo = _make_bounded_repo(variable_limit=99)
+    token_ids, _payload = _seed_blocked(engine, repo, count=120)
+
+    n = repo.complete_barrier(
+        barrier_key=BARRIER_KEY,
+        consumed_token_ids=token_ids,
+        emitted_pending_sink=[],
+        emitted_ready=[],
+        intake_snapshot_token_ids=frozenset(token_ids),
+        coordination_token=COORD_TOKEN,
+        terminal_outcomes=tuple(
+            BarrierTerminalOutcomeSpec(token_id=token_id, outcome=TerminalOutcome.SUCCESS, path=TerminalPath.FILTER_DROPPED)
+            for token_id in token_ids
+        ),
+    )
+
+    assert n == len(token_ids)
+    with engine.connect() as conn:
+        # Whole-run reads: an IN over 120 ids would itself exceed this connection's limit.
+        statuses = conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.status)).all()
+        recorded = sorted(conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars())
+    assert sorted(statuses) == [(token_id, TokenWorkStatus.TERMINAL.value) for token_id in token_ids]
+    assert recorded == token_ids
+    terminal_events = [e for e in _events(engine) if e["event_type"] == SchedulerEventType.MARK_BLOCKED_BARRIER_TERMINAL.value]
+    assert sorted(e["token_id"] for e in terminal_events) == token_ids
+
+
+def test_complete_barrier_shipped_budget_fits_the_historical_sqlite_variable_limit() -> None:
+    """With the shipped budget, 1,000 consumed tokens with outcomes release under a 999-bind connection.
+
+    The lock read and the duplicate-outcome read each bind 1,000 token ids
+    unchunked; the shipped budget splits them so each statement, fixed
+    predicates included, stays under SQLite's historical default ceiling.
+    """
+    engine, repo = _make_bounded_repo(variable_limit=999)
+    token_ids, _payload = _seed_blocked(engine, repo, count=1000)
+
+    n = repo.complete_barrier(
+        barrier_key=BARRIER_KEY,
+        consumed_token_ids=token_ids,
+        emitted_pending_sink=[],
+        emitted_ready=[],
+        intake_snapshot_token_ids=frozenset(token_ids),
+        coordination_token=COORD_TOKEN,
+        terminal_outcomes=tuple(
+            BarrierTerminalOutcomeSpec(token_id=token_id, outcome=TerminalOutcome.SUCCESS, path=TerminalPath.FILTER_DROPPED)
+            for token_id in token_ids
+        ),
+    )
+
+    assert n == len(token_ids)
+    with engine.connect() as conn:
+        recorded = sorted(conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.completed == 1)).scalars())
+    assert recorded == token_ids
+
+
+def test_complete_barrier_refuses_a_consumed_token_with_two_blocked_rows() -> None:
+    """One consumed token holding two BLOCKED rows at the barrier is refused, with nothing written.
+
+    The terminalize UPDATE runs one statement per candidate row (X1 fix round 2),
+    so both rows would change; the count is checked against the consumed tokens
+    before any event is recorded, and the completion rolls back.
+    """
+    engine, repo = _make_repo()
+    _seed_three_blocked(engine, repo)
+    original = dict(_row_for_token(engine, "t1"))
+    duplicate = {**original, "work_item_id": "f" * 64, "attempt": original["attempt"] + 1}
+    with engine.begin() as conn:
+        conn.execute(insert(token_work_items_table).values(**duplicate))
+    events_before = len(_events(engine))
+
+    with pytest.raises(AuditIntegrityError, match="terminalization mismatch"):
+        repo.complete_barrier(
+            barrier_key=BARRIER_KEY,
+            consumed_token_ids=["t1", "t2", "t3"],
+            emitted_pending_sink=[],
+            emitted_ready=[],
+            coordination_token=COORD_TOKEN,
+        )
+
+    with engine.connect() as conn:
+        statuses = conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == RUN_ID)).scalars().all()
+    assert set(statuses) == {TokenWorkStatus.BLOCKED.value}
+    assert len(statuses) == 4
+    assert len(_events(engine)) == events_before
+
+
+def test_complete_barrier_passthrough_handoff_failure_is_value_free() -> None:
+    """A refused handoff statement raises LandscapeRecordError without the bound row payloads."""
+    engine, repo = _make_bounded_repo(variable_limit=99)
+    token_ids, payload = _seed_blocked(engine, repo, count=4)
+    # The hand-off UPDATE binds 8 values per row plus its fixed predicates:
+    # more than a 6-bind connection admits, so the database refuses it. The
+    # reads before it bind at most 4.
+    raw = engine.raw_connection()
+    try:
+        raw.driver_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 6)
+    finally:
+        raw.close()
+
+    with pytest.raises(LandscapeRecordError, match="pending-sink handoff") as caught:
+        repo.complete_barrier(
+            barrier_key=BARRIER_KEY,
+            consumed_token_ids=[],
+            emitted_pending_sink=[_handoff(token_id, index, payload) for index, token_id in enumerate(token_ids)],
+            emitted_ready=[],
+            coordination_token=COORD_TOKEN,
+        )
+
+    assert isinstance(caught.value.__cause__, SQLAlchemyError)
+    assert "too many SQL variables" in str(caught.value.__cause__)
+    assert payload not in str(caught.value)
+    assert "error 1" not in str(caught.value)
+    assert _statuses(engine, token_ids) == {TokenWorkStatus.BLOCKED.value}
+
+
+def test_complete_barrier_cross_group_snapshot_read_is_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The §E.3 cross-group read over a large unknown snapshot still names the mis-included token."""
+    from elspeth.core.landscape import bind_budget
+
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    engine, repo = _make_bounded_repo(variable_limit=99)
+    _seed_two_coalesce_groups(engine, repo)
+    # 120 snapshot ids the journal does not hold, plus t2a from the sibling group:
+    # 121 binds unchunked.
+    unknown = frozenset(f"t-unknown-{index:03d}" for index in range(120))
+
+    with pytest.raises(AuditIntegrityError, match=r"DIFFERENT row group.*t2a"):
+        repo.complete_barrier(
+            barrier_key=COALESCE_KEY,
+            consumed_token_ids=["t1a", "t1b"],
+            emitted_pending_sink=[],
+            emitted_ready=[],
+            scope_row_id="r1",
+            intake_snapshot_token_ids=frozenset({"t1a", "t1b", "t2a"}) | unknown,
+            coordination_token=COORD_TOKEN,
+        )
+
+    assert _statuses(engine, ["t1a", "t1b", "t2a", "t2b"]) == {TokenWorkStatus.BLOCKED.value}

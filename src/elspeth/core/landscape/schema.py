@@ -466,6 +466,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        2026-09-26, no bump; a store created before the fold carries the
 #        narrower CHECK and startup shape validation refuses it). Populated
 #        epoch-45 stores require delete/recreate.
+#  47 → Verification verdicts page through a run/time/call index, while
+#        corrupt run bindings are found from indexed call parents. Populated
+#        epoch-46 stores require delete/recreate.
 #  48 → A source-quarantined row is handed to its sink through a durable
 #        PENDING_SINK work item written in its ingest transaction (the fifth
 #        pending_sink_bundle_clause arm), resume re-drives only scheduler work
@@ -474,7 +477,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        tokens are neither decided nor covered by scheduler work). A store
 #        written before this epoch can hold a quarantined token with no work
 #        item that the new resume refuses as corruption, so only a bump — not
-#        a fold — keeps such a store from opening. Populated epoch-46 stores
+#        a fold — keeps such a store from opening. Populated epoch-47 stores
 #        require delete/recreate.
 SQLITE_SCHEMA_EPOCH = 48
 
@@ -2392,7 +2395,12 @@ call_verifications_table = Table(
     CheckConstraint("current_run_id <> source_run_id", name="ck_call_verifications_distinct_runs"),
     CheckConstraint("is_match IS NOT TRUE OR source_call_id IS NOT NULL", name="ck_call_verifications_match_has_source"),
 )
-Index("ix_call_verifications_run", call_verifications_table.c.current_run_id)
+Index(
+    "ix_call_verifications_run",
+    call_verifications_table.c.current_run_id,
+    call_verifications_table.c.recorded_at,
+    call_verifications_table.c.current_call_id,
+)
 
 # Partial unique indexes for call_index uniqueness within each parent type.
 # Since calls can be parented by EITHER state_id OR operation_id (XOR),
@@ -2636,6 +2644,7 @@ Index("ix_tokens_run_id", tokens_table.c.run_id)
 Index("ix_token_parents_parent", token_parents_table.c.parent_token_id)
 Index("ix_node_states_token", node_states_table.c.token_id)
 Index("ix_node_states_node", node_states_table.c.node_id)
+Index("ix_node_states_run", node_states_table.c.run_id)
 Index("ix_calls_state", calls_table.c.state_id)
 Index("ix_calls_operation", calls_table.c.operation_id)  # For operation call lookups
 # Phase 5b — supports the cross-DB anchor lookup: "given a session-side

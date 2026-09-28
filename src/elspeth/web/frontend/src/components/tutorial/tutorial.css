@@ -57,8 +57,8 @@
 .tutorial-kicker {
   /* Centre the 64rem block; text stays left-aligned inside it. This centring
      now only serves the bookend-turn context (where the cap rarely binds) —
-     in the guided step the whole header band is full-bleed and the
-     .tutorial-shell--guided override below neutralises the cap so the kicker
+     in Build the whole header band is full-bleed and the
+     .tutorial-shell--workspace override below neutralises the cap so the kicker
      shares the progress row's and stepper's left edge. */
   margin: 0 auto var(--space-sm);
   max-width: 64rem;
@@ -72,43 +72,14 @@
   letter-spacing: 0.01em;
 }
 
-/* Guided-shell bridge wrapper (TutorialGuidedShell): the common Composer
+/* Tutorial workspace wrapper: the common Composer
    workspace lives here and owns the authoring/artifact split. */
-.tutorial-guided-shell {
+.tutorial-workspace-shell {
   width: 100%;
 }
 
-/* ── Workspace steps: height-bounded authoring frame (the column scrolls) ────
-   The bookend turns (welcome/audit/graduation) are short centred cards on the
-   base `.tutorial-shell` document scroll. The guided step — and, since I-1,
-   the run step, which keeps the pipeline pane beside its run card — instead
-   becomes a FIXED FRAME: the shell stops scrolling, the common workspace's authoring
-   chain terminates in ChatPanel, and `.guided-authoring-scroll` owns the
-   conversation scroll, with the composer
-   docked beneath it. In the app, ComposerWorkspace provides the surrounding
-   authoring/artifact split; this tutorial bridge joins the same chain at the
-   ChatPanel boundary.
-
-   (History: the guided step once borrowed the freeform chat model — a flex:1
-   inner scroll that FILLS the viewport + a flex-shrink:0 bottom dock — which
-   produced a ~550px void when content under-flowed and a clipped, unreachable
-   forward button when it over-flowed. The difference THIS time: the CONTENT
-   COLUMN owns the scroll and the decision card lives inside it, so underflow
-   just leaves empty column space and overflow scrolls — nothing is docked that
-   can outgrow the viewport.)
-
-   The height chain below is all-or-nothing: shell → guided-shell → common
-   workspace → authoring body → tutorial authoring → chat-panel → authoring
-   scroll each need flex:1/min-height:0. Miss ONE min-height:0 and the chain
-   silently reverts to content-height growth — the internal scroll never engages.
-
-   Scoped under `.tutorial-shell--guided` (live-guided + freeform never render
-   under `.tutorial-shell`). tutorial.css imports BEFORE chat.css/guided.css, so
-   every override here must WIN ON SPECIFICITY, never on source order —
-   `.tutorial-shell.tutorial-shell--guided` (0,2,0) also outranks the (0,1,0)
-   base rules later in THIS file (the ≤760px shell padding). */
-.tutorial-shell.tutorial-shell--guided {
-  /* The fixed frame: no document scroll on the guided step. */
+.tutorial-shell.tutorial-shell--workspace {
+  /* The fixed frame: no document scroll on Build. */
   overflow: hidden;
   flex: 1 1 auto;
   height: 100%;
@@ -122,12 +93,12 @@
   gap: var(--space-sm);
 }
 
-.tutorial-shell--guided .tutorial-progress {
+.tutorial-shell--workspace .tutorial-progress {
   flex-shrink: 0;
   padding-inline: var(--space-lg);
 }
 
-.tutorial-shell--guided .tutorial-kicker {
+.tutorial-shell--workspace .tutorial-kicker {
   flex-shrink: 0;
   padding-inline: var(--space-lg);
   margin-bottom: var(--space-2xs);
@@ -138,19 +109,19 @@
   margin-inline: 0;
 }
 
-.tutorial-shell--guided .tutorial-guided-shell {
+.tutorial-shell--workspace .tutorial-workspace-shell {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
 }
 
-.tutorial-shell--guided .tutorial-guided-shell > .composer-workspace {
+.tutorial-shell--workspace .tutorial-workspace-shell > .composer-workspace {
   flex: 1 1 auto;
   min-height: 0;
 }
 
-.tutorial-shell--guided .tutorial-guided-authoring {
+.tutorial-shell--workspace .tutorial-workspace-authoring {
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
@@ -159,44 +130,45 @@
   min-height: 0;
 }
 
+.tutorial-brief {
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-md);
+  background: var(--color-surface-elevated);
+  font: inherit;
+}
+
 /* Re-bound the panel (chat.css's base .chat-panel is height:100% against a
    full-height parent; here the parent is a flex column, so height:auto +
    flex:1 is the correct fill). overflow:hidden clips to the frame — the
    conversation column inside owns the scroll. */
-.tutorial-shell--guided .tutorial-guided-authoring > .chat-panel {
+.tutorial-shell--workspace .tutorial-workspace-authoring > .chat-panel {
   flex: 1 1 auto;
   min-height: 0;
   height: auto;
   overflow: hidden;
 }
 
-/* The COMPLETED branch renders persistently under this same shell (back-nav
-   state, TutorialGuidedShell sawActiveRef) but has NO internal scroll region —
-   a plain overflow:hidden frame would strand its content off-screen. Let the
-   completed panel scroll itself instead. */
-.tutorial-shell--guided .tutorial-guided-authoring > .chat-panel--completed {
-  overflow-y: auto;
-}
-
 /* Run step (I-1): the run card lives in the same workspace frame as the
-   guided build, so the pipeline pane keeps showing the graph the learner just
+   freeform Build, so the pipeline pane keeps showing the graph the learner just
    confirmed beside the Run button. The card has no internal scroll region
    (the result table can outgrow the frame), so the authoring wrapper owns the
    scroll — the same escape the completed panel above takes — and the card
    keeps its intrinsic height inside the flex column instead of being squashed
    to fit. */
-.tutorial-shell--guided .tutorial-run-authoring {
+.tutorial-shell--workspace .tutorial-run-authoring {
   overflow-y: auto;
   padding: var(--space-md) var(--space-lg) var(--space-xl);
 }
 
-.tutorial-shell--guided .tutorial-run-authoring > .tutorial-turn {
+.tutorial-shell--workspace .tutorial-run-authoring > .tutorial-turn {
   flex: 0 0 auto;
 }
 
-/* (Stepper full-bleed alignment now lives in guided.css — the workspace is
-   the one guided layout, so `.chat-panel--guided > .guided-workflow` carries
-   the full-bleed band for the tutorial and the app shell alike.) */
 
 .tutorial-sample-loading {
   color: var(--color-text-muted);
@@ -729,20 +701,7 @@
   gap: var(--space-sm);
 }
 
-/* Span the card this row reports on (elspeth-0c11a9cf90). The bookend turns
-   centre a min(920px, 100%) `.tutorial-turn` under the shell's
-   `align-items: center`; with no width of its own the progress row
-   shrink-to-fit and centred ~300px right of the card it labels, and
-   `.tutorial-exit-button`'s `margin-left: auto` had no free space to push
-   against — so a persistent chrome control changed position turn by turn,
-   right-anchoring only on the guided step (where `align-items: stretch`
-   applies). The width MUST track `.tutorial-turn`'s; tutorialShell.test.ts pins
-   the pair.
-
-   The `:not()` scoping is load-bearing: the guided step's own override (:118)
-   sets flex-shrink and padding but no width, so an unscoped rule here would cap
-   the one full-bleed band that is currently correct at 920px. */
-.tutorial-shell:not(.tutorial-shell--guided) .tutorial-progress {
+.tutorial-shell:not(.tutorial-shell--workspace) .tutorial-progress {
   width: min(920px, 100%);
 }
 

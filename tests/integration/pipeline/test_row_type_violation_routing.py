@@ -1209,11 +1209,21 @@ def test_a_buffered_row_missing_a_declared_field_routes_the_whole_batch_to_on_er
 
     [failed_state] = audit["failed_states"]
     reason = json.loads(failed_state.error_json)
+    # ADR-013 Amendment 2026-09-27: the unproven absence routes as missing_field, config field names only.
+    # The full text is pinned for this SOURCE-column miss and, in
+    # test_declared_input_miss.py, for a field a lost coalesce branch creates:
+    # the remedy must hold for both (R2 review r2 F1).
     assert reason == {
-        "reason": "contract_violation",
+        "reason": "missing_field",
+        "fields": ["v"],
         "error": (
-            f"Aggregation transform 'batch_threshold_summary' input validation failed for buffered row {offending_index}: "
-            "required input field(s) ['v'] absent from the row. The transform's schema declares them required."
+            f"Aggregation transform 'batch_threshold_summary' (buffered row {offending_index}) requires input field(s) ['v'] "
+            "that the arriving row does not carry. The build proves a field only when every path into this node "
+            "guarantees it, and it could not prove these, so the row is routed instead of processed. Where every row "
+            "should carry them: declare a column the source reads in the source's schema fields (a source row lacking "
+            "it is then handled by the source's on_validation_failure); a field a transform creates must be created on "
+            "every row and guaranteed by that transform's output schema; after a merge: union coalesce whose policy can "
+            "lose a branch (best_effort, first, or a quorum below the branch count), every branch must guarantee it."
         ),
     }
     [routing] = audit["routing"]
@@ -1324,11 +1334,11 @@ def test_a_buffered_row_missing_a_declared_field_fails_its_collector_group_and_t
 
     assert not [state for state in states if state.status == "open"], "no member hold may be left OPEN"
     failed = [json.loads(state.error_json) for state in states if state.status == "failed"]
-    [flush_error] = [error for error in failed if error["type"] == "PluginContractViolation"]
+    [flush_error] = [error for error in failed if error["type"] == "DeclaredInputFieldAbsentViolation"]
     assert flush_error["phase"] == "collector_flush"
-    assert flush_error["exception"] == (
-        "Collector transform 'batch_threshold_summary' input validation failed for buffered row 0: "
-        "required input field(s) ['score'] absent from the row. The transform's schema declares them required."
+    assert flush_error["exception"].startswith(
+        "Collector transform 'batch_threshold_summary' (buffered row 0) requires input field(s) ['score'] "
+        "that the arriving row does not carry."
     )
     member_errors = [error for error in failed if error["type"] == "CollectorGroupFailure"]
     assert len(member_errors) == 2
@@ -1338,7 +1348,7 @@ def test_a_buffered_row_missing_a_declared_field_fails_its_collector_group_and_t
     assert len(failed_pages) == 2
 
     # Positive control for the scan: it finds the reason it must find.
-    assert ("node_states", "error_json") in _audit_cells_containing(db, "required input field(s) ['score']")
+    assert ("node_states", "error_json") in _audit_cells_containing(db, "requires input field(s) ['score']")
     assert _audit_cells_containing(db, _MISSING_FIELD_SENTINEL) == []
 
 
@@ -1467,6 +1477,65 @@ def test_a_collector_emitting_non_canonical_output_fails_its_group_without_the_v
     payloads = [path.read_bytes() for path in (tmp_path / "payloads").rglob("*") if path.is_file()]
     assert any(str(_BIG_PAGE_VALUE).encode() in payload for payload in payloads)
     assert not any(str(_NON_CANONICAL_SUM).encode() in payload for payload in payloads)
+
+
+_NON_CANONICAL_SOURCE_INT = 9_182_737_777_777_777_777_777_777_777_777
+
+
+def test_a_source_row_the_ingest_hash_refuses_ends_the_run_without_the_value(tmp_path: Any) -> None:
+    """The fourth non-canonical seam: a VALID source row hashed at ingest (C3 fix round 1).
+
+    A json source passes an integer beyond the JSON safe range as a valid row;
+    the ingest transaction's hash refuses it and the run ends (the source's
+    contract breach). rfc8785's own text is the integer, and it reached the
+    source operation's error and the printed traceback. The violation names the
+    row index, withholds the observed (data-derived) field name, and carries
+    neither the value nor a chained cause.
+    """
+    from elspeth.core.landscape.database import LandscapeDB
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    (tmp_path / "input.jsonl").write_text('{"id": 1, "n": ' + str(_NON_CANONICAL_SOURCE_INT) + "}\n")
+    settings = f"""
+sources:
+  src:
+    plugin: json
+    on_success: out
+    options:
+      path: {tmp_path / "input.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+sinks:
+  out:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "payloads"}
+"""
+    cli = _run_cli(tmp_path, settings)
+
+    assert cli.exit_code not in (0, cli_completion_for(RunStatus.COMPLETED_WITH_FAILURES)[1]), cli.output
+    assert (
+        "Source 'json' emitted a valid row with non-canonical data at emitted row 0, in a field its output schema does not declare (IntegerDomainError)."
+        in cli.output
+    )
+    assert str(_NON_CANONICAL_SOURCE_INT) not in cli.output
+    assert "direct cause" not in cli.output
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+    # Positive control: the violation text reaches the very cell the leak reached.
+    assert ("operations", "error_message") in _audit_cells_containing(db, "emitted a valid row with non-canonical data")
+    assert _audit_cells_containing(db, str(_NON_CANONICAL_SOURCE_INT)) == []
 
 
 # ---------------------------------------------------------------------------

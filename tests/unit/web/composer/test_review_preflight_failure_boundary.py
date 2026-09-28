@@ -12,16 +12,18 @@ import pytest
 from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import _CallModelOutcome
+from elspeth.web.composer.advisor_checkpoint import _AdvisorCheckpointComposeDeadlineExpired
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_success
 from elspeth.web.composer.protocol import ComposerRuntimePreflightError
-from elspeth.web.composer.service import ComposerServiceImpl, _admit_composer_llm_completion, _AdvisorCheckpointComposeDeadlineExpired
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from tests.unit.web.execution.test_validation_complaint_triage import complaint_triage_state
 
 from .conftest import _fake_llm_response
-from .test_preview_policy_snapshot import _service
+from .test_preview_policy_snapshot import _registry, _service
 
 
 @pytest.mark.anyio
@@ -35,8 +37,14 @@ async def test_review_preflight_failure_is_not_a_plugin_crash(
 ) -> None:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
-    service = _service(tmp_path, snapshot)
-    service._sessions_service = composer_service_with_real_sessions._sessions_service
+    registry = _registry(tmp_path)
+    service = _service(
+        tmp_path,
+        snapshot,
+        catalog,
+        registry=registry,
+        sessions_service=composer_service_with_real_sessions._sessions_service,
+    )
     state = complaint_triage_state(pending=True)
     recorder = BufferingRecorder()
     prior = finish_success(
@@ -58,7 +66,7 @@ async def test_review_preflight_failure_is_not_a_plugin_crash(
         observed_deadlines.append(kwargs["deadline"])
         raise failure
 
-    monkeypatch.setattr(service, "_cached_runtime_preflight", fail_preflight)
+    monkeypatch.setattr(service._preflight, "cached_runtime_preflight", fail_preflight)
     completion = _admit_composer_llm_completion(
         _fake_llm_response(
             tool_calls=(
@@ -103,7 +111,7 @@ async def test_review_preflight_failure_is_not_a_plugin_crash(
             failed_turn=None,
             cancellation_requested=asyncio.Event(),
             plugin_snapshot=snapshot,
-            policy_catalog=PolicyCatalogView(catalog, snapshot, service._operator_profile_registry),
+            policy_catalog=PolicyCatalogView(catalog, snapshot, registry),
         )
 
     assert observed_deadlines == [deadline]

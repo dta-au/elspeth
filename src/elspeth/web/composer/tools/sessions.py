@@ -25,6 +25,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer.path_canonicalization import canonical_sink_local_paths
 from elspeth.web.composer.protocol import (
     INTERPRETATION_RATE_CAP_PER_SESSION_DAY_EXPECTATION,
     INTERPRETATION_RATE_CAP_PER_TERM_EXPECTATION,
@@ -452,8 +453,7 @@ def canonicalize_authored_node_review_requirements(
     -> ``_llm_has_shield_recommendation`` -> ``_requirements``) reaches that
     parser through a path with no ``try``/``except``. So the exact short form the
     skill asks the planner to author raised ``KeyError('id')`` and escaped the
-    candidate builder as a raw 500 ("The operation failed.") — the guided
-    first-run tutorial's step-3 web_scrape -> llm -> field_mapper crash.
+    candidate builder as a raw 500 ("The operation failed.").
 
     Canonicalise that short form into the full form BEFORE any consumer parses
     it: synthesise a stable ``id`` from ``user_term`` + node id and default the
@@ -538,13 +538,8 @@ def authored_node_interpretation_requirement_parse_error(
     documents but could not enforce: a review row missing a usable ``user_term``
     (absent, empty, non-string, or under a misnamed key) gets no synthesized
     ``id``, and the always-on prompt-shield walk in ``CompositionState.validate``
-    then raised ``KeyError('id')`` out of the candidate builder — surfacing on
-    the guided planner surfaces as a terminal
-    ``planner_code=CANDIDATE_CONSTRUCTION_ERROR`` (sessions deebaaa6 / f7ba27ca
-    ``guided_staged``, 470631e8 ``tutorial_profile``, 2026-07-22). The guided
-    step skills carry no ``interpretation_requirements`` exemplar (unlike the
-    freeform ``pipeline_composer.md``), so the staged planner authors these rows
-    from repair-feedback fragments alone and cannot avoid the malformed shapes.
+    then raised ``KeyError('id')`` out of the candidate builder, surfacing as a
+    terminal ``planner_code=CANDIDATE_CONSTRUCTION_ERROR``.
 
     Parse the authored rows through the same validated accessor the review
     walks use (:func:`parse_interpretation_requirements`) so ANY row those
@@ -1563,14 +1558,11 @@ def build_set_pipeline_candidate(
     # redundant (the type system already proves it is a Mapping).
     raw_outputs = args.get("outputs")
     # Root bare relative sink paths in the managed outputs pool exactly as
-    # the guided sink form does (canonical_sink_local_paths, elspeth-859e2702dd
-    # L3): "write it to colours.json" is the natural authoring form, and the
+    # the canonical sink form does: "write it to colours.json" is the natural authoring form, and the
     # raw value would otherwise park an unrepairable S2 rejection. '..'
     # segments are rejected outright; absolutes pass through to the S2
     # allowlist below. The canonical dict feeds validation AND the stored
     # OutputSpec so one runnable value flows everywhere.
-    from elspeth.web.composer.guided.stage_transitions import canonical_sink_local_paths
-
     canonical_out_options: dict[int, dict[str, Any]] = {}
     # An output whose paths would not canonicalize has no entry below, so its
     # remaining checks are skipped outright rather than reading a missing

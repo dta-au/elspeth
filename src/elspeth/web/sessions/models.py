@@ -54,320 +54,9 @@ from elspeth.core.schema_identity import create_schema_identity_table
 # but is independent: the Landscape and session DBs are separate files
 # with separate lifecycles and separate epochs.
 #
-# Epoch history (pre-1.0 policy — bumps require DB recreation):
-#   1 → initial schema.
-#   2 → interpretation_events_table added; operators upgrading across
-#        this boundary MUST delete their session DB.
-#   3 → composition_proposals gains user_message_id so explicit-approval
-#        replay can preserve inline-blob chat-message provenance when
-#        accepting a deferred proposal.
-#   4 → composer_completion_events_table added (Phase 6A completion
-#        gestures: mark_ready_for_review, export_yaml audit events).
-#   5 → composer_completion_events gains per-event-type partial CHECK
-#        constraints (Phase 6A post-merge hardening): payload_digest +
-#        expires_at are NOT NULL iff event_type='mark_ready_for_review';
-#        composition_state_id is NOT NULL for both event types. SQLite
-#        does not support ALTER TABLE ADD CONSTRAINT, so the constraint
-#        change is a fresh-schema bump.
-#   6 → user_preferences gains tutorial_completed_at for the Phase 4
-#        hello-world tutorial first-run/completed gate. Pre-release
-#        policy remains delete-and-recreate for stale session DBs.
-#   7 → resolved interpretation DELETE trigger permits whole-session
-#        archival cascades while preserving direct-delete protection.
-#   8 → ``composition_states.provenance`` closed enum gains the
-#        ``tutorial_normalization`` value (Phase 4 hello-world tutorial
-#        template-normalization writer). SQLite cannot ALTER a CHECK
-#        constraint in place, so the operator deletes the staging
-#        session DB and the schema is recreated. Pre-release policy
-#        remains delete-and-recreate for stale session DBs.
-#   9 → ``sessions.archived_at`` added so user-side archive can hide
-#        sessions with durable run/completion history rather than deleting
-#        audit-bearing rows. Unrun sessions may still be physically deleted.
-#   10 → ``interpretation_events.kind`` added; surface-specific
-#        ``auto_interpreted_opt_out`` rows now carry reviewed LLM artefacts
-#        and V2 argument hashes.
-#   11 → composition_proposals gains composer provenance fields so deferred
-#        explicit-approval accepts can replay inline-blob writes with the same
-#        model/provider/skill/arguments context as the original compose turn.
-#   12 → blob_inline_resolutions added for runtime inline-content blob
-#        substitution audit rows.
-#   13 → composer provenance CHECK constraints reject blank/whitespace strings
-#        as missing for blobs and composition proposals.
-#   14 → blobs LLM-authored provenance CHECK constraint requires a non-blank
-#        created_from_message_id anchor alongside the five creating_* fields.
-#   15 → blob_inline_resolutions.blob_id preserved as historical audit data
-#        without a live blobs.id foreign key, so completed-run audit rows do
-#        not prevent blob deletion.
-#   16 → blobs LLM-authored provenance CHECK constraint now rejects any
-#        creating_* field on verbatim rows; whitespace strings can no longer
-#        bypass the verbatim-side nullability invariant.
-#   17 → interpretation_events.kind CHECK gains pipeline_decision for
-#        LLM-authored cleanup/shape decisions that gate execution.
-#   18 → sessions.forked_from_session_id self-referential foreign key constraint
-#        removed to allow physical deletion of parent sessions (no-durable-history
-#        archive path) when child forks exist.
-#   19 → ``composition_states.sources`` added so named multi-source composer
-#        states survive save/load instead of collapsing to the legacy singular
-#        ``source`` compatibility column.
-#   20 → ``sessions.forked_from_message_id`` gains an ON DELETE SET NULL
-#        foreign key to ``chat_messages.id`` so source-message deletion cannot
-#        leave dangling fork provenance.
-#   21 → ``sessions.auth_provider_type`` and
-#        ``user_secrets.auth_provider_type`` gain closed-list CHECK
-#        constraints for the supported auth-provider namespaces.
-#   22 → ``composition_states.provenance`` closed enum gains the
-#        ``post_compose`` value for successful send-message/recompose state
-#        advances. SQLite cannot ALTER a CHECK constraint in place, so
-#        pre-release policy remains delete-and-recreate for stale session DBs.
-#   23 → ``run_events.sequence`` added as a durable per-run replay cursor so
-#        websocket reconnects can replay in insertion order and de-duplicate
-#        live queue events already delivered by the persisted replay.
-#   24 -> no SQL-shape change; bumped in lockstep with GUIDED_SESSION_SCHEMA_VERSION
-#        5->6 (composer_meta JSON adds GuidedSession.profile state); stale
-#        sessions.db fail-closes at boot via _assert_schema_sentinels instead
-#        of lazy-500-ing per guided row on GuidedSession.from_dict. Pre-release
-#        delete-and-recreate policy; see docs/runbooks/staging-session-db-recreation.md.
-#   25 -> no SQL-shape change; bumped in lockstep with GUIDED_SESSION_SCHEMA_VERSION
-#        6->7 (composer_meta JSON drops the vestigial GuidedSession.profile.entry_seed
-#        key). Invalidates the WHOLE sessions DB at boot, not just guided rows: this
-#        is the eager fail-close that keeps a stale entry_seed-bearing profile blob
-#        from lazy-500-ing deep in WorkflowProfile.from_dict's closed-key-set check.
-#        Pre-release delete-and-recreate policy; see runbook above.
-#   26 -> ``user_preferences`` gains the first-run tutorial resume columns
-#        (``tutorial_stage`` + ``tutorial_session_id`` + ``tutorial_run_id`` +
-#        ``tutorial_source_data_hash``) so a reload mid-tutorial resumes at the
-#        persisted stage instead of restarting at Welcome (elspeth-918f4434b3).
-#        Pre-release delete-and-recreate policy; see runbook above.
-#   27 -> ``user_preferences`` gains ``freeform_intro_dismissed_at`` so the
-#        freeform empty-state introduction can be dismissed account-wide.
-#        Pre-release delete-and-recreate policy; see runbook above.
-#   28 -> ``elspeth_schema_identity`` gives SQLite and PostgreSQL the same
-#        application/store/epoch proof, including semantic-only schema bumps.
-#   29 -> guided schema 8 invalidates schema-7 composer metadata and chain
-#        proposal state and adds durable, fenced guided operation reservations
-#        plus their append-only lease/takeover event history. Pre-release
-#        policy remains delete-and-recreate for stale session databases.
-#   30 -> ``guided_operations.failure_code`` gains the closed
-#        ``quota_exceeded`` value so fork quota failures settle once and replay
-#        as a stable HTTP 413 instead of violating the epoch-29 CHECK.
-#        Pre-release policy remains delete-and-recreate; no migration exists.
-#   31 -> guided checkpoint schema 9 adds ``guided_plan``, the closed
-#        pipeline-proposal replay locator, and ``request_cancelled``. Schema 8
-#        and epoch 30 are rejected outright; no decoder or migration exists.
-#   32 -> every failed guided-operation event commits the exact ordered audit
-#        evidence cohort. Epoch 31 is rejected outright; no decoder, backfill,
-#        or migration exists.
-#   33 -> guided-start reconciliation gains a durable append-only negative
-#        admission barrier. Epoch 32 cannot represent a cancelled operation id
-#        before reservation and is rejected outright; no migration exists.
-#   34 -> guided checkpoint schema 10 removes persisted advisor counters and
-#        the workflow-profile advisor flag. Schema 9 and epoch 33 are rejected
-#        outright; no decoder, backfill, or migration exists.
-#   35 -> guided confirmation admission is now a database-enforced, exclusive
-#        proposal lease. A partial unique index prevents independent workers
-#        from dispatching the same pending proposal under competing operations.
-#        Epoch 34 is rejected outright; no migration or compatibility decoder
-#        exists.
-#   36 -> ``blob_deletion_cleanups`` retains the exact staged filesystem delete
-#        across post-commit unlink/fsync failures. Epoch 35 cannot make those
-#        purges retryable after the ``blobs`` row is gone and is rejected.
-#   37 -> ``guided_operations`` completed-plan result CHECKs gain the
-#        ``declined`` result kind and its state-only locator. Epoch 36 cannot
-#        represent an ordinary guided planner decline and is rejected outright.
-#   38 -> completed guided-plan declines also retain the exact assistant
-#        message ID used for replay. Epoch 37 cannot distinguish the original
-#        decline from later assistant messages sharing an unchanged state.
-#   39 -> ``guided_operations.failure_code`` gains the closed ``policy_blocked``
-#        value so a deployment-policy refusal settles as a permanent failure
-#        instead of being misattributed to the provider. Epoch 38's CHECK
-#        rejects the row outright; SQLite cannot ALTER a CHECK in place, so
-#        pre-release policy remains delete-and-recreate for stale session
-#        databases (sessions.db only — auth.db is never touched).
-#   40 -> guided propose-pipeline payloads require an explicit coalesce
-#        ``timeout_seconds`` key, including ``None``. Epoch 39 sessions may
-#        reference persisted schema-10 payloads that omit it, so they are
-#        rejected at startup instead of failing lazily during guided replay.
-#        This is a semantic-only hard cut; guided checkpoint schema stays 10.
-#   41 -> guided propose-pipeline and confirm-wiring nodes require a
-#        ``node_options_summary`` key, including the empty list (R2-F3: the
-#        review cards render a transform's key options, not just its behavior
-#        discriminant). Epoch 40 sessions reference persisted payloads that
-#        omit it, so a stored proposal would fail its projection verifier —
-#        and its wire turn would fail frontend decode — mid-replay. Reject
-#        those stores at startup instead. Guided checkpoint schema stays 10.
-#   42 -> failed guided operations retain the reviewed output-field gap needed
-#        to reproduce the original closed HTTP failure envelope exactly.
-#        Epoch 41 rows cannot represent that replay enrichment and are rejected
-#        outright; no migration or compatibility decoder exists.
-#   43 -> ``chat_messages.writer_principal`` closed enum gains the
-#        ``run_diagnostics`` value so run-diagnostics LLM audit rows are
-#        attributed to their real writer instead of being misattributed to
-#        ``compose_loop`` (elspeth-0fcf68d50f). SQLite cannot ALTER a CHECK
-#        constraint in place, so pre-release policy remains delete-and-
-#        recreate for stale session databases (sessions.db only — auth.db is
-#        never touched).
-#   44 -> ``guided_operations.failure_code`` closed enum gains
-#        ``planner_repair_exhausted`` so planner repair exhaustion settles
-#        under its own honest classification instead of the provider-blaming
-#        ``invalid_provider_response`` (elspeth-5904b1683a). SQLite cannot
-#        ALTER a CHECK constraint in place, so pre-release policy remains
-#        delete-and-recreate for stale session databases (sessions.db only —
-#        auth.db is never touched).
-#   45 -> Textract web authoring moves to operator document profiles
-#        (ADR-036, elspeth-cd0f6a6cd9): the public projection drops
-#        bucket_field entirely and the ``deployment`` alias is replaced by
-#        named ``aws_textract_profiles`` aliases. No table shape changed,
-#        but stored sessions authored against the old public schema
-#        (bucket_field / ``deployment``) can no longer validate or replay,
-#        so pre-release policy applies: delete stale session databases
-#        (sessions.db only — auth.db is never touched).
-#   46 -> no SQL-shape change; bumped in lockstep with
-#        GUIDED_SESSION_SCHEMA_VERSION 10->11 (composer_meta JSON
-#        chat_history entries gain the occurrence-binding ``turn_token``
-#        key so guided Retry is occurrence-bound instead of content-based,
-#        elspeth-ea80e34fdc). Pre-release delete-and-recreate policy for
-#        stale session databases (sessions.db only — auth.db is never
-#        touched).
-#   47 -> ``proposal_events.event_type`` closed enum gains
-#        ``auto_commit.revoked`` so an auto-commit blocked by the settlement
-#        trust-mode recheck (elspeth-01d4c6e683) leaves a durable audit row
-#        instead of silently falling back to the review path — without it
-#        the trail showed a successful dispatch against a still-pending
-#        proposal with nothing recording the block. SQLite cannot ALTER a
-#        CHECK constraint in place, so pre-release policy remains delete-
-#        and-recreate for stale session databases (sessions.db only —
-#        auth.db is never touched).
-#   48 -> ``interpretation_events.choice`` closed enum gains ``superseded``
-#        (elspeth-dbc39dd367, un-deferred by elspeth-d73139155a): a
-#        composition-state commit that extinguishes a reviewed site now
-#        terminally retires the persisted PENDING row in the same
-#        transaction instead of leaving a zombie card that gates Run
-#        forever. ABANDONED was adjudicated semantically wrong for
-#        supersession (the session continues; the review was obsoleted).
-#        SQLite cannot ALTER a CHECK constraint in place, so pre-release
-#        policy remains delete-and-recreate for stale session databases
-#        (sessions.db only — auth.db is never touched).
-#   49 -> ``composition_rejection_events`` table added (elspeth-3e28029d2f):
-#        durable session-side record of composer mutation-tool rejections —
-#        the unredacted reason the planner saw, keyed to session + the
-#        composition state current at rejection. Operator ruling 2026-09-02:
-#        session data, not Landscape data. New table ships by DB recreation
-#        (sessions.db only — auth.db is never touched).
-#   50 -> ``ck_proposal_events_type`` widened with ``proposal.rebased``
-#        (elspeth-ed67eb9d0d): a guided settlement that carries a pending
-#        proposal across the checkpoint it writes must re-pin the
-#        proposal's forward-declared base, and that rebinding is an
-#        appended immutable lifecycle event plus a lifecycle-managed
-#        ``composition_proposals.base_state_id``. Without it the carried
-#        base kept naming the previous checkpoint and every later binding
-#        check failed closed — an unreadable guided session that the
-#        frontend silently reopened in freeform. SQLite cannot ALTER a
-#        CHECK constraint in place, so pre-release policy remains
-#        delete-and-recreate for stale session databases (sessions.db
-#        only — auth.db is never touched).
-#   51 -> persistent session-operation authority, compatible-generation
-#        membership/run-start coordination, cross-replica ticket/progress/rate
-#        state, bounded cleanup claims, monotonic user-secret row versions, and
-#        durable proposal blob-effect receipts. Epoch 50 cannot represent these
-#        authorities or receipts and is rejected outright; no migration exists.
-#        The composer_inflight_requests / composer_progress_snapshots tables
-#        drafted for cross-replica composer progress were removed before this
-#        substrate shipped (John 2026-08-31: progress persistence is deferred
-#        to the cross-replica ticket work). The substrate carried the number
-#        44 and then 48 on the original multi-replica lane and shipped under
-#        neither; it lands here as 51 because both of those numbers already
-#        name different schemas on the release line, and the epoch sentinel is
-#        enforced by exact equality, so one integer must name exactly one
-#        shape.
-#   52 → pluggable SSO (elspeth-07cd19ba73, spec
-#        docs/specs/2026-09-02-pluggable-sso-design.md): the auth provider
-#        discriminator widens from three values to five on BOTH tables that
-#        carry it (``sessions`` and ``user_secrets``, via the single
-#        ``_AUTH_PROVIDER_TYPE_CHECK``), admitting 'vanguard' and 'google'.
-#        SQLite cannot ALTER a CHECK constraint in place, so this is a
-#        delete-and-recreate boundary even though the constraint only
-#        widens. The identity substrate (``identities``, ``identity_roles``,
-#        ``identity_relationships``, ``sso_handoffs``), the workflow
-#        governance tables, and the ownership re-key onto ``identity_id``
-#        all land inside this same epoch: ONE cutover window carries the
-#        whole sprint, so no second one is ever required. Cut over together
-#        with Landscape epoch 37. It lands as 52 rather than 50 because the
-#        coordination substrate took 51 on the release line first, and the
-#        sentinel is exact equality — one integer names exactly one shape.
-#        Pre-1.0 delete-and-recreate boundary; no migration,
-#        rollback_permitted: false (sessions.db only — auth.db is never
-#        touched).
-#   53 -> ``session_read_admissions`` table added (elspeth-f98e0ae8b2, under
-#        A-3 elspeth-bf52d495a2): one row per shareable BLOB_READ admission
-#        so a released or expired read context is REFUSED on its next proof
-#        instead of keeping read authority until the session is archived or
-#        deleted. The row carries the admission's operation id and lease
-#        token, its database-time expiry (renew extends it), and the fence
-#        epoch it was admitted under as an informational custody
-#        generation — never compared, because a writer's epoch advance must
-#        not invalidate a shareable read. Release deletes the row; the
-#        session's ``ON DELETE CASCADE`` removes the rest. Written only by
-#        ``SessionOperationAuthority``. New table ships by DB recreation
-#        (sessions.db only — auth.db is never touched); no migration,
-#        rollback_permitted: false.
-#   54 -> Durable Composer progress snapshots and exact request lifecycle leases.
-#        Pre-release delete-and-recreate boundary; no migration or rollback.
-#   55 -> VANguard residual schema batch (elspeth-e6c2d254b2,
-#        elspeth-2371269e07, elspeth-dcd26dcfe5): reserve workflow_inspect in
-#        audit_access_log.writer_principal; enforce the identity ownership
-#        already carried by sessions, user_secrets and user_preferences with
-#        RESTRICT foreign keys; retain approval revocation actor/transition
-#        provenance and durable run admission/refusal policy evidence.
-#        Guided operations gain admission_refused as a distinct terminal
-#        failure code, so policy refusal cannot masquerade as provider outage.
-#        Admission refusal remains retryable until Landscape and retained
-#        output cleanup settle; a failed Sessions row alone is not completion.
-#        The epoch-52 ownership statement above described the intended batch;
-#        its three ownership foreign keys and third read principal did not
-#        ship then. This prepared residual batch after ACA epoch 54 is the
-#        explicit trigger for those missed shapes. Deploy together with
-#        Landscape epoch 40 in ONE service-stop window, after preserving or
-#        exporting required evidence. Preparation is not a deployed cutover.
-#        Pre-1.0 delete-and-recreate boundary; no migration,
-#        rollback_permitted: false (sessions.db only; auth.db is untouched).
-# Coupled cut: sparse proposal display and structured stored validation errors.
-# 57 → Approved prompt artifact anchor replaces the fallback-template digest.
-#      Pre-1.0 delete/recreate; old approvals must not be reinterpreted.
-# 58: quota policy quantities require 64-bit storage; unavailable provider
-# token counts remain NULL rather than becoming invented zero usage.
-# 59: timestamp-leading quota scan indexes support container-wide daily
-# admission checks alongside the identity-leading indexes.
-# 60: terminal guided operations preserve fork failure diagnostics.
-# 61: default new preferences to freeform and remove the retired mode banner.
-#     Pre-1.0 delete/recreate boundary; no migration of existing preferences.
-# 62: durable advisor completion gates require a nullable backend suggestion.
-#     Semantic-only JSON grammar cut: reject earlier stores at startup before
-#     an old blocked envelope can fail during session reload. No migration.
-# 63: blob_inline_resolutions.content_hash carries the full lowercase SHA-256
-#     shape, not the length alone (elspeth-f99b16fc2f), and so do the four
-#     blob_replacement_cleanups evidence hashes. The same cut gives every
-#     remaining digest column its rule: the nullable composer provenance
-#     hashes, skill_markdown_history.hash, the bare library payload digest
-#     and the ``sha256:``-prefixed review and completion-event digests.
-#     That rule exposed three server routes writing their own name into
-#     interpretation_events' LLM provenance columns; the same cut adds
-#     interpretation_events.surface_origin and ties provenance to it.
-#     Pairs with Landscape epoch 43. Pre-1.0 delete/recreate.
-# 64: guided operation failures distinguish unavailable cost accounting from
-#     malformed provider content. Pre-1.0 delete/recreate.
-# 65: durable advisor gate notes become required envelope fields.
-# 66: control-message v2 binds origin and provider role alongside content.
-#     Semantic JSON cut: reject v1 histories at startup; no migration or replay
-#     fallback to the content-only checksum. Pre-1.0 delete/recreate.
-# 67: the composer authority projection binds coalesce mapping-branch order and
-#     multi-source ``sources`` order, and the advisor fingerprint binds both;
-#     stored draft, content, private-argument, dispatch-binding and fingerprint
-#     preimages changed. Pre-1.0 delete/recreate, no legacy path.
-# 68: persisted proposal.rebased events admit compose_checkpoint and
-#     ordinary_proposal_checkpoint reason codes so pending proposals retain
-#     their authoritative head across compose checkpoints. Earlier readers
-#     reject these reasons. Pre-1.0 delete/recreate, no legacy path.
-SESSION_SCHEMA_EPOCH = 68
+# Epoch 71 is the freeform-only session schema. Pre-release stores are
+# recreated on mismatch; there is no in-place migration or legacy decoder.
+SESSION_SCHEMA_EPOCH = 71
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -772,6 +461,32 @@ chat_messages_table = Table(
     ),
 )
 
+message_ingress_receipts_table = Table(
+    "message_ingress_receipts",
+    metadata,
+    Column("session_id", String, ForeignKey("sessions.id", ondelete="CASCADE"), primary_key=True),
+    Column("client_request_id", String, primary_key=True),
+    Column("user_message_id", String, nullable=False),
+    Column("requested_state_id", String, nullable=True),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    ForeignKeyConstraint(
+        ["user_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_message_ingress_receipts_user_message_session",
+        ondelete="CASCADE",
+    ),
+    ForeignKeyConstraint(
+        ["requested_state_id", "session_id"],
+        ["composition_states.id", "composition_states.session_id"],
+        name="fk_message_ingress_receipts_requested_state_session",
+        ondelete="CASCADE",
+    ),
+    UniqueConstraint("user_message_id", name="uq_message_ingress_receipts_user_message"),
+    *_non_blank_text_constraints("session_id", name="ck_message_ingress_receipts_session_id_nonblank"),
+    *_non_blank_text_constraints("client_request_id", name="ck_message_ingress_receipts_client_request_id_nonblank"),
+    *_non_blank_text_constraints("user_message_id", name="ck_message_ingress_receipts_user_message_id_nonblank"),
+)
+
 # Partial unique index: tool_call_id must be unique within
 # (session_id, role='tool') scope. Two tool rows in the same session
 # cannot share a provider tool_call_id (would conflate distinct LLM
@@ -825,7 +540,7 @@ composition_states_table = Table(
     # in validity across lanes; the marker makes that transition legible
     # to an auditor. Absence (NULL composer_meta or missing key) is honest
     # for writer paths that predate the marker or copy an existing row
-    # (revert, fork, guided checkpoint copies).
+    # (revert and fork).
     Column("composer_meta", JSON, nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column(
@@ -893,7 +608,7 @@ composition_states_table = Table(
     #                                    LLM-driven state advances, including the
     #                                    transition_consumed metadata-only row.
     #   - ``session_seed``            — route-driven seed/import writes and
-    #                                    service.py guided state reverts
+    #                                    service.py state reverts
     #   - ``session_fork``            — service.py fork_session_at_message and
     #                                    routes/sessions.py fork blob-reference
     #                                    rewrite, which is part of the same fork
@@ -985,9 +700,7 @@ composition_proposals_table = Table(
         "tool_call_id",
         name="uq_composition_proposals_session_tool_call",
     ),
-    # Composite target for guided_operations.proposal_id. The proposal id is
-    # globally unique already; the pair exists to make same-session custody a
-    # database invariant on both SQLite and PostgreSQL.
+    # Composite proposal identity is retained for same-session custody checks.
     UniqueConstraint("id", "session_id", name="uq_composition_proposals_id_session"),
     CheckConstraint(
         "status IN ('pending', 'committed', 'rejected')",
@@ -1008,47 +721,11 @@ composition_proposals_table = Table(
     *_lower_sha256_constraints("composer_skill_hash", name="ck_composition_proposals_composer_skill_hash_format", nullable=True),
     *_lower_sha256_constraints("tool_arguments_hash", name="ck_composition_proposals_tool_arguments_hash_format", nullable=True),
 )
-# Durable negative admission authority for a guided start whose client lost
-# its request body before the server ever reserved an operation row. The row
-# deliberately carries no request hash or raw intent: an exact operation id is
-# permanently closed as request_cancelled, independent of any later payload.
-guided_operation_admission_blocks_table = Table(
-    "guided_operation_admission_blocks",
-    metadata,
-    Column("session_id", String(128), nullable=False),
-    Column("operation_id", String(128), nullable=False),
-    Column("kind", String(32), nullable=False),
-    Column("failure_code", String(128), nullable=False),
-    Column("actor", String(128), nullable=False),
-    Column("created_at", DateTime(timezone=True), nullable=False),
-    PrimaryKeyConstraint("session_id", "operation_id", name="pk_guided_operation_admission_blocks"),
-    ForeignKeyConstraint(
-        ["session_id"],
-        ["sessions.id"],
-        name="fk_guided_operation_admission_blocks_session",
-        ondelete="CASCADE",
-    ),
-    CheckConstraint(
-        "length(operation_id) >= 1 AND length(operation_id) <= 128",
-        name="ck_guided_operation_admission_blocks_operation_id_bounded",
-    ),
-    CheckConstraint("kind = 'guided_start'", name="ck_guided_operation_admission_blocks_kind"),
-    CheckConstraint(
-        "failure_code = 'request_cancelled'",
-        name="ck_guided_operation_admission_blocks_failure_code",
-    ),
-    CheckConstraint(
-        "length(actor) >= 1 AND length(actor) <= 128",
-        name="ck_guided_operation_admission_blocks_actor_bounded",
-    ),
-)
-
-
-# One bounded reservation row per client-authored mutating action. Raw request
-# bodies, user intent, and provider errors are deliberately absent: replay is
-# bound by a canonical request hash and a small immutable result locator.
-guided_operations_table = Table(
-    "guided_operations",
+# Fork and state-revert requests own an immutable request digest. Only a live exact lease may advance the
+# receipt to a terminal response locator. No planner/proposal columns belong
+# in this table.
+session_operation_receipts_table = Table(
+    "session_operation_receipts",
     metadata,
     Column("session_id", String(128), nullable=False),
     Column("operation_id", String(128), nullable=False),
@@ -1059,186 +736,94 @@ guided_operations_table = Table(
     Column("lease_expires_at", DateTime(timezone=True), nullable=True),
     Column("attempt", Integer, nullable=False),
     Column("originating_message_id", String(128), nullable=True),
-    Column("proposal_id", String(128), nullable=True),
-    Column("result_kind", String(32), nullable=True),
     Column("result_state_id", String(128), nullable=True),
-    Column("result_message_id", String(128), nullable=True),
     Column("result_session_id", String(128), nullable=True),
     Column("response_hash", String(64), nullable=True),
     Column("failure_code", String(128), nullable=True),
-    Column("unproducible_output_fields", JSON(none_as_null=True), nullable=True),
     Column("failure_diagnostics", JSON(none_as_null=True), nullable=True),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     Column("settled_at", DateTime(timezone=True), nullable=True),
-    PrimaryKeyConstraint("session_id", "operation_id", name="pk_guided_operations"),
-    UniqueConstraint(
-        "session_id",
-        "operation_id",
-        "request_hash",
-        name="uq_guided_operations_request_binding",
-    ),
-    ForeignKeyConstraint(["session_id"], ["sessions.id"], name="fk_guided_operations_session", ondelete="CASCADE"),
+    PrimaryKeyConstraint("session_id", "operation_id", name="pk_session_operation_receipts"),
+    UniqueConstraint("session_id", "operation_id", "request_hash", name="uq_session_operation_receipts_request_binding"),
+    ForeignKeyConstraint(["session_id"], ["sessions.id"], name="fk_session_operation_receipts_session", ondelete="CASCADE"),
     ForeignKeyConstraint(
         ["originating_message_id", "session_id"],
         ["chat_messages.id", "chat_messages.session_id"],
-        name="fk_guided_operations_originating_message_session",
-        ondelete="RESTRICT",
-    ),
-    ForeignKeyConstraint(
-        ["proposal_id", "session_id"],
-        ["composition_proposals.id", "composition_proposals.session_id"],
-        name="fk_guided_operations_proposal_session",
+        name="fk_session_operation_receipts_originating_message_session",
         ondelete="RESTRICT",
     ),
     ForeignKeyConstraint(
         ["result_state_id", "session_id"],
         ["composition_states.id", "composition_states.session_id"],
-        name="fk_guided_operations_result_state_session",
+        name="fk_session_operation_receipts_result_state_session",
         ondelete="RESTRICT",
     ),
-    ForeignKeyConstraint(
-        ["result_message_id", "session_id"],
-        ["chat_messages.id", "chat_messages.session_id"],
-        name="fk_guided_operations_result_message_session",
-        ondelete="RESTRICT",
-    ),
-    ForeignKeyConstraint(["result_session_id"], ["sessions.id"], name="fk_guided_operations_result_session", ondelete="RESTRICT"),
-    CheckConstraint("length(operation_id) >= 1 AND length(operation_id) <= 128", name="ck_guided_operations_operation_id_bounded"),
-    CheckConstraint(
-        "originating_message_id IS NULL OR (length(originating_message_id) >= 1 AND length(originating_message_id) <= 128)",
-        name="ck_guided_operations_originating_message_id_bounded",
-    ),
-    CheckConstraint(
-        "proposal_id IS NULL OR (length(proposal_id) >= 1 AND length(proposal_id) <= 128)",
-        name="ck_guided_operations_proposal_id_bounded",
-    ),
-    CheckConstraint(
-        "result_state_id IS NULL OR (length(result_state_id) >= 1 AND length(result_state_id) <= 128)",
-        name="ck_guided_operations_result_state_id_bounded",
-    ),
-    CheckConstraint(
-        "result_message_id IS NULL OR (length(result_message_id) >= 1 AND length(result_message_id) <= 128)",
-        name="ck_guided_operations_result_message_id_bounded",
-    ),
-    CheckConstraint(
-        "result_session_id IS NULL OR (length(result_session_id) >= 1 AND length(result_session_id) <= 128)",
-        name="ck_guided_operations_result_session_id_bounded",
-    ),
-    CheckConstraint(
-        "kind IN ('guided_start', 'guided_respond', 'guided_chat', 'guided_convert', 'guided_reenter', 'guided_plan', 'state_revert', 'session_fork')",
-        name="ck_guided_operations_kind",
-    ),
-    CheckConstraint("status IN ('in_progress', 'completed', 'failed')", name="ck_guided_operations_status"),
-    CheckConstraint(_lower_sha256_check("request_hash", dialect="sqlite"), name="ck_guided_operations_request_hash").ddl_if(
+    ForeignKeyConstraint(["result_session_id"], ["sessions.id"], name="fk_session_operation_receipts_result_session", ondelete="RESTRICT"),
+    CheckConstraint("length(operation_id) >= 1 AND length(operation_id) <= 128", name="ck_session_operation_receipts_id_bounded"),
+    CheckConstraint("kind IN ('session_fork', 'state_revert')", name="ck_session_operation_receipts_kind"),
+    CheckConstraint("status IN ('in_progress', 'completed', 'failed')", name="ck_session_operation_receipts_status"),
+    CheckConstraint("attempt >= 1", name="ck_session_operation_receipts_attempt"),
+    CheckConstraint("updated_at >= created_at", name="ck_session_operation_receipts_updated_after_created"),
+    CheckConstraint("settled_at IS NULL OR settled_at >= created_at", name="ck_session_operation_receipts_settled_after_created"),
+    CheckConstraint(_lower_sha256_check("request_hash", dialect="sqlite"), name="ck_session_operation_receipts_request_hash").ddl_if(
         dialect="sqlite"
     ),
-    CheckConstraint(_lower_sha256_check("request_hash", dialect="postgresql"), name="ck_guided_operations_request_hash").ddl_if(
+    CheckConstraint(_lower_sha256_check("request_hash", dialect="postgresql"), name="ck_session_operation_receipts_request_hash").ddl_if(
         dialect="postgresql"
     ),
-    CheckConstraint("attempt >= 1", name="ck_guided_operations_attempt"),
-    CheckConstraint("updated_at >= created_at", name="ck_guided_operations_updated_after_created"),
-    CheckConstraint("settled_at IS NULL OR settled_at >= created_at", name="ck_guided_operations_settled_after_created"),
     CheckConstraint(
         "lease_token IS NULL OR (length(lease_token) >= 1 AND length(lease_token) <= 256)",
-        name="ck_guided_operations_lease_token_bounded",
+        name="ck_session_operation_receipts_lease_token_bounded",
     ),
     CheckConstraint(
-        "result_kind IS NULL OR result_kind IN ('composition_state', 'pipeline_proposal', 'session', 'declined')",
-        name="ck_guided_operations_result_kind",
-    ),
-    CheckConstraint(
-        "failure_code IS NULL OR failure_code IN ('provider_unavailable', 'provider_timeout', "
-        "'invalid_provider_response', 'cost_unavailable', 'planner_repair_exhausted', 'policy_blocked', 'admission_refused', 'stale_conflict', 'integrity_error', 'custody_error', "
+        "failure_code IS NULL OR failure_code IN ('stale_conflict', 'integrity_error', 'custody_error', "
         "'quota_exceeded', 'operation_failed', 'request_cancelled')",
-        name="ck_guided_operations_failure_code",
+        name="ck_session_operation_receipts_failure_code",
     ),
     CheckConstraint(
-        "unproducible_output_fields IS NULL OR "
-        "(json_type(unproducible_output_fields) = 'array' AND json_array_length(unproducible_output_fields) > 0)",
-        name="ck_guided_operations_unproducible_output_fields_shape",
-    ).ddl_if(dialect="sqlite"),
-    # The ``'array'::text`` spelling matches PostgreSQL's deparse of the
-    # untyped literal (json_typeof returns text), so the declared and
-    # reflected constraints parse identically for the fail-closed
-    # schema-shape comparator; a bare ``'array'`` reflects as a cast and
-    # classifies a fresh database as non-current.
-    CheckConstraint(
-        "unproducible_output_fields IS NULL OR "
-        "(json_typeof(unproducible_output_fields) = 'array'::text AND json_array_length(unproducible_output_fields) > 0)",
-        name="ck_guided_operations_unproducible_output_fields_shape",
-    ).ddl_if(dialect="postgresql"),
-    CheckConstraint(
-        "failure_diagnostics IS NULL OR "
-        "(json_type(failure_diagnostics) = 'array' AND "
+        "failure_diagnostics IS NULL OR (json_type(failure_diagnostics) = 'array' AND "
         "json_array_length(failure_diagnostics) > 0 AND json_array_length(failure_diagnostics) <= 32)",
-        name="ck_guided_operations_failure_diagnostics_shape",
+        name="ck_session_operation_receipts_failure_diagnostics_shape",
     ).ddl_if(dialect="sqlite"),
     CheckConstraint(
-        "failure_diagnostics IS NULL OR "
-        "(json_typeof(failure_diagnostics) = 'array'::text AND "
+        "failure_diagnostics IS NULL OR (json_typeof(failure_diagnostics) = 'array'::text AND "
         "json_array_length(failure_diagnostics) > 0 AND json_array_length(failure_diagnostics) <= 32)",
-        name="ck_guided_operations_failure_diagnostics_shape",
+        name="ck_session_operation_receipts_failure_diagnostics_shape",
     ).ddl_if(dialect="postgresql"),
     CheckConstraint(
         "(status = 'in_progress' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
-        "AND settled_at IS NULL AND result_kind IS NULL "
-        "AND result_message_id IS NULL AND response_hash IS NULL AND failure_code IS NULL "
-        "AND unproducible_output_fields IS NULL AND failure_diagnostics IS NULL) OR "
-        "(status = 'completed' AND lease_token IS NULL AND lease_expires_at IS NULL "
-        "AND settled_at IS NOT NULL AND result_kind IS NOT NULL AND response_hash IS NOT NULL AND failure_code IS NULL "
-        "AND unproducible_output_fields IS NULL AND failure_diagnostics IS NULL) OR "
-        "(status = 'failed' AND lease_token IS NULL AND lease_expires_at IS NULL "
-        "AND settled_at IS NOT NULL AND result_kind IS NULL AND result_state_id IS NULL "
-        "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL "
-        "AND response_hash IS NULL AND failure_code IS NOT NULL)",
-        name="ck_guided_operations_status_bundle",
+        "AND settled_at IS NULL AND response_hash IS NULL AND failure_code IS NULL AND failure_diagnostics IS NULL) OR "
+        "(status = 'completed' AND lease_token IS NULL AND lease_expires_at IS NULL AND settled_at IS NOT NULL "
+        "AND response_hash IS NOT NULL AND failure_code IS NULL AND failure_diagnostics IS NULL) OR "
+        "(status = 'failed' AND lease_token IS NULL AND lease_expires_at IS NULL AND settled_at IS NOT NULL "
+        "AND result_state_id IS NULL AND result_session_id IS NULL AND response_hash IS NULL AND failure_code IS NOT NULL)",
+        name="ck_session_operation_receipts_status_bundle",
     ),
     CheckConstraint(
-        "(status = 'in_progress' AND "
-        "(result_session_id IS NULL OR kind = 'session_fork') AND "
-        "(result_state_id IS NULL OR kind <> 'session_fork') AND "
-        "(proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))) OR "
-        "(status = 'completed' AND ("
-        "(kind = 'session_fork' AND result_kind = 'session' AND result_session_id IS NOT NULL "
-        "AND result_state_id IS NULL AND result_message_id IS NULL AND proposal_id IS NULL) OR "
-        "(kind = 'guided_plan' AND result_kind = 'pipeline_proposal' "
-        "AND result_state_id IS NOT NULL AND result_message_id IS NULL "
-        "AND result_session_id IS NULL AND proposal_id IS NOT NULL) OR "
-        "(kind = 'guided_plan' AND result_kind = 'declined' "
-        "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
-        "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
-        "(kind NOT IN ('session_fork', 'guided_plan') AND result_kind = 'composition_state' "
-        "AND result_state_id IS NOT NULL AND result_message_id IS NULL AND result_session_id IS NULL "
-        "AND (proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))))) OR "
-        "(status = 'failed' AND result_kind IS NULL AND result_state_id IS NULL "
-        "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL)",
-        name="ck_guided_operations_result_locator",
+        "(kind = 'session_fork' AND result_state_id IS NULL AND "
+        "(status <> 'completed' OR result_session_id IS NOT NULL)) OR "
+        "(kind = 'state_revert' AND result_session_id IS NULL AND originating_message_id IS NULL AND "
+        "(status <> 'completed' OR result_state_id IS NOT NULL))",
+        name="ck_session_operation_receipts_result_locator",
     ),
     CheckConstraint(
         "response_hash IS NULL OR (length(response_hash) = 64 AND response_hash NOT GLOB '*[^a-f0-9]*')",
-        name="ck_guided_operations_response_hash",
+        name="ck_session_operation_receipts_response_hash",
     ).ddl_if(dialect="sqlite"),
     CheckConstraint(
         "response_hash IS NULL OR (length(response_hash) = 64 AND response_hash ~ '^[a-f0-9]+$')",
-        name="ck_guided_operations_response_hash",
+        name="ck_session_operation_receipts_response_hash",
     ).ddl_if(dialect="postgresql"),
 )
-Index("ix_guided_operations_status_lease", guided_operations_table.c.status, guided_operations_table.c.lease_expires_at)
 Index(
-    "uq_guided_operations_active_proposal_admission",
-    guided_operations_table.c.session_id,
-    guided_operations_table.c.proposal_id,
-    unique=True,
-    sqlite_where=(guided_operations_table.c.status == "in_progress") & guided_operations_table.c.proposal_id.is_not(None),
-    postgresql_where=(guided_operations_table.c.status == "in_progress") & guided_operations_table.c.proposal_id.is_not(None),
+    "ix_session_operation_receipts_status_lease",
+    session_operation_receipts_table.c.status,
+    session_operation_receipts_table.c.lease_expires_at,
 )
 
-
-# Append-only evidence for initial claims, renewals, takeovers, and terminal
-# settlement. Lease tokens and request/provider text never enter this table.
-guided_operation_events_table = Table(
-    "guided_operation_events",
+session_operation_receipt_events_table = Table(
+    "session_operation_receipt_events",
     metadata,
     Column("session_id", String(128), nullable=False),
     Column("operation_id", String(128), nullable=False),
@@ -1249,36 +834,41 @@ guided_operation_events_table = Table(
     Column("prior_attempt", Integer, nullable=True),
     Column("lease_expires_at", DateTime(timezone=True), nullable=True),
     Column("request_hash", String(64), nullable=False),
-    # SQL NULL means "not a failed event". JSON null is not an admissible
-    # second spelling, so preserve Python ``None`` as SQL NULL on both stores.
-    Column("failure_audit_cohort", JSON(none_as_null=True), nullable=True),
+    Column("terminal_hash", String(64), nullable=True),
     Column("occurred_at", DateTime(timezone=True), nullable=False),
-    PrimaryKeyConstraint("session_id", "operation_id", "sequence", name="pk_guided_operation_events"),
+    PrimaryKeyConstraint("session_id", "operation_id", "sequence", name="pk_session_operation_receipt_events"),
     ForeignKeyConstraint(
         ["session_id", "operation_id", "request_hash"],
-        ["guided_operations.session_id", "guided_operations.operation_id", "guided_operations.request_hash"],
-        name="fk_guided_operation_events_operation",
+        ["session_operation_receipts.session_id", "session_operation_receipts.operation_id", "session_operation_receipts.request_hash"],
+        name="fk_session_operation_receipt_events_receipt",
         ondelete="CASCADE",
     ),
-    CheckConstraint("sequence >= 1", name="ck_guided_operation_events_sequence"),
-    CheckConstraint("event_kind IN ('claimed', 'renewed', 'taken_over', 'completed', 'failed')", name="ck_guided_operation_events_kind"),
-    CheckConstraint("length(actor) >= 1 AND length(actor) <= 128", name="ck_guided_operation_events_actor_bounded"),
-    CheckConstraint("attempt >= 1", name="ck_guided_operation_events_attempt"),
-    CheckConstraint(_lower_sha256_check("request_hash", dialect="sqlite"), name="ck_guided_operation_events_request_hash").ddl_if(
+    CheckConstraint("sequence >= 1", name="ck_session_operation_receipt_events_sequence"),
+    CheckConstraint(
+        "event_kind IN ('claimed', 'renewed', 'taken_over', 'completed', 'failed')", name="ck_session_operation_receipt_events_kind"
+    ),
+    CheckConstraint("length(actor) >= 1 AND length(actor) <= 128", name="ck_session_operation_receipt_events_actor_bounded"),
+    CheckConstraint("attempt >= 1", name="ck_session_operation_receipt_events_attempt"),
+    CheckConstraint(_lower_sha256_check("request_hash", dialect="sqlite"), name="ck_session_operation_receipt_events_request_hash").ddl_if(
         dialect="sqlite"
     ),
-    CheckConstraint(_lower_sha256_check("request_hash", dialect="postgresql"), name="ck_guided_operation_events_request_hash").ddl_if(
-        dialect="postgresql"
-    ),
     CheckConstraint(
-        "(event_kind IN ('claimed', 'renewed') AND prior_attempt IS NULL AND lease_expires_at IS NOT NULL) OR "
-        "(event_kind = 'taken_over' AND prior_attempt IS NOT NULL AND prior_attempt = attempt - 1 AND lease_expires_at IS NOT NULL) OR "
-        "(event_kind IN ('completed', 'failed') AND prior_attempt IS NULL AND lease_expires_at IS NULL)",
-        name="ck_guided_operation_events_bundle",
-    ),
+        _lower_sha256_check("request_hash", dialect="postgresql"), name="ck_session_operation_receipt_events_request_hash"
+    ).ddl_if(dialect="postgresql"),
     CheckConstraint(
-        "(event_kind = 'failed') = (failure_audit_cohort IS NOT NULL)",
-        name="ck_guided_operation_events_failure_audit_cohort",
+        "terminal_hash IS NULL OR (length(terminal_hash) = 64 AND terminal_hash NOT GLOB '*[^a-f0-9]*')",
+        name="ck_session_operation_receipt_events_terminal_hash",
+    ).ddl_if(dialect="sqlite"),
+    CheckConstraint(
+        "terminal_hash IS NULL OR (length(terminal_hash) = 64 AND terminal_hash ~ '^[a-f0-9]+$')",
+        name="ck_session_operation_receipt_events_terminal_hash",
+    ).ddl_if(dialect="postgresql"),
+    CheckConstraint(
+        "(event_kind IN ('claimed', 'renewed') AND prior_attempt IS NULL AND lease_expires_at IS NOT NULL AND terminal_hash IS NULL) OR "
+        "(event_kind = 'taken_over' AND prior_attempt IS NOT NULL AND prior_attempt = attempt - 1 "
+        "AND lease_expires_at IS NOT NULL AND terminal_hash IS NULL) OR "
+        "(event_kind IN ('completed', 'failed') AND prior_attempt IS NULL AND lease_expires_at IS NULL AND terminal_hash IS NOT NULL)",
+        name="ck_session_operation_receipt_events_bundle",
     ),
 )
 
@@ -1309,10 +899,9 @@ guided_operation_events_table = Table(
 #   status="pending"} shape. The old schema-less three-field payload is
 #   invalid and is never inferred or upgraded by readers.
 #   Canonical set_pipeline rows use the distinct closed
-#   schema="pipeline_proposal_created.v1" metadata. It binds the exact
+#   schema="pipeline_proposal_created.v2" metadata. It binds the exact
 #   private arguments, manifest-redacted audit projection, provenance,
-#   tagged base, surface, draft/reviewed-anchor/skill hashes, repair count,
-#   deferred-intent ids, optional supersession pair, and custody result.
+#   tagged base, draft/skill hashes, repair count, and custody result.
 #   Readers must never reinterpret malformed metadata as another schema.
 #
 # Payload contract for event_type="proposal.accepted":
@@ -1352,8 +941,7 @@ proposal_events_table = Table(
     Column("payload", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', "
-        "'trust_mode.changed', 'auto_commit.revoked', 'proposal.rebased')",
+        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed', 'auto_commit.revoked')",
         name="ck_proposal_events_type",
     ),
 )
@@ -2005,17 +1593,56 @@ POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
         ),
     ),
     PostgresqlAuditDDL(
-        table=guided_operations_table,
-        trigger_name="trg_guided_operations_terminal_immutable",
-        function_name="elspeth_guided_operations_terminal_immutable",
+        table=message_ingress_receipts_table,
+        trigger_name="trg_message_ingress_receipts_no_update",
+        function_name="elspeth_message_ingress_receipts_no_update",
         function_sql="""
-        CREATE FUNCTION elspeth_guided_operations_terminal_immutable()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
+        CREATE FUNCTION elspeth_message_ingress_receipts_no_update()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          RAISE EXCEPTION 'message_ingress_receipts is append-only; UPDATE is forbidden'
+            USING ERRCODE = '23000';
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_message_ingress_receipts_no_update "
+            "BEFORE UPDATE ON message_ingress_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_message_ingress_receipts_no_update()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=message_ingress_receipts_table,
+        trigger_name="trg_message_ingress_receipts_no_delete",
+        function_name="elspeth_message_ingress_receipts_no_delete",
+        function_sql="""
+        CREATE FUNCTION elspeth_message_ingress_receipts_no_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
+            RAISE EXCEPTION 'message_ingress_receipts is append-only; DELETE is forbidden'
+              USING ERRCODE = '23000';
+          END IF;
+          RETURN OLD;
+        END;
+        $$
+        """,
+        trigger_sql=(
+            "CREATE TRIGGER trg_message_ingress_receipts_no_delete "
+            "BEFORE DELETE ON message_ingress_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_message_ingress_receipts_no_delete()"
+        ),
+    ),
+    PostgresqlAuditDDL(
+        table=session_operation_receipts_table,
+        trigger_name="trg_session_operation_receipts_terminal_immutable",
+        function_name="elspeth_session_operation_receipts_terminal_immutable",
+        function_sql="""
+        CREATE FUNCTION elspeth_session_operation_receipts_terminal_immutable()
+        RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
           IF OLD.status IN ('completed', 'failed') THEN
-            RAISE EXCEPTION 'guided_operations terminal rows are immutable'
+            RAISE EXCEPTION 'session_operation_receipts terminal rows are immutable'
               USING ERRCODE = '23000';
           END IF;
           RETURN NEW;
@@ -2023,44 +1650,40 @@ POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
         $$
         """,
         trigger_sql=(
-            "CREATE TRIGGER trg_guided_operations_terminal_immutable "
-            "BEFORE UPDATE ON guided_operations "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operations_terminal_immutable()"
+            "CREATE TRIGGER trg_session_operation_receipts_terminal_immutable "
+            "BEFORE UPDATE ON session_operation_receipts "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_session_operation_receipts_terminal_immutable()"
         ),
     ),
     PostgresqlAuditDDL(
-        table=guided_operation_admission_blocks_table,
-        trigger_name="trg_guided_operation_admission_blocks_no_update",
-        function_name="elspeth_guided_operation_admission_blocks_no_update",
+        table=session_operation_receipt_events_table,
+        trigger_name="trg_session_operation_receipt_events_no_update",
+        function_name="elspeth_session_operation_receipt_events_no_update",
         function_sql="""
-        CREATE FUNCTION elspeth_guided_operation_admission_blocks_no_update()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
+        CREATE FUNCTION elspeth_session_operation_receipt_events_no_update()
+        RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
-          RAISE EXCEPTION 'guided_operation_admission_blocks is append-only; UPDATE is forbidden'
+          RAISE EXCEPTION 'session_operation_receipt_events is append-only; UPDATE is forbidden'
             USING ERRCODE = '23000';
         END;
         $$
         """,
         trigger_sql=(
-            "CREATE TRIGGER trg_guided_operation_admission_blocks_no_update "
-            "BEFORE UPDATE ON guided_operation_admission_blocks "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operation_admission_blocks_no_update()"
+            "CREATE TRIGGER trg_session_operation_receipt_events_no_update "
+            "BEFORE UPDATE ON session_operation_receipt_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_session_operation_receipt_events_no_update()"
         ),
     ),
     PostgresqlAuditDDL(
-        table=guided_operation_admission_blocks_table,
-        trigger_name="trg_guided_operation_admission_blocks_no_delete",
-        function_name="elspeth_guided_operation_admission_blocks_no_delete",
+        table=session_operation_receipt_events_table,
+        trigger_name="trg_session_operation_receipt_events_no_delete",
+        function_name="elspeth_session_operation_receipt_events_no_delete",
         function_sql="""
-        CREATE FUNCTION elspeth_guided_operation_admission_blocks_no_delete()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
+        CREATE FUNCTION elspeth_session_operation_receipt_events_no_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
           IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
-            RAISE EXCEPTION 'guided_operation_admission_blocks is append-only; DELETE is forbidden'
+            RAISE EXCEPTION 'session_operation_receipt_events is append-only; DELETE is forbidden'
               USING ERRCODE = '23000';
           END IF;
           RETURN OLD;
@@ -2068,135 +1691,9 @@ POSTGRESQL_AUDIT_DDL_COHORT: tuple[PostgresqlAuditDDL, ...] = (
         $$
         """,
         trigger_sql=(
-            "CREATE TRIGGER trg_guided_operation_admission_blocks_no_delete "
-            "BEFORE DELETE ON guided_operation_admission_blocks "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operation_admission_blocks_no_delete()"
-        ),
-    ),
-    PostgresqlAuditDDL(
-        table=guided_operations_table,
-        trigger_name="trg_guided_operation_admission_blocks_reject_existing_operation",
-        function_name="elspeth_guided_operation_admission_blocks_reject_existing_operation",
-        function_sql="""
-        CREATE FUNCTION elspeth_guided_operation_admission_blocks_reject_existing_operation()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-          IF EXISTS (
-            SELECT 1 FROM guided_operations
-            WHERE session_id = NEW.session_id AND operation_id = NEW.operation_id
-          ) THEN
-            RAISE EXCEPTION 'guided operation admission block cannot shadow an existing operation'
-              USING ERRCODE = '23000';
-          END IF;
-          RETURN NEW;
-        END;
-        $$
-        """,
-        trigger_sql=(
-            "CREATE TRIGGER trg_guided_operation_admission_blocks_reject_existing_operation "
-            "BEFORE INSERT ON guided_operation_admission_blocks "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operation_admission_blocks_reject_existing_operation()"
-        ),
-    ),
-    PostgresqlAuditDDL(
-        table=guided_operations_table,
-        trigger_name="trg_guided_operations_reject_admission_block_insert",
-        function_name="elspeth_guided_operations_reject_admission_block",
-        function_sql="""
-        CREATE FUNCTION elspeth_guided_operations_reject_admission_block()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-          IF EXISTS (
-            SELECT 1 FROM guided_operation_admission_blocks
-            WHERE session_id = NEW.session_id AND operation_id = NEW.operation_id
-          ) THEN
-            RAISE EXCEPTION 'guided operation is closed by an admission block'
-              USING ERRCODE = '23000';
-          END IF;
-          RETURN NEW;
-        END;
-        $$
-        """,
-        trigger_sql=(
-            "CREATE TRIGGER trg_guided_operations_reject_admission_block_insert "
-            "BEFORE INSERT ON guided_operations "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operations_reject_admission_block()"
-        ),
-    ),
-    PostgresqlAuditDDL(
-        table=guided_operations_table,
-        trigger_name="trg_guided_operations_reject_admission_block_update",
-        function_name="elspeth_guided_operations_reject_admission_block_update",
-        function_sql="""
-        CREATE FUNCTION elspeth_guided_operations_reject_admission_block_update()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-          IF EXISTS (
-            SELECT 1 FROM guided_operation_admission_blocks
-            WHERE session_id = NEW.session_id AND operation_id = NEW.operation_id
-          ) THEN
-            RAISE EXCEPTION 'guided operation is closed by an admission block'
-              USING ERRCODE = '23000';
-          END IF;
-          RETURN NEW;
-        END;
-        $$
-        """,
-        trigger_sql=(
-            "CREATE TRIGGER trg_guided_operations_reject_admission_block_update "
-            "BEFORE UPDATE ON guided_operations "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operations_reject_admission_block_update()"
-        ),
-    ),
-    PostgresqlAuditDDL(
-        table=guided_operation_events_table,
-        trigger_name="trg_guided_operation_events_no_update",
-        function_name="elspeth_guided_operation_events_no_update",
-        function_sql="""
-        CREATE FUNCTION elspeth_guided_operation_events_no_update()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-          RAISE EXCEPTION 'guided_operation_events is append-only; UPDATE is forbidden'
-            USING ERRCODE = '23000';
-        END;
-        $$
-        """,
-        trigger_sql=(
-            "CREATE TRIGGER trg_guided_operation_events_no_update "
-            "BEFORE UPDATE ON guided_operation_events "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operation_events_no_update()"
-        ),
-    ),
-    PostgresqlAuditDDL(
-        table=guided_operation_events_table,
-        trigger_name="trg_guided_operation_events_no_delete",
-        function_name="elspeth_guided_operation_events_no_delete",
-        function_sql="""
-        CREATE FUNCTION elspeth_guided_operation_events_no_delete()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-          IF EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) THEN
-            RAISE EXCEPTION 'guided_operation_events is append-only; DELETE is forbidden'
-              USING ERRCODE = '23000';
-          END IF;
-          RETURN OLD;
-        END;
-        $$
-        """,
-        trigger_sql=(
-            "CREATE TRIGGER trg_guided_operation_events_no_delete "
-            "BEFORE DELETE ON guided_operation_events "
-            "FOR EACH ROW EXECUTE FUNCTION elspeth_guided_operation_events_no_delete()"
+            "CREATE TRIGGER trg_session_operation_receipt_events_no_delete "
+            "BEFORE DELETE ON session_operation_receipt_events "
+            "FOR EACH ROW EXECUTE FUNCTION elspeth_session_operation_receipt_events_no_delete()"
         ),
     ),
 )
@@ -2332,119 +1829,60 @@ event.listen(
 )
 
 event.listen(
-    guided_operations_table,
+    message_ingress_receipts_table,
     "after_create",
     DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operations_terminal_immutable "
-        "BEFORE UPDATE ON guided_operations "
-        "FOR EACH ROW "
-        "WHEN OLD.status IN ('completed', 'failed') "
+        "CREATE TRIGGER IF NOT EXISTS trg_message_ingress_receipts_no_update "
+        "BEFORE UPDATE ON message_ingress_receipts "
         "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided_operations terminal rows are immutable'); "
+        "  SELECT RAISE(ABORT, 'message_ingress_receipts is append-only; UPDATE is forbidden'); "
         "END;"
     ).execute_if(dialect="sqlite"),
 )
 
 event.listen(
-    guided_operation_admission_blocks_table,
+    message_ingress_receipts_table,
     "after_create",
     DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operation_admission_blocks_no_update "
-        "BEFORE UPDATE ON guided_operation_admission_blocks "
-        "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided_operation_admission_blocks is append-only; UPDATE is forbidden'); "
-        "END;"
-    ).execute_if(dialect="sqlite"),
-)
-
-event.listen(
-    guided_operation_admission_blocks_table,
-    "after_create",
-    DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operation_admission_blocks_no_delete "
-        "BEFORE DELETE ON guided_operation_admission_blocks "
+        "CREATE TRIGGER IF NOT EXISTS trg_message_ingress_receipts_no_delete "
+        "BEFORE DELETE ON message_ingress_receipts "
         "FOR EACH ROW "
         "WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
         "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided_operation_admission_blocks is append-only; DELETE is forbidden'); "
+        "  SELECT RAISE(ABORT, 'message_ingress_receipts is append-only; DELETE is forbidden'); "
         "END;"
     ).execute_if(dialect="sqlite"),
 )
 
 event.listen(
-    guided_operations_table,
+    session_operation_receipts_table,
     "after_create",
     DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operation_admission_blocks_reject_existing_operation "
-        "BEFORE INSERT ON guided_operation_admission_blocks "
-        "FOR EACH ROW "
-        "WHEN EXISTS ("
-        "  SELECT 1 FROM guided_operations "
-        "  WHERE session_id = NEW.session_id AND operation_id = NEW.operation_id"
-        ") "
-        "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided operation admission block cannot shadow an existing operation'); "
-        "END;"
+        "CREATE TRIGGER IF NOT EXISTS trg_session_operation_receipts_terminal_immutable "
+        "BEFORE UPDATE ON session_operation_receipts "
+        "FOR EACH ROW WHEN OLD.status IN ('completed', 'failed') "
+        "BEGIN SELECT RAISE(ABORT, 'session_operation_receipts terminal rows are immutable'); END;"
     ).execute_if(dialect="sqlite"),
 )
 
 event.listen(
-    guided_operations_table,
+    session_operation_receipt_events_table,
     "after_create",
     DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operations_reject_admission_block_insert "
-        "BEFORE INSERT ON guided_operations "
-        "FOR EACH ROW "
-        "WHEN EXISTS ("
-        "  SELECT 1 FROM guided_operation_admission_blocks "
-        "  WHERE session_id = NEW.session_id AND operation_id = NEW.operation_id"
-        ") "
-        "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided operation is closed by an admission block'); "
-        "END;"
+        "CREATE TRIGGER IF NOT EXISTS trg_session_operation_receipt_events_no_update "
+        "BEFORE UPDATE ON session_operation_receipt_events "
+        "BEGIN SELECT RAISE(ABORT, 'session_operation_receipt_events is append-only; UPDATE is forbidden'); END;"
     ).execute_if(dialect="sqlite"),
 )
 
 event.listen(
-    guided_operations_table,
+    session_operation_receipt_events_table,
     "after_create",
     DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operations_reject_admission_block_update "
-        "BEFORE UPDATE ON guided_operations "
-        "FOR EACH ROW "
-        "WHEN EXISTS ("
-        "  SELECT 1 FROM guided_operation_admission_blocks "
-        "  WHERE session_id = NEW.session_id AND operation_id = NEW.operation_id"
-        ") "
-        "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided operation is closed by an admission block'); "
-        "END;"
-    ).execute_if(dialect="sqlite"),
-)
-
-event.listen(
-    guided_operation_events_table,
-    "after_create",
-    DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operation_events_no_update "
-        "BEFORE UPDATE ON guided_operation_events "
-        "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided_operation_events is append-only; UPDATE is forbidden'); "
-        "END;"
-    ).execute_if(dialect="sqlite"),
-)
-
-event.listen(
-    guided_operation_events_table,
-    "after_create",
-    DDL(  # type: ignore[no-untyped-call]
-        "CREATE TRIGGER IF NOT EXISTS trg_guided_operation_events_no_delete "
-        "BEFORE DELETE ON guided_operation_events "
-        "FOR EACH ROW "
-        "WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
-        "BEGIN "
-        "  SELECT RAISE(ABORT, 'guided_operation_events is append-only; DELETE is forbidden'); "
-        "END;"
+        "CREATE TRIGGER IF NOT EXISTS trg_session_operation_receipt_events_no_delete "
+        "BEFORE DELETE ON session_operation_receipt_events "
+        "FOR EACH ROW WHEN EXISTS (SELECT 1 FROM sessions WHERE id = OLD.session_id) "
+        "BEGIN SELECT RAISE(ABORT, 'session_operation_receipt_events is append-only; DELETE is forbidden'); END;"
     ).execute_if(dialect="sqlite"),
 )
 
@@ -3274,23 +2712,10 @@ Index("ix_user_secrets_user_provider", user_secrets_table.c.user_id, user_secret
 # the same canonical identity ID, not a provider username. RESTRICT preserves
 # owned data when an identity is retired; retirement is not a cascading purge.
 #
-# CLOSED-LIST default_composer_mode. Permitted values are exactly
-# {"guided", "freeform"} — enforced at the Tier-3 boundary by Pydantic
-# Literal and at Tier-1 read time by the PreferencesService read guard
-# (any stored value outside this set crashes the read with the offending
-# value named). Extending the set requires (a) a Pydantic ``ComposerMode``
-# Literal amendment, (b) a service read-guard amendment, and (c) a UI
-# affordance for the new mode — do not extend silently here.
 user_preferences_table = Table(
     "user_preferences",
     metadata,
     Column("user_id", String, ForeignKey("identities.identity_id", ondelete="RESTRICT"), primary_key=True),
-    Column(
-        "default_composer_mode",
-        String,
-        nullable=False,
-        server_default="freeform",
-    ),
     # NULL = freeform introduction visible; non-NULL = dismissed account-wide.
     Column("freeform_intro_dismissed_at", DateTime(timezone=True), nullable=True),
     # NULL = tutorial not completed/reset; non-NULL = completed-at timestamp.
@@ -3301,7 +2726,7 @@ user_preferences_table = Table(
     # The stage vocabulary mirrors the frontend TutorialStep union
     # (tutorialMachine.ts) minus "welcome"; the CHECK constraint below plus
     # the Tier-1 read guard in ``PreferencesService._row_to_prefs`` are the
-    # closed-list pair, same lockstep rule as ``default_composer_mode``.
+    # closed-list pair.
     Column("tutorial_stage", String, nullable=True),
     # The tutorial session the persisted stage belongs to, so resume
     # re-attaches to the SAME session instead of abandoning it. run id +
@@ -3317,11 +2742,7 @@ user_preferences_table = Table(
     Column("show_advanced", Boolean, nullable=False, server_default=sa_false()),
     Column("updated_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "default_composer_mode IN ('guided', 'freeform')",
-        name="ck_user_preferences_default_composer_mode",
-    ),
-    CheckConstraint(
-        "tutorial_stage IS NULL OR tutorial_stage IN ('guided', 'run', 'audit', 'graduation')",
+        "tutorial_stage IS NULL OR tutorial_stage IN ('build', 'run', 'audit', 'graduation')",
         name="ck_user_preferences_tutorial_stage",
     ),
     # Empty-string user_id would silently key a "shared" preferences row

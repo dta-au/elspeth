@@ -74,15 +74,13 @@
       <div class="surface-card">
         <span class="ic"><i data-lucide="messages-square"></i></span>
         <h3>Web Composer</h3>
-        <p>For knowledge workers building document QA, classification, routing, or review workflows. Since 0.7.0, Guided Composer has been LLM-primary and staged: it makes the graph, validation, and review visible before a pipeline is wired. Guided and freeform authoring use different interactions, but both commit through the same canonical proposal + validation path.</p>
+        <p>For knowledge workers building document QA, classification, routing, or review workflows. The freeform Web Composer uses an LLM to propose a pipeline in conversation, then makes the graph, validation, and review visible before execution.</p>
         <ul>
-          <li><i data-lucide="check"></i> Guided — default-on for a first pipeline: a stepped walk through source → sink → transforms → wiring, prompting one stage at a time</li>
-          <li><i data-lucide="check"></i> Freeform — one open conversation for a fluent operator who drives the whole pipeline at once, no rails</li>
+          <li><i data-lucide="check"></i> Freeform — one open conversation to build and revise the pipeline</li>
           <li><i data-lucide="check"></i> Visible graph, preview validation, review, spec, YAML, and repair hints</li>
           <li><i data-lucide="check"></i> Blob-backed sources and wired <code>{secret_ref: NAME}</code> references</li>
           <li><i data-lucide="check"></i> Background runs streamed over WebSocket, safely cancellable</li>
         </ul>
-        <p><strong>Current guided-staged limits:</strong> it cannot author cross-sink write-failure fallback or require-all coalesce shapes. Use freeform and guided-full for those pipelines.</p>
       </div>
     </div>
   </div>
@@ -171,7 +169,7 @@
       <div class="fork-arrow">→</div>
       <div class="fork-node"><span class="fn-k">Sink</span><span class="fn-v">output</span></div>
     </div>
-    <p class="fork-caption">This diagram is illustrative; the <code>require_all</code> shape must be authored through freeform or guided-full rather than guided-staged. Each branch token carries the same <code>fork_group_id</code>, so the trail knows the two are siblings of one row. When the coalesce node merges them, its lineage names <em>both</em> parent branch token ids, preserving which branch produced each part of the joined result.</p>
+    <p class="fork-caption">This diagram is illustrative; Composer can author the <code>require_all</code> shape in freeform conversation. Each branch token carries the same <code>fork_group_id</code>, so the trail knows the two are siblings of one row. When the coalesce node merges them, its lineage names <em>both</em> parent branch token ids, preserving which branch produced each part of the joined result.</p>
   </div>
 </section>
 

@@ -66,8 +66,8 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 # below, so they cannot be exercised through it. Each rejection is a fail-closed
 # answer to an author error, not a capture gap:
 #
-# * ``batch_outlier_annotator`` / ``batch_replicate`` forbid declaring the
-#   fields they add while the option that adds them is on.
+# * ``batch_outlier_annotator`` / ``batch_rank`` / ``batch_replicate`` forbid
+#   declaring the fields they add while the option that adds them is on.
 # * ``json_explode`` / ``line_explode`` require their source column to be
 #   declared in ``fields``, and a probe schema that declares none leaves the
 #   mutation naming only created fields.
@@ -80,6 +80,7 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 _EXPECTED_MUTATION_REJECTIONS = frozenset(
     {
         "batch_outlier_annotator",
+        "batch_rank",
         "batch_replicate",
         "json_explode",
         "line_explode",

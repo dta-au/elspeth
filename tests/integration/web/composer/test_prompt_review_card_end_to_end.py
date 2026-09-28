@@ -9,7 +9,7 @@ checks that they agree:
 1. the real auto-stager (``tools._common._options_with_default_prompt_template_review``)
    stages the pending requirement on an LLM node;
 2. the state is persisted under a real COMPOSE lease;
-3. the real surfacer (``composer.service.surface_pending_interpretation_reviews_for_state``,
+3. the real surfacer (``composer.interpretation_surfacing.surface_pending_interpretation_reviews_for_state``,
    which derives the card through ``_backend_surface_args_for_site``) writes the
    pending event through the strict writer boundary;
 4. the operator accepts the card as drafted (``resolve_interpretation_event``);
@@ -47,7 +47,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSurfaceOrigin,
 )
 from elspeth.contracts.hashing import stable_hash
-from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
 from elspeth.web.composer.tools._common import _options_with_default_prompt_template_review
 from elspeth.web.coordination.contracts import SessionOperationKind
@@ -70,7 +70,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _NODE_ID = "pair_colours"
 _PROMPT_TERM = f"llm_prompt_template:{_NODE_ID}"
@@ -94,7 +94,7 @@ def engine() -> Engine:
 
 @pytest.fixture
 def sessions_service(engine: Engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.prompt_review_card_end_to_end"),

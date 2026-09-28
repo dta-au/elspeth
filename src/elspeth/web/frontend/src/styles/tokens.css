@@ -172,18 +172,6 @@
   --color-accent:            #1a7a52;
   --color-focus-ring:        #ffffff;
   --color-btn-primary-bg:    #16664a;
-  /* Hover retune (elspeth-3b57d9025b): dark-theme hover LIGHTENS — the house
-     hover direction (outlined .btn hover is a 4% white wash). The old values
-     (#1a5840 / #912f2d) darkened, so filled buttons receded on the same
-     gesture that brightens every outlined control. Both retunes are HLS
-     lifts with hue and saturation held exactly. The primary hover must clear
-     BOTH resting fills that share it — .btn-primary (#16664a, L 0.102) and
-     the accent-filled guided/chat buttons (--color-accent #1a7a52, L 0.148)
-     — so it is accent +0.02 L; white text on it is the binding AA pairing at
-     4.79:1 (accent +0.03 lands at 4.50 with zero margin). Danger is base
-     +0.04 L; white text 5.22:1. Light theme is untouched and DARKENS by
-     design — colorContrast.test.ts pins light hover surfaces darker.
-     Gated by styles/tokenContracts.test.ts. */
   --color-btn-primary-bg-hover: #1c8258;
   --color-btn-danger-bg:     #b23835;
   --color-btn-danger-bg-hover: #c23d3a;
@@ -271,16 +259,6 @@
   --tracking-wordmark: 0.18em;
 
   /* ── Letter-spacing scale (elspeth-7ac472c22c) ───────────────────────────── */
-  /* Tracking rungs for the "hierarchy below body text is carried by weight,
-     case, and letter-spacing" axis promised at the type floor above. Em-based
-     so tracking scales WITH the text it spaces — the shipped px sites (0.5px,
-     0.3px) drift out of proportion the moment font-size changes. Rungs are
-     the shipped em values verbatim so initial adoption is value-preserving:
-     0.01em ×2 (tutorial), 0.04em ×3 (guided, blobs), 0.05em ×2 (settings),
-     0.06em ×4 (settings, tutorial). The px strays map at the 12px floor:
-     0.5px ≈ 0.042em → -normal; 0.3px (status-badge) sits between rungs, so
-     its adoption picks the nearest rung deliberately. --tracking-wordmark
-     stays separate: brand lockup tracking, not a scale rung. */
   --letter-spacing-tight:  0.01em;   /* sentence-case emphasis: kickers, subheads */
   --letter-spacing-normal: 0.04em;   /* default uppercase micro-label / eyebrow tracking */
   --letter-spacing-wide:   0.05em;   /* mid-emphasis caps: settings section labels */
@@ -339,29 +317,9 @@
   /* Fixed app-header row height (desktop); the <=960px wrap rule reuses it as
      a min-height so a wrapped header never renders shorter than the fixed row. */
   --size-header-height:   40px;
-  /* Workspace header-band height (border-box, includes the 1px bottom seam).
-     The bands that sit side by side across the authoring/artifact pane
-     boundary — .chat-panel-header, the guided stepper band, and
-     .artifact-workspace-toolbar — all read this token as min-height and
-     center their content with NO vertical padding, so their bottom seams
-     stay on one line. Derived from the toolbar's historic construction:
-     --space-sm + --size-control-compact + --space-sm + 1px border. The
-     short-screen density regime (workspace.css, ≥961px wide and ≤800px
-     tall) overrides it to 45px on .composer-workspace so every band
-     compresses together. The stepper's icon+label stack is content-derived
-     (~38px, font-metric dependent) and centers inside the band instead of
-     defining it. */
   --size-workspace-band:  53px;
 
   /* ── Icon sizes (elspeth-7f63055e06) ─────────────────────────────────────── */
-  /* Glyph boxes are sized in px DELIBERATELY, matching the px type scale:
-     icons and the labels beside them scale together under browser zoom, and
-     neither tracks a default-text-size change alone. The shipped mix — a rem
-     step indicator vs a px checkbox two rows apart in the guided pane — fell
-     out of relative scale as soon as root font-size moved off 16px. Values
-     are the shipped majority: 16 is the components/ui Icon.tsx primitive
-     viewport; 20 is the toolbar / step-indicator rank (chat.css, header.css,
-     and the guided indicator's 1.25rem ≡ 20px at the default root). */
   --size-icon-sm: 16px;
   --size-icon-md: 20px;
 

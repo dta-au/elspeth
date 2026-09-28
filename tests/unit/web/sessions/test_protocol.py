@@ -25,8 +25,7 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     CompositionStateData,
     CompositionStateRecord,
-    GuidedOperationFence,
-    GuidedPipelineProposalAcceptCommand,
+    OperationReceiptFence,
     RunAlreadyActiveError,
     RunEventRecord,
     RunRecord,
@@ -103,31 +102,31 @@ def _session_context(
     )
 
 
-def _guided_fence(session_id: str, *, operation_id: str = "guided-operation") -> GuidedOperationFence:
-    return GuidedOperationFence(
+def _receipt_fence(session_id: str, *, operation_id: str = "fork-receipt") -> OperationReceiptFence:
+    return OperationReceiptFence(
         session_id=uuid4().__class__(session_id),
         operation_id=operation_id,
-        lease_token="guided-lease",
+        lease_token="receipt-lease",
         attempt=1,
     )
 
 
 def test_session_fork_parent_authority_is_exact_immutable_and_cross_bound() -> None:
     parent_id = str(uuid4())
-    guided = _guided_fence(parent_id)
+    receipt = _receipt_fence(parent_id)
     authority = SessionForkParentAuthority(
         parent_context=_session_context(parent_id),
-        guided_fence=guided,
+        receipt_fence=receipt,
     )
 
     assert authority.parent_context.fence.session_id == parent_id
-    assert authority.guided_fence is guided
+    assert authority.receipt_fence is receipt
     with pytest.raises(AttributeError):
-        authority.guided_fence = guided  # type: ignore[misc]
+        authority.receipt_fence = receipt  # type: ignore[misc]
     with pytest.raises(AuditIntegrityError, match="same parent session"):
         SessionForkParentAuthority(
             parent_context=_session_context(parent_id),
-            guided_fence=_guided_fence(str(uuid4())),
+            receipt_fence=_receipt_fence(str(uuid4())),
         )
 
 
@@ -136,21 +135,21 @@ def test_session_fork_parent_authority_requires_exact_session_fork_context() -> 
     with pytest.raises(AuditIntegrityError, match="SESSION_FORK"):
         SessionForkParentAuthority(
             parent_context=_session_context(parent_id, kind=SessionOperationKind.ARCHIVE),
-            guided_fence=_guided_fence(parent_id),
+            receipt_fence=_receipt_fence(parent_id),
         )
     with pytest.raises(AuditIntegrityError, match="exact"):
         SessionForkParentAuthority(  # type: ignore[arg-type]
             parent_context=object(),
-            guided_fence=_guided_fence(parent_id),
+            receipt_fence=_receipt_fence(parent_id),
         )
 
 
-def test_session_fork_authority_exactly_binds_parent_child_and_guided() -> None:
+def test_session_fork_authority_exactly_binds_parent_child_and_receipt() -> None:
     parent_id = str(uuid4())
     child_id = str(uuid4())
     parent = SessionForkParentAuthority(
         parent_context=_session_context(parent_id),
-        guided_fence=_guided_fence(parent_id),
+        receipt_fence=_receipt_fence(parent_id),
     )
     authority = SessionForkAuthority(
         parent=parent,
@@ -168,13 +167,9 @@ def test_session_fork_authority_exactly_binds_parent_child_and_guided() -> None:
         )
 
 
-def test_guided_pipeline_accept_command_has_no_dead_proposal_projection() -> None:
-    assert "proposal_payload" not in inspect.signature(GuidedPipelineProposalAcceptCommand).parameters
-
-
 def test_session_operation_authority_exposes_context_as_sole_action_capability() -> None:
     SessionForkChildMutations = session_protocol.SessionForkChildMutations
-    SessionForkParentGuidedMutations = session_protocol.SessionForkParentGuidedMutations
+    SessionForkParentReceiptMutations = session_protocol.SessionForkParentReceiptMutations
     acquire = inspect.signature(SessionOperationAuthority.acquire)
     assert acquire.return_annotation == "SessionOperationContext"
 
@@ -209,7 +204,6 @@ def test_session_operation_authority_exposes_context_as_sole_action_capability()
         "count_parent_proposal_terminal_events",
         "read_child_snapshot",
         "read_parent_blob_custody",
-        "read_parent_guided_root_authority",
         "read_parent_message",
         "read_parent_proposal",
         "read_parent_proposal_creation_events",
@@ -217,31 +211,31 @@ def test_session_operation_authority_exposes_context_as_sole_action_capability()
         "read_parent_ready_blobs",
         "read_parent_session",
         "read_parent_state",
-        "require_parent_guided_operation",
+        "require_parent_fork_receipt",
     }
     assert isinstance(SessionForkCreationTransaction.__dict__["child_mutations"], property)
-    assert isinstance(SessionForkCreationTransaction.__dict__["parent_guided_mutations"], property)
+    assert isinstance(SessionForkCreationTransaction.__dict__["parent_receipt_mutations"], property)
     assert "execute" not in transaction_surface
 
     child_surface = {name for name, value in inspect.getmembers(SessionForkChildMutations, inspect.isfunction) if not name.startswith("_")}
     assert child_surface == {"append_child_messages", "insert_child_state"}
-    parent_guided_surface = {
-        name for name, value in inspect.getmembers(SessionForkParentGuidedMutations, inspect.isfunction) if not name.startswith("_")
+    parent_receipt_surface = {
+        name for name, value in inspect.getmembers(SessionForkParentReceiptMutations, inspect.isfunction) if not name.startswith("_")
     }
-    assert parent_guided_surface == {"bind_guided_fork"}
-    assert tuple(inspect.signature(SessionForkParentGuidedMutations.bind_guided_fork).parameters) == (
+    assert parent_receipt_surface == {"bind_fork_receipt"}
+    assert tuple(inspect.signature(SessionForkParentReceiptMutations.bind_fork_receipt).parameters) == (
         "self",
         "originating_message_id",
     )
 
-    for protocol in (SessionForkChildMutations, SessionForkParentGuidedMutations):
+    for protocol in (SessionForkChildMutations, SessionForkParentReceiptMutations):
         assert getattr(protocol, "_is_runtime_protocol", False) is False
         with pytest.raises(TypeError, match="runtime_checkable"):
             isinstance(object(), protocol)
     assert getattr(SessionForkCreationTransaction, "_is_runtime_protocol", False) is True
 
     forbidden_names = {"connection", "engine", "execute"}
-    for protocol in (SessionForkCreationTransaction, SessionForkChildMutations, SessionForkParentGuidedMutations):
+    for protocol in (SessionForkCreationTransaction, SessionForkChildMutations, SessionForkParentReceiptMutations):
         assert forbidden_names.isdisjoint(protocol.__dict__)
 
 

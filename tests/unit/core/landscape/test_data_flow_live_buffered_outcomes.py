@@ -14,11 +14,23 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+
 from elspeth.contracts import Batch, NodeType, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.core.landscape.schema import tokens_table
 from tests.fixtures.audit_hashing import fake_error_hash
-from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    leader_coordination_token,
+    lowered_sqlite_variable_limit,
+    make_recorder_with_run,
+    record_statement_binds,
+    register_test_node,
+)
 
 NOW = datetime(2026, 6, 12, 12, 0, 0, tzinfo=UTC)
 
@@ -227,3 +239,47 @@ def test_failed_unrouted_reconcile_read_scopes_to_failure_unrouted() -> None:
 def test_failed_unrouted_reconcile_read_empty_input_short_circuits() -> None:
     setup, _node_id, _batch, _token = _setup_buffered_token()
     assert setup.factory.barrier_restore.find_failed_unrouted_terminal_token_ids(setup.run_id, []) == frozenset()
+
+
+# --- Bound-parameter budget (elspeth-5887 X2) ---------------------------------
+# Resume reconciles a restored barrier by reading the (FAILURE, UNROUTED)
+# terminals among its members, and a barrier's member set has no row cap, so
+# the read may not bind a list that grows with the member count. SQLite here
+# refuses a statement over 99 binds, with the shared budget lowered to 60.
+
+
+def test_failed_unrouted_reconcile_read_binds_a_bounded_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape import bind_budget
+
+    monkeypatch.setattr(bind_budget, "BIND_BUDGET_PER_STATEMENT", 60)
+    members = 120
+    with lowered_sqlite_variable_limit(monkeypatch, 99):
+        setup = make_recorder_with_run(run_id="run-bound-1")
+        token = leader_coordination_token(setup.factory, setup.run_id)
+        token_ids: list[str] = []
+        for index in range(members):
+            _row, member = setup.factory.data_flow.create_row_with_token(
+                setup.source_node_id, index, {"id": index}, source_row_index=index, ingest_sequence=index, coordination_token=token
+            )
+            token_ids.append(member.token_id)
+        # Every member but each seventh carries the failed-flush terminal.
+        failed = frozenset(token_id for index, token_id in enumerate(token_ids) if index % 7)
+        for token_id in failed:
+            setup.factory.data_flow.record_token_outcome_leader(
+                TokenRef(token_id=token_id, run_id=setup.run_id),
+                TerminalOutcome.FAILURE,
+                TerminalPath.UNROUTED,
+                error_hash=fake_error_hash("deadbeef"),
+                coordination_token=token,
+            )
+        # Control: this connection refuses a statement that binds one parameter per member.
+        with setup.db.connection() as conn, pytest.raises(OperationalError, match="too many SQL variables"):
+            conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.token_id.in_(token_ids)))
+
+        with record_statement_binds() as binds:
+            result = setup.factory.barrier_restore.find_failed_unrouted_terminal_token_ids(setup.run_id, token_ids)
+
+    assert result == failed
+    # 60 chunked ids plus the fixed run / completed / outcome / path predicates.
+    assert binds.executions > 0
+    assert binds.max_binds <= 60 + 4, binds.statement

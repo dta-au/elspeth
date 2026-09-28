@@ -834,8 +834,7 @@ def apply_anthropic_cache_markers(
       from ``build_catalog_context_string``) receives the same marker: the
       block is byte-stable per deployment, so it is written to the cache
       once and read at ~10% price on every later call of every session
-      (elspeth-a79f1b2e6b). Surfaces whose message lists carry no catalog
-      message (guided solver, planner) are unaffected.
+      (elspeth-a79f1b2e6b). Calls without a catalog message are unaffected.
     - When ``mark_history_tail`` is True, the LAST message receives the
       marker — the sliding-breakpoint pattern for append-only agentic
       loops: each call re-reads the previously written conversation prefix

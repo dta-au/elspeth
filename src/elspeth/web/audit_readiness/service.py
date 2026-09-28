@@ -830,8 +830,8 @@ _BOUNDARY_RULE_VERSION = "phase-7a-v3"
 # same footing as ``web/plugin_policy/coverage.py``, which resolves a
 # node's plugin without consulting the node kind at all.
 #
-# KNOWN DUPLICATE — this set is the THIRD hand-written statement of the
-# plugin-free node kinds in the tree. The siblings:
+# KNOWN DUPLICATE — this set and the Composer structural-node set both
+# describe plugin-free node kinds:
 #
 #   - ``web/composer/state.py::_PLUGINLESS_STRUCTURAL_NODE_TYPES``
 #     — {gate, coalesce}. A strict SUBSET, not a disagreement: it backs
@@ -839,36 +839,8 @@ _BOUNDARY_RULE_VERSION = "phase-7a-v3"
 #     for the two kinds no other validator already covered (queue and
 #     row_union are enforced by ``queue_node_contract_error`` and by
 #     row_union's forbidden-fields block respectively).
-#   - ``web/sessions/routes/composer/guided_chat_intent_management.py::
-#     _STRUCTURAL_NODE_TYPES`` — {gate, coalesce, row_union, queue}.
-#     IDENTICAL membership, and — CORRECTED 2026-08-26, see below — the
-#     SAME underlying rule, reached from the other direction. It is not a
-#     validation set: it keyword-matches the USER'S CHAT TEXT to pick a
-#     teaching line. But the line it picks reads "a {x} is a built-in
-#     topology node, NOT a transform plugin", so a kind belongs in the
-#     tuple exactly when that sentence is true of it — which is the
-#     plugin-free partition, the same one this set states. Same question,
-#     different consumer.
-#
-#     What this entry said before f4565143e was wrong on both halves, and
-#     the correction is recorded rather than silently swapped because the
-#     mistake is instructive. It said the tuple "carries no comment" —
-#     true when written, false now: ``_model_catalog_identity_chat``
-#     acquired a docstring stating this membership rule explicitly. And
-#     it said the rationale was "about dispatch ordering, not about
-#     hosting a plugin", which conflated the tuple's MECHANISM (a
-#     ``next()`` scan, which is indeed ordering-sensitive) with its
-#     MEMBERSHIP RULE (the truth condition of the clause, which is
-#     entirely about hosting a plugin). Writing "different predicate"
-#     over two sets that share a rule is the same restatement error this
-#     block warns about, one level up: it manufactured a licence for the
-#     two to diverge that neither side actually has.
-#
-# All three currently agree BY HAND, not by structure. Nothing in the
-# tree fails if one drifts from the others. Unifying them is
-# elspeth-b3117ec3ac's job (the node-kind vocabulary ticket) — do NOT
-# unify from here, which would add a fourth authority beside the three
-# rather than removing one.
+# The Composer set is a strict subset because queue and row_union have their
+# own validation paths. Keep both sets aligned with the node-kind contracts.
 #
 # For the same reason this set is subtracted from ``get_args(NodeType)``
 # rather than from ``state.py::COMPOSER_NODE_TYPES``: that frozenset is

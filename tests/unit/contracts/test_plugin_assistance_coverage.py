@@ -66,10 +66,9 @@ def test_builtin_plugin_publishes_summary(plugin_type: str, plugin_cls: type) ->
 def test_llm_assistance_includes_structured_multi_query_example() -> None:
     """The shared LLM assistance carries one concrete structured multi-query example.
 
-    Catalog, freeform, guided-full, guided-staged, and tutorial all consume this
-    same discovery-time assistance, so the structured-output authoring shape
-    (``queries`` mapping with typed ``output_fields``) must live here — not be
-    copied into any guided prompt.
+    Catalog, freeform Composer, and tutorial all consume this same
+    discovery-time assistance, so the structured-output authoring shape
+    (``queries`` mapping with typed ``output_fields``) must live here.
     """
     pytest.importorskip(
         "litellm",

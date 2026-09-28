@@ -10,6 +10,10 @@ export function isCurrentAuthGeneration(observed: number): boolean {
   return observed === generation;
 }
 
+export function currentAuthGeneration(): number {
+  return generation;
+}
+
 /** Associate the response with the credential sent, before any asynchronous work. */
 export async function authFetch(input: string, init?: RequestInit): Promise<Response> {
   const authorization = new Headers(init?.headers).get("Authorization");

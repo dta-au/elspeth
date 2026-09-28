@@ -75,8 +75,6 @@ export function CommandPalette({
   const createSession = useSessionStore((s) => s.createSession);
   const selectSession = useSessionStore((s) => s.selectSession);
   const compositionState = useSessionStore((s) => s.compositionState);
-  const guidedSession = useSessionStore((s) => s.guidedSession);
-  const reenterGuided = useSessionStore((s) => s.reenterGuided);
 
   const validationResult = useExecutionStore((s) => s.validationResult);
   const isExecuting = useExecutionStore((s) => s.isExecuting);
@@ -151,22 +149,6 @@ export function CommandPalette({
       },
     });
 
-    if (
-      activeSessionId &&
-      guidedSession?.terminal?.kind === "exited_to_freeform" &&
-      guidedSession.terminal.reason === "user_pressed_exit"
-    ) {
-      cmds.push({
-        id: "reenter-guided",
-        title: "Re-enter guided mode",
-        category: "action",
-        action: () => {
-          void reenterGuided();
-          onClose();
-        },
-      });
-    }
-
     cmds.push({
       id: "show-graph",
       title: "Show graph",
@@ -230,14 +212,12 @@ export function CommandPalette({
     sessions,
     activeSessionId,
     compositionState,
-    guidedSession,
     validationResult,
     runAdmissionAvailable,
     isExecuting,
     progress,
     createSession,
     selectSession,
-    reenterGuided,
     onClose,
   ]);
 

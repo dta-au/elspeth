@@ -250,7 +250,6 @@ def _inherited_cases() -> tuple[DiagnosticCase, ...]:
         for exception in (
             errors.SinkEffectCapabilityError,
             errors.VerificationMismatchError,
-            errors.GuidedCustodyIntegrityError,
             errors.PipelineLoweringError,
             errors.OrchestrationInvariantError,
             errors.PluginContractViolation,
@@ -457,21 +456,61 @@ DIAGNOSTIC_CASES = (
     # observations must survive the renderer.
     _message_case(
         errors.HeaderSpelledDeclarationViolation,
-        {"component": "Transform 'fixed'", "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read"),)},
+        {
+            "component": "Transform 'fixed'",
+            "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read", leg="normalized"),),
+        },
         "component",
         (("Transform 'alpha_component'", "Transform 'alpha_component'"), ("Sink 'omega_component'", "Sink 'omega_component'")),
     ),
     _message_case(
         errors.HeaderSpelledDeclarationViolation,
-        {"component": "Transform 'fixed'", "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read"),)},
+        {
+            "component": "Transform 'fixed'",
+            "spellings": (HeaderSpelling(literal="Fixed", canonical="fixed", kind="read", leg="normalized"),),
+        },
         "spellings",
         (
-            ((HeaderSpelling(literal="Alpha", canonical="alpha", kind="read"),), "'Alpha' is a header spelling of 'alpha'"),
             (
-                (HeaderSpelling(literal="Omega", canonical="omega", kind="create"),),
+                (HeaderSpelling(literal="Alpha", canonical="alpha", kind="read", leg="normalized"),),
+                "'Alpha' is a header spelling of 'alpha'",
+            ),
+            (
+                (HeaderSpelling(literal="Omega", canonical="omega", kind="create", leg="normalized"),),
                 "'Omega' is a header spelling of the arriving field 'omega'",
             ),
         ),
+    ),
+    # The routed half of a declared-input miss (ADR-013 Amendment 2026-09-27,
+    # elspeth-5887fb7928 R2): the routed reason is its message plus the config
+    # field names, so both observations must survive the renderer.
+    _message_case(
+        errors.DeclaredInputFieldAbsentViolation,
+        {"component": "Transform 'fixed'", "fields": ("fixed_field",)},
+        "component",
+        (("Transform 'alpha_component'", "Transform 'alpha_component'"), ("Collector transform 'omega'", "Collector transform 'omega'")),
+    ),
+    _message_case(
+        errors.DeclaredInputFieldAbsentViolation,
+        {"component": "Transform 'fixed'", "fields": ("fixed_field",)},
+        "fields",
+        ((("alpha_field",), "['alpha_field']"), (("omega_one", "omega_two"), "['omega_one', 'omega_two']")),
+    ),
+    *_structured_cases(
+        errors.BatchDeclaredInputFieldsViolation,
+        {
+            "message": "fixed-message",
+            "failure_kind": "proven_field_absent",
+            "plugin": "fixed-plugin",
+            "node_kind": "Aggregation",
+            "missing": frozenset({"fixed_field"}),
+        },
+        {
+            "failure_kind": ("proven_field_absent", "contract_payload_divergence"),
+            "plugin": ("plugin-alpha", "plugin-omega"),
+            "node_kind": ("Aggregation", "Collector"),
+            "missing": (frozenset({"alpha_field"}), frozenset({"omega_one", "omega_two"})),
+        },
     ),
     *_structured_cases(
         errors.ZeroEmissionSuccessContractViolation,

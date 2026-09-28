@@ -30,7 +30,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.helpers.postgres_target import postgres_test_target
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # Integration-suite shared session-insert helper.
 from .conftest import (
@@ -61,7 +61,7 @@ def pg_engine():
 
 @pytest.fixture
 def service(pg_engine, tmp_path):
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         pg_engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

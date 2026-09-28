@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  clientWireBlockerMessages,
   formatFindingBody,
   humaniseValidationMessage,
   humaniseExecutionError,
@@ -12,7 +11,7 @@ import {
 import {
   COLLECTOR_PHRASE,
   UNKNOWN_COMPONENT_PHRASE,
-} from "@/components/chat/guided/pipelineGloss";
+} from "@/components/chat/pipelineGloss";
 import { makeComposition } from "@/test/composerFixtures";
 import type { NodeSpec } from "@/types/index";
 
@@ -169,8 +168,8 @@ describe("makePhraseFor", () => {
 
   it("guesses a phrase for a role+format-bearing generated id absent from the composition", () => {
     const phraseFor = makePhraseFor(null);
-    expect(phraseFor("sink_guided_output_csv_abcd1234")).toBe("write a CSV");
-    expect(phraseFor("transform_guided_xform_0_abcd1234")).toBe("process each row");
+    expect(phraseFor("sink_generated_output_csv_abcd1234")).toBe("write a CSV");
+    expect(phraseFor("transform_generated_xform_0_abcd1234")).toBe("process each row");
   });
 
   // ── elspeth-66f50ba810: fuzzy known-component match must win over the ────
@@ -269,7 +268,7 @@ describe("makePhraseFor", () => {
 
   it("prioritises an authoritative row_union type over generated id-role heuristics", () => {
     const phraseFor = makePhraseFor(null);
-    expect(phraseFor("output_guided_row_union_a1b2", "row_union")).toBe(
+    expect(phraseFor("output_generated_row_union_a1b2", "row_union")).toBe(
       "wait for every branch, then preserve every branch row",
     );
   });
@@ -277,7 +276,7 @@ describe("makePhraseFor", () => {
   it("prioritises an authoritative collector type over generated id-role heuristics", () => {
     const phraseFor = makePhraseFor(null);
 
-    expect(phraseFor("output_guided_collector_a1b2", "collector")).toBe(
+    expect(phraseFor("output_generated_collector_a1b2", "collector")).toBe(
       COLLECTOR_PHRASE,
     );
   });
@@ -371,10 +370,8 @@ describe("makePhraseFor — compiled-id strip", () => {
 
   it("leaves short-hash generated ids to the existing fuzzy/role ladder (12-hex suffix required)", () => {
     const phraseFor = makePhraseFor(null);
-    // 8-hex suffixes (the guided generated-id shape pinned above) must not
-    // enter the strip; the role/format guess still answers.
-    expect(phraseFor("transform_guided_xform_0_abcd1234")).toBe("process each row");
-    expect(phraseFor("sink_guided_output_csv_abcd1234")).toBe("write a CSV");
+    expect(phraseFor("transform_generated_xform_0_abcd1234")).toBe("process each row");
+    expect(phraseFor("sink_generated_output_csv_abcd1234")).toBe("write a CSV");
   });
 });
 
@@ -482,21 +479,5 @@ describe("formatFindingBody", () => {
       phraseFor,
     );
     expect(calls).toEqual([["csv_refunds_a1b2", "source"]]);
-  });
-});
-
-describe("clientWireBlockerMessages", () => {
-  it("filters the structured guided status regardless of prose", () => {
-    expect(clientWireBlockerMessages([{message: "placeholder details", error_code: "guided_composition_invalid", component: null}])).toEqual([]);
-  });
-
-  it("does not hide a message that only resembles the guided status", () => {
-    const error = {message: "guided_composition_invalid", error_code: null, component: null};
-    expect(clientWireBlockerMessages([error])).toEqual([error]);
-  });
-
-  it("preserves ordinary structured blockers", () => {
-    const error = {message: "No source configured.", error_code: "source_missing", component: "source"};
-    expect(clientWireBlockerMessages([{message: "placeholder", error_code: "guided_composition_invalid", component: null}, error])).toEqual([error]);
   });
 });

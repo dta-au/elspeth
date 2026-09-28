@@ -14,7 +14,7 @@ def test_current_cutover_and_verification_use_live_schema_epochs() -> None:
     runbook = _RUNBOOK.read_text(encoding="utf-8")
     current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
     current_procedure = runbook.split("### Procedure", maxsplit=1)[1].split(
-        "#### 0.7.0 epoch + smoke verification",
+        "#### Current epoch + Composer smoke verification",
         maxsplit=1,
     )[0]
     session_expectations = re.findall(
@@ -34,6 +34,9 @@ def test_current_cutover_and_verification_use_live_schema_epochs() -> None:
     assert f"repair the epoch-{SESSION_SCHEMA_EPOCH} release forward" in current_cutover
     assert session_expectations == [str(SESSION_SCHEMA_EPOCH)]
     assert landscape_expectations == [str(SQLITE_SCHEMA_EPOCH)]
+    assert "guided" not in runbook.lower()
+    assert "freeform Build step" in runbook
+    assert "inspect its recorded audit story" in runbook
 
 
 def test_replica_schema_cutover_belongs_to_0_8_1() -> None:

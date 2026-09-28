@@ -528,8 +528,11 @@ class SinkExecutor:
         both callers end the run with every token's terminal recorded.
         """
         declared_spellings = DeclaredSpellings.of(reads=sink.declared_read_fields, creates=())
-        for row in rows:
-            spellings = declared_spellings.in_row(row_keys=frozenset(row), forwarded_keys=())
+        # Resolved through each token's own contract — the one a lookup of the
+        # row would use — on the failsink path too, whose enriched rows carry
+        # no contract of their own but keep every field of the token's.
+        for token, row in zip(tokens, rows, strict=True):
+            spellings = declared_spellings.in_row(row_keys=frozenset(row), forwarded_keys=(), contract=token.row_data.contract)
             if spellings:
                 raise HeaderSpelledDeclarationViolation(component=f"Sink '{sink.name}'", spellings=spellings)
         for row_index, (token, row) in enumerate(zip(tokens, rows, strict=True)):

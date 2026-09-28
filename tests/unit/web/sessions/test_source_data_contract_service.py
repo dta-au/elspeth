@@ -50,7 +50,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import seed_live_compose_context
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -314,12 +314,9 @@ async def test_demand_drift_between_surface_and_resolve_is_refused(service, tmp_
 
 @pytest.mark.asyncio
 async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(service, tmp_path: Path) -> None:
-    """The kind-general settlement surfacer — the SAME pass the freeform
-    settlement and the guided wire-confirm settlement run
-    (surface_pending_interpretation_reviews_for_state) — mints the
-    data-contract event with the server-computed draft, so a guided session
-    reaching the blocked shape gets its card without a planner tool call."""
-    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+    """The ordinary settlement surfacer mints a data-contract review card
+    from the server-computed draft, without a planner tool call."""
+    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
     from elspeth.web.interpretation_state import BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX
 
     csv_path = tmp_path / "upload.csv"
@@ -363,7 +360,7 @@ async def test_settlement_surfacer_rejects_a_pending_legacy_v1_card(
 ) -> None:
     """A retired persisted contract fails closed without migrating audit rows."""
     from elspeth.contracts.errors import AuditIntegrityError
-    from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+    from elspeth.web.composer.interpretation_surfacing import surface_pending_interpretation_reviews_for_state
 
     csv_path = tmp_path / "upload.csv"
     csv_path.write_text("colour,extra\nred,1\n", encoding="utf-8")
@@ -448,7 +445,7 @@ async def test_settlement_surfacer_skips_card_ineligible_sources(service, tmp_pa
     """Composer-authored bound content never gets a data-contract card from
     the surfacer (the invented_source flow owns it), and neither does a
     source the pipeline demands nothing from."""
-    from elspeth.web.composer.service import _backend_surface_args_for_site
+    from elspeth.web.composer.interpretation_surfacing import _backend_surface_args_for_site
     from elspeth.web.interpretation_state import InterpretationReviewSite
 
     csv_path = tmp_path / "generated.csv"

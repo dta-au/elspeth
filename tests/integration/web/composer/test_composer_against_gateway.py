@@ -89,8 +89,9 @@ import uvicorn
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.web.composer import provider_gateway
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --- sys.path shim ------------------------------------------------------
 # ``gateway/`` is not on the default ELSPETH import path (see
@@ -108,7 +109,6 @@ from elspeth_llm_gateway.reference.adapter import ReferenceV1InvokeAdapter  # no
 from mock.oauth import create_mock_oauth_app  # noqa: E402
 from mock.upstream import create_mock_upstream_app  # noqa: E402
 
-import elspeth.web.composer.service as composer_service_module  # noqa: E402
 from elspeth.web.catalog.protocol import CatalogService  # noqa: E402
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary  # noqa: E402
 from elspeth.web.composer.service import ComposerServiceImpl  # noqa: E402
@@ -319,7 +319,7 @@ def _build_sessions_service(tmp_path: Path) -> SessionServiceImpl:
         poolclass=StaticPool,
     )
     initialize_session_schema(engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -681,9 +681,9 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
         choice = type("Choice", (), {"message": message})()
         return type("Response", (), {"choices": [choice]})()
 
-    monkeypatch.setattr(composer_service_module, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await service._call_advisor_with_audit(
+    await service._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -712,7 +712,7 @@ async def test_advisor_role_does_not_use_primary_gateway_endpoint(
 def _loop_tools_stamped(flag: bool) -> list[dict[str, Any]]:
     """The compose loop's ``openai_strict`` tools whose stamp is ``flag`` (32 true, 10 false)."""
     from elspeth.contracts.composer_llm_audit import ToolContractDialect
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 
     tools = [tool for tool in composer_loop_tool_definitions(ToolContractDialect.OPENAI_STRICT) if tool["function"]["strict"] is flag]
     assert len(tools) == (32 if flag else 10)
@@ -772,7 +772,7 @@ async def test_gateway_accepts_the_preferred_route_tool_list(gateway_base_url: s
     """
     import litellm
 
-    from elspeth.web.composer.service import composer_loop_tool_definitions
+    from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
     from elspeth.web.composer.strict_transport import StrictTransport, dialect_for, resolve_strict_transport
 
     resolution = resolve_strict_transport(model=_MODEL_ALIAS, api_base=f"{gateway_base_url}/v1", setting="preferred", env={})

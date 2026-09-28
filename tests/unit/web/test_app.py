@@ -3482,7 +3482,7 @@ class TestValidationErrorRedaction:
         # Send a message with state_id as a non-UUID string — triggers 422
         resp = client.post(
             f"/api/sessions/{session_id}/messages",
-            json={"content": "leaked-password-value", "state_id": "not-a-uuid"},
+            json={"content": "leaked-password-value", "state_id": "not-a-uuid", "client_request_id": str(uuid4())},
         )
         assert resp.status_code == 422
         body_text = resp.text

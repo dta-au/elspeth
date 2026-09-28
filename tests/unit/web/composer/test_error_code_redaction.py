@@ -34,7 +34,6 @@ _WEB = _SRC / "web"
 # ``validate_authored_composition_state`` and ``ToolResult.runtime_preflight``).
 # It walks all of ``web/`` and excludes only what cannot, each with its reason.
 _CENSUS_EXCLUDED: dict[tuple[str, ...], str] = {
-    ("composer", "guided"): "guided mode is being removed; out of scope for the strict-contract campaign",
     ("_acceptance_common",): "deployment acceptance HTTP client; its codes are probe results, never a tool response",
     ("_aws_ecs_acceptance",): "deployment acceptance client (AWS ECS)",
     ("_azure_container_apps_acceptance",): "deployment acceptance client (Azure Container Apps)",
@@ -65,7 +64,6 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/_common.py", "_prepend_rejection_entry", "error_code"),
         ("composer/tools/_common.py", "_rejection_only_validation", "error_code"),
         ("composer/tools/sessions.py", "_failure_result", "error_code"),
-        ("composer/pipeline_planner.py", "_candidate_policy_rejection", "error_code"),
         ("composer/state.py", "add", "code"),
         # PluginUnavailableReason members; the registry holds every value.
         ("composer/tools/_common.py", "_plugin_policy_failure", "violation.error_code.value"),
@@ -84,14 +82,12 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/tools/transforms.py", "_execute_upsert_edge", "error_code"),
         ("composer/tools/transforms.py", "_execute_patch_node_options", "error_code"),
         ("composer/tools/transforms.py", "_prepare_transform_candidate", "error_code"),
-        ("composer/service.py", "_state_payload_for_compose_turn", "error.error_code"),
-        ("composer/pipeline_planner.py", "_build_valid_pipeline_plan", "exc.error_code"),
+        ("composer/turn_audit.py", "_state_payload_for_compose_turn", "error.error_code"),
         # The imported ``ADVISOR_SIGNOFF_BLOCKED_CODE`` (pinned below).
-        ("composer/service.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
+        ("composer/advisor_policy.py", "_advisor_signoff_fully_blocking_validation", "_ADVISOR_SIGNOFF_BLOCKED_CODE"),
         # Planner / discovery feedback that projects an already-produced code,
         # a closed ``ToolArgumentError.code`` or a closed category value.
         ("composer/pipeline_planner.py", "_allowlisted_candidate_feedback", "code"),
-        ("composer/pipeline_planner.py", "_binding_rejection_feedback", "rejection.error_code"),
         ("composer/pipeline_planner.py", "_plan_pipeline_inner", "entry.error_code or 'validation_error'"),
         ("composer/pipeline_planner.py", "_allowlisted_argument_error_entry", "error.code or 'argument_error'"),
         ("composer/pipeline_planner.py", "execute_one_discovery", "exc.category.value"),
@@ -261,18 +257,17 @@ class TestRegistryCensus:
         # Keyword producer, positional ``_err`` producer, and dict-key producer.
         assert "plugin_options_invalid" in codes
         assert "pipeline_cycle" in codes
-        assert "deferred_intent_claim" in codes
+        assert "schema_contract_violation" in codes
         # Producers outside ``web/composer`` whose codes reach tool responses.
         assert "profile_alias_used_as_bucket" in codes
         assert "fabricated_secret" in codes
 
     def test_exclusions_skip_only_what_they_name(self) -> None:
         paths = {site.path for site in _live_code_sites()}
-        assert not any(path.startswith(("composer/guided/", "_acceptance_common/")) for path in paths)
+        assert not any(path.startswith("_acceptance_common/") for path in paths)
         assert "plugin_policy/validation.py" in paths
         assert "execution/_validation_authoring.py" in paths
-        assert _is_excluded(Path("composer/guided/x.py"))
-        assert not _is_excluded(Path("composer/guided_x.py"))
+        assert not _is_excluded(Path("composer/ordinary.py"))
 
     def test_instrument_flags_a_planted_unregistered_code(self) -> None:
         planted = "def f(state):\n    return _failure_result(state, 'm', error_code='zz_planted_unregistered')\n"

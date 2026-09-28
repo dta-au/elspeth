@@ -139,18 +139,6 @@ test.describe("composer freeform live — the two-LLM A/B test (staging)", () =>
       await composer.goto(sessionId);
       await composer.waitForChatReady();
 
-      // Hydration race: an API-created session sometimes lands on the guided
-      // surface (observed runs 5/12/16 — the freeform transcript then never
-      // renders and the success poll starves while the backend composes
-      // fine). Normalize deterministically via the user-visible escape.
-      const exitToFreeform = page.getByRole("button", { name: "Exit to freeform", exact: true });
-      if (await exitToFreeform.isVisible({ timeout: 3_000 }).catch(() => false)) {
-        await exitToFreeform.click();
-        // The exit interposes a confirmation group.
-        await page.getByRole("button", { name: "Confirm exit to freeform" }).click();
-        await composer.waitForChatReady();
-      }
-
       // ── One outcome-stated request; the planner owns the design ──────────
       const request =
         `I uploaded ${BLOB_FILENAME} (color_name,hex — ${expectedRows.length} rows). ` +
@@ -224,17 +212,6 @@ test.describe("composer freeform live — the two-LLM A/B test (staging)", () =>
       if (!(await runButton.isEnabled().catch(() => false))) {
         await page.reload();
         await page.waitForLoadState("networkidle");
-        // Fresh hydration can land an API-created session on the guided
-        // surface; the user-visible escape restores the freeform composer
-        // with the committed pipeline intact.
-        const exitToFreeform = page.getByRole("button", { name: "Exit to freeform", exact: true });
-        if (await exitToFreeform.isVisible().catch(() => false)) {
-          await exitToFreeform.click();
-          await page
-            .getByRole("button", { name: "Confirm exit to freeform" })
-            .click()
-            .catch(() => {});
-        }
       }
       await expect(runButton).toBeEnabled({ timeout: 120_000 });
 

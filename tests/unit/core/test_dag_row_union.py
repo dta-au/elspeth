@@ -1239,9 +1239,9 @@ coalesce:
 
 
 def _branch_agg_yaml(tmp_path: Path, *, output_mode: str) -> str:
-    # The aggregation is the test-only identity batch plugin: output_mode:
-    # passthrough admits no shipped batch plugin (none emits exactly one row
-    # per buffered row), and the placement rule under test ignores the plugin.
+    # The aggregation is the test-only identity batch plugin (passthrough
+    # admits only a plugin that emits exactly one row per buffered row; it adds
+    # no fields), and the placement rule under test ignores the plugin.
     input_path = tmp_path / "branch_agg_input.jsonl"
     if not input_path.exists():
         input_path.write_text('{"id": 1, "copies": 1}\n')

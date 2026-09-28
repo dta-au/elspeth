@@ -1211,7 +1211,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a6ff8d1e5faa13bf"
+    source_file_hash: str | None = "sha256:bd65800eab881694"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1671,6 +1671,20 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         """
         return self._config
 
+    @property
+    def consumed_input_fields(self) -> frozenset[str]:
+        """The base set plus every ``image_inputs`` column, the optional ones included.
+
+        An image marked ``required: false`` is not a declared input
+        (``LLMConfig.declared_input_fields``) because its absence is a valid
+        row, but the transform reads it whenever it is present. The base
+        class's column-option limb cannot see it (``image_inputs`` is not a
+        ``*_field`` option), so the plugin surfaces it here, as the base
+        contract asks of a plugin that reads a column it does not declare:
+        demotion must never treat a read column as created-only.
+        """
+        return super().consumed_input_fields | self._config.image_input_fields
+
     def output_semantics(self) -> OutputSemanticDeclaration:
         """Declare that raw LLM response fields are unconstrained strings.
 
@@ -2040,7 +2054,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
                     "If downstream cleanup, sink, mapper, or transform needs the LLM response, guarantee the response_field by name in the LLM node schema. If downstream also needs source or scrape fields that pass through the LLM, also guarantee pass-through fields such as URL or identifier fields.",
                     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
-                    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str. The raw response_field and automatic usage/model fields remain available.",
+                    "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
+                    "Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str.",
                     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
                     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
                     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",

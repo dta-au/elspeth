@@ -1,4 +1,4 @@
-import { authFetch, responseOwnsCredential } from "./authSession";
+import { authFetch, currentAuthGeneration, isCurrentAuthGeneration, responseOwnsCredential } from "./authSession";
 // ============================================================================
 // ELSPETH API Client
 //
@@ -47,23 +47,10 @@ import type {
   SystemStatus,
   MessageWithStateResponse,
 } from "@/types/index";
-import type {
-  GetGuidedResponse,
-  GuidedChatRequest,
-  GuidedChatResponse,
-  GuidedRespondRequest,
-  GuidedRespondResponse,
-  GuidedStartOperationReconciliation,
-  TutorialSampleResponse,
-} from "@/types/guided";
 import {
   decodeCompositionState,
   decodeCompositionStateVersions,
-  decodeGetGuidedResponse,
-  decodeGuidedChatResponse,
-  decodeGuidedRespondResponse,
-  decodeGuidedStartOperationReconciliation,
-} from "./guidedDecoder";
+} from "./compositionDecoder";
 import { decodeUserComposerPreferences } from "./preferencesDecoder";
 import type {
   InterpretationEvent,
@@ -80,6 +67,8 @@ import type {
   TutorialOrphanCleanupResponse,
   TutorialRunRequest,
   TutorialRunResponse,
+  TutorialReadinessResponse,
+  TutorialSampleResponse,
   UserComposerPreferencesPayload,
   UpdateUserComposerPreferencesPayload,
 } from "@/types/api";
@@ -106,6 +95,74 @@ export function authHeaders(contentType?: string): HeadersInit {
     headers["Content-Type"] = contentType;
   }
   return headers;
+}
+
+// Review decisions and validation both acquire a backend session lease. Queue
+// these calls per session so rapid decisions across cards, or validation after
+// a decision, do not race each other into a lease-conflict response. Nginx's
+// production read timeout is 360s; a slightly longer client deadline also
+// bounds this queue when a direct/local connection loses its response.
+const REVIEW_MUTATION_TIMEOUT_MS = 370_000;
+const REVIEW_MUTATION_RECOVERY_MESSAGE =
+  "The request outcome is uncertain. Refresh the page to reload this session before making another review decision.";
+const reviewMutationTails = new Map<string, Promise<void>>();
+const ambiguousReviewMutations = new Set<string>();
+
+function isDefinitiveReviewRejection(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("status" in error)) {
+    return false;
+  }
+  const status = error.status;
+  // A 4xx other than request timeout means the server rejected this action.
+  // A 5xx, malformed success, or transport failure may follow a committed
+  // decision, so later queued actions must wait for a fresh session reload.
+  return typeof status === "number" && status >= 400 && status < 500 && status !== 408;
+}
+
+function serializeReviewMutation<T>(
+  sessionId: string,
+  action: (signal: AbortSignal) => Promise<T>,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  const authGeneration = currentAuthGeneration();
+  const token = getToken();
+  const key = `${authGeneration}:${sessionId}`;
+  const previous = reviewMutationTails.get(key) ?? Promise.resolve();
+  const result = previous.then(async () => {
+    if (!isCurrentAuthGeneration(authGeneration) || getToken() !== token) {
+      throw { status: 0, detail: "Authentication changed before request dispatch" } satisfies ApiError;
+    }
+    if (ambiguousReviewMutations.has(key)) {
+      throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+    }
+    if (externalSignal?.aborted) {
+      throw { status: 0, detail: "Request cancelled before dispatch" } satisfies ApiError;
+    }
+    const deadline = new AbortController();
+    const signal = externalSignal === undefined
+      ? deadline.signal
+      : AbortSignal.any([externalSignal, deadline.signal]);
+    const timer = setTimeout(() => deadline.abort(), REVIEW_MUTATION_TIMEOUT_MS);
+    try {
+      return await action(signal);
+    } catch (error) {
+      if (deadline.signal.aborted || externalSignal?.aborted || !isDefinitiveReviewRejection(error)) {
+        ambiguousReviewMutations.add(key);
+        throw { status: 504, detail: REVIEW_MUTATION_RECOVERY_MESSAGE } satisfies ApiError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+  const tail = result.then(() => undefined, () => undefined);
+  reviewMutationTails.set(key, tail);
+  void tail.then(() => {
+    if (reviewMutationTails.get(key) === tail) {
+      reviewMutationTails.delete(key);
+    }
+  });
+  return result;
 }
 
 // ── Response Parsing ────────────────────────────────────────────────────────
@@ -213,16 +270,6 @@ export function isForkCommittedResponseError(error: unknown): error is ForkCommi
   return error instanceof ForkCommittedResponseError;
 }
 
-export class GuidedResponseReceiptError extends Error {
-  readonly received = true;
-  readonly cause: unknown;
-
-  constructor(cause: unknown) {
-    super("The guided response was received but could not be read.");
-    this.name = "GuidedResponseReceiptError";
-    this.cause = cause;
-  }
-}
 
 const CANONICAL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -265,7 +312,10 @@ export async function parseResponse<T>(
     let storageQuota: ApiError["storage_quota"];
     let sources: string[] | undefined;
     let requestId: string | undefined;
+    let clientRequestId: string | undefined;
+    let userMessageId: string | undefined;
     let failureCode: string | undefined;
+    let guidance: string | undefined;
     let componentId: string | undefined;
     let pluginId: string | undefined;
     let nestedSnapshotFingerprint: string | undefined;
@@ -311,7 +361,10 @@ export async function parseResponse<T>(
         : undefined;
 
       requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      clientRequestId = firstStringField([body, nestedDetail], ["client_request_id"]);
+      userMessageId = firstStringField([body, nestedDetail], ["user_message_id"]);
       failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+      guidance = firstStringField([body, nestedDetail], ["guidance"]);
 
       // Convergence discriminator + its recovery copy. Kept off `detail` so
       // the SPA branches on the taxonomy rather than parsing prose.
@@ -462,7 +515,10 @@ export async function parseResponse<T>(
       storage_quota: storageQuota,
       sources,
       request_id: requestId,
+      client_request_id: clientRequestId,
+      user_message_id: userMessageId,
       failure_code: failureCode,
+      guidance,
       component_id: componentId,
       plugin_id: pluginId,
       reason,
@@ -896,11 +952,15 @@ export async function rejectCompositionProposal(
 export async function sendMessage(
   sessionId: string,
   content: string,
-  stateId?: string,
+  clientRequestId: string,
+  stateId?: string | null,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
-  const body: { content: string; state_id?: string } = { content };
-  if (stateId) {
+  const body: { content: string; client_request_id: string; state_id?: string | null } = {
+    content,
+    client_request_id: clientRequestId,
+  };
+  if (stateId !== undefined) {
     body.state_id = stateId;
   }
   const response = await authFetch(`/api/sessions/${sessionId}/messages`, {
@@ -916,64 +976,29 @@ export async function sendMessage(
  *  Used by the retry flow when the user message is already persisted. */
 export async function recompose(
   sessionId: string,
+  expectedUserMessageId: string,
   signal?: AbortSignal,
 ): Promise<MessageWithStateResponse> {
   const response = await authFetch(`/api/sessions/${sessionId}/recompose`, {
     method: "POST",
     headers: authHeaders("application/json"),
+    body: JSON.stringify({ expected_user_message_id: expectedUserMessageId }),
     signal,
   });
   return parseResponse<MessageWithStateResponse>(response);
 }
 
-/**
- * Fetch the current guided-session state for a session.
- *
- * Returns the active GuidedSession (step + history + terminal), the
- * server-emitted next turn payload (if any), and the current composition
- * state.  When no guided session has started for the session, the server
- * returns an in-memory initial GuidedSession and Step 1 turn without creating
- * a composition-state version.
- */
-export function getGuided(
-  sessionId: string,
-  signal: AbortSignal | undefined,
-  probe: true,
-): Promise<GetGuidedResponse | null>;
-export function getGuided(
-  sessionId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse>;
-export async function getGuided(
-  sessionId: string,
-  signal?: AbortSignal,
-  probe = false,
-): Promise<GetGuidedResponse | null> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided${probe ? "?probe=true" : ""}`, {
-    method: "GET",
-    headers: authHeaders(),
-    signal,
-  });
-  const body = await parseResponse<unknown>(response);
-  return probe && body === null ? null : decodeGetGuidedResponse(body);
-}
 
 /**
- * Fetch the runtime-derived synthetic-scrape sample URLs for the active
- * TUTORIAL session's resolved origin (p4 Task 8a GET surface).
- *
- * Consumed by `TutorialGuidedShell`: the URLs are computed server-side from the
- * resolved base at request time (they cannot ride the frozen profile
- * constants), so the shell fetches them and appends them to the locked STEP_1
- * prompt. The synthetic pages are publicly hosted, so the tutorial's web_scrape
- * node carries no SSRF allowlist (it uses the plugin default `public_only`).
+ * Fetch runtime-derived sample URLs for the freeform tutorial brief.
+ * They are data, not a server-authored pipeline proposal.
  */
 export async function getTutorialSample(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<TutorialSampleResponse> {
   const response = await authFetch(
-    `/api/sessions/${sessionId}/guided/tutorial-sample`,
+    `/api/tutorial/${sessionId}/sample`,
     {
       method: "GET",
       headers: authHeaders(),
@@ -983,177 +1008,24 @@ export async function getTutorialSample(
   return parseResponse<TutorialSampleResponse>(response);
 }
 
-/**
- * Seed a guided session with a server-owned WorkflowProfile.
- *
- * The `profileKind` is a closed-enum discriminator ("live" | "tutorial"); the
- * SERVER constructs the concrete profile object and persists the GuidedSession.
- * Idempotent (D16): a second call for a session that already has a persisted
- * guided session returns the existing session unchanged.
- *
- * `intent` is required for BOTH profiles (goal-first start, elspeth-378cfa0e18
- * / elspeth-13579d1110). It is the session's visible root intent: the goal the
- * user typed on the goal card, or — for the tutorial — the frozen lesson prompt
- * the shell seeds, which is the same shape a live goal takes. The server 400s a
- * start with no intent for every profile, so a planner run can never be reached
- * without one. The old `profile === "live"` conditional that STRIPPED intent for
- * the tutorial is gone; sending it is not a tutorial-special path, it is the one
- * path (ADR-031).
- */
-interface GuidedStartCommand {
-  profile: "live" | "tutorial";
-  intent: string;
-  operationId: string;
-}
-
-export async function startGuidedSession(
+export async function getTutorialReadiness(
   sessionId: string,
-  command: GuidedStartCommand,
   signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/start`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({
-      profile: command.profile,
-      intent: command.intent,
-      operation_id: command.operationId,
-    }),
+): Promise<TutorialReadinessResponse> {
+  const response = await authFetch(`/api/tutorial/${sessionId}/readiness`, {
+    method: "GET",
+    headers: authHeaders(),
     signal,
   });
-  if (!response.ok) {
-    return parseResponse<never>(response);
-  }
-  try {
-    return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-  } catch (cause) {
-    throw new GuidedResponseReceiptError(cause);
-  }
+  return parseResponse<TutorialReadinessResponse>(response);
 }
 
-export async function reconcileGuidedStartOperation(
-  sessionId: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GuidedStartOperationReconciliation> {
-  const response = await authFetch(
-    `/api/sessions/${sessionId}/guided/start/${operationId}/reconcile`,
-    {
-      method: "POST",
-      headers: authHeaders(),
-      signal,
-    },
-  );
-  return decodeGuidedStartOperationReconciliation(await parseResponse<unknown>(response));
-}
 
-/**
- * Post a user response to the active guided turn.
- *
- * Server consumes the response, advances the state machine, and returns
- * the replacement GuidedSession + next turn (or terminal state).  The
- * client is expected to atomically replace its cached guided state with
- * the response shape — no optimistic updates (spec §7.3).
- */
-export async function respondGuided(
-  sessionId: string,
-  body: GuidedRespondRequest,
-  signal?: AbortSignal,
-): Promise<GuidedRespondResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/respond`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  if (!response.ok) {
-    return parseResponse<never>(response);
-  }
-  try {
-    return decodeGuidedRespondResponse(await parseResponse<unknown>(response));
-  } catch (cause) {
-    throw new GuidedResponseReceiptError(cause);
-  }
-}
 
-/**
- * Re-enter guided mode after a deliberate user exit to freeform.
- *
- * Server clears the reversible exited_to_freeform/user_pressed_exit terminal
- * and returns the same envelope shape as GET /guided.
- */
-export async function reenterGuided(
-  sessionId: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/reenter`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId }),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
-/**
- * Convert a freeform session into guided mode.
- *
- * "Switch to guided" on a session that has already done freeform composition
- * work cannot go through GET /guided — that endpoint 400s by design for a
- * session with no persisted guided_session (and must, since it is also the
- * passive freeform-probe on session select). This POST is the explicit
- * conversion: it seeds a FRESH wizard as a new composition-state version,
- * setting the freeform pipeline aside (recoverable from version history), and
- * returns the same envelope shape as GET /guided.
- *
- * `intent` is REQUIRED (goal-first, elspeth-378cfa0e18): the converted wizard is
- * rooted on the goal the user stated in the mode-switch card, exactly as a live
- * start is. A convert is no longer idempotent-by-silence for an already-guided
- * session — the server 409s `guided_already_started` rather than discarding the
- * client's goal — so callers must probe GET /guided first (the store's GET-first
- * `enterGuided` does) and only convert on the documented 400.
- */
-export async function convertToGuided(
-  sessionId: string,
-  intent: string,
-  operationId: string,
-  signal?: AbortSignal,
-): Promise<GetGuidedResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/convert`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify({ operation_id: operationId, intent }),
-    signal,
-  });
-  return decodeGetGuidedResponse(await parseResponse<unknown>(response));
-}
 
-/**
- * Post a free-text chat message scoped to the user's current wizard step.
- *
- * The server runs bounded Step 1/2 provider work, projects supported results
- * through the schema-8 transition authority, and returns the authoritative
- * post-settlement session, turn, terminal, and composition state. Generated
- * inline source bytes are reported as a typed non-applying failure until blob
- * custody can join the same atomic settlement.
- *
- * The required turn token binds the request to the server-held current
- * unanswered occurrence; stale tokens return 409 before provider work.
- */
-export async function chatGuided(
-  sessionId: string,
-  body: GuidedChatRequest,
-  signal?: AbortSignal,
-): Promise<GuidedChatResponse> {
-  const response = await authFetch(`/api/sessions/${sessionId}/guided/chat`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
-    body: JSON.stringify(body),
-    signal,
-  });
-  return decodeGuidedChatResponse(await parseResponse<unknown>(response));
-}
+
+
 
 /** Fork a session from a specific user message. */
 export async function forkFromMessage(
@@ -1279,9 +1151,7 @@ export interface ImportedCompositionState {
 /**
  * Import (replace) a session's composition state from hand-edited or
  * previously-exported YAML (elspeth-24c56585f9 T-1). This REPLACES the
- * current composition -- the backend does not merge -- and always resets
- * the session's guided_session to null server-side, landing the session in
- * freeform. The prior version remains reachable via `fetchStateVersions` /
+ * current composition -- the backend does not merge. The prior version remains reachable via `fetchStateVersions` /
  * `revertToVersion`. A 200 response does not imply the imported pipeline is
  * runnable: check `is_valid`/`validation_errors` on the result.
  */
@@ -1383,13 +1253,17 @@ export async function validatePipeline(
     params.set("state_id", stateId);
   }
   const query = params.size > 0 ? `?${params.toString()}` : "";
-  const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
-    method: "POST",
-    headers: authHeaders("application/json"),
+  const { result, status } = await serializeReviewMutation(sessionId, async (signal) => {
+    const response = await authFetch(`/api/sessions/${sessionId}/validate${query}`, {
+      method: "POST",
+      headers: authHeaders("application/json"),
+      signal,
+    });
+    const result = await parseResponse<ValidationResult>(response);
+    return { result, status: response.status };
   });
-  const result = await parseResponse<ValidationResult>(response);
   if (typeof result !== "object" || result === null || !isValidationReadiness(result.readiness)) {
-    throw { status: response.status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
+    throw { status, detail: "Unexpected readiness shape from validate endpoint" } satisfies ApiError;
   }
   return result;
 }
@@ -1469,9 +1343,10 @@ export async function getRunResults(
 }
 
 /** List runs for a session. */
-export async function fetchRuns(sessionId: string): Promise<Run[]> {
+export async function fetchRuns(sessionId: string, signal?: AbortSignal): Promise<Run[]> {
   const response = await authFetch(`/api/sessions/${sessionId}/runs`, {
     headers: authHeaders(),
+    signal,
   });
   return parseResponse<Run[]>(response);
 }
@@ -1837,16 +1712,18 @@ export async function resolveInterpretation(
   body: InterpretationResolveRequest,
   signal?: AbortSignal,
 ): Promise<InterpretationResolveResponse> {
-  const response = await authFetch(
-    `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
-    {
-      method: "POST",
-      headers: authHeaders("application/json"),
-      body: JSON.stringify(body),
-      signal,
-    },
-  );
-  return parseResponse<InterpretationResolveResponse>(response);
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/${eventId}/resolve`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        body: JSON.stringify(body),
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationResolveResponse>(response);
+  }, signal);
 }
 
 /**
@@ -1863,19 +1740,21 @@ export async function optOutOfInterpretations(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<InterpretationOptOutResponse> {
-  const response = await authFetch(
-    `/api/sessions/${sessionId}/interpretations/opt_out`,
-    {
-      method: "POST",
-      headers: authHeaders("application/json"),
-      // The route accepts an empty body; sending "{}" rather than omitting
-      // body entirely so the Content-Type: application/json header has a
-      // matching payload (some HTTP intermediaries reject the inverse).
-      body: "{}",
-      signal,
-    },
-  );
-  return parseResponse<InterpretationOptOutResponse>(response);
+  return serializeReviewMutation(sessionId, async (requestSignal) => {
+    const response = await authFetch(
+      `/api/sessions/${sessionId}/interpretations/opt_out`,
+      {
+        method: "POST",
+        headers: authHeaders("application/json"),
+        // The route accepts an empty body; sending "{}" rather than omitting
+        // body entirely so the Content-Type: application/json header has a
+        // matching payload (some HTTP intermediaries reject the inverse).
+        body: "{}",
+        signal: requestSignal,
+      },
+    );
+    return parseResponse<InterpretationOptOutResponse>(response);
+  }, signal);
 }
 
 /**

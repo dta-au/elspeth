@@ -32,6 +32,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,11 +40,17 @@ from elspeth.config_loading import load_settings
 from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.dag import ExecutionGraph
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
+from tests.fixtures.declared_input_proof_pin import named_declared_input_proof
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLES = _REPO_ROOT / "examples"
 _PINS_PATH = Path(__file__).parent / "canonical_hash_corpus.json"
 _RECORD = os.environ.get("ELSPETH_CANONICAL_CORPUS_RECORD") == "1"
+# The declared-input proof pin (R2, systems C4) — same build, its own pin
+# file and its own record switch, because a proof move is judged on its own
+# (a vote change that under-proves turns aborts into quiet routes).
+_PROOF_PINS_PATH = Path(__file__).parent / "declared_input_proof_examples.json"
+_PROOF_RECORD = os.environ.get("ELSPETH_DECLARED_INPUT_PROOF_RECORD") == "1"
 _PLACEHOLDER_ENV: dict[str, str] = {
     # Every environment variable an examples/*/settings*.yaml references
     # (`grep -oE '\$\{[A-Z_]+' examples/*/settings*.yaml`), each bound to a
@@ -70,7 +77,7 @@ def _settings_files() -> list[Path]:
     return sorted(_EXAMPLES.glob("*/settings*.yaml"))
 
 
-def _topology_hash(settings_path: Path) -> str:
+def _build_graph(settings_path: Path) -> ExecutionGraph:
     config = load_settings(settings_path)
     plugins = instantiate_plugins_from_config(config, preflight_mode=True)
     graph = ExecutionGraph.from_plugin_instances(
@@ -87,7 +94,7 @@ def _topology_hash(settings_path: Path) -> str:
         scope_settings=list(config.scopes) or None,
         max_bound_region_depth=config.max_bound_region_depth,
     )
-    return compute_full_topology_hash(graph)
+    return graph
 
 
 def _referenced_environment_variables() -> frozenset[str]:
@@ -97,7 +104,7 @@ def _referenced_environment_variables() -> frozenset[str]:
     return frozenset(names)
 
 
-def _build_corpus(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, str]]:
+def _build_corpus(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, Any]]:
     # Only the placeholders reach the build: an operator's real values (or a
     # loaded .env) must neither make an example buildable nor move a hash.
     for name in list(os.environ):
@@ -106,14 +113,19 @@ def _build_corpus(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, str]]:
     for name, value in _PLACEHOLDER_ENV.items():
         monkeypatch.setenv(name, value)
     hashes: dict[str, str] = {}
+    proofs: dict[str, dict[str, list[str]]] = {}
     unbuildable: dict[str, str] = {}
     for path in _settings_files():
         rel = str(path.relative_to(_REPO_ROOT))
         try:
-            hashes[rel] = _topology_hash(path)
+            graph = _build_graph(path)
+            hashes[rel] = compute_full_topology_hash(graph)
         except Exception as exc:  # pylint: disable=broad-except — roster records WHY, test pins the roster
             unbuildable[rel] = type(exc).__name__
-    return {"hashes": hashes, "unbuildable": unbuildable}
+            continue
+        # Outside the roster's except: an unnamed proof entry is a defect, not an unbuildable example.
+        proofs[rel] = named_declared_input_proof(graph)
+    return {"hashes": hashes, "unbuildable": unbuildable, "declared_input_proof": proofs}
 
 
 def test_placeholder_environment_covers_every_variable_the_examples_reference() -> None:
@@ -126,7 +138,8 @@ def test_placeholder_environment_covers_every_variable_the_examples_reference() 
 def test_examples_canonical_hash_corpus_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
     corpus = _build_corpus(monkeypatch)
     if _RECORD:
-        _PINS_PATH.write_text(json.dumps(corpus, indent=2, sort_keys=True) + "\n")
+        pins = {"hashes": corpus["hashes"], "unbuildable": corpus["unbuildable"]}
+        _PINS_PATH.write_text(json.dumps(pins, indent=2, sort_keys=True) + "\n")
         pytest.fail("Corpus recorded to canonical_hash_corpus.json — commit it and re-run without ELSPETH_CANONICAL_CORPUS_RECORD.")
     pinned = json.loads(_PINS_PATH.read_text())
     # Roster first: a moved roster with matching hashes is still a corpus change.
@@ -139,4 +152,30 @@ def test_examples_canonical_hash_corpus_is_pinned(monkeypatch: pytest.MonkeyPatc
         "spec §3 pins these byte-identical across WS2. Diff the two dicts, find the "
         "node whose canonical config changed, and fix the serialization (likely a "
         "key that stopped being omitted-when-None) rather than re-pinning."
+    )
+
+
+def test_examples_declared_input_proof_is_pinned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pins the build's declared-input proof for every buildable example (R2, systems C4).
+
+    The engine aborts on a miss of a PROVEN field and routes a miss the build
+    never proved (ADR-013 Amendment 2026-09-27), so a presence-vote change
+    that under-proves silently converts aborts into routed rows. This pin
+    makes every such change visible: judge the moved entries (did the build
+    really stop knowing the field is present?) before re-recording with
+
+        ELSPETH_DECLARED_INPUT_PROOF_RECORD=1 pytest \
+            tests/unit/core/dag/test_canonical_hash_corpus.py -k declared_input_proof
+    """
+    corpus = _build_corpus(monkeypatch)
+    if _PROOF_RECORD:
+        _PROOF_PINS_PATH.write_text(json.dumps(corpus["declared_input_proof"], indent=2, sort_keys=True) + "\n")
+        pytest.fail(
+            "Proof recorded to declared_input_proof_examples.json — commit it and re-run without ELSPETH_DECLARED_INPUT_PROOF_RECORD."
+        )
+    pinned = json.loads(_PROOF_PINS_PATH.read_text())
+    assert corpus["declared_input_proof"] == pinned, (
+        "The declared-input proof moved for an example. A field that leaves a node's proof turns its "
+        "run-ending miss into a routed row; a field that joins it does the reverse. Diff the two dicts "
+        "and judge each moved entry against the vote change that moved it before re-recording."
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from uuid import UUID
 
 import drive_battery as db
 import pytest
@@ -53,7 +54,10 @@ def test_patch_title_precedes_post_message_and_label_format(tmp_path: Path) -> N
     steps = client.steps()
     assert steps.index("PATCH /api/sessions/s1") < steps.index("POST /api/sessions/s1/messages")
     assert client.calls[steps.index("PATCH /api/sessions/s1")].json == {"title": "battery/r1/fork_coalesce/1"}
-    assert client.calls[steps.index("POST /api/sessions/s1/messages")].timeout == 620.0
+    message_call = client.calls[steps.index("POST /api/sessions/s1/messages")]
+    assert message_call.timeout == 620.0
+    assert message_call.json["content"] == "p"
+    assert str(UUID(message_call.json["client_request_id"])) == message_call.json["client_request_id"]
     assert verdict is None
     meta = json.loads((tmp_path / "runs/r1/fork_coalesce/1/meta.json").read_text())
     assert [h["step"] for h in meta["http"]][:5] == [

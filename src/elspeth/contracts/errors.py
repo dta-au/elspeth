@@ -674,7 +674,6 @@ class TransformErrorReason(TypedDict):
         completion_tokens: Actual tokens used in response
         prompt_tokens: Tokens used in prompt
         raw_response: Truncated raw LLM response content
-        raw_response_preview: Alternative name for truncated preview
         content_after_fence_strip: Content after markdown fence removal
         usage: Token usage stats from LLM response
         response: Full response object for debugging
@@ -686,7 +685,6 @@ class TransformErrorReason(TypedDict):
         expected: Expected type or value
         actual: Actual type or value received
         actual_type: Actual Python type name for type checks
-        value: The actual value (truncated for audit)
 
     Contract violation context:
         violation_type: Specific ContractViolation subclass name
@@ -785,7 +783,6 @@ class TransformErrorReason(TypedDict):
     prompt_tokens: NotRequired[int | None]
     finish_reason: NotRequired[str | None]  # LLM finish reason (e.g., "stop", "length")
     raw_response: NotRequired[str]  # LLM response text; absent = empty/unavailable
-    raw_response_preview: NotRequired[str]  # Truncated preview; absent = empty/unavailable
     content_after_fence_strip: NotRequired[str]
     usage: NotRequired[UsageStats | dict[str, int]]
     response: NotRequired[dict[str, Any]]
@@ -806,7 +803,6 @@ class TransformErrorReason(TypedDict):
     rows_skipped: NotRequired[int]  # Actual rows skipped before exhaustion
 
     # Reference-table join context (reference_join)
-    reference_key_value: NotRequired[str]  # The row's join key, as matched against the table
     unresolved_fields: NotRequired[list[str]]  # Output fields the lookup could not produce
 
     # PDF rasterization context
@@ -819,7 +815,6 @@ class TransformErrorReason(TypedDict):
     expected: NotRequired[str]
     actual: NotRequired[str]
     actual_type: NotRequired[str]
-    value: NotRequired[str]
     emitted_index: NotRequired[int]  # Which emitted row broke a declared output type (ADR-050)
     authorship: NotRequired[Literal["computed", "carried"]]  # Transform created the field / rewrote an input field (ADR-050)
     declared_by: NotRequired[Literal["operator", "plugin", "upstream"]]  # Who declared the violated type (ADR-050 D6)
@@ -1002,20 +997,6 @@ class AuditIntegrityError(Exception):
     ) -> None:
         super().__init__(*args)
         self.failed_turn = failed_turn
-
-
-@tier_1_error(
-    reason="ADR-008: guided reviewed-source custody cannot bind to the live sources — the audit trail's source provenance is unprovable",
-    caller_module=__name__,
-)
-class GuidedCustodyIntegrityError(AuditIntegrityError):
-    """Raised when a guided session's retained source review cannot bind.
-
-    Every guided blob custody validator and the custody projection raise this
-    subclass so a read arm can name the condition (a stable 409 on a legacy
-    tip persisted before the write gate) without catching the whole
-    ``AuditIntegrityError`` family as if it were custody.
-    """
 
 
 # TIER-2: Authoring-state lowering defect — the state is malformed, no audit mutation has begun, and the author can repair and retry.
@@ -1939,6 +1920,131 @@ class HeaderSpelledDeclarationViolation(PluginContractViolation):
             "error": scrub_text_for_audit(str(self)),
             "fields": [spelling.literal for spelling in self.spellings],
             "canonical_fields": [spelling.canonical for spelling in self.spellings],
+        }
+
+
+# TIER-2: A row lacks an input field its node derives from its own options and the build could not prove present (observed or open upstream) — a fact about that row, routed via on_error with a value-free, row-invariant reason; never audit corruption.
+class DeclaredInputFieldAbsentViolation(PluginContractViolation):
+    """A row arrives without a declared input field the build never proved present.
+
+    The routed half of a declared-input miss (ADR-013 Amendment 2026-09-27).
+    A node's option-derived input declaration (web_scrape's ``url_field``,
+    type_coerce's ``conversions[].field``, a batch plugin's ``value_field`` …)
+    names a column. Behind an ``observed`` or otherwise open upstream, or a
+    ``merge: union`` coalesce whose policy can lose the branch that creates the
+    field, the build cannot settle that the column exists, so it admits the
+    pipeline and the engine settles each row: a row that does not carry the column is a fact
+    about THAT row, like a wrong type, and is refused before the plugin runs
+    and routed through ``on_error`` (operator ruling 2026-09-23 B2; Q4
+    doctrine §4 cond. 2). The miss of a field the build PROVED present, or of
+    one the row's payload carries while its contract lost it, is not this
+    class: it stays the Tier-1 ``DeclaredRequiredInputFieldsViolation`` at a
+    transform and ``BatchDeclaredInputFieldsViolation`` at a batch seam.
+
+    Raised by the engine's preflight, never by a declaration contract: the
+    ADR-010 dispatcher catches only ``DeclarationContractViolation``, and the
+    ADR-013 contract keeps one Tier-1 ``violation_class``. This class is row
+    validation, not an ADR-010 adopter.
+
+    Value-free AND row-invariant by construction: the message and reason carry
+    the component name and the field names from the node's CONFIG only —
+    never a row value, never the row's own keys, never a row or token id — so
+    every row missing the same fields at a node records one ``error_hash`` and
+    reads as one failure category. Reason ``missing_field``, the category the
+    plugins' own absent-field guards already use.
+
+    The remedy in the message must hold for EVERY member of the routed class,
+    and the runtime cannot tell them apart: behind an observed source a column
+    the source reads and a field an undeclaring transform creates vote alike.
+    So it names each shape's own remedy instead of choosing one — "declare it
+    in the source's schema fields" alone discards every row at the source when
+    the field is created downstream (R2 review r2 F1).
+    """
+
+    def __init__(self, *, component: str, fields: tuple[str, ...]) -> None:
+        if not fields:
+            raise ValueError("DeclaredInputFieldAbsentViolation requires at least one field")
+        self.component = component
+        self.fields = fields
+        super().__init__(
+            f"{component} requires input field(s) {list(fields)} that the arriving row does not carry. "
+            "The build proves a field only when every path into this node guarantees it, and it could not prove "
+            "these, so the row is routed instead of processed. Where every row should carry them: declare a column "
+            "the source reads in the source's schema fields (a source row lacking it is then handled by the source's "
+            "on_validation_failure); a field a transform creates must be created on every row and guaranteed by that "
+            "transform's output schema; after a merge: union coalesce whose policy can lose a branch (best_effort, "
+            "first, or a quorum below the branch count), every branch must guarantee it."
+        )
+
+    def to_transform_error_reason(self) -> TransformErrorReason:
+        """The routed reason: ``missing_field`` with the config field names only."""
+        return {
+            "reason": "missing_field",
+            "error": scrub_text_for_audit(str(self)),
+            "fields": list(self.fields),
+        }
+
+
+BatchDeclaredInputMissKind = Literal["proven_field_absent", "contract_payload_divergence"]
+
+
+class BatchDeclaredInputFieldsAudit(TypedDict):
+    """Value-free audit payload of ``BatchDeclaredInputFieldsViolation``."""
+
+    exception_type: str
+    failure_kind: BatchDeclaredInputMissKind
+    plugin: str
+    node_kind: str
+    missing: list[str]
+
+
+@tier_1_error(
+    reason="ADR-013 Amendment 2026-09-27: a batch input field the build proved present, or one the row's payload carries but its contract lost, is missing — engine defect at the batch input seam",
+    caller_module=__name__,
+)
+class BatchDeclaredInputFieldsViolation(AuditEvidenceBase, OrchestrationInvariantError):
+    """A buffered row misses a required batch input field in a way only our code can cause.
+
+    The Tier-1 half of a declared-input miss at an aggregation or collector
+    input seam (ADR-013 Amendment 2026-09-27), classified by the same rule as
+    the per-row transform preflight:
+
+    - ``proven_field_absent`` — the build PROVED the field present on every
+      row arriving here (every live predecessor's presence vote lists it, each
+      backed by an upstream val), yet a row lacks it: a contract-propagation,
+      merge or restore defect;
+    - ``contract_payload_divergence`` — the row's payload carries the field but
+      its contract does not: the contract lost a field the data still has.
+
+    An unproven field absent from the row is NOT this class; it is the routed
+    ``DeclaredInputFieldAbsentViolation``. The aggregation records every
+    buffered token FAILURE / UNROUTED with ``to_audit_dict`` before raising,
+    so no token of the batch is left without a terminal outcome. Value-free:
+    config field names, the plugin and the node kind only.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_kind: BatchDeclaredInputMissKind,
+        plugin: str,
+        node_kind: str,
+        missing: frozenset[str],
+    ) -> None:
+        super().__init__(message)
+        self.failure_kind: BatchDeclaredInputMissKind = failure_kind
+        self.plugin = plugin
+        self.node_kind = node_kind
+        self.missing = missing
+
+    def to_audit_dict(self) -> BatchDeclaredInputFieldsAudit:
+        return {
+            "exception_type": type(self).__name__,
+            "failure_kind": self.failure_kind,
+            "plugin": self.plugin,
+            "node_kind": self.node_kind,
+            "missing": sorted(self.missing),
         }
 
 

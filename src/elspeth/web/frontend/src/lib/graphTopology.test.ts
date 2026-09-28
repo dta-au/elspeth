@@ -250,16 +250,6 @@ describe("buildConnectionProducers agrees with GraphView's producer registry", (
 
 describe("shared member sets and sentinels", () => {
   it("pins the frontend's single copy of the coalesce members", () => {
-    // Backend authority: CoalesceSettings.policy / .merge in core/config.py.
-    // These were declared privately a SECOND time in api/guidedDecoder.ts;
-    // this module is now the one place the frontend states them.
-    //
-    // Be honest about what this assertion is: it compares a TypeScript literal
-    // against another TypeScript literal, so it is DRIFT DETECTION within the
-    // frontend — it can only fail when someone edits the tuple. It is NOT the
-    // cross-language mirror. That is the parity assertion in
-    // tests/unit/web/composer/test_graph_topology_parity.py, which
-    // reads this file and compares against the Python Literals.
     expect([...COALESCE_POLICIES]).toEqual(["require_all", "quorum", "best_effort", "first"]);
     expect([...COALESCE_MERGES]).toEqual(["union", "nested", "select"]);
   });

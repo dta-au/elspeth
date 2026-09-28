@@ -22,7 +22,6 @@ from ._helpers import (
     _handle_convergence_error,
     _handle_plugin_crash,
     _handle_runtime_preflight_failure,
-    _initial_composition_state_with_guided_session,
     _litellm_error_detail,
     _persist_tool_invocations,
     _record_composer_authoring_validation_telemetry,
@@ -32,7 +31,6 @@ from ._helpers import (
     _state_data_from_composer_state,
     load_run_accounting_for_settings,
     slog,
-    solve_step_chat_with_auto_drop,
 )
 from .composer import register_composer_routes
 from .interpretation import register_interpretation_routes
@@ -67,7 +65,6 @@ __all__ = [
     "_handle_plugin_crash",
     "_handle_runtime_preflight_failure",
     "_helpers_module",
-    "_initial_composition_state_with_guided_session",
     "_litellm_error_detail",
     "_persist_tool_invocations",
     "_record_composer_authoring_validation_telemetry",
@@ -77,5 +74,4 @@ __all__ = [
     "create_session_router",
     "load_run_accounting_for_settings",
     "slog",
-    "solve_step_chat_with_auto_drop",
 ]

@@ -16,6 +16,22 @@ class TutorialRunRequest(BaseModel):
     session_id: UUID
 
 
+class TutorialSampleResponse(BaseModel):
+    """Public sample-page addresses for the tutorial brief."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    sample_urls: tuple[str, str, str]
+
+
+class TutorialReadinessResponse(BaseModel):
+    """Exact committed state admitted for tutorial execution."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    state_id: UUID
+
+
 class TutorialRunOutput(BaseModel):
     """Output preview returned by the tutorial run endpoint."""
 

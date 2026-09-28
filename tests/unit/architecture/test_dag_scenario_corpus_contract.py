@@ -94,7 +94,6 @@ EXPECTED_DIMENSION_VALUES = (
     "recovery",
     "concurrency",
     "freeform",
-    "guided",
     "round_trip",
     "scale",
 )
@@ -121,7 +120,7 @@ EXPECTED_SCENARIO_VALUES = (
 )
 
 EXPECTED_STATUS_MATRIX = {
-    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial", "partial"),
+    "linear": ("pass", "pass", "pass", "pass", "pass", "pass", "unknown", "pass", "partial", "partial"),
     "multiple-independent-sources": (
         "pass",
         "pass",
@@ -131,7 +130,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -144,7 +142,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -157,7 +154,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -170,7 +166,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -183,7 +178,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -196,7 +190,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -209,7 +202,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -222,7 +214,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -235,7 +226,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "partial",
         "pass",
-        "fail",
         "unknown",
         "unknown",
     ),
@@ -247,7 +237,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "pass",
         "unknown",
-        "pass",
         "pass",
         "partial",
         "unknown",
@@ -261,7 +250,6 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "unknown",
         "pass",
-        "fail",
         "partial",
         "unknown",
     ),
@@ -275,7 +263,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "pass",
         "partial",
-        "partial",
         "unknown",
     ),
     "checkpoint-deterministic-resume": (
@@ -288,7 +275,6 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
         "not_applicable",
         "not_applicable",
-        "not_applicable",
         "unknown",
     ),
     "multi-worker-lease-reclaim-late-completion": (
@@ -299,7 +285,6 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "partial",
-        "not_applicable",
         "not_applicable",
         "not_applicable",
         "unknown",
@@ -431,7 +416,7 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics",
     ),
     "composer-row-union-authoring-parity": (
-        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph",
+        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_freeform_derives_isomorphic_committed_graph",
     ),
 }
 
@@ -472,7 +457,9 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # collision (every consumed token failed union_field_collision, collision
 # record on each FAILED hold, FAILED run, export unavailable by policy)
 # instead of pinning the abort-at-row-1 CoalesceCollisionError.
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48fbc55f6810c9554198fbc4"
+# Merged 2026-09-28 with release e1a2ef001 (its own evidence-registry move);
+# digest re-captured from the merged tree.
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd4e54681f780013ef34354"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -886,7 +873,67 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ee7e5228c4e2a2cc97e97d6f0d56b7dd39d5e0cd48f
 # observed_error), whose only user pinned the abort, is deleted, so its nine
 # `"expected_error": null` manifest literals dropped. Exactly one oracle_freeze
 # snapshot moved (this case's), sanctioned by the same ruling.
-EXPECTED_CASE_REGISTRY_SHA256 = "7c11c485d085d128914319b804a8e1121f191d9e254aa0812b176ac534acd620"
+# Rotated 2026-09-28 (elspeth-5887fb7928 B1, field_mapper `strict` retired): a
+# PLUGIN PROVENANCE rotation with no manifest pin. field_mapper refuses the
+# retired `strict` option and routes every missing mapping source, so its
+# source_file_hash moved b96c5b5e88bcd1eb -> 4fed05d6f8252950
+# (scripts/cicd/plugin_hash); no corpus case uses field_mapper, so no manifest
+# literal, resume digest, registry digest or oracle_freeze snapshot moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928, field-name spelling rule, C1 fix
+# round 1): a PLUGIN PROVENANCE rotation. csv_source publishes what it matches
+# field_mapping keys against (headerless columns as written) on
+# SourceProtocol.field_renames, so its source_file_hash moved
+# 081b2eaaf545bb99 -> 040ed5b1c21f4dae (scripts/cicd/plugin_hash). Order: (1)
+# the manifest's 15 csv literals; (2) reopen-resume's
+# resumed_full_projection_sha256 0488ea94... -> 3c03ee77..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — setting only the csv pin (code and manifest) back to
+# 081b2eaaf545bb99 reproduces 0488ea94... exactly, so the move is plugin
+# provenance, not runtime semantics; (3) this digest. aws_s3
+# (aaaf6619345f0665 -> b491b922f1b34cb4) and azure_blob (6bf3a35d44316f7b ->
+# 719563e76907222d) moved too with no manifest pin. No oracle_freeze snapshot
+# moved.
+# Rotated 2026-09-27 (elspeth-5887fb7928, C3 value-free reasons, review r1 F1):
+# a PLUGIN PROVENANCE rotation. value_transform records the evaluator's
+# value-free ``kind`` as ``error_type`` in its failure reason, so its
+# source_file_hash moved f645e8e83a012f3f -> de648209de2ccdd6
+# (scripts/cicd/plugin_hash). Order: (1) the 3 manifest pins, plain and
+# JSON-escaped, in fork-coalesce-policies/union-collision-fail; (2) this
+# digest 5134cb96... -> 1908eb05... — with the new code and the OLD manifest
+# pins this parity test passed and only the provenance-pin test failed, so the
+# move is the pin literal alone. No union-collision-fail row hits an
+# evaluation error; no resume digest and no oracle_freeze snapshot moved.
+# The same round moved reference_join 46245d6f287224d6 -> 6aa4025393448c89 (it
+# tells a sparse miss from a broken expression by the evaluator's ``kind``, the
+# chained cause being gone) with no manifest pin; no digest moved.
+# Rotated 2026-09-28 (elspeth-5887fb7928, C3 value-free reasons, review r3 +
+# sink census): a PLUGIN PROVENANCE rotation. json_sink's encode/serialize
+# diversion reasons carry the exception class, never the codec's text (which
+# quotes the row's character), so its source_file_hash moved
+# 2629742182442969 -> 9ef547005076060e (scripts/cicd/plugin_hash). Order:
+# (1) the manifest's 15 literal pins; (2) reopen-resume's
+# resumed_full_projection_sha256 3c03ee77... -> cab4aab8..., captured from
+# test_checkpoint_reopen_resume_has_exact_restart_evidence's own failure
+# output — with ONLY the json_sink pin (code and manifest) set back to
+# 2629742182442969 the reopen/checkpoint production-path and oracle-freeze
+# cases pass 23/23, so the move is the pin literal alone; (3) this digest
+# 1908eb05... -> a3b8a299.... csv_sink cb4119567e0d1b1c, dataverse
+# 934b0bdb38c02efa and azure_blob 0719093e3ea19a79 moved in the same round
+# with no manifest pin. No oracle_freeze snapshot moved.
+# Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the codex
+# branch onto the lane): the two rotation chains above ran on sibling branches;
+# the manifest carries both sides' literals and this digest is re-captured from
+# the merged tree (never hand-computed).
+# Rotated 2026-09-27 (elspeth-5887fb7928, R2 declared-input miss): a PLUGIN
+# PROVENANCE rotation. json_explode now declares array_field as an input
+# (declared_input_fields), so its source_file_hash moved 26471026c209f7ef ->
+# 1919e96964500441 (the 1 manifest pin in json-explode-parent-child;
+# scripts/cicd/plugin_hash). No count, terminal, projection, resume digest or
+# oracle_freeze snapshot moved (test_oracle_freeze + production-path files green).
+# Rotated 2026-09-28 (elspeth-5887fb7928 merge-1 integration of the R2 branch):
+# the R2 json_explode pin above joins the lane's chain; digest re-captured from
+# the merged tree.
+EXPECTED_CASE_REGISTRY_SHA256 = "104886128377b61f4611a95b993b1cb1dcef2a65e795521b415ae7450ac3895a"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -6100,8 +6147,6 @@ def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_r
                 expected_owner = "elspeth-f321e3ff21"
             elif scenario.id == "checkpoint-deterministic-resume" and dimension == "recovery":
                 expected_owner = "elspeth-245b21351b"
-            elif dimension == "guided":
-                expected_owner = "elspeth-7e2dd67275"
             elif dimension == "round_trip":
                 expected_owner = "elspeth-7cf763da7c"
             elif dimension == "scale":
@@ -6420,7 +6465,7 @@ def test_manifest_rejects_harness_attached_beyond_its_workflow_even_with_other_e
         load_manifest(write_manifest(tmp_path, raw))
 
 
-@pytest.mark.parametrize("dimension", ["concurrency", "guided", "scale"])
+@pytest.mark.parametrize("dimension", ["concurrency", "freeform", "scale"])
 def test_manifest_rejects_run_harness_attached_to_non_lifecycle_dimension(tmp_path: Path, dimension: str) -> None:
     raw = valid_manifest_dict()
     independent_sources = next(scenario for scenario in _raw_scenarios(raw) if scenario["id"] == "multiple-independent-sources")

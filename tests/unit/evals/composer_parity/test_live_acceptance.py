@@ -43,13 +43,18 @@ def _verify(tmp_path: Path, document: dict[str, Any], *, revision: str = REVISIO
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("surface", ["freeform", "guided_full", "guided_staged"])
-def test_valid_evidence_accepted(tmp_path: Path, surface: str) -> None:
-    report = _verify(tmp_path, build_valid_evidence(surface=surface))
-    assert report.surface == surface
+def test_valid_evidence_accepted(tmp_path: Path) -> None:
+    report = _verify(tmp_path, build_valid_evidence(surface="freeform"))
+    assert report.surface == "freeform"
     assert report.revision == REVISION
     assert "live_provider" in report.checks
     assert len(report.checks) == 9
+
+
+@pytest.mark.parametrize("retired_surface", ["guided_full", "guided_staged"])
+def test_retired_authoring_surface_is_rejected(tmp_path: Path, retired_surface: str) -> None:
+    with pytest.raises(la.AcceptanceError, match="unknown_surface"):
+        _verify(tmp_path, build_valid_evidence(surface=retired_surface))
 
 
 def test_accept_single_repair(tmp_path: Path) -> None:

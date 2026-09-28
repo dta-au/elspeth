@@ -155,8 +155,8 @@ class NodeSpecResponse(_StrictResponse):
     # in ``nodes[].id`` and the edge list) and the public YAML consumer
     # ``generate_public_pipeline_dict`` requires it to lower the ``scopes:``
     # block (yaml_generator.py ``_require_node_key(c, "scope_name", ...)``).
-    # The guided ``_CollectorBehavior`` privacy ruling governs the stable-id'd
-    # proposal projection, which this mirror is not.
+    # Proposal projections have their own privacy boundary; this strict
+    # mirror is not a proposal projection.
     scope_name: str | None = None
     scope_opener: str | None = None
     scope_policy: str | None = None
@@ -185,9 +185,7 @@ class OutputSpecResponse(_StrictResponse):
 class CompositionStateResponse(_StrictResponse):
     """Strict wire mirror of ``CompositionState`` (web/composer/state.py).
 
-    Shape tracks ``CompositionState.to_dict()`` exactly. ``guided_session``
-    is intentionally absent — the producer (``to_dict``) does not emit it,
-    and the shared-inspect view has no read on guided-session state.
+    Shape tracks ``CompositionState.to_dict()`` exactly.
 
     JsonValue is acceptable as the type of free-form plugin options but
     the structural top-level keys are closed.

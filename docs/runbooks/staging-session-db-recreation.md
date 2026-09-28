@@ -2,9 +2,9 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and legacy issue tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 68 and Landscape epoch 48)
+## Current Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 71 and Landscape epoch 48)
 
-0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 68 and Landscape
+0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 71 and Landscape
 `SQLITE_SCHEMA_EPOCH` from 38 to 48. Session epoch 54 adds durable Composer
 progress snapshots and exact request lifecycle leases. Landscape epoch 39
 adds immutable web run-start permit binding and recoverable pre-effect
@@ -26,7 +26,7 @@ never zero). Landscape epoch 42 requires admission evidence v2 with per-principa
 token quota usage and limits; the decoder rejects stored v1 evidence even though
 the table layout is unchanged. Do not relabel old evidence as v2.
 Session epoch 59 adds timestamp-leading indexes for container-wide quota scans.
-Session epoch 60 persists guided fork failure diagnostics on terminal operations.
+Session epoch 60 adds durable fork failure diagnostics.
 Session epoch 61 defaults new Composer preferences to freeform and removes the
 retired default-change banner field. Recreate predecessor session databases;
 do not migrate stored preferences.
@@ -51,6 +51,10 @@ with no arrived members. Populated epoch-44 stores also require recreation.
 Landscape epoch 46 records the exact contract for each valid source row so
 replay and verify can reconstruct sparse source streams. Populated epoch-45
 stores require recreation.
+Landscape epoch 47 indexes verification decisions in run, time, and call order
+and indexes node states by run so corrupted verdict ownership can be checked
+without scanning the verification table. Populated epoch-46 stores require
+recreation.
 Landscape epoch 48 hands each source-quarantined row to its sink through a
 durable PENDING_SINK work item written with the row, and resume re-drives only
 scheduler work (it never re-derives a source row). Populated epoch-47 stores
@@ -59,7 +63,7 @@ Session epoch 63 also adds `interpretation_events.surface_origin`: review cards 
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
-Session epoch 64 adds the distinct `cost_unavailable` guided-operation failure
+Session epoch 64 adds the distinct `cost_unavailable` failure
 classification so missing model pricing directs administrators to repair pricing
 instead of asking users to retry an invalid provider response.
 Session epoch 65 makes `completion_gates.advisor_signoff.note` a required key
@@ -80,7 +84,17 @@ Session epoch 68 adds `compose_checkpoint` and `ordinary_proposal_checkpoint`
 to the closed reason vocabulary of persisted `proposal.rebased` events. They
 keep pending proposals bound to the composition head across checkpoints.
 Earlier readers reject these reasons, so recreate epoch-67 session stores too;
-the nested guided schema remains 11 and the Landscape epoch remains 46.
+session epoch 68 does not change the Landscape schema.
+Session epoch 69 adds immutable `message_ingress_receipts`: each accepted
+freeform client request UUID binds to one user message and the original nullable
+requested state. Recreate epoch-68 session stores before starting this schema;
+do not relabel them as epoch 69.
+Session epoch 70 updates the persisted tutorial Build stage and its closed
+CHECK. Session epoch 71 removes the retired Composer mode selector and mode-specific
+storage, and adds mode-neutral fork/revert receipts with append-only attempt
+and settlement evidence. Recreate predecessor session stores before starting
+this version; these session epochs do not change the Landscape schema.
+
 These intermediate definitions
 share one prepared 0.8.1 cutover; installing the intermediate ACA pair is not
 required. This procedure describes an operator action, not an already
@@ -88,37 +102,15 @@ performed reset. Stop the service, archive/export required evidence, recreate
 both stale stores, and install 0.8.1 using the procedure below.
 
 The preceding 0.8.0 release advanced `SESSION_SCHEMA_EPOCH` from 35 to 53
-and Landscape `SQLITE_SCHEMA_EPOCH` from 29 to 38. Its historical changes
-and credential re-admission guidance remain relevant when recreating these
-stores. Epoch 36 ensures a committed
-blob deletion whose tombstone unlink or directory fsync fails remains retryable
-after restart. Epoch 37 adds the completed `guided_plan` `declined`
-result kind and its state-only result locator. Epoch 38 additionally retains the
-exact assistant message ID a completed decline replays; epoch 37 cannot
-distinguish the original decline from later assistant messages sharing an
-unchanged state. Epoch 39 adds `policy_blocked` to the closed
-`guided_operations.failure_code` CHECK so a deployment-policy refusal settles as
-a permanent failure with its own HTTP 422 envelope instead of replaying as a
-retryable provider fault; epoch 38 rejects that row outright. Epoch 40 requires
-the explicit coalesce `timeout_seconds` key, including `null`, in persisted
-guided proposal payloads. Epoch 39 sessions may still reference older payloads
-without that key and are rejected at startup instead of failing during replay.
-Epoch 41 requires the `node_options_summary` key the review cards render, on
-both the proposal and wiring node projections, for the same reason. Epoch 42
-adds the reviewed output-field gap to failed guided operations so the initial
-and replayed HTTP failures remain equivalent. Epoch 43 adds the
-`run_diagnostics` chat writer principal so run-diagnostics LLM audit rows are
-attributed to their real writer instead of the compose loop. Epoch 44 adds
-`planner_repair_exhausted` to the closed `guided_operations.failure_code`
-CHECK so planner repair exhaustion settles under its own honest coded failure
-(HTTP 500 with a retry offer) instead of the provider-blaming
-`invalid_provider_response` 502 (elspeth-5904b1683a). Epoch 45 moves web
-Textract authoring to operator document profiles (ADR-036): sessions authored
-against the old public schema (`bucket_field` / the `deployment` alias) can no
-longer validate or replay. Epoch 46 is the lockstep cut for guided schema 11:
-persisted chat-history turns gain the occurrence-binding `turn_token` key so
-guided Retry is occurrence-bound instead of content-based
-(elspeth-ea80e34fdc). Epoch 47 adds `auto_commit.revoked` to the closed
+and Landscape `SQLITE_SCHEMA_EPOCH` from 29 to 38. Its credential re-admission
+guidance remains relevant when recreating these stores. Epoch 36 ensures a
+committed blob deletion whose tombstone unlink or directory fsync fails remains
+retryable after restart. Epoch 43 adds the `run_diagnostics` chat writer
+principal so run-diagnostics LLM audit rows are attributed to their real
+writer instead of the compose loop. Epoch 45 moves web Textract authoring to
+operator document profiles (ADR-036): sessions authored against the old public
+schema (`bucket_field` / the `deployment` alias) can no longer validate or
+replay. Epoch 47 adds `auto_commit.revoked` to the closed
 `proposal_events.event_type` CHECK so an auto-commit blocked by the
 settlement-boundary trust-mode recheck (elspeth-01d4c6e683) leaves a durable
 proposal event instead of silently falling back to the review path.
@@ -149,26 +141,14 @@ An epoch-35 through epoch-53 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never
 deleted by this procedure; recreating the session DB severs stale payload
-references. Guided checkpoint schema advances to 11.
+references.
 
 0.7.1 advances the session store from epoch 26 through epoch 35. Epoch 27 lets
 `user_preferences.freeform_intro_dismissed_at` persist the account-wide
 freeform-primer preference, then to 28 so SQLite and PostgreSQL session stores
-carry the same application/store/epoch identity proof. Composer parity then
-advances the session store to epoch 29 for guided schema 8 and durable fenced
-guided operations, and to epoch 30 because the closed
-`guided_operations.failure_code` CHECK gains `quota_exceeded`. That final
-boundary makes a fork quota failure settle and replay as a stable HTTP 413.
-Later hard cuts add guided pipeline-proposal replay (31), exact failed-operation
-audit cohorts (32), guided-start negative admission (33), guided schema 10 (34),
-exclusive guided-confirmation proposal admission (35), retryable blob-deletion
-cleanup (36), ordinary guided-plan decline settlement (37), exact decline
-replay message identity (38), the permanent `policy_blocked` guided-operation
-failure code (39), explicit persisted coalesce timeout metadata (40), the
-guided `node_options_summary` projection the review cards render (41),
-operation failure output-field replay enrichment (42), and the
-`run_diagnostics` chat writer principal (43). The
-universal web plugin-policy work in 0.7.1 also advances
+carry the same application/store/epoch identity proof. Later hard cuts add
+retryable blob-deletion cleanup (36) and the `run_diagnostics` chat writer
+principal (43). The universal web plugin-policy work in 0.7.1 also advances
 `SQLITE_SCHEMA_EPOCH` from 22 to 23 and adds `run_web_plugin_policy`. This
 table is optional per run but required in the schema: web runs receive one
 policy-evidence row atomically with the run, attribution, and leader records;
@@ -223,9 +203,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-68 release forward,
+unsupported: keep the service drained, repair the epoch-71 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-68/Landscape-epoch-48 record when binding candidate and rollback
+session-epoch-71/Landscape-epoch-48 record when binding candidate and rollback
 decisions.
 
 For a later candidate that has used identity administration, the window also
@@ -360,17 +340,7 @@ procedure and the [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) procedure
 inside the same service-stop window. Do not run 0.7.0 against a stale
 Landscape audit DB from epoch 21.
 
-The session epoch changes in this release are:
-
-- **23→24 / `GUIDED_SESSION_SCHEMA_VERSION` 5→6** added guided metadata
-  (`profile`, `advisor_checkpoint_passes_used`,
-  `advisor_signoff_escape_offered`) inside the
-  `composition_states.composer_meta` JSON blob.
-- **24→25 / `GUIDED_SESSION_SCHEMA_VERSION` 6→7** dropped the vestigial
-  `profile.entry_seed` key. Without the lockstep epoch bump, a stale
-  `entry_seed`-bearing blob would slip past both version gates and lazy-500
-  inside `WorkflowProfile.from_dict`'s closed-key-set check.
-- **25→26** adds first-run tutorial resume columns to `user_preferences`
+The session epoch 25→26 adds first-run tutorial resume columns to `user_preferences`
   (`tutorial_stage`, `tutorial_session_id`, `tutorial_run_id`,
   `tutorial_source_data_hash`).
 
@@ -645,9 +615,9 @@ If the invariant fires, do not retry. Stop the service, preserve both DB snapsho
 
 ## Skill Changes Require Service Restart, Not Reload
 
-The composer LLM system prompt is loaded from `src/elspeth/web/composer/skills/pipeline_composer.md` (and the guided variants under `src/elspeth/web/composer/guided/prompts.py`) through module-level `@lru_cache` decorators (`functools.lru_cache` on `build_system_prompt` and the guided prompt loaders). Cache entries live for the process lifetime and are not invalidated by file mtime, `SIGHUP`, or `systemctl reload`.
+The Composer LLM system prompt is loaded from `src/elspeth/web/composer/skills/pipeline_composer.md` through the module-level `@lru_cache` on `build_system_prompt`. Cache entries live for the process lifetime and are not invalidated by file mtime, `SIGHUP`, or `systemctl reload`.
 
-When deploying skill-content changes such as Phase 5a.8 (`34d272360` — inline_blob preference for chat-typed source data) and Phase 5b.8 (`d6219faa2` — teaching the LLM when to call `request_interpretation_review`), or any future edit to `pipeline_composer.md` / guided prompt fragments:
+When deploying skill-content changes such as Phase 5a.8 (`34d272360` — inline_blob preference for chat-typed source data) and Phase 5b.8 (`d6219faa2` — teaching the LLM when to call `request_interpretation_review`), or any future edit to `pipeline_composer.md`:
 
 ```bash
 sudo systemctl restart elspeth-web.service
@@ -843,7 +813,7 @@ sentinels before creating any session. If `LANDSCAPE_PATH` is not already set,
 resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 68 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 71 (== SESSION_SCHEMA_EPOCH)
 sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 48 (== SQLITE_SCHEMA_EPOCH)
 ```
 
@@ -852,19 +822,19 @@ service drained, recreate both stores with the current release, and rerun the
 probes. Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.
 
-#### 0.7.0 epoch + smoke verification
+#### Current epoch + Composer smoke verification
 
 Confirm the recreated session DB and Landscape audit DB carry the new epoch
-sentinels, then drive a fresh guided session to completion to prove the 0.7.0
-build is serving the recreated schemas cleanly:
+sentinels, then drive a fresh freeform tutorial through its Run, Audit, and
+Graduation capstone to prove the candidate serves the recreated schemas cleanly:
 
 ```bash
 # Confirm the recreated session DB carries the new epoch sentinel.
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 26 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # compare with deployed SESSION_SCHEMA_EPOCH
 
 # If LANDSCAPE_PATH is not already set from the two-DB reset procedure, resolve
 # it with that procedure's Landscape path block before running this check.
-sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 22 (== SQLITE_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # compare with deployed SQLITE_SCHEMA_EPOCH
 ```
 
 If either `PRAGMA user_version` is not the expected value, the running process
@@ -873,18 +843,16 @@ is serving a stale or non-recreated DB; stop and re-resolve the paths per
 
 Then run a fresh-session smoke through the UI:
 
-1. Create a new session.
-2. Start the tutorial on the `TUTORIAL` profile.
-3. Drive the staged guided walk through to a `terminal=completed` state.
-4. Run the resulting pipeline.
+1. Use a new account, or reset the tutorial from Composer preferences on a
+   test account.
+2. Start the first-run tutorial and complete its freeform Build step.
+3. Run the resulting pipeline and inspect its recorded audit story.
+4. Graduate into an ordinary Composer session.
 
-Confirm the service journal shows **no** `SessionSchemaError` (the boot
-guard passed), **no** per-row HTTP 500 from `GuidedSession.from_dict`
-(the guided-schema bump landed in the recreated DB, not lazily on a stale
-row), and **no** `UnresolvedInterpretationPlaceholderError` (proving the
-B1 interpretation-surfacing fix is in the deployed build). Any of these in
-the journal means the deploy is not clean — stop and inspect before
-handing staging back to users.
+Confirm the service journal shows **no** `SessionSchemaError`, no Composer
+HTTP 500, and no `UnresolvedInterpretationPlaceholderError`. Any of these in
+the journal means the deploy is not clean — stop and inspect before handing
+staging back to users.
 
 Before handing staging back to users, verify the `user_secrets` outcome the operator chose in the preconditions. Confirm the affected composer/provider flow reports the expected missing-secret state and that the operator has re-entered or reseeded any required staging secrets. Never reopen the predecessor archive in the current release. On the 0.8.0 cutover, every local account is `pending` until an operator activates it, per [Every local account lands `pending` after this reset](#every-local-account-lands-pending-after-this-reset). On a later identity-workflow cutover, finish the [cohort re-admission and notice](identity-workflow-cutover.md#recreate-and-re-admit-within-the-window) before handing the service back.
 

@@ -3,12 +3,14 @@ from __future__ import annotations
 import sys
 from dataclasses import replace as _replace_dataclass
 
+from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.compartments import compartment_ingress_record
-from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
-from elspeth.web.composer.service import ComposerAdmissionRefused
+from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerAdmissionRefused, ComposerResult
+from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
+from elspeth.web.sessions.schemas import RecomposeRequest
 
 from .._helpers import (
     _COMPOSER_REQUESTS_INFLIGHT,
@@ -22,10 +24,8 @@ from .._helpers import (
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
-    CompositionStateData,
     CompositionStateResponse,
     Depends,
-    GuidedSession,
     HTTPException,
     InvariantError,
     MessageWithStateResponse,
@@ -34,8 +34,8 @@ from .._helpers import (
     SessionServiceProtocol,
     UserIdentity,
     WebRateLimiter,
-    _BadRequestLLMError,
     _cancel_on_client_disconnect,
+    _capture_freeform_child,
     _chat_ingress_inputs,
     _composer_chat_history,
     _composer_conversation_messages,
@@ -43,14 +43,20 @@ from .._helpers import (
     _composer_heartbeat_failed_progress_event,
     _composer_progress_sink,
     _ComposerRequestTerminalStatus,
+    _freeform_child_result,
+    _FreeformContinuationReceipt,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
+    _handle_composer_chargeable_refusal,
+    _handle_composer_provider_failure,
     _handle_convergence_error,
     _handle_planner_failure,
     _handle_plugin_crash,
     _handle_runtime_preflight_failure,
     _initial_composition_state,
     _is_client_disconnect_cancel,
+    _join_freeform_owned_task,
+    _join_shielded_task_after_cancellation,
     _litellm_error_detail,
     _llm_calls_from_exception,
     _message_response,
@@ -70,13 +76,11 @@ from .._helpers import (
     asyncio,
     client_cancelled_progress_event,
     composer_turn_end_assistant_row,
-    contextlib,
     convergence_progress_event,
     get_current_user,
     get_rate_limiter,
     merge_composer_meta_updates,
     slog,
-    validation_errors_for_composer_surface,
 )
 from .pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
 
@@ -89,6 +93,7 @@ router = APIRouter()
 )
 async def recompose(
     session_id: UUID,
+    body: RecomposeRequest,
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
     rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
@@ -150,6 +155,14 @@ async def recompose(
                 "Recompose is only valid when the most recent message is the "
                 "user turn whose composition failed.",
             )
+        if conversation_records[-1].id != body.expected_user_message_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error_type": "recompose_user_message_mismatch",
+                    "detail": "The latest user message changed. Refresh the session before retrying composition.",
+                },
+            )
 
         last_user_content = conversation_records[-1].content
         chat_ingress = compartment_ingress_record(last_user_content, own_compartment_id=settings.compartment_id)
@@ -172,15 +185,6 @@ async def recompose(
                 likely_next="ELSPETH will prepare the composer prompt with the current pipeline.",
             ),
         )
-        # Detect guided→freeform mode transition (spec §8.2).
-        # Recompose is a retried freeform chat call — progressive disclosure
-        # fires here on the same semantics as send_message (first freeform
-        # turn after guided_session.terminal is set uses the layered prompt).
-        _guided = state.guided_session
-        _guided_terminal_for_compose = (
-            _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
-        )
-
         _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "recompose"})
         terminal_status: _ComposerRequestTerminalStatus = "failed"
         try:
@@ -191,9 +195,198 @@ async def recompose(
 
             # Run the LLM composition loop
             composer: ComposerService = request.app.state.composer_service
-            from litellm.exceptions import APIError as LiteLLMAPIError
-            from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+            from openai import OpenAIError
 
+            async def settle_post_provider(result: ComposerResult) -> _FreeformContinuationReceipt:
+                _post_compose_updates: dict[str, Any] = {
+                    "repair_turns_used": result.repair_turns_used,
+                    "ingress": chat_ingress,
+                    "chat_ingress_inputs": chat_ingress_inputs,
+                }
+                _post_compose_meta = merge_composer_meta_updates(
+                    state_record.composer_meta if state_record is not None else None,
+                    _post_compose_updates,
+                )
+
+                # Save state if version changed.
+                # Path 2 (post-compose runtime preflight): mirror of the
+                # send_message post-compose try/except — see the send_message
+                # block for the full rationale on the structural fix.
+                state_response: CompositionStateResponse | None = None
+                post_compose_state_id: UUID | None = pre_send_state_id
+                assistant_msg: ChatMessageRecord | None = None
+                route_settlement: PipelineRouteSettlement | None = None
+                if result.pipeline_commit_intent is not None:
+                    settlement_outcome = await settle_auto_commit_intent(
+                        request=request,
+                        session_operation_context=compose_operation_lease.context,
+                        user=user,
+                        service=service,
+                        session_id=session.id,
+                        intent=result.pipeline_commit_intent,
+                        composer_meta=_post_compose_meta,
+                        telemetry_source="recompose",
+                    )
+                    if type(settlement_outcome) is PipelineRouteSettlement:
+                        route_settlement = settlement_outcome
+                    else:
+                        # Auto-commit authority was durably revoked before the
+                        # settlement transaction (elspeth-01d4c6e683): the
+                        # proposal stays pending, so this turn becomes an
+                        # ordinary review-path response.
+                        result = _replace_dataclass(
+                            result,
+                            message=PIPELINE_STAGED_REVIEW_MESSAGE,
+                            pipeline_commit_intent=None,
+                        )
+                # Computed HERE, below the auto-commit-revoked branch above: that
+                # branch rebinds ``result`` with the staged-review message, so a
+                # pair hoisted to the top of the handler would be stale. Every
+                # writer below shares this one — the turn-end row must not re-carry
+                # prose the compose loop already committed mid-turn
+                # (elspeth-d581b3da7f).
+                _turn_end = composer_turn_end_assistant_row(result)
+                if route_settlement is not None:
+                    state_response = _state_response(
+                        route_settlement.settlement.state,
+                        live_validation=route_settlement.validation,
+                    )
+                    post_compose_state_id = route_settlement.settlement.state.id
+                    assistant_msg = route_settlement.settlement.transition_message
+                elif result.state.version != state.version or completion_gate_decision_changes(
+                    prior_completion_gates_facts, result.advisor_gate_decision, result.state
+                ):
+                    await _publish_progress(
+                        progress_sink,
+                        event=ComposerProgressEvent(
+                            phase="validating",
+                            headline="The composer is validating the pipeline and its review status.",
+                            evidence=("The pipeline state and review outcome are being checked before persistence.",),
+                            likely_next="ELSPETH will save the validated pipeline snapshot.",
+                        ),
+                    )
+                    try:
+                        state_data, validation = await _state_data_from_composer_state(
+                            result.state,
+                            settings=settings,
+                            secret_service=request.app.state.scoped_secret_resolver,
+                            user_id=str(user.user_id),
+                            session_id=session.id,
+                            plugin_snapshot=plugin_snapshot,
+                            profile_registry=profile_registry,
+                            catalog=request.app.state.catalog_service,
+                            runtime_preflight=result.runtime_preflight,
+                            preflight_exception_policy="raise",
+                            initial_version=state.version,
+                            telemetry_source="recompose",
+                            composer_meta=_post_compose_meta,
+                            advisor_gate_decision=result.advisor_gate_decision,
+                        )
+                    except ComposerRuntimePreflightError as rpf_exc:
+                        rpf_exc = ComposerRuntimePreflightError(
+                            original_exc=rpf_exc.original_exc,
+                            partial_state=rpf_exc.partial_state,
+                            tool_invocations=result.tool_invocations,
+                            llm_calls=result.llm_calls,
+                        )
+                        await _publish_progress(
+                            progress_sink,
+                            event=ComposerProgressEvent(
+                                phase="failed",
+                                headline="The composer could not safely validate the pipeline update.",
+                                evidence=("Runtime preflight failed during state persistence.",),
+                                likely_next="Review the visible error message, then retry after the issue is resolved.",
+                                reason="runtime_preflight_failed",
+                            ),
+                        )
+                        response_body = await _handle_runtime_preflight_failure(
+                            rpf_exc,
+                            service,
+                            session.id,
+                            str(user.user_id),
+                            "recompose",
+                            pre_send_state_id,
+                            settings=settings,
+                            secret_service=request.app.state.scoped_secret_resolver,
+                            plugin_snapshot=plugin_snapshot,
+                            profile_registry=profile_registry,
+                            catalog=request.app.state.catalog_service,
+                            session_operation_context=compose_operation_lease.context,
+                            ingress=chat_ingress,
+                            chat_ingress_inputs=chat_ingress_inputs,
+                        )
+                        raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
+                    await _publish_progress(
+                        progress_sink,
+                        event=ComposerProgressEvent(
+                            phase="saving",
+                            headline="ELSPETH is saving the pipeline and review status.",
+                            evidence=("A new composition state version is being stored for this session.",),
+                            likely_next="The assistant response will appear after the save completes.",
+                        ),
+                    )
+                    new_state_record = await service.save_composition_state(
+                        session.id,
+                        state_data,
+                        # Successful recompose state advance after the LLM
+                        # composer returns a newer state version.
+                        provenance="post_compose",
+                        session_operation_context=compose_operation_lease.context,
+                    )
+                    state_response = _state_response(new_state_record, live_validation=validation)
+                    post_compose_state_id = new_state_record.id
+                # Persist assistant message
+                if assistant_msg is None:
+                    assistant_msg = await service.add_message(
+                        session.id,
+                        "assistant",
+                        _turn_end.content,
+                        composition_state_id=post_compose_state_id,
+                        raw_content=_turn_end.raw_content,
+                        writer_principal="compose_loop",
+                        session_operation_context=compose_operation_lease.context,
+                    )
+                # Per-tool-call audit trail (recompose path; symmetric with
+                # send_message). Tool rows and LLM sidecars are ONE turn cohort
+                # and settle in a single transaction (elspeth-90231248dc) even
+                # though they bind to different state ids.
+                await _persist_turn_audit_cohort(
+                    service,
+                    session.id,
+                    result.tool_invocations if not result.persisted_tool_call_turn else (),
+                    result.llm_calls,
+                    tool_composition_state_id=post_compose_state_id,
+                    llm_composition_state_id=pre_send_state_id,
+                    parent_assistant_id=assistant_msg.id,
+                    plugin_crash_pending=False,
+                    session_operation_context=compose_operation_lease.context,
+                )
+                # See send_message return-flow comment for why response
+                # construction precedes the terminal_status flip.
+                proposals = await _pending_proposal_responses(service, session.id)
+                response = MessageWithStateResponse(
+                    message=_message_response(assistant_msg),
+                    state=state_response,
+                    proposals=proposals,
+                )
+                await _publish_progress(
+                    progress_sink,
+                    event=ComposerProgressEvent(
+                        phase="complete",
+                        headline="The composer has updated the pipeline."
+                        if result.state.version != state.version
+                        else "The composer response is ready.",
+                        evidence=("The assistant response has been saved for this session.",),
+                        likely_next="Review the response and current pipeline.",
+                        reason="composer_complete",
+                    ),
+                )
+
+                return _FreeformContinuationReceipt(response=response)
+
+            post_provider_error: BaseException | None = None
+            continuation_receipt: _FreeformContinuationReceipt | None = None
+            deferred_cancellation: asyncio.CancelledError | None = None
             try:
                 # Same disconnect watcher as send_message: cancel the
                 # zombie turn when the client aborts the retry
@@ -208,11 +401,27 @@ async def recompose(
                         current_state_id=str(pre_send_state_id) if pre_send_state_id is not None else None,
                         user_id=str(user.user_id),
                         progress=progress_sink,
-                        guided_terminal=_guided_terminal_for_compose,
                         user_message_id=request_id,
                         session_operation_context=compose_operation_lease.context,
                         completion_gates=prior_completion_gates_facts,
                     )
+                    continuation = compose_operation_lease.create_task(
+                        _capture_freeform_child(settle_post_provider(result)),
+                        name="recompose-post-provider-settlement",
+                    )
+                    try:
+                        outcome, deferred_cancellation = await _join_freeform_owned_task(continuation)
+                        receipt = _freeform_child_result(outcome)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        post_provider_error = exc
+                    else:
+                        continuation_receipt = receipt
+                        request.state.composer_durable_completed = True
+                        terminal_status = receipt.terminal_status
+            except asyncio.CancelledError as watcher_cancel:
+                if post_provider_error is not None:
+                    raise post_provider_error from watcher_cancel
+                raise
             except ComposerConvergenceError as exc:
                 terminal_status = "timed_out" if exc.budget_exhausted == "timeout" else "failed"
                 # Same three-sub-cause discriminator as the /messages catch
@@ -239,79 +448,16 @@ async def recompose(
                     chat_ingress_inputs=chat_ingress_inputs,
                 )
                 raise HTTPException(status_code=422, detail=response_body) from exc
-            except LiteLLMAuthError as exc:
-                # Recompose mirror of the redaction contract in send_message
-                # (see block comment there for full rationale).  The two
-                # paths MUST carry byte-identical response shapes and
-                # redaction granularity — any future divergence becomes a
-                # selective leak surface (attacker picks whichever endpoint
-                # still echoes str(exc)).
-                slog.error(
-                    "recompose_llm_auth_error",
-                    session_id=str(session_id),
-                    exc_class=type(exc).__name__,
-                )
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="failed",
-                        headline="The composer model is not available.",
-                        evidence=("The model provider rejected the composer request.",),
-                        likely_next="Check the composer provider configuration before retrying.",
-                        reason="provider_auth_failed",
-                    ),
-                )
-                llm_calls = _llm_calls_from_exception(exc)
-                if llm_calls:
-                    await _persist_llm_calls(
-                        service,
-                        session.id,
-                        llm_calls,
-                        pre_send_state_id,
-                        plugin_crash_pending=True,
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                raise HTTPException(
-                    status_code=502,
-                    detail=_litellm_error_detail(
-                        "llm_auth_error",
-                        exc,
-                        expose_provider_error=settings.composer_expose_provider_errors,
-                    ),
-                ) from exc
-            except LiteLLMAPIError as exc:
-                slog.error(
-                    "recompose_llm_unavailable",
-                    session_id=str(session_id),
-                    exc_class=type(exc).__name__,
-                )
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="failed",
-                        headline="The composer model is temporarily unavailable.",
-                        evidence=("The model provider did not complete the request.",),
-                        likely_next="Retry when the provider is available.",
-                        reason="provider_unavailable",
-                    ),
-                )
-                llm_calls = _llm_calls_from_exception(exc)
-                if llm_calls:
-                    await _persist_llm_calls(
-                        service,
-                        session.id,
-                        llm_calls,
-                        pre_send_state_id,
-                        plugin_crash_pending=True,
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                raise HTTPException(
-                    status_code=502,
-                    detail=_litellm_error_detail(
-                        "llm_unavailable",
-                        exc,
-                        expose_provider_error=settings.composer_expose_provider_errors,
-                    ),
+            except OpenAIError as exc:
+                raise await _handle_composer_provider_failure(
+                    exc,
+                    route="recompose",
+                    service=service,
+                    session_id=session.id,
+                    composition_state_id=pre_send_state_id,
+                    progress_sink=progress_sink,
+                    session_operation_context=compose_operation_lease.context,
+                    expose_provider_error=settings.composer_expose_provider_errors,
                 ) from exc
             except _BadRequestLLMError as exc:
                 slog.error(
@@ -445,6 +591,15 @@ async def recompose(
                     session_operation_context=compose_operation_lease.context,
                 )
                 raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
+            except ChargeableAdmissionRefused as exc:
+                raise await _handle_composer_chargeable_refusal(
+                    exc,
+                    service=service,
+                    session_id=session.id,
+                    composition_state_id=pre_send_state_id,
+                    progress_sink=progress_sink,
+                    session_operation_context=compose_operation_lease.context,
+                ) from exc
             except ComposerAdmissionRefused as exc:
                 # Mirror of the send_message arm (messages.py). The refusal is
                 # a committed admission decision (identity disabled, quota), so
@@ -510,267 +665,19 @@ async def recompose(
                         session_operation_context=compose_operation_lease.context,
                     )
 
-            # Compute the post-compose guided_session and composer_meta.
-            # Mirror of send_message §5a-§5b: if the transition prompt fired
-            # this turn, flip transition_consumed so subsequent turns use the
-            # freeform-only prompt.  guided_session rides in composer_meta (not
-            # a first-class column) — any save must propagate it forward.
-            _post_compose_guided: GuidedSession | None = result.state.guided_session
-            if _guided_terminal_for_compose is not None:
-                # transition_consumed flip — _guided is non-None because
-                # _guided_terminal_for_compose was derived from _guided.terminal.
-                if _guided is None:
-                    raise InvariantError(
-                        "guided_terminal_for_compose is set but guided_session is None — "
-                        "impossible state: transition gate should have blocked this path"
-                    )
-                from dataclasses import replace as _replace_dc
-
-                _post_compose_guided = _replace_dc(
-                    _guided,
-                    transition_consumed=True,
-                )
-
-            _post_compose_updates: dict[str, Any] = {
-                "repair_turns_used": result.repair_turns_used,
-                "ingress": chat_ingress,
-                "chat_ingress_inputs": chat_ingress_inputs,
-            }
-            if _post_compose_guided is not None:
-                _post_compose_updates["guided_session"] = _post_compose_guided.to_dict()
-            _post_compose_meta = merge_composer_meta_updates(
-                state_record.composer_meta if state_record is not None else None,
-                _post_compose_updates,
-            )
-
-            # Save state if version changed.
-            # Path 2 (post-compose runtime preflight): mirror of the
-            # send_message post-compose try/except — see the send_message
-            # block for the full rationale on the structural fix.
-            state_response: CompositionStateResponse | None = None
-            post_compose_state_id: UUID | None = pre_send_state_id
-            assistant_msg: ChatMessageRecord | None = None
-            route_settlement: PipelineRouteSettlement | None = None
-            if result.pipeline_commit_intent is not None:
-                settlement_outcome = await settle_auto_commit_intent(
-                    request=request,
-                    session_operation_context=compose_operation_lease.context,
-                    user=user,
-                    service=service,
-                    session_id=session.id,
-                    intent=result.pipeline_commit_intent,
-                    composer_meta=_post_compose_meta,
-                    telemetry_source="recompose",
-                    transition_assistant=composer_turn_end_assistant_row(result) if _guided_terminal_for_compose is not None else None,
-                )
-                if type(settlement_outcome) is PipelineRouteSettlement:
-                    route_settlement = settlement_outcome
-                else:
-                    # Auto-commit authority was durably revoked before the
-                    # settlement transaction (elspeth-01d4c6e683): the
-                    # proposal stays pending, so this turn becomes an
-                    # ordinary review-path response.
-                    result = _replace_dataclass(
-                        result,
-                        message=PIPELINE_STAGED_REVIEW_MESSAGE,
-                        pipeline_commit_intent=None,
-                    )
-            # Computed HERE, below the auto-commit-revoked branch above: that
-            # branch rebinds ``result`` with the staged-review message, so a
-            # pair hoisted to the top of the handler would be stale. Every
-            # writer below shares this one — the turn-end row must not re-carry
-            # prose the compose loop already committed mid-turn
-            # (elspeth-d581b3da7f).
-            _turn_end = composer_turn_end_assistant_row(result)
-            if route_settlement is not None:
-                state_response = _state_response(
-                    route_settlement.settlement.state,
-                    live_validation=route_settlement.validation,
-                )
-                post_compose_state_id = route_settlement.settlement.state.id
-                assistant_msg = route_settlement.settlement.transition_message
-            elif result.state.version != state.version or completion_gate_decision_changes(
-                prior_completion_gates_facts, result.advisor_gate_decision, result.state
-            ):
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="validating",
-                        headline="The composer is validating the pipeline and its review status.",
-                        evidence=("The pipeline state and review outcome are being checked before persistence.",),
-                        likely_next="ELSPETH will save the validated pipeline snapshot.",
-                    ),
-                )
-                try:
-                    state_data, validation = await _state_data_from_composer_state(
-                        result.state,
-                        settings=settings,
-                        secret_service=request.app.state.scoped_secret_resolver,
-                        user_id=str(user.user_id),
-                        session_id=session.id,
-                        plugin_snapshot=plugin_snapshot,
-                        profile_registry=profile_registry,
-                        catalog=request.app.state.catalog_service,
-                        runtime_preflight=result.runtime_preflight,
-                        preflight_exception_policy="raise",
-                        initial_version=state.version,
-                        telemetry_source="recompose",
-                        composer_meta=_post_compose_meta,
-                        advisor_gate_decision=result.advisor_gate_decision,
-                    )
-                except ComposerRuntimePreflightError as rpf_exc:
-                    rpf_exc = ComposerRuntimePreflightError(
-                        original_exc=rpf_exc.original_exc,
-                        partial_state=rpf_exc.partial_state,
-                        tool_invocations=result.tool_invocations,
-                        llm_calls=result.llm_calls,
-                    )
-                    await _publish_progress(
-                        progress_sink,
-                        event=ComposerProgressEvent(
-                            phase="failed",
-                            headline="The composer could not safely validate the pipeline update.",
-                            evidence=("Runtime preflight failed during state persistence.",),
-                            likely_next="Review the visible error message, then retry after the issue is resolved.",
-                            reason="runtime_preflight_failed",
-                        ),
-                    )
-                    response_body = await _handle_runtime_preflight_failure(
-                        rpf_exc,
-                        service,
-                        session.id,
-                        str(user.user_id),
-                        "recompose",
-                        pre_send_state_id,
-                        settings=settings,
-                        secret_service=request.app.state.scoped_secret_resolver,
-                        plugin_snapshot=plugin_snapshot,
-                        profile_registry=profile_registry,
-                        catalog=request.app.state.catalog_service,
-                        session_operation_context=compose_operation_lease.context,
-                        ingress=chat_ingress,
-                        chat_ingress_inputs=chat_ingress_inputs,
-                    )
-                    raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
-                await _publish_progress(
-                    progress_sink,
-                    event=ComposerProgressEvent(
-                        phase="saving",
-                        headline="ELSPETH is saving the pipeline and review status.",
-                        evidence=("A new composition state version is being stored for this session.",),
-                        likely_next="The assistant response will appear after the save completes.",
-                    ),
-                )
-                if _guided_terminal_for_compose is not None:
-                    transition_settlement = await service.commit_transition_response(
-                        session_id=session.id,
-                        expected_current_state_id=pre_send_state_id,
-                        state=state_data,
-                        assistant_content=_turn_end.content,
-                        raw_content=_turn_end.raw_content,
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                    new_state_record = transition_settlement.state
-                    assistant_msg = transition_settlement.message
-                else:
-                    new_state_record = await service.save_composition_state(
-                        session.id,
-                        state_data,
-                        # Successful recompose state advance after the LLM
-                        # composer returns a newer state version.
-                        provenance="post_compose",
-                        session_operation_context=compose_operation_lease.context,
-                    )
-                state_response = _state_response(new_state_record, live_validation=validation)
-                post_compose_state_id = new_state_record.id
-            elif _guided_terminal_for_compose is not None and _post_compose_guided is not None:
-                # Version unchanged but transition_consumed must be flipped.
-                # Persist the updated guided_session in a new state row so
-                # subsequent turns pick up transition_consumed=True.
-                _transition_state = result.state
-                _transition_state_d = _transition_state.to_dict()
-                _transition_state_data = CompositionStateData(
-                    sources=_transition_state_d["sources"],
-                    nodes=_transition_state_d["nodes"],
-                    edges=_transition_state_d["edges"],
-                    outputs=_transition_state_d["outputs"],
-                    metadata_=_transition_state_d["metadata"],
-                    is_valid=False,
-                    validation_errors=validation_errors_for_composer_surface(
-                        composer_meta=_post_compose_meta,
-                        is_valid=False,
-                        validation_errors=None,
-                    ),
-                    composer_meta=_post_compose_meta,
-                )
-                transition_settlement = await service.commit_transition_response(
-                    session_id=session.id,
-                    expected_current_state_id=pre_send_state_id,
-                    state=_transition_state_data,
-                    assistant_content=_turn_end.content,
-                    raw_content=_turn_end.raw_content,
-                    session_operation_context=compose_operation_lease.context,
-                )
-                _transition_record = transition_settlement.state
-                assistant_msg = transition_settlement.message
-                post_compose_state_id = _transition_record.id
-                state_response = _state_response(_transition_record)
-
-            # Persist assistant message
-            if assistant_msg is None:
-                assistant_msg = await service.add_message(
-                    session.id,
-                    "assistant",
-                    _turn_end.content,
-                    composition_state_id=post_compose_state_id,
-                    raw_content=_turn_end.raw_content,
-                    writer_principal="compose_loop",
-                    session_operation_context=compose_operation_lease.context,
-                )
-            # Per-tool-call audit trail (recompose path; symmetric with
-            # send_message). Tool rows and LLM sidecars are ONE turn cohort
-            # and settle in a single transaction (elspeth-90231248dc) even
-            # though they bind to different state ids.
-            await _persist_turn_audit_cohort(
-                service,
-                session.id,
-                result.tool_invocations if not result.persisted_tool_call_turn else (),
-                result.llm_calls,
-                tool_composition_state_id=post_compose_state_id,
-                llm_composition_state_id=pre_send_state_id,
-                parent_assistant_id=assistant_msg.id,
-                plugin_crash_pending=False,
-                session_operation_context=compose_operation_lease.context,
-            )
-            await _publish_progress(
-                progress_sink,
-                event=ComposerProgressEvent(
-                    phase="complete",
-                    headline="The composer has updated the pipeline."
-                    if result.state.version != state.version
-                    else "The composer response is ready.",
-                    evidence=("The assistant response has been saved for this session.",),
-                    likely_next="Review the response and current pipeline.",
-                    reason="composer_complete",
-                ),
-            )
-
-            # See send_message return-flow comment for why response
-            # construction precedes the terminal_status flip.
-            proposals = await _pending_proposal_responses(service, session.id)
-            response = MessageWithStateResponse(
-                message=_message_response(assistant_msg),
-                state=state_response,
-                proposals=proposals,
-            )
-            terminal_status = "completed"
-            return response
+            if post_provider_error is not None:
+                raise post_provider_error
+            if continuation_receipt is None:
+                raise InvariantError("Provider returned without a freeform continuation receipt")
+            if deferred_cancellation is not None:
+                raise deferred_cancellation
+            return continuation_receipt.response
         except InvariantError as exc:
             # Mirror of send_message InvariantError handler — same
             # B1-sanitization rationale. Static 500 detail; slog carries
             # exc_class + frames only.
             slog.error(
-                "guided.invariant_violated",
+                "composer.invariant_violated",
                 session_id=str(session_id),
                 user_id=user.user_id,
                 exc_class=type(exc).__name__,
@@ -785,12 +692,20 @@ async def recompose(
                 },
             ) from exc
         except asyncio.CancelledError as exc:
+            if request.state.composer_durable_completed:
+                terminal_status = "completed"
+                if _is_client_disconnect_cancel(exc):
+                    raise HTTPException(
+                        status_code=499,
+                        detail="Client disconnected after the compose turn completed.",
+                    ) from exc
+                raise
             # Mirror of send_message cancellation path. See block
             # comment there for the shielded-publish rationale.
             llm_calls = _llm_calls_from_exception(exc)
             if llm_calls:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await asyncio.shield(
+                await _join_shielded_task_after_cancellation(
+                    asyncio.create_task(
                         _persist_llm_calls(
                             service,
                             session.id,
@@ -798,23 +713,29 @@ async def recompose(
                             pre_send_state_id,
                             plugin_crash_pending=True,
                             session_operation_context=compose_operation_lease.context,
-                        )
-                    )
+                        ),
+                        name="recompose-cancelled-llm-call-persist",
+                    ),
+                    primary_cancellation=exc,
+                )
             # A cancel delivered by the compose heartbeat after it lost the
             # request's lease is a server fault, not a user Stop (finding
             # #28): publish ``failed`` and record ``failed``. The bare
             # ``raise`` below hands it to ``_track_compose_inflight``, which
             # uncancels the task and answers with the structured 503.
             heartbeat_cancel = _composer_heartbeat_cancel_of(exc)
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.shield(
+            await _join_shielded_task_after_cancellation(
+                asyncio.create_task(
                     _publish_progress(
                         progress_sink,
                         event=(
                             client_cancelled_progress_event() if heartbeat_cancel is None else _composer_heartbeat_failed_progress_event()
                         ),
-                    )
-                )
+                    ),
+                    name="recompose-cancelled-progress-publish",
+                ),
+                primary_cancellation=exc,
+            )
             terminal_status = "cancelled" if heartbeat_cancel is None else "failed"
             if _is_client_disconnect_cancel(exc):
                 # Disconnect-initiated cancel — see the send_message

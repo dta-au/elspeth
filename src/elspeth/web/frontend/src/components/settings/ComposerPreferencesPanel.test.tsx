@@ -27,7 +27,6 @@ describe("ComposerPreferencesForm", () => {
     resetStore(usePreferencesStore);
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
       writing: false,
@@ -38,105 +37,23 @@ describe("ComposerPreferencesForm", () => {
     useSessionStore.setState({ activeSessionId: null });
     vi.clearAllMocks();
   });
-
-  it.each(["freeform", "guided"] as const)("lists Freeform first and focuses it when the saved default is %s", (mode) => {
-    usePreferencesStore.setState({ defaultMode: mode });
-    render(<ComposerPreferencesPanel onClose={vi.fn()} />);
-    const group = screen.getByRole("group", { name: "Default mode for new sessions" });
-    const radios = within(group).getAllByRole("radio");
-    expect(radios[0]).toHaveAccessibleName("Freeform");
-    expect(radios[1]).toHaveAccessibleName("Guided");
-    // Guided is disabled, and a disabled input cannot take focus: a saved
-    // Guided default must not leave the dialog with no initial focus.
-    expect(screen.getByRole("radio", { name: "Freeform" })).toHaveFocus();
-  });
-
-  it("disables the Guided option while idle and says why (guided mode is being retired)", () => {
-    usePreferencesStore.setState({ defaultMode: "freeform", writing: false });
-    render(<ComposerPreferencesForm />);
-
-    expect(screen.getByRole("radio", { name: "Guided" })).toBeDisabled();
-    expect(screen.getByRole("radio", { name: "Freeform" })).toBeEnabled();
-    expect(screen.getByText(/guided mode is being retired/i)).toBeInTheDocument();
-  });
-
-  it("still shows a saved Guided default as selected, and lets the user switch to Freeform", async () => {
-    const setDefault = vi.spyOn(usePreferencesStore.getState(), "setDefaultMode").mockResolvedValueOnce(undefined);
-    usePreferencesStore.setState({ defaultMode: "guided" });
-    render(<ComposerPreferencesForm />);
-
-    expect(screen.getByRole("radio", { name: "Guided" })).toBeChecked();
-    await userEvent.click(screen.getByRole("radio", { name: "Freeform" }));
-
-    expect(setDefault).toHaveBeenCalledWith("freeform");
-  });
-
-  it("does not write a Guided default when the disabled option is clicked", async () => {
-    const setDefault = vi.spyOn(usePreferencesStore.getState(), "setDefaultMode").mockResolvedValueOnce(undefined);
-    usePreferencesStore.setState({ defaultMode: "freeform" });
-    render(<ComposerPreferencesForm />);
-
-    await userEvent.click(screen.getByRole("radio", { name: "Guided" }));
-
-    expect(setDefault).not.toHaveBeenCalled();
-  });
-
-  it("renders the current default-mode selection (freeform)", () => {
-    usePreferencesStore.setState({ defaultMode: "freeform" });
-    render(<ComposerPreferencesForm />);
-    expect(screen.getByLabelText(/freeform/i)).toBeChecked();
-    expect(screen.getByLabelText(/guided/i)).not.toBeChecked();
-  });
-
-  it("exposes reversible theme controls in Composer preferences", async () => {
-    localStorage.setItem("elspeth_theme", "light");
-    render(<ComposerPreferencesForm />);
-
-    expect(screen.getByRole("group", { name: /theme/i })).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /system/i })).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /light/i })).toBeChecked();
-
-    await userEvent.click(screen.getByRole("radio", { name: /dark/i }));
-
-    expect(localStorage.getItem("elspeth_theme")).toBe("dark");
-    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
-  });
-
-  it("writes the new default-mode on selection", async () => {
-    const setDefault = vi
-      .spyOn(usePreferencesStore.getState(), "setDefaultMode")
-      .mockResolvedValueOnce(undefined);
-
-    render(<ComposerPreferencesForm />);
-    await userEvent.click(screen.getByLabelText(/freeform/i));
-
-    expect(setDefault).toHaveBeenCalledWith("freeform");
-  });
-
-  it("changes only the default when an active session exists", async () => {
-    useSessionStore.setState({ activeSessionId: "sess-xyz" });
-    const setDefault = vi
-      .spyOn(usePreferencesStore.getState(), "setDefaultMode")
-      .mockResolvedValueOnce(undefined);
-
-    render(<ComposerPreferencesForm />);
-    await userEvent.click(screen.getByLabelText(/freeform/i));
-
-    expect(setDefault).toHaveBeenCalledWith("freeform");
-  });
-
   it("disables inputs while writing", () => {
     usePreferencesStore.setState({ writing: true });
     render(<ComposerPreferencesForm />);
-    expect(screen.getByLabelText(/guided/i)).toBeDisabled();
-    expect(screen.getByLabelText(/freeform/i)).toBeDisabled();
+    expect(screen.getByRole("radio", { name: /show technical detail/i })).toBeDisabled();
   });
 
-  it("returns null before preferences load (defaultMode null)", () => {
-    usePreferencesStore.setState({ loaded: false, defaultMode: null });
+  it("returns null before preferences load", () => {
+    usePreferencesStore.setState({ loaded: false });
     const { container } = render(<ComposerPreferencesForm />);
-    // Component must gate on loaded === true; defaultMode is null pre-bootstrap.
     expect(container.firstChild).toBeNull();
+  });
+
+  it("has no mode preference and focuses the theme control", () => {
+    render(<ComposerPreferencesPanel onClose={vi.fn()} />);
+    expect(screen.queryByRole("group", { name: /default mode/i })).toBeNull();
+    expect(screen.queryByRole("radio", { name: /guided|freeform/i })).toBeNull();
+    expect(screen.getByRole("radio", { name: /system/i })).toHaveFocus();
   });
 
   it("surfaces writeError via role=alert when a PATCH fails (Panel a11y F2)", () => {
@@ -163,7 +80,7 @@ describe("ComposerPreferencesForm", () => {
     const { container } = render(<ComposerPreferencesForm />);
 
     const groups = screen.getAllByRole("group");
-    expect(groups).toHaveLength(3);
+    expect(groups).toHaveLength(2);
     for (const group of groups) {
       expect(group).toHaveClass("composer-preferences-fieldset");
       expect(group.getAttribute("style")).toBeNull();
@@ -173,7 +90,7 @@ describe("ComposerPreferencesForm", () => {
     }
 
     const radios = screen.getAllByRole("radio");
-    expect(radios).toHaveLength(7);
+    expect(radios).toHaveLength(5);
     for (const radio of radios) {
       expect(radio.closest("label")).toHaveClass("composer-preferences-option");
     }
@@ -229,7 +146,7 @@ describe("ComposerPreferencesForm", () => {
     usePreferencesStore.setState({
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-in-progress",
     });
     render(<ComposerPreferencesForm />);
@@ -248,7 +165,6 @@ describe("ComposerPreferencesForm", () => {
   it("offers a Detail level group and writes show_advanced", async () => {
     const user = userEvent.setup();
     vi.mocked(updateUserComposerPreferences).mockResolvedValueOnce({
-      default_mode: "guided",
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: null,
       tutorial_stage: null,
@@ -284,7 +200,6 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     resetStore(usePreferencesStore);
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
       writing: false,
@@ -391,7 +306,7 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     render(<ComposerPreferencesPanel onClose={vi.fn()} />);
     // The inner form's radios are present — the wrapper composes the
     // form correctly.
-    expect(screen.getByLabelText(/guided/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/freeform/i)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /theme/i })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: /detail level/i })).toBeInTheDocument();
   });
 });

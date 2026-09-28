@@ -180,11 +180,6 @@
   white-space: nowrap;
 }
 
-/* Labeled home for approvals that cannot anchor beside a turn — sentinel
-   (backend-auto-surfaced), guided-raised, and seed/revert/import rows
-   (elspeth-3574f87208). The border-top + heading segment the block away from
-   the dialogue so it stops reading as a reply to the newest turn; the count
-   lives in the heading, the per-row node clause stays (elspeth-52be5924d7). */
 .interpretation-approvals-section {
   display: flex;
   flex-direction: column;
@@ -201,22 +196,6 @@
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-}
-
-/* A guided synthetic-failure turn (C-2, composer first-principles review
-   2026-07-04): a scaffold-guard rejection or provider-unavailability reply
-   from POST /guided/chat, discriminated by ChatTurn.assistant_message_kind.
-   Left-aligned like .bubble-assistant (it IS a reply in the transcript
-   position), but styled with the error tokens instead of the assistant
-   tokens so it reads as a distinct, non-authoritative event — never
-   mistakeable for a real assistant reply. Same tokens as .chat-panel-error /
-   .ack-stack-error; no new colours. */
-.bubble-error {
-  align-self: flex-start;
-  background-color: var(--color-error-bg);
-  border: 1px solid var(--color-error-border);
-  border-left: 3px solid var(--color-error);
-  color: var(--color-text);
 }
 
 /* Action buttons on message bubbles — legible at rest, emphasized on
@@ -782,14 +761,6 @@
     left: 0;
   }
 
-  /* The hint rejoins the flow and fills the attachment row's gutter
-     (elspeth-1b7227936c): in guided mode Upload has no More sibling, so
-     without the hint the wrapped row was one 44px button and ~344px of
-     nothing. position: static undoes the ordinary-width placement above the
-     buttons — here the attachment row IS a second line, and the hint has a
-     place on it. Specificity (0,2,0) on purpose — the base .chat-input-hint
-     rule appears LATER in this file, so an unqualified (0,1,0) rule here
-     would lose its overrides to source order. */
   .chat-input-row .chat-input-hint {
     position: static;
     order: 2;
@@ -827,17 +798,6 @@
   stroke-linejoin: round;
 }
 
-/* State surface for Upload and the "…" overflow trigger (elspeth-90d8528b23).
-   These were hand-rolled instead of composing .btn-compact, and their entire
-   state surface was `cursor: not-allowed` — no hover to confirm the pointer
-   is on target, no visual difference between an enabled and a disabled
-   Upload (which is the STANDING state in guided mode), and an open overflow
-   menu whose trigger looked exactly like a closed one.
-
-   Guards live inside :where() for the same cascade reason as .btn:hover in
-   shared.css: it keeps this rule at (0,2,0) so the pressed rule below, also
-   (0,2,0) but later in source order, wins on an open-and-hovered trigger
-   only where it should. */
 .chat-input-icon-btn:hover:where(:not(:disabled)) {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
@@ -930,27 +890,6 @@
 }
 
 .chat-input-hint {
-  /* At ordinary pane widths (container ≥ 430px) the hint sits INSIDE the
-     control line's height, right-aligned above Upload/More/Send in the space
-     the four-row textarea leaves over the 44px buttons, so the composer
-     region ends flush with the textarea's bottom edge (operator request,
-     2026-08-16). It used to be the row's last flex item at flex-basis:100%,
-     taking a full-width line of its own BELOW the controls (elspeth-
-     1b7227936c) — one text row of region height under the box, at every
-     pane width. Positioned rather than placed by grid or a wrapper: the
-     controls are conditional siblings (Upload/More absent read-only, Stop
-     present only while composing), so a per-column grid would pay gaps for
-     empty columns, and a right-column wrapper would break the narrow-pane
-     rule that Send stays beside the textarea while Upload/More wrap. bottom
-     = one control height plus --space-xs, and the padding-bottom below is
-     --space-xs, so the text clears the buttons by the row's --space-sm gap.
-     The row carries a min-height floor so a user-shortened textarea cannot
-     let this escape upward. Two regimes put it back in flow, each with a
-     line of its own to sit on: the narrow-pane container query (it fills the
-     wrapped attachment row's gutter — ~344px of nothing beside a lone 44px
-     Upload in guided mode) and the ≤760px viewport regime (the buttons are
-     already on a second line there); flex-basis:100% is what gives it its
-     own full-width line in the latter, and is inert while positioned. */
   position: absolute;
   right: 0;
   bottom: calc(var(--size-control) + var(--space-xs));
@@ -1219,157 +1158,6 @@
   border-left-color: var(--color-success);
 }
 
-/* ModeSwitchButton — conversion controls in the Guided header.
-   Quiet outline at rest with
-   a hover lift and WCAG 2.5.8 target height (36px compact — the chrome-row
-   size; this is the control that sets the header's 52px canonical height,
-   matching .artifact-workspace-toolbar across the pane divider). The confirm
-   primary is slightly stronger (accent border) but NOT danger-styled, because
-   switching is non-destructive (the session keeps both modes' state). */
-.mode-switch-btn {
-  padding: var(--space-sm) var(--space-md);
-  background-color: transparent;
-  color: var(--color-text-secondary);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  font-size: var(--font-size-sm);
-  font-family: inherit;
-  font-weight: 500;
-  cursor: pointer;
-  min-height: var(--size-control-compact);
-  flex-shrink: 0;
-  transition: background-color var(--transition-fast),
-    border-color var(--transition-fast), color var(--transition-fast);
-}
-
-.mode-switch-btn:hover {
-  background-color: var(--color-surface-elevated);
-  border-color: var(--color-border-strong);
-  color: var(--color-text);
-}
-
-.mode-switch-btn:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
-}
-
-/* Tokenised disabled pair, not opacity (elspeth-37b6c47145). shared.css:167
-   documents rejecting exactly this mechanism: an opacity dim composites
-   against whatever chrome sits behind the control, so the resulting text
-   contrast is unbounded and can silently fail WCAG 1.4.3. The muted-on-page
-   -background pair .btn:disabled uses is a known value in both themes
-   (dark 6.45:1, light 6.32:1). */
-.mode-switch-btn:disabled,
-.mode-switch-btn:disabled:hover {
-  background-color: var(--color-bg);
-  border-color: var(--color-border-strong);
-  color: var(--color-text-muted);
-  cursor: not-allowed;
-}
-
-/* Confirm primary (shown only when the current chat has work). */
-.mode-switch-btn--confirm {
-  color: var(--color-text);
-  border-color: var(--color-accent);
-}
-
-/* Two-step confirm container: primary + Cancel, wraps if the header is tight.
-   Flex (not grid) is load-bearing: flex-wrap lets Confirm and Cancel break
-   onto independent lines as space shrinks. A `grid-template-columns: auto
-   auto` version (tried and reverted, elspeth-036e8ab365) anchors both
-   buttons to the same row every time — its "auto" columns can't fall below
-   the combined min-content width of BOTH buttons, so next to the
-   nowrap ModelChip in .chat-panel-header-actions the Cancel button was
-   clipped by .chat-panel's clip on narrow viewports (~320-400px).
-   flex-wrap lets a single button occupy a line on its own, so the floor is
-   one button's min-content width, not the pair's. */
-.mode-switch-confirm {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: var(--space-xs) var(--space-sm);
-  align-items: center;
-  max-width: min(34rem, 100%);
-}
-
-.mode-switch-confirm-card {
-  padding: var(--space-sm);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  background-color: var(--color-surface-elevated);
-  box-shadow: var(--shadow-popover);
-}
-
-.mode-switch-confirm-title {
-  flex-basis: 100%;
-  color: var(--color-text);
-  font-size: var(--font-size-sm);
-  font-weight: 700;
-  line-height: var(--line-height-tight);
-}
-
-/* Guided-direction consent disclosure ("fresh wizard + consent",
-   elspeth-e2c3dba6b5): the switch reseeds a fresh wizard and sets the current
-   pipeline aside (recoverable via version history). Muted, informational
-   register — same treatment as .mode-switch-disabled-reason; it explains an
-   expected consequence, not an error. Given a full row so it reads before the
-   confirm/cancel buttons in the wrapped flex layout. */
-.mode-switch-confirm-note {
-  flex-basis: 100%;
-  font-size: var(--font-size-xs);
-  color: var(--color-text-muted);
-  line-height: var(--line-height-normal);
-}
-
-/* Goal field on the fresh-wizard confirm card (goal-first,
-   elspeth-378cfa0e18). Given a full row of the wrapped flex layout for the
-   same reason the note above is: it must read (and be filled in) BEFORE the
-   confirm/cancel buttons. The <label> is the flex item and stacks its own text
-   above the control, so the question is a real accessible name rather than a
-   placeholder that vanishes on the first keystroke. */
-.mode-switch-goal {
-  display: flex;
-  flex-basis: 100%;
-  flex-direction: column;
-  gap: var(--space-2xs);
-  font-size: var(--font-size-xs);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-secondary);
-}
-
-/* Sizing only. The control composes the shared `.textarea` primitive
-   (shared.css) for its border, background, focus ring and AA-gated
-   placeholder colour, so this card does not introduce a second input skin
-   with its own contrast story. chat.css is imported AFTER shared.css in the
-   styles barrel, so these equal-specificity declarations win the overrides
-   they make: a one-sentence answer wants the smaller type and tighter
-   padding of the header's register, not the full form-field rung. */
-.mode-switch-goal-input {
-  padding: var(--space-xs) var(--space-sm);
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-regular);
-}
-
-/* Disabled mode switch + adjacent plain-language reason so the affordance never
-   reads as a silent no-op — same register as .chat-panel-error's inline
-   explanation, without borrowing its alert-red treatment (this is expected,
-   not a failure). */
-.mode-switch-disabled {
-  display: inline-flex;
-  flex-wrap: wrap;
-  gap: var(--space-sm);
-  align-items: center;
-}
-
-.mode-switch-disabled-reason {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-muted);
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .mode-switch-btn {
-    transition: none;
-  }
-}
 
 .chat-panel-error {
   padding: var(--space-sm) var(--space-md);
@@ -1467,14 +1255,6 @@
   flex: 1;
   overflow-y: auto;
   padding: var(--space-lg) 0;
-  /* Marked bottom boundary (elspeth-1f4b60a492): the "How pipelines work"
-     teaching panel is genuinely taller than the pane, and its text was cut
-     dead mid-word where the composer begins — no fade, no scrollbar cue —
-     so a clipped panel read as broken rather than scrollable. Same alpha
-     ramp as .guided-authoring-scroll's top edge (guided.css), mirrored to
-     the bottom: gradient colours are ALPHA data, not theme colours. The
-     ramp is shorter than this scroller's 24px bottom padding, so when the
-     transcript is scrolled to the end nothing visible is faded. */
   mask-image: linear-gradient(to bottom, #000 calc(100% - var(--space-md)), transparent);
 }
 
@@ -1507,15 +1287,6 @@
      so Gestalt proximity inverted: separate turns bound together while each
      bubble's own content floated apart. */
   padding: var(--space-sm) var(--space-lg);
-  /* Cap the conversation to a centred column so a right-aligned (user) and a
-     left-aligned (assistant) bubble stay near each other instead of pinning to
-     opposite edges of a wide chat column. On WQHD+ the chat column is ~2240px,
-     which left a ~1100px dead gulf down the middle and forced the eye to jump
-     left↔right to follow the thread. 56rem keeps a comfortable reading measure
-     while giving consecutive bubbles a generous horizontal overlap.
-     Applies to freeform AND guided/tutorial — both emit .message-row. Guided
-     authoring cards and common-workspace artifact panels are NOT .message-row,
-     so they keep their containing pane's width. */
   max-width: min(100%, 56rem);
   margin-inline: auto;
   width: 100%;
@@ -2735,11 +2506,6 @@
   }
 }
 
-/* ── Acknowledgement stack (pinned top-of-chat LLM decisions) ─────────────
-   One surface for BOTH guided and freeform. Reframed from approval to
-   acknowledgement: a compact stack of decision cards on an elevated surface
-   with an amber left-accent so it reads as "clear these to proceed" rather
-   than ordinary assistant prose. Replaces the old verbose per-mode widgets. */
 .ack-stack {
   display: flex;
   flex-direction: column;
@@ -3226,4 +2992,64 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-sm);
+}
+
+.pipeline-gloss {
+  margin: 0;
+  font-size: var(--font-size-base);
+  line-height: 1.4;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.pipeline-validation-summary {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  line-height: 1.45;
+  color: var(--color-text-secondary);
+}
+
+.pipeline-validation-summary-glyph {
+  font-weight: 700;
+}
+
+.pipeline-validation-summary--ok .pipeline-validation-summary-glyph {
+  color: var(--color-success);
+}
+
+.pipeline-validation-summary--warning .pipeline-validation-summary-glyph {
+  color: var(--color-warning);
+}
+
+.pipeline-validation-summary--error .pipeline-validation-summary-glyph {
+  color: var(--color-error);
+}
+
+.pipeline-validation-summary-status {
+  margin: 0;
+}
+
+.pipeline-validation-summary-suggestion {
+  margin: var(--space-2xs) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.pipeline-validation-summary-raw {
+  margin-top: var(--space-2xs);
+  font-size: var(--font-size-sm);
+}
+
+.pipeline-validation-summary-raw > summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+}
+
+.pipeline-validation-summary-raw-text {
+  margin: var(--space-2xs) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }

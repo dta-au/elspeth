@@ -2,8 +2,7 @@
 // composer-freeform-live.staging.spec.ts — THE COLOUR TEST, freeform surface
 // (real LLM planner, live deployment).
 //
-// Freeform sibling of composer-guided-live.staging.spec.ts: the user states
-// the outcome in chat, the real planner authors and commits the pipeline
+// The user states the outcome in chat; the real planner authors and commits the pipeline
 // through the freeform tool loop, and the run writes every colour row to the
 // JSON output. Same gating (ELSPETH_RUN_COMPOSER_LIVE=1 + STAGING_* creds +
 // ELSPETH_LIVE_OUTPUTS_DIR), same fixture, same ground-truth assertion.
@@ -93,7 +92,7 @@ test.describe("composer freeform live — the colour test (staging)", () => {
       await expect(runButton).toBeEnabled({ timeout: 5 * 60_000 });
       await runButton.click();
 
-      // Credential-egress confirmation dialog (same surface as guided).
+      // Credential-egress confirmation dialog.
       const runDialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(runDialog).toBeVisible();
       await runDialog.getByRole("button", { name: "Run pipeline" }).click();

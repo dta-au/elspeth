@@ -144,6 +144,7 @@ class TestExplicitEngineKwargs:
         fake.assert_called_once_with(
             "postgresql+psycopg://db.example/audit",
             echo=False,
+            hide_parameters=True,
             pool_size=3,
             max_overflow=2,
             pool_pre_ping=True,
@@ -165,6 +166,7 @@ class TestExplicitEngineKwargs:
         fake.assert_called_once_with(
             "postgresql+psycopg://db.example/audit",
             echo=False,
+            hide_parameters=True,
             pool_size=3,
             max_overflow=2,
             pool_pre_ping=True,
@@ -1780,7 +1782,7 @@ class TestJournalPathGuards:
         with pytest.raises(ValueError, match="dump_to_jsonl requires dump_to_jsonl_path for non-SQLite databases"):
             LandscapeDB.from_url("postgresql://user@host/db", dump_to_jsonl=True)
 
-        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False)
+        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False, hide_parameters=True)
 
     def test_from_url_dump_to_jsonl_rejects_in_memory_sqlite_without_path(self) -> None:
         """In-memory SQLite has no file path, so automatic journal derivation must fail."""
@@ -1795,7 +1797,7 @@ class TestJournalPathGuards:
         with pytest.raises(ValueError, match="dump_to_jsonl requires dump_to_jsonl_path for non-SQLite databases"):
             LandscapeDB.from_url("postgresql://user@host/db", dump_to_jsonl=True, dump_to_jsonl_path="")
 
-        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False)
+        create_engine_fake.assert_called_once_with("postgresql://user@host/db", echo=False, hide_parameters=True)
 
     def test_from_url_dump_to_jsonl_rejects_explicit_path_outside_sqlite_db_dir(self, tmp_path: Path) -> None:
         """Explicit SQLite journal paths must not escape the database directory."""

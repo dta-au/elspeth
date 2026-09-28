@@ -65,6 +65,23 @@ def test_quorum_with_one_collision_free_subset_is_not_certain() -> None:
     assert certain_union_collisions(guarantees, require_all=False, policy="quorum", quorum_count=2) == {}
 
 
+def test_quorum_larger_than_two_checks_subsets_of_the_quorum_size() -> None:
+    """quorum 3 of 4 with guarantees {x},{x},{y},{y}: every 3-subset holds a
+    pair sharing x or y, so every merge collides — although the pair
+    {path_a, path_c} alone shares nothing. Checking pairs instead of
+    quorum-size subsets would miss this certain case."""
+    guarantees = {
+        "path_a": frozenset({"x"}),
+        "path_b": frozenset({"x"}),
+        "path_c": frozenset({"y"}),
+        "path_d": frozenset({"y"}),
+    }
+    assert certain_union_collisions(guarantees, require_all=False, policy="quorum", quorum_count=3) == {
+        "x": ("path_a", "path_b"),
+        "y": ("path_c", "path_d"),
+    }
+
+
 def test_quorum_without_a_count_is_a_config_validation_escape() -> None:
     with pytest.raises(RuntimeError, match="without a quorum_count"):
         certain_union_collisions(

@@ -8,7 +8,7 @@ lives here and nowhere else:
   attributed to the session's owning identity, on the CALLER's connection so the
   accounting row commits with the audit row it was derived from. The three
   adapters are the Composer audit cohorts (``SessionServiceImpl.add_messages_atomic``,
-  ``_insert_prepared_guided_audit_rows_on_connection``,
+  prepared audit-row writers,
   ``RepositoryRunDiagnosticsAuditAuthority.append_audit_messages``), auto-title
   (``SessionServiceImpl.record_token_usage`` from ``_auto_title.py``) and run
   finalisation (the same service method from ``execution/service.py``).
@@ -34,6 +34,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Literal, final
 
 from sqlalchemy import BigInteger, and_, case, cast, func, insert, or_, select, update
@@ -44,7 +45,8 @@ from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import IdentityStorageQuotaExceededError, StorageAccountingUnavailableError
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy, ChargeableAdmissionRefused
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.hashing import canonical_json
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.mutation_connection_registry import (
     _register_mutation_connection,
@@ -53,6 +55,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
 )
 from elspeth.web.sessions.models import (
     blobs_table,
+    chat_messages_table,
     quota_policies_table,
     quota_provider_attempts_table,
     runs_table,
@@ -189,6 +192,13 @@ def settle_provider_attempt_on_connection(connection: Connection, *, session_id:
     owner = connection.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == session_id)).scalar_one()
     if owner != attempt.identity_id:
         raise AuditIntegrityError("Provider attempt settlement changed its owning identity")
+    if (
+        connection.execute(
+            select(chat_messages_table.c.id).where(chat_messages_table.c.id == _undispatched_cancellation_event_id(attempt_id))
+        ).one_or_none()
+        is not None
+    ):
+        raise AuditIntegrityError("An undispatched provider attempt cannot acquire a provider-call result")
     entry_id = _usage_entry_id(session_id=session_id, source=attempt.source, run_id=attempt.run_id, call_id=entry.call_id)
     previous = connection.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.entry_id == entry_id)).one_or_none()
     if previous is not None:
@@ -230,6 +240,135 @@ def settle_provider_attempt_on_connection(connection: Connection, *, session_id:
         update(quota_provider_attempts_table)
         .where(quota_provider_attempts_table.c.attempt_id == attempt_id)
         .values(settled_at=database_now(connection), ledger_entry_id=entry_id)
+    )
+
+
+def _undispatched_cancellation_event_id(attempt_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"elspeth:provider-attempt:cancelled-before-dispatch:{attempt_id}"))
+
+
+def cancel_undispatched_provider_attempt_on_connection(
+    connection: Connection,
+    *,
+    session_operation_context: SessionOperationContext,
+    attempt_id: str,
+    requested_model: str,
+    append_audit_event: Callable[[str, str, datetime], None],
+) -> None:
+    """Close one proven undispatched intent with audit evidence and zero usage.
+
+    The caller must hold the session write lock and validate the current live
+    fence in this transaction. Only a caller that has positively established no
+    SDK entry may invoke this operation. A past pending row is not proof.
+    """
+    if type(session_operation_context) is not SessionOperationContext:
+        raise TypeError("session_operation_context must be an exact SessionOperationContext")
+    if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+        raise ValueError("Undispatched cancellation requires COMPOSE authority")
+    if type(attempt_id) is not str or not attempt_id:
+        raise ValueError("attempt_id must be a non-empty exact string")
+    if type(requested_model) is not str or not requested_model.strip():
+        raise ValueError("requested_model must be a non-blank exact string")
+    fence = session_operation_context.fence
+    attempt = connection.execute(
+        select(quota_provider_attempts_table).where(quota_provider_attempts_table.c.attempt_id == attempt_id).with_for_update()
+    ).one_or_none()
+    if attempt is None:
+        raise AuditIntegrityError("Undispatched cancellation has no admitted provider attempt")
+    if (
+        attempt.session_id != fence.session_id
+        or attempt.operation_id != fence.operation_id
+        or attempt.operation_epoch != fence.operation_epoch
+        or attempt.lease_token != fence.lease_token
+        or attempt.source not in {"composer", "auto_title"}
+    ):
+        raise AuditIntegrityError("Undispatched cancellation does not own the original attempt fence")
+    owner = connection.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == fence.session_id)).scalar_one()
+    if owner != attempt.identity_id:
+        raise AuditIntegrityError("Undispatched cancellation changed its owning identity")
+    event_id = _undispatched_cancellation_event_id(attempt_id)
+    entry_id = _usage_entry_id(session_id=fence.session_id, source=attempt.source, run_id=attempt.run_id, call_id=attempt_id)
+    event_content = canonical_json(
+        {
+            "kind": "provider_attempt.cancelled_before_dispatch",
+            "attempt_id": attempt_id,
+            "source": attempt.source,
+            "run_id": attempt.run_id,
+            "requested_model": requested_model,
+            "operation_id": fence.operation_id,
+            "operation_epoch": fence.operation_epoch,
+            "lease_token_sha256": sha256(fence.lease_token.encode("utf-8")).hexdigest(),
+        }
+    )
+    event = connection.execute(select(chat_messages_table).where(chat_messages_table.c.id == event_id)).one_or_none()
+    ledger = connection.execute(select(token_usage_ledger_table).where(token_usage_ledger_table.c.entry_id == entry_id)).one_or_none()
+    if attempt.settled_at is not None:
+        if event is None or ledger is None or attempt.ledger_entry_id != entry_id:
+            raise AuditIntegrityError("Settled undispatched attempt lacks matching audit and usage evidence")
+        event_time = event.created_at.replace(tzinfo=UTC) if event.created_at.tzinfo is None else event.created_at.astimezone(UTC)
+        ledger_time = ledger.recorded_at.replace(tzinfo=UTC) if ledger.recorded_at.tzinfo is None else ledger.recorded_at.astimezone(UTC)
+        settled_time = attempt.settled_at.replace(tzinfo=UTC) if attempt.settled_at.tzinfo is None else attempt.settled_at.astimezone(UTC)
+        if (
+            event.session_id != fence.session_id
+            or event.role != "audit"
+            or event.writer_principal != "compose_loop"
+            or event.content != event_content
+            or event.tool_calls is not None
+            or event.raw_content is not None
+            or event.composition_state_id is not None
+            or event.tool_call_id is not None
+            or event.parent_assistant_id is not None
+            or ledger.identity_id != attempt.identity_id
+            or ledger.session_id != fence.session_id
+            or ledger.source != attempt.source
+            or ledger.run_id != attempt.run_id
+            or ledger.model != requested_model
+            or ledger.prompt_tokens != 0
+            or ledger.completion_tokens != 0
+            or ledger.cached_prompt_tokens != 0
+            or ledger.reasoning_tokens != 0
+            or ledger_time != event_time
+            or settled_time != event_time
+        ):
+            raise AuditIntegrityError("Undispatched cancellation replay contradicts recorded evidence")
+        return
+    if attempt.ledger_entry_id is not None or event is not None or ledger is not None:
+        raise AuditIntegrityError("Pending undispatched attempt has conflicting durable evidence")
+    cancelled_at = database_now(connection)
+    append_audit_event(event_id, event_content, cancelled_at)
+    written_event = connection.execute(select(chat_messages_table).where(chat_messages_table.c.id == event_id)).one_or_none()
+    written_at = None if written_event is None else written_event.created_at
+    if written_at is not None and written_at.tzinfo is None:
+        written_at = written_at.replace(tzinfo=UTC)
+    if (
+        written_event is None
+        or written_event.session_id != fence.session_id
+        or written_event.role != "audit"
+        or written_event.writer_principal != "compose_loop"
+        or written_event.content != event_content
+        or written_event.tool_calls is not None
+        or written_at != cancelled_at.astimezone(UTC)
+    ):
+        raise AuditIntegrityError("Undispatched cancellation audit event was not durably written as requested")
+    connection.execute(
+        insert(token_usage_ledger_table).values(
+            entry_id=entry_id,
+            identity_id=attempt.identity_id,
+            session_id=fence.session_id,
+            source=attempt.source,
+            run_id=attempt.run_id,
+            model=requested_model,
+            prompt_tokens=0,
+            completion_tokens=0,
+            cached_prompt_tokens=0,
+            reasoning_tokens=0,
+            recorded_at=cancelled_at,
+        )
+    )
+    connection.execute(
+        update(quota_provider_attempts_table)
+        .where(quota_provider_attempts_table.c.attempt_id == attempt_id, quota_provider_attempts_table.c.settled_at.is_(None))
+        .values(settled_at=cancelled_at, ledger_entry_id=entry_id)
     )
 
 
@@ -320,8 +459,7 @@ def _daily_token_total_on_connection(
 def token_usage_entry_from_llm_call_envelope(envelope: Mapping[str, Any]) -> TokenUsageEntry | None:
     """Derive the ledger entry for one persisted ``llm_call_audit`` envelope.
 
-    ELSPETH wrote the envelope (``composer/audit.py`` ``llm_call_audit_envelope``
-    and the guided failure projection in ``sessions/guided_audit.py``), so its
+    ELSPETH wrote the envelope (``composer/audit.py`` ``llm_call_audit_envelope``), so its
     keys are read directly. Failed calls may have consumed provider tokens
     before their response was lost, so missing usage remains unknown too.
     """

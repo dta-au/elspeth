@@ -1,4 +1,4 @@
-"""Freeform persistence must not create an authoritative guided checkpoint."""
+"""Freeform proposals and lazy composition persist through ordinary session APIs."""
 
 import asyncio
 import uuid
@@ -15,12 +15,11 @@ from tests.unit.web.sessions.test_routes import (
     _async_return,
     _create_test_composition_proposal,
     _make_app,
-    _start_live_guided_session,
 )
 
 
 @pytest.mark.parametrize("tool_name", ["set_source", "set_pipeline"])
-def test_rootless_freeform_proposal_stays_freeform_after_reload_and_can_explicitly_convert(tmp_path, monkeypatch, tool_name) -> None:
+def test_rootless_freeform_proposal_survives_reload(tmp_path, monkeypatch, tool_name) -> None:
     from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 
     app, service = _make_app(tmp_path)
@@ -132,47 +131,19 @@ def test_rootless_freeform_proposal_stays_freeform_after_reload_and_can_explicit
     assert persisted.sources["primary"]["plugin"] == "csv"
     assert persisted.sources["primary"]["options"]["path"] == str(input_path)
     assert persisted.sources["primary"]["options"]["schema"]["mode"] == "observed"
-    reloaded = client.get(f"/api/sessions/{session_id}/guided")
-    assert reloaded.status_code == 400, reloaded.json()
-    assert persisted.composer_meta is None or "guided_session" not in persisted.composer_meta
-
-    converted = client.post(
-        f"/api/sessions/{session_id}/guided/convert",
-        json={"operation_id": str(uuid.uuid4()), "intent": "Summarize this CSV and save the result"},
-    )
-    assert converted.status_code == 200, converted.json()
-    resumed = client.get(f"/api/sessions/{session_id}/guided")
-    assert resumed.status_code == 200, resumed.json()
-    assert resumed.json()["composition_state"]["composer_meta"]["guided_session"]["root_intent_message_id"] is not None
-    assert resumed.json()["next_turn"] is not None
+    reloaded = client.get(f"/api/sessions/{session_id}/state")
+    assert reloaded.status_code == 200, reloaded.json()
+    assert reloaded.json()["id"] == str(persisted.id)
     assert asyncio.run(service.get_state(persisted.id)) == persisted
 
 
-def test_deliberate_guided_start_remains_guided_after_reload(tmp_path) -> None:
-    app, service = _make_app(tmp_path)
-    client = TestClient(app)
-    session = client.post("/api/sessions", json={"title": "Deliberate guided"}).json()
-    session_id = uuid.UUID(session["id"])
-    started = _start_live_guided_session(client, session_id, "Summarize this CSV and save the result")
-    reloaded = client.get(f"/api/sessions/{session_id}/guided")
-    assert reloaded.status_code == 200, reloaded.json()
-    assert reloaded.json()["guided_session"] == started.json()["guided_session"]
-    persisted = asyncio.run(service.get_current_state(session_id))
-    assert persisted is not None
-    assert persisted.composer_meta["guided_session"]["root_intent_message_id"] is not None
-    assert reloaded.json()["next_turn"] is not None
-
-
 @pytest.mark.parametrize("endpoint", ["messages", "recompose"])
-def test_lazy_freeform_composition_does_not_pass_a_guided_checkpoint(tmp_path, endpoint) -> None:
+def test_lazy_freeform_composition_passes_empty_state(tmp_path, endpoint) -> None:
     app, service = _make_app(tmp_path)
     client = TestClient(app)
     session = client.post("/api/sessions", json={"title": "Freeform request"}).json()
     session_id = uuid.UUID(session["id"])
     composer = MagicMock(spec=ComposerService)
-    composer.surface_pending_interpretation_reviews = AsyncMock(
-        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
-    )
     composer.compose = AsyncMock(
         spec=ComposerService.compose,
         return_value=ComposerResult(
@@ -182,12 +153,19 @@ def test_lazy_freeform_composition_does_not_pass_a_guided_checkpoint(tmp_path, e
     )
     app.state.composer_service = composer
     if endpoint == "recompose":
-        asyncio.run(service.add_message(session_id, "user", "Summarize my CSV", writer_principal="route_user_message"))
-        response = client.post(f"/api/sessions/{session_id}/recompose")
+        user_message = asyncio.run(service.add_message(session_id, "user", "Summarize my CSV", writer_principal="route_user_message"))
+        response = client.post(
+            f"/api/sessions/{session_id}/recompose",
+            json={"expected_user_message_id": str(user_message.id)},
+        )
     else:
-        response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Summarize my CSV"})
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Summarize my CSV", "client_request_id": str(uuid.uuid4())},
+        )
     assert response.status_code == 200, response.json()
     composer.compose.assert_awaited_once()
     supplied_state = composer.compose.call_args.args[2]
     assert isinstance(supplied_state, CompositionState)
-    assert supplied_state.guided_session is None
+    assert supplied_state.sources == {}
+    assert supplied_state.nodes == ()

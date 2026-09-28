@@ -1213,7 +1213,7 @@ class RowTokenRepository:
         except (AuditIntegrityError, RunLeadershipLostError):
             raise
         except Exception as exc:
-            raise AuditIntegrityError(f"coalesce effect finalization failure: {type(exc).__name__}: {exc}") from exc
+            raise AuditIntegrityError(f"coalesce effect finalization failure: {type(exc).__name__}") from exc
 
     def _lock_coalesce_dependencies(
         self,

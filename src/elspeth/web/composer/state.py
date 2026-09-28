@@ -25,7 +25,10 @@ from elspeth.contracts.enums import NodeType as RuntimeNodeType
 from elspeth.contracts.field_collision import can_overwrite_input_fields
 from elspeth.contracts.field_spelling import (
     HEADER_SPELLING_RULE,
+    NO_SOURCE_RENAMES,
     DeclaredSpellings,
+    FieldNameResolution,
+    SourceFieldRenames,
     describe_header_spellings,
     header_spelled_declarations,
 )
@@ -92,7 +95,6 @@ from elspeth.web.composer._validation_probe import (
     is_inline_content_reference,
     prepare_validation_probe_options,
 )
-from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
@@ -1984,7 +1986,7 @@ _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX: Final[str] = (
     "spelling the declaration does not carry works at best by accident of the producer's original header, so "
     "'correcting' the declaration to match a template typo moves the failure rather than clearing it. Add a name to "
     "options.required_input_fields ONLY if the upstream producer guarantees that exact name: declaring one it does "
-    "not guarantee is accepted here and then fails every row at run time with a declared-required-fields violation. "
+    "not guarantee is refused when the pipeline is validated. "
     'Where the rejection shows a parenthesised form, declare THAT — a bracket literal such as row["Original Header"] '
     "is not a legal declaration entry and is rejected on application. Send the full list when you patch: "
     "patch_node_options replaces the option's value, it does not append. Do not answer this by emptying "
@@ -2045,8 +2047,8 @@ def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: st
     """Return True only for expected draft/config failures from probe construction.
 
     The single probe-tolerance taxonomy for this module and for every other
-    composer consumer (``guided.emitters``, ``_semantic_validator``), which
-    reuse it rather than restating it. Composer probes construct plugins from in-progress composer/
+    composer consumer (including ``_semantic_validator``), which
+    reuses it rather than restating it. Composer probes construct plugins from in-progress composer/
     LLM/user-authored config, so a config, lookup, or template failure is
     ordinary external input and the caller abstains. Anything else is a
     genuine engine defect and must crash through.
@@ -2664,9 +2666,7 @@ def _fork_branch_reaches_sink_before_closer(
     at all is the "no path to closer" limb (Stage-1 abstains — the roster's
     declared VALUES having no producer at all is
     ``coalesce_branch_unreachable``/``row_union_branch_unreachable``'s job,
-    already a more specific, planner-actionable diagnostic — see
-    guided-incident regression `test_orphaned_coalesce_rejects_with_the_
-    single_observed_code`). Firing here too would silently duplicate that
+    already a more specific, planner-actionable diagnostic). Firing here too would silently duplicate that
     single-code guarantee with a less specific message.
     """
     from elspeth.web.composer._producer_resolver import published_success_connection
@@ -2870,20 +2870,16 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, CoalesceRe
     the walk but are never a correct branch value, so the facts must not
     steer a repair toward them).
 
-    Guided session 277fb6c4 (2026-07-22) exhausted its repair budget on four
-    identical ``coalesce_branch_unreachable`` rejections: the observed
-    miswiring — branch transforms publishing straight to the sink — is
-    invisible from the bare code, and the planner's repair feedback strips
-    raw messages. Everything here is a node id or connection name the
+    Branch transforms publishing straight to a sink are invisible from the
+    bare ``coalesce_branch_unreachable`` code, and repair feedback strips raw
+    messages. Everything here is a node id or connection name the
     session owner / planner authored — the same redaction judgment as
     ``SchemaContractDetail`` — so forwarding it through the message-stripped
     repair feedback does not re-open the redaction boundary.
 
     A MAPPED branch whose branch-side transform CHAIN terminates in a
     sink-publishing hop carries ``sink_lure``: that transform's id and the
-    sink it publishes to. Guided attempt 14 (session 04200b45) re-wired
-    branch transforms to the reviewed sink three times WITH the bare facts
-    live — the repair needs the exact miswired node named. The lure rides
+    sink it publishes to. The repair needs the exact miswired node named. The lure rides
     on the branch record it explains, so nothing has to be joined back by
     connection name; the connection the coalesce expects is that record's
     own ``consumed_connection``.
@@ -5635,8 +5631,9 @@ def _check_schema_contracts(
                 # of the declared branch names and ``require_all`` and never
                 # reads a branch's guarantees at all. That is why this dispatches
                 # BEFORE the per-branch vote below — the walk is dead work here,
-                # and the vote's participation filter (which drops abstaining
-                # branches) would under-report the branch-name set.
+                # and the union merge's abstention rule (an abstaining branch
+                # under a non-require_all policy abstains the whole vote) would
+                # under-report the branch-name set.
                 #
                 # Running the union arm on a nested merge claimed the branches'
                 # inner fields, so Stage 1 validated GREEN a pipeline the DAG
@@ -5663,46 +5660,31 @@ def _check_schema_contracts(
                     branch_connection,
                     visited_fan_in_ids=visited_fan_in_ids | {producer_node.id},
                 )
-                if not branch_participates:
-                    continue
+                # EVERY branch enters, an abstainer as a schema without
+                # guarantees, exactly as the DAG builder builds its
+                # ``guarantee_branch_schemas``: ``merge_guaranteed_fields``
+                # skips it under require_all and abstains on it under every
+                # other policy (a merged row can be that branch alone), so
+                # this vote and the runtime's read one rule (R2 fix round 1).
                 branch_schemas[branch_name] = SchemaConfig(
                     mode="observed",
                     fields=None,
-                    guaranteed_fields=tuple(sorted(branch_guarantees)),
+                    guaranteed_fields=tuple(sorted(branch_guarantees)) if branch_participates else None,
                 )
-
-            if not branch_schemas:
-                return False, frozenset()
 
             merged = merge_guaranteed_fields(
                 branch_schemas,
                 require_all=require_all,
             )
-            # ``merge_guaranteed_fields`` documents None and () as SEMANTICALLY
-            # distinct — None is "no branch has effective guarantees, abstain",
-            # () is "branches have guarantees and the merge is empty". The
-            # ``or ()`` therefore looks like it flattens an abstention into an
-            # assertion. It cannot, and the reason is three lines up, not here:
-            #
-            #   * the loop ``continue``s on every non-participating branch, so
-            #     an abstainer never enters ``branch_schemas``;
-            #   * ``if not branch_schemas`` returns participated=False above,
-            #     so the all-abstained case never reaches this call;
-            #   * every surviving entry is built with an explicit
-            #     ``guaranteed_fields=tuple(...)``, never None, so
-            #     ``has_effective_guarantees`` is True for all of them.
-            #
-            # With at least one participating set present, the None limb is
-            # unreachable, and participated=True is the correct answer. The
-            # ``or ()`` stays as a fail-safe rather than an assert: if a future
-            # edit let None through, it would reach
-            # ``_mirrored_coalesce_merged_guarantees``, whose three consumers
-            # all test ``is not None``, and an abstention arriving as
-            # ``frozenset()`` would make them adjudicate the coalesce as a
-            # zero-guarantee producer and false-reject a downstream sink. Any
-            # edit that removes the ``continue`` or the empty-case return owes
-            # this line a real abstention channel.
-            return True, frozenset(merged or ())
+            # None is the abstention channel ``merge_guaranteed_fields``
+            # documents (no branch vouches, or a non-require_all policy with an
+            # abstaining branch); () is a participating empty merge. Flattening
+            # None into frozenset() would make the three consumers of
+            # ``_mirrored_coalesce_merged_guarantees`` adjudicate the coalesce
+            # as a zero-guarantee producer and false-reject a downstream sink.
+            if merged is None:
+                return False, frozenset()
+            return True, frozenset(merged)
 
         return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
@@ -7389,6 +7371,121 @@ def _check_schema_contracts(
     # makes unbounded.
     spelling_rule_abstains = _node_topology_cycle(nodes) is not None
 
+    # The rule resolves a declared name the way the upstream does: through the
+    # ``field_mapping`` of every source whose rows reach the consumer, read off
+    # a probe instance's ``field_renames`` exactly as the builder reads the real
+    # source's, followed through every transform's ``renamed_input_fields`` on
+    # the way (``upstream_name_resolution`` in core/dag/schema_validation.py).
+    source_renames_memo: dict[str, SourceFieldRenames] = {}
+
+    def _source_field_renames(producer: ProducerEntry) -> SourceFieldRenames:
+        """A source producer's ``field_renames``; none when its draft config does not construct.
+
+        A source that does not build is refused by its own validation, and the
+        build that would read its renames never runs, so it contributes none.
+        """
+        source_name = "source" if producer.producer_id == "source" else producer.producer_id.removeprefix("source:")
+        if source_name in source_renames_memo:
+            return source_renames_memo[source_name]
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+        source_spec = source_map[source_name]
+        probe: SourceProtocol | None = None
+        renames: SourceFieldRenames
+        try:
+            probe_options = prepare_validation_probe_options(source_spec.options, plugin=source_spec.plugin)
+            probe_options["on_validation_failure"] = source_spec.on_validation_failure
+            with plugin_preflight_mode(True):
+                probe = get_shared_plugin_manager().create_source(source_spec.plugin, probe_options)
+            renames = probe.field_renames
+        except Exception as exc:
+            if not _is_source_config_probe_exception(exc):
+                raise
+            renames = NO_SOURCE_RENAMES
+        finally:
+            if probe is not None:
+                probe.close()
+        source_renames_memo[source_name] = renames
+        return renames
+
+    def _node_input_connections(node: NodeSpec) -> tuple[str, ...]:
+        return _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+
+    def _publishes_live(entry: ProducerEntry, connection: str) -> bool:
+        """Whether the producer delivers ROWS on ``connection`` — success, a route or a fork, never ``on_error``.
+
+        The builder's non-DIVERT edges; a source registers only its ``on_success``.
+        """
+        if is_source_producer_id(entry.producer_id):
+            return True
+        node = node_by_id[entry.producer_id]
+        return (
+            connection == published_success_connection(node)
+            or (node.routes is not None and connection in node.routes.values())
+            or (node.fork_to is not None and connection in node.fork_to)
+        )
+
+    def _live_producers_of(connection: str) -> tuple[ProducerEntry, ...]:
+        if connection in sink_names:
+            return tuple(entry for entry in resolver.sink_producers(connection) if _publishes_live(entry, connection))
+        producer = resolver.find_producer_for(connection)
+        if producer is None:
+            return ()
+        if not is_source_producer_id(producer.producer_id) and node_by_id[producer.producer_id].node_type == "queue":
+            return tuple(
+                entry for entry in resolver.queue_predecessors(producer.producer_id) if _publishes_live(entry, producer.producer_id)
+            )
+        return (producer,) if _publishes_live(producer, connection) else ()
+
+    live_reach_memo: dict[tuple[str, ...], FieldNameResolution] = {}
+    producer_resolution_memo: dict[str, FieldNameResolution] = {}
+
+    def _transform_renamed_input_fields(node: NodeSpec) -> Mapping[str, str]:
+        """A transform node's ``renamed_input_fields``, read off its shared probe; none for any other kind.
+
+        Exactly what the builder threads onto a TRANSFORM ``NodeInfo``. A node
+        whose draft options do not construct is refused by its own validation
+        and the build that would follow its renames never runs, so it renames
+        nothing here (as ``_source_field_renames`` abstains).
+        """
+        if node.node_type != "transform" or node.plugin is None:
+            return {}
+        try:
+            return probe_cache.transform(node.plugin, node).renamed_input_fields
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return {}
+
+    def _producer_name_resolution(producer: ProducerEntry) -> FieldNameResolution:
+        """The name resolution of the rows ``producer`` emits (``_output_name_resolution`` in the builder's validator)."""
+        if producer.producer_id in producer_resolution_memo:
+            return producer_resolution_memo[producer.producer_id]
+        if is_source_producer_id(producer.producer_id):
+            resolution = FieldNameResolution.of_source_renames((_source_field_renames(producer),))
+        else:
+            node = node_by_id[producer.producer_id]
+            resolution = _live_name_resolution(_node_input_connections(node)).then_renamed(_transform_renamed_input_fields(node))
+        producer_resolution_memo[producer.producer_id] = resolution
+        return resolution
+
+    def _live_name_resolution(connections: tuple[str, ...]) -> FieldNameResolution:
+        """The name resolution of the rows arriving over ``connections`` (``upstream_name_resolution``'s mirror).
+
+        The renames of every source whose rows reach them over live wiring,
+        followed through every transform rename on the way. Asked only once a
+        producer vote participates (``_header_spelling_error``), so a source is
+        probed only when a verdict can depend on its renames. A node cycle never
+        reaches here: the rule abstains on one (``spelling_rule_abstains``).
+        """
+        if connections in live_reach_memo:
+            return live_reach_memo[connections]
+        live_reach_memo[connections] = FieldNameResolution.union(
+            _producer_name_resolution(producer) for connection in connections for producer in _live_producers_of(connection)
+        )
+        return live_reach_memo[connections]
+
     def _header_spelling_error(
         *,
         component: str,
@@ -7397,8 +7494,13 @@ def _check_schema_contracts(
         declared: DeclaredSpellings,
         removed: frozenset[str],
         producer: ProducerEntry,
+        reach: tuple[str, ...],
     ) -> ValidationEntry | None:
         participates, vote_fields = _effective_producer_vote(producer)
+        # An abstaining vote settles nothing (``header_spelled_declarations``),
+        # so no source is probed for its renames.
+        if not participates:
+            return None
         producer_schema = _known_producer_schema_config(producer)
         spellings = header_spelled_declarations(
             spellings=declared,
@@ -7406,6 +7508,7 @@ def _check_schema_contracts(
             forwarded=vote_fields - removed,
             participated=participates,
             closed=producer_schema is not None and not producer_schema.allows_extra_fields,
+            resolution=_live_name_resolution(reach),
         )
         if not spellings:
             return None
@@ -7469,8 +7572,8 @@ def _check_schema_contracts(
         if node.id in parse_failed_producers:
             continue
         surfaces = _probe_transform_spelling_surfaces(node.plugin, node)
-        # A node whose declarations are all canonical has nothing any upstream
-        # could make a header spelling, so no producer is walked for it.
+        # A node that declares nothing has nothing any upstream could make a
+        # header spelling, so no producer is walked for it.
         if surfaces is None or surfaces.declared.is_empty:
             continue
         spelling_producer = _walk_to_real_producer(node.input, warnings=spelling_walk_warnings)
@@ -7483,6 +7586,7 @@ def _check_schema_contracts(
             declared=surfaces.declared,
             removed=surfaces.removed,
             producer=spelling_producer,
+            reach=_node_input_connections(node),
         )
         if spelling_error is not None:
             errors.append(spelling_error)
@@ -7514,6 +7618,7 @@ def _check_schema_contracts(
                 declared=sink_declared,
                 removed=frozenset(),
                 producer=real_producer,
+                reach=(output.name,),
             )
             if spelling_error is not None:
                 errors.append(spelling_error)
@@ -7577,9 +7682,6 @@ class CompositionState:
         outputs: Sink configurations.
         metadata: Pipeline name and description.
         version: Monotonically increasing per session, starting at 1.
-        guided_session: Optional guided-mode session pointer. None for freeform
-            sessions; set to GuidedSession.initial() at session-create time for
-            guided sessions (spec §5.2).
     """
 
     nodes: tuple[NodeSpec, ...]
@@ -7587,7 +7689,6 @@ class CompositionState:
     outputs: tuple[OutputSpec, ...]
     metadata: PipelineMetadata
     version: int
-    guided_session: GuidedSession | None = None
     sources: Mapping[str, SourceSpec] = field(default_factory=dict)
     # Write-once memo slot for ``pipeline_proposal.composition_content_hash``:
     # the hash serializes the whole state, and preflight identity keys rebuild
@@ -7606,7 +7707,6 @@ class CompositionState:
         outputs: tuple[OutputSpec, ...],
         metadata: PipelineMetadata,
         version: int,
-        guided_session: GuidedSession | None = None,
         sources: Mapping[str, SourceSpec] | None = None,
         source: SourceSpec | None = None,
     ) -> None:
@@ -7620,7 +7720,6 @@ class CompositionState:
         object.__setattr__(self, "outputs", outputs)
         object.__setattr__(self, "metadata", metadata)
         object.__setattr__(self, "version", version)
-        object.__setattr__(self, "guided_session", guided_session)
         object.__setattr__(self, "sources", source_map)
         object.__setattr__(self, "_content_hash_memo", None)
         freeze_fields(self, "sources")
@@ -7831,10 +7930,6 @@ class CompositionState:
         The round-trip is CONTENT-exact, not identity-exact, in both directions,
         and callers that need either property must say which:
 
-        * ``from_dict(to_dict(state)) == state`` fails whenever ``state`` carries
-          a ``guided_session`` — ``to_dict`` never emits it and this never
-          restores it. It is carried on the ``composer_meta`` side channel
-          instead (``sessions/converters.py``).
         * ``to_dict(from_dict(payload)) == payload`` fails for any payload the
           spec constructors normalise (coalesce ``merge``/``policy`` defaults,
           ``row_union`` list branches), for any key not declared by the spec

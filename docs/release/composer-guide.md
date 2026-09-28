@@ -1,7 +1,7 @@
 # ELSPETH Composer Guide
 
-**Document date:** 8 September 2026
-**Release covered:** 0.8.0
+**Document date:** 28 September 2026
+**Release covered:** 0.8.1
 **Audience:** Evaluators, program teams, operators, and technical reviewers
 **Register:** Public-facing / lightly technical
 **Status:** Current capability guide
@@ -18,16 +18,16 @@ Composer turns a conversation into an auditable pipeline artifact. The generated
 pipeline is still validation-gated, exportable as YAML, and backed by the same
 audit and lineage model as hand-authored ELSPETH pipelines.
 
-Use Composer when you want a guided way to build a pipeline without starting
+Use Composer when you want to build a pipeline in conversation without starting
 from a blank YAML file.
 
 ## What You Can Do
 
 | Need | Composer capability |
 |---|---|
-| Start from plain-language intent | Describe the workflow in chat or use guided mode to let the model build each stage from an operator instruction. |
+| Start from plain-language intent | Describe the workflow in chat and refine the model's proposal through follow-up instructions. |
 | Build with structure | Add or revise plural sources, sinks, transforms, queues, gates, forks, coalesces, final wiring, and plugin options through controlled UI turns. |
-| Keep the operator in control | Accept, reject, or edit proposed changes before they become part of the composition. |
+| Keep the operator in control | See the session's authority mode, inspect versioned changes, and accept or reject changes that require approval. |
 | Check readiness | Use the audit-readiness and live verification panels to see validation, plugin trust, provenance, retention, LLM interpretation, and secret status. |
 | Review the shape | Inspect the graph view and rendered YAML before running or sharing. |
 | Handle credentials safely | Reference secrets by name instead of placing secret values in pipeline configuration. |
@@ -37,31 +37,31 @@ from a blank YAML file.
 
 ## The Authoring Experience
 
-Composer supports three authoring paths.
+Composer has one authoring path: freeform conversation. The first-run tutorial
+uses that same Composer path with a fixed example, then takes the new user
+through a real run, its audit story, and graduation to an ordinary session.
 
 | Path | Best for | How it feels |
 |---|---|---|
-| First-run tutorial | New users learning the vocabulary | A short guided walkthrough that builds a simple pipeline and explains the audit story. |
-| Guided mode | Users who want structure | A conversational builder that uses an LLM to construct source, sink, transforms, and final wiring one stage at a time. |
-| Freeform mode | Experienced users with a clear pipeline in mind | A chat-first surface where the user describes the pipeline and reviews proposed changes. |
+| First-run tutorial | New users learning the vocabulary | A fixed example composed through the ordinary chat, followed by Run, Audit, and Graduation. |
+| Freeform Composer | Anyone building or revising a pipeline | Describe the intended result, inspect applied changes or pending proposals, and refine in conversation. |
 
-Guided mode is the default for new sessions unless the user changes their
-Composer preference. Users can switch modes during a session without changing
-their account default.
-
-In 0.7.1, guided mode remains LLM-primary but uses the same canonical pipeline
-proposal contract as freeform mode. The model can propose a complete DAG or a
-stage-scoped revision; ELSPETH keeps that candidate separate from committed
-state, validates it, presents the plain-language and graph impact, and applies
-it only after review and wire confirmation. Closed rejection codes return
-contract facts to a bounded repair round instead of letting the model silently
-replace the operator's intent.
+The model proposes the pipeline structure. New sessions default to
+**Auto-apply on**: eligible changes can become versioned, audited pipeline
+state without an Accept click. A full-pipeline proposal auto-commits only when
+a green runtime preflight validates the candidate and the session remains in
+auto-apply mode. The chat header shows the authority mode. With
+**Approval required**, changes
+wait as proposals for explicit Accept or Reject; a full-pipeline proposal also
+remains pending when auto-commit's conditions are not met. Inspect the graph and
+plain-language impact in either case. A rejected proposal can be revised in the
+next turn without silently replacing the operator's intent.
 
 The desktop workspace keeps authoring beside the pipeline artifact. Its
 resizable authoring pane can collapse and reopen while the Graph, Spec, YAML,
 Checks, and Run views remain available in the artifact pane. Checks collects
 readiness details; the inspector opens additional context without replacing
-the artifact. Guided and freeform sessions use this same workspace. On narrower
+the artifact. Tutorial and ordinary sessions use this same workspace. On narrower
 screens, the views remain reachable through the workspace tabs and controls.
 
 ## How Composer Keeps Work Auditable
@@ -78,11 +78,10 @@ Composer treats authoring as part of the evidence chain.
   to run or share.
 - If an LLM-assisted step depends on a subjective interpretation, Composer can
   surface that interpretation for review instead of silently deciding it.
-- Guided sessions surface pending interpretation cards before persistence can
-  advance, and the wire stage can request an advisor rather than auto-complete.
-- Guided planning, start admission, failed-operation evidence, and proposal
-  confirmation are durable and fenced. A concurrent mutation receives a fast
-  conflict instead of entering a second long-running planner queue.
+- Pending interpretation cards ask for operator review before a subjective
+  decision becomes part of the pipeline.
+- Authoring operations retain durable request and failure evidence. Concurrent
+  mutations are fenced so a stale response cannot overwrite newer work.
 
 This does not make the language model an authority. The language model proposes
 changes. ELSPETH records, validates, and gates the resulting pipeline.

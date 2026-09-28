@@ -104,15 +104,6 @@ vi.mock("./components/workspace/ArtifactWorkspace", () => ({
   },
 }));
 
-vi.mock("./components/workspace/WorkspaceInspector", () => ({
-  WorkspaceInspector: () => (
-    <div data-testid="workspace-inspector-stub">
-      <div data-testid="audit-readiness-stub" />
-      <div data-testid="side-rail-validation-banner-stub" />
-    </div>
-  ),
-}));
-
 vi.mock("./components/workspace/WorkspaceActionBar", () => ({
   WorkspaceActionBar: ({
     capabilities,
@@ -285,7 +276,6 @@ vi.mock("./api/client", () => ({
   // module imports these from @/api/client and would receive `undefined`
   // (throwing at first call) without the mock entries.
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
-    default_mode: "guided",
     freeform_intro_dismissed_at: null,
     tutorial_completed_at: "2026-05-19T00:00:00Z",
     tutorial_stage: null,
@@ -653,7 +643,7 @@ describe("App banner roles", () => {
     expect(screen.queryByLabelText(/sessions sidebar/i)).not.toBeInTheDocument();
   });
 
-  it("mounts one common workspace with authoring, artifact, inspector, and actions", async () => {
+  it("mounts one common workspace with authoring, artifact, and actions", async () => {
     // An active session keeps the composer shell mounted — with no sessions
     // at all App now renders the empty landing instead (elspeth-e69642fede).
     useSessionStore.setState({ activeSessionId: "session-1" });
@@ -662,10 +652,6 @@ describe("App banner roles", () => {
     await waitFor(() => {
       expect(api.fetchSystemStatus).toHaveBeenCalled();
     });
-    expect(screen.getByTestId("audit-readiness-stub")).toBeInTheDocument();
-    expect(
-      screen.getByTestId("side-rail-validation-banner-stub"),
-    ).toBeInTheDocument();
     expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
     expect(screen.getByTestId("artifact-workspace-stub")).toBeInTheDocument();
     expect(screen.getByTestId("workspace-action-bar-stub")).toBeInTheDocument();
@@ -699,8 +685,8 @@ describe("App banner roles", () => {
   });
 
   it.each([
-    ["busy", { guidedChatPending: true, error: null }],
-    ["error", { guidedChatPending: false, error: "authoring failed" }],
+    ["busy", { isComposing: true, error: null }],
+    ["error", { isComposing: false, error: "authoring failed" }],
   ] as const)(
     "renders the real App-owned collapsed status projection with %s tone",
     async (tone, state) => {
@@ -718,85 +704,6 @@ describe("App banner roles", () => {
       expect(projection).toHaveClass("workspace-collapsed-status");
     },
   );
-
-  it("keeps the common workspace during active guided work but exposes status controls only", async () => {
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      // Non-terminal guided session at step_3 with no server turn — the
-      // cold-start arm of isGuidedBuildActive, the same predicate ChatPanel's
-      // workspace branch renders under. Rendering the SideRail alongside it
-      // would put two rails side by side.
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-
-    await waitFor(() => {
-      expect(api.fetchSystemStatus).toHaveBeenCalled();
-    });
-    expect(screen.getByTestId("composer-workspace-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /validation/i })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /audit/i })).toBeInTheDocument();
-    expect(screen.queryByTestId("completion-bar")).toBeNull();
-    expect(screen.queryByRole("button", { name: /import yaml/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /catalog/i })).toBeNull();
-    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
-    expect(workspaceMountSpy).toHaveBeenCalled();
-    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
-      completion: false,
-    });
-    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ catalogAvailable: false }),
-    );
-  });
-
-  it("keeps the same common workspace and restores actions after guided completion", async () => {
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      guidedSession: {
-        step: "step_4_wire",
-        history: [],
-        terminal: {
-          kind: "completed",
-          reason: null,
-          pipeline_yaml: "pipeline: {}",
-        },
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-
-    await waitFor(() => {
-      expect(api.fetchSystemStatus).toHaveBeenCalled();
-    });
-    expect(screen.getByTestId("audit-readiness-stub")).toBeInTheDocument();
-    expect(
-      screen.getByTestId("side-rail-validation-banner-stub"),
-    ).toBeInTheDocument();
-    expect(screen.getByTestId("composer-workspace-stub")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
-    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
-    expect(workspaceMountSpy).toHaveBeenCalled();
-    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
-      completion: true,
-    });
-    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ catalogAvailable: true }),
-    );
-  });
 
   it("loads sessions on startup after SessionSidebar removal", async () => {
     const session: Session = {
@@ -850,78 +757,6 @@ describe("App banner roles", () => {
     expect(onOpenCatalog).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("dialog", { name: "Plugin catalog" })).toBeInTheDocument();
     window.removeEventListener("open-catalog", onOpenCatalog);
-  });
-
-  it("blocks ambient and shortcut catalog requests during active guided work", async () => {
-    const onOpenCatalog = vi.fn();
-    window.addEventListener("open-catalog", onOpenCatalog);
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-
-    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
-    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("dialog", { name: "Plugin catalog" })).toBeNull();
-
-    fireEvent.keyDown(document, {
-      key: "P",
-      code: "KeyP",
-      ctrlKey: true,
-      shiftKey: true,
-    });
-    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("dialog", { name: "Plugin catalog" })).toBeNull();
-    window.removeEventListener("open-catalog", onOpenCatalog);
-  });
-
-  it("closes the Catalog drawer when active guided work revokes the capability", async () => {
-    useSessionStore.setState({ activeSessionId: "session-1" });
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-
-    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
-    expect(
-      screen.getByRole("dialog", { name: "Plugin catalog" }),
-    ).toBeInTheDocument();
-
-    act(() => {
-      useSessionStore.setState({
-        guidedSession: {
-          step: "step_3_transforms",
-          history: [],
-          terminal: null,
-          chat_history: [],
-          chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] },
-          profile: null,
-        } as unknown as import("./types/guided").GuidedSession,
-        guidedNextTurn: null,
-      });
-    });
-
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("dialog", { name: "Plugin catalog" }),
-      ).toBeNull(),
-    );
-    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
-      completion: false,
-    });
-    expect(artifactWorkspacePropsSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ catalogAvailable: false }),
-    );
   });
 
   it("routes Graph and YAML shortcuts to the active session's persistent artifact tabs", async () => {
@@ -1078,41 +913,6 @@ describe("App banner roles", () => {
     fireEvent.keyDown(document, { key: "e", metaKey: true });
 
     expect(onRequestRun).toHaveBeenCalledTimes(1);
-    expect(execute).not.toHaveBeenCalled();
-    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
-  });
-
-  it("does not dispatch run intent from Ctrl+E while the guided build hides the run owner", async () => {
-    const execute = vi.fn();
-    const onRequestRun = vi.fn();
-    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      compositionState: makeState(1),
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        reviewed_components: { sources: [], outputs: [] },
-        profile: null,
-      } as unknown as import("./types/guided").GuidedSession,
-      guidedNextTurn: null,
-    });
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
-    useExecutionStore.setState({
-      validationResult: makeValidationResult({
-        readiness: READY_VALIDATION_READINESS,
-      }),
-      isExecuting: false,
-      progress: null,
-      execute,
-    });
-    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
-
-    expect(onRequestRun).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
   });
@@ -1789,8 +1589,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
       expect(state.bootstrapError).not.toBeNull();
       expect(state.writeError).toBeNull();
     });
-    // No-fabrication shape: defaultMode is still null (we don't guess).
-    expect(usePreferencesStore.getState().defaultMode).toBeNull();
     // App chrome remains rendered. The Layout/ChatPanel stubs are still
     // present — proves the bootstrap failure didn't unmount the tree.
     expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
@@ -1813,7 +1611,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
     });
@@ -1831,7 +1628,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
     });
@@ -1856,7 +1652,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "freeform",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
       bootstrapError: null,
@@ -1877,7 +1672,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: null,
       tutorialCompletedAt: null,
       tutorialCompleted: false,
       bootstrapError: "Preferences could not be loaded: network down",
@@ -1897,10 +1691,9 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "guided",
       tutorialCompletedAt: null,
       tutorialCompleted: false,
-      tutorialStage: "guided",
+      tutorialStage: "build",
       tutorialSessionId: "sess-in-progress",
       tutorialRunId: null,
       tutorialSourceDataHash: null,
@@ -1910,7 +1703,6 @@ describe("App preferences bootstrap (Phase 1B)", () => {
       undefined,
     );
     vi.spyOn(api, "updateUserComposerPreferences").mockResolvedValueOnce({
-      default_mode: "guided",
       freeform_intro_dismissed_at: null,
       tutorial_completed_at: null,
       tutorial_stage: null,

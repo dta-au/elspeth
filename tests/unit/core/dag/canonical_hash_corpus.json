@@ -10,6 +10,8 @@
     "examples/batch_error_routing/settings.yaml": "df19593f2997c351447b3e3fbb70c34da38d22047ef9e40b9110ae5e29104991",
     "examples/batch_error_routing/settings_declared.yaml": "a3e34192953f152b7ec9505f4092a78d1a21794e68d05b83ad0b3a24385bccc7",
     "examples/batch_error_routing/settings_discard.yaml": "cbebbf28df32c9b75c6ae3d299077b6b0a5a1b4b8b983349846f9f8710533acd",
+    "examples/batch_rank_passthrough/settings.yaml": "5d116ccb535d4238cf5d6a26fd064d3115b8998fdc6a73a91f0005451b0ef1ef",
+    "examples/batch_rank_passthrough/settings_transform.yaml": "e0d146239f0d3f8ae2d9b58e87b48ee307d836d8d1537a3cbb0bde792ef12ea3",
     "examples/blob_transforms/settings_expand_csv_blobs.yaml": "c17f1ddc4282853c9b82466b1564c23903d2b2181e7606873a1714af5cbaf3b6",
     "examples/blob_transforms/settings_expand_inline_csv.yaml": "1fd413c85493b307fbdc9116e3d4196cebf021e61642b1cc56488f987137ba46",
     "examples/blob_transforms/settings_expand_inline_json.yaml": "5bcc6c54b8253b724997e533e3bf4c1a06017bef58158d93b260eb59a27ab42b",

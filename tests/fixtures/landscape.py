@@ -13,6 +13,7 @@ Factory hierarchy:
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -20,7 +21,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import event, insert, select
+from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
+from sqlalchemy.engine import Engine, ExecutionContext
+from sqlalchemy.engine.interfaces import ExecuteStyle
+from sqlalchemy.pool import Pool
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
@@ -90,6 +95,74 @@ def expire_worker(engine: Any, worker_id: str, *, seconds_ago: float = 1.0) -> N
     with engine.begin() as conn:
         lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=seconds_ago)
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=lapsed))
+
+
+@contextmanager
+def lowered_sqlite_variable_limit(monkeypatch: pytest.MonkeyPatch, limit: int) -> Iterator[None]:
+    """Every SQLite connection opened inside refuses a statement over ``limit`` binds.
+
+    A Landscape statement must not bind a parameter per row, token or item
+    (SQLite refuses above 32,766, PostgreSQL above 65,535). Lowering the ceiling
+    lets a test prove the bound with a few hundred rows: any statement whose
+    bind count grows with the collection is refused by SQLite itself.
+    SQLAlchemy pages its own multi-row INSERTs by the dialect's declared
+    maximum (32,700), so that page is lowered to the same ceiling. Only pools
+    created inside the block are affected.
+    """
+
+    def _lower(dbapi_connection: sqlite3.Connection, _record: object) -> None:
+        dbapi_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+
+    monkeypatch.setattr(SQLiteDialect_pysqlite, "insertmanyvalues_max_parameters", limit)
+    event.listen(Pool, "connect", _lower)
+    try:
+        yield
+    finally:
+        event.remove(Pool, "connect", _lower)
+
+
+@dataclass
+class StatementBinds:
+    """The most parameters one statement execution bound inside ``record_statement_binds``."""
+
+    max_binds: int = 0
+    statement: str = ""
+    executions: int = 0
+
+
+@contextmanager
+def record_statement_binds() -> Iterator[StatementBinds]:
+    """Record the largest bind count of any one statement execution, on every engine, inside the block.
+
+    The dialect-agnostic half of the bind-budget proof: SQLite's ceiling can be
+    lowered (``lowered_sqlite_variable_limit``), PostgreSQL's cannot, so a test
+    asserts on the count recorded here instead. An ``executemany`` counts one
+    row's parameter set (its statement is fixed-size). A SQLAlchemy
+    insertmanyvalues page is not counted: the driver pages it by the dialect's
+    own ceiling, so it cannot outgrow the database. ``executions`` counts the
+    recorded executions, so a caller can prove the listener fired.
+    """
+    seen = StatementBinds()
+
+    def _record(
+        _conn: object, _cursor: object, statement: str, parameters: Any, context: ExecutionContext | None, executemany: bool
+    ) -> None:
+        if context is not None and context.execute_style is ExecuteStyle.INSERTMANYVALUES:
+            return
+        if executemany:
+            binds = max((len(row) for row in parameters), default=0)
+        else:
+            binds = 0 if parameters is None else len(parameters)
+        seen.executions += 1
+        if binds > seen.max_binds:
+            seen.max_binds = binds
+            seen.statement = " ".join(statement.split())[:300]
+
+    event.listen(Engine, "before_cursor_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(Engine, "before_cursor_execute", _record)
 
 
 def expire_lease(engine: Any, work_item_id: str, *, seconds_ago: float = 1.0) -> datetime:

@@ -38,6 +38,7 @@ from elspeth.web.coordination.contracts import (
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository, SessionOperationConflictError
 from elspeth.web.sessions import archive_quarantine as archive_quarantine_module
+from elspeth.web.sessions import mutation_capabilities
 from elspeth.web.sessions import service as session_service_module
 from elspeth.web.sessions.archive_quarantine import (
     ArchiveQuarantineIdentity,
@@ -52,21 +53,21 @@ from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_proposals_table,
     composition_states_table,
-    guided_operations_table,
     proposal_events_table,
     session_operation_fences_table,
+    session_operation_receipts_table,
     sessions_table,
     web_instances_table,
 )
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     CompositionStateData,
-    GuidedForkSettlementCommand,
-    GuidedOperationClaimed,
-    GuidedOperationFenceLostError,
-    GuidedOperationTakenOver,
+    OperationReceiptClaimed,
+    OperationReceiptFenceLostError,
+    OperationReceiptTakenOver,
     SessionForkAuthority,
     SessionForkParentAuthority,
+    SessionForkSettlementCommand,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import QuarantineCleanupError, SessionServiceImpl
@@ -190,7 +191,7 @@ async def test_postgres_composer_proposal_stale_predecessor_writes_nothing_befor
     )
     entered = threading.Event()
     release = threading.Event()
-    original_validate = session_service_module.validate_proposal_blob_references
+    original_validate = mutation_capabilities.validate_proposal_blob_references
 
     def block_after_initial_authority(*args: Any, **kwargs: Any) -> None:
         entered.set()
@@ -198,7 +199,7 @@ async def test_postgres_composer_proposal_stale_predecessor_writes_nothing_befor
             raise AssertionError("proposal predecessor barrier timed out")
         original_validate(*args, **kwargs)
 
-    monkeypatch.setattr(session_service_module, "validate_proposal_blob_references", block_after_initial_authority)
+    monkeypatch.setattr(mutation_capabilities, "validate_proposal_blob_references", block_after_initial_authority)
     predecessor_task = asyncio.create_task(
         first.create_composition_proposal(
             session_id=session_id,
@@ -333,7 +334,7 @@ async def test_postgres_composer_proposal_reject_stale_predecessor_writes_nothin
     )
     entered = threading.Event()
     release = threading.Event()
-    original_reject = session_service_module._SessionComposerMutations.reject_pending_proposal
+    original_reject = mutation_capabilities._SessionComposerMutations.reject_pending_proposal
     blocked = False
 
     def block_first_reject(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -345,7 +346,7 @@ async def test_postgres_composer_proposal_reject_stale_predecessor_writes_nothin
                 raise AssertionError("proposal reject predecessor barrier timed out")
         original_reject(self, *args, **kwargs)
 
-    monkeypatch.setattr(session_service_module._SessionComposerMutations, "reject_pending_proposal", block_first_reject)
+    monkeypatch.setattr(mutation_capabilities._SessionComposerMutations, "reject_pending_proposal", block_first_reject)
     predecessor_task = asyncio.create_task(
         first.reject_composition_proposal(
             session_id=session_id,
@@ -462,7 +463,7 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
     )
     entered = threading.Event()
     release = threading.Event()
-    original_accept = session_service_module._SessionComposerMutations.accept_pending_ordinary_proposal
+    original_accept = mutation_capabilities._SessionComposerMutations.accept_pending_ordinary_proposal
     blocked = False
     successor_reached_advisory_lock = threading.Event()
 
@@ -480,7 +481,7 @@ async def test_postgres_composer_proposal_accept_stale_predecessor_writes_nothin
             successor_reached_advisory_lock.set()
 
     monkeypatch.setattr(
-        session_service_module._SessionComposerMutations,
+        mutation_capabilities._SessionComposerMutations,
         "accept_pending_ordinary_proposal",
         block_first_accept,
     )
@@ -691,20 +692,20 @@ def _fork_write_fence(
 ) -> BlobForkWriteFence:
     """Mint the blob write fence exactly as the fork route does.
 
-    ``copy_blobs_for_fork`` takes an exact ``BlobForkWriteFence`` (the guided
+    ``copy_blobs_for_fork`` takes an exact ``BlobForkWriteFence`` (the receipt
     lease projected onto the source/target pair), not the whole fork
-    authority; ``routes/sessions.py`` derives it from the parent's guided
+    authority; ``routes/sessions.py`` derives it from the parent's receipt
     fence, and so does this helper. A fence minted from a superseded
     authority carries the old lease token and attempt, so the blob service
     refuses it with ``BlobForkFenceLostError``.
     """
-    guided = authority.parent.guided_fence
+    receipt = authority.parent.receipt_fence
     return BlobForkWriteFence(
         source_session_id=source_session_id,
         target_session_id=target_session_id,
-        operation_id=guided.operation_id,
-        lease_token=guided.lease_token,
-        attempt=guided.attempt,
+        operation_id=receipt.operation_id,
+        lease_token=receipt.lease_token,
+        attempt=receipt.attempt,
     )
 
 
@@ -751,7 +752,7 @@ async def _claim(
         owner_instance_id=service.session_operation_owner_instance_id,
         lease_seconds=service.session_operation_lease_seconds,
     )
-    outcome = await service.reserve_guided_operation(
+    outcome = await service.reserve_operation_receipt(
         session_id=session_id,
         operation_id=operation_id,
         kind="session_fork",
@@ -760,11 +761,11 @@ async def _claim(
         lease_seconds=30,
         session_operation_context=context,
     )
-    assert type(outcome) in {GuidedOperationClaimed, GuidedOperationTakenOver}
-    claimed = cast("GuidedOperationClaimed | GuidedOperationTakenOver", outcome)
+    assert type(outcome) in {OperationReceiptClaimed, OperationReceiptTakenOver}
+    claimed = cast("OperationReceiptClaimed | OperationReceiptTakenOver", outcome)
     return SessionForkParentAuthority(
         parent_context=context,
-        guided_fence=claimed.fence,
+        receipt_fence=claimed.fence,
     )
 
 
@@ -829,15 +830,15 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
                     sessions_table.c.id.label("child_id"),
                     session_operation_fences_table.c.operation_kind,
                     session_operation_fences_table.c.operation_epoch,
-                    guided_operations_table.c.operation_id.label("guided_operation_id"),
+                    session_operation_receipts_table.c.operation_id.label("receipt_operation_id"),
                 )
                 .join(
                     session_operation_fences_table,
                     session_operation_fences_table.c.session_id == sessions_table.c.id,
                 )
                 .join(
-                    guided_operations_table,
-                    guided_operations_table.c.result_session_id == sessions_table.c.id,
+                    session_operation_receipts_table,
+                    session_operation_receipts_table.c.result_session_id == sessions_table.c.id,
                 )
                 .where(sessions_table.c.id == str(staged.session.id))
             )
@@ -847,7 +848,7 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
     assert atomic["child_id"] == str(staged.session.id)
     assert atomic["operation_kind"] == "session_fork"
     assert atomic["operation_epoch"] == 2
-    assert atomic["guided_operation_id"] == operation_id
+    assert atomic["receipt_operation_id"] == operation_id
 
     with first_engine.begin() as conn:
         now = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
@@ -857,10 +858,10 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
             .values(lease_expires_at=now - timedelta(seconds=1))
         )
         conn.execute(
-            update(guided_operations_table)
+            update(session_operation_receipts_table)
             .where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
             .values(lease_expires_at=now - timedelta(seconds=1))
         )
@@ -881,13 +882,13 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
     assert resumed.authority.child_context.fence.operation_epoch > staged.authority.child_context.fence.operation_epoch
     assert resumed.authority.parent.parent_context.fence.lease_token != staged.authority.parent.parent_context.fence.lease_token
     assert resumed.authority.child_context.fence.lease_token != staged.authority.child_context.fence.lease_token
-    assert resumed.authority.parent.guided_fence.operation_id == operation_id
-    assert resumed.authority.parent.guided_fence.attempt > staged.authority.parent.guided_fence.attempt
+    assert resumed.authority.parent.receipt_fence.operation_id == operation_id
+    assert resumed.authority.parent.receipt_fence.attempt > staged.authority.parent.receipt_fence.attempt
     with second_engine.connect() as conn:
         durable_binding = conn.execute(
-            select(guided_operations_table.c.result_session_id).where(
-                guided_operations_table.c.session_id == str(parent.id),
-                guided_operations_table.c.operation_id == operation_id,
+            select(session_operation_receipts_table.c.result_session_id).where(
+                session_operation_receipts_table.c.session_id == str(parent.id),
+                session_operation_receipts_table.c.operation_id == operation_id,
             )
         ).scalar_one()
     assert durable_binding == str(staged.session.id)
@@ -935,7 +936,7 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
         before_session_count = conn.execute(
             select(func.count()).select_from(sessions_table).where(sessions_table.c.id.in_([str(parent.id), str(staged.session.id)]))
         ).scalar_one()
-    stale_command = GuidedForkSettlementCommand(
+    stale_command = SessionForkSettlementCommand(
         authority=staged.authority,
         expected_current_state_id=None,
         edited_message_id=staged.messages[-1].id,
@@ -944,10 +945,10 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
         response_hash="b" * 64,
         actor="composer_route",
     )
-    with pytest.raises(GuidedOperationFenceLostError):
-        await first.settle_guided_fork_operation(stale_command)
-    with pytest.raises(GuidedOperationFenceLostError):
-        await first.fail_guided_fork_operation(
+    with pytest.raises(OperationReceiptFenceLostError):
+        await first.settle_fork_operation_receipt(stale_command)
+    with pytest.raises(OperationReceiptFenceLostError):
+        await first.fail_fork_operation_receipt(
             staged.authority,
             failure_code="operation_failed",
             actor="composer_route",
@@ -972,8 +973,8 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
             == before_session_count
         )
 
-    settled = await second.settle_guided_fork_operation(
-        GuidedForkSettlementCommand(
+    settled = await second.settle_fork_operation_receipt(
+        SessionForkSettlementCommand(
             authority=resumed.authority,
             expected_current_state_id=None,
             edited_message_id=resumed.messages[-1].id,
@@ -984,9 +985,9 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
         )
     )
     assert settled.archived_at is None
-    with pytest.raises(GuidedOperationFenceLostError):
-        await second.settle_guided_fork_operation(
-            GuidedForkSettlementCommand(
+    with pytest.raises(OperationReceiptFenceLostError):
+        await second.settle_fork_operation_receipt(
+            SessionForkSettlementCommand(
                 authority=resumed.authority,
                 expected_current_state_id=None,
                 edited_message_id=resumed.messages[-1].id,
@@ -996,8 +997,8 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
                 actor="competing-settler",
             )
         )
-    with pytest.raises(GuidedOperationFenceLostError):
-        await second.fail_guided_fork_operation(
+    with pytest.raises(OperationReceiptFenceLostError):
+        await second.fail_fork_operation_receipt(
             resumed.authority,
             failure_code="operation_failed",
             actor="competing-settler",
@@ -1228,16 +1229,16 @@ async def test_postgres_target_rename_paused_copy_reds_at_finalize_when_the_pare
         )
         try:
             assert await asyncio.to_thread(entered.wait, 10)
-            guided = staged.authority.parent.guided_fence
+            receipt = staged.authority.parent.receipt_fence
             with first_engine.begin() as conn:
                 now = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
                 expired = conn.execute(
-                    update(guided_operations_table)
+                    update(session_operation_receipts_table)
                     .where(
-                        guided_operations_table.c.session_id == str(parent.id),
-                        guided_operations_table.c.operation_id == guided.operation_id,
-                        guided_operations_table.c.lease_token == guided.lease_token,
-                        guided_operations_table.c.attempt == guided.attempt,
+                        session_operation_receipts_table.c.session_id == str(parent.id),
+                        session_operation_receipts_table.c.operation_id == receipt.operation_id,
+                        session_operation_receipts_table.c.lease_token == receipt.lease_token,
+                        session_operation_receipts_table.c.attempt == receipt.attempt,
                     )
                     .values(lease_expires_at=now - timedelta(seconds=1))
                 )
@@ -1251,7 +1252,7 @@ async def test_postgres_target_rename_paused_copy_reds_at_finalize_when_the_pare
 
 
 @pytest.mark.asyncio
-async def test_postgres_archive_first_paused_gap_admits_no_guided_row_or_child(
+async def test_postgres_archive_first_paused_gap_admits_no_receipt_or_child(
     deployment,
 ) -> None:
     first_engine, second_engine, first, second, shared = deployment
@@ -1296,7 +1297,9 @@ async def test_postgres_archive_first_paused_gap_admits_no_guided_row_or_child(
         with second_engine.connect() as conn:
             assert (
                 conn.execute(
-                    select(func.count()).select_from(guided_operations_table).where(guided_operations_table.c.session_id == str(parent.id))
+                    select(func.count())
+                    .select_from(session_operation_receipts_table)
+                    .where(session_operation_receipts_table.c.session_id == str(parent.id))
                 ).scalar_one()
                 == 0
             )

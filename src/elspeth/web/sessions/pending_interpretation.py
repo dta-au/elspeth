@@ -49,7 +49,6 @@ from elspeth.web.interpretation_state import (
     validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.sessions.converters import state_from_record
-from elspeth.web.sessions.guided_replay import validation_errors_for_composer_surface
 from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
@@ -2175,11 +2174,7 @@ class _SessionPendingInterpretationPlanner:
         patched_state = replace(
             patched_state,
             is_valid=validation.is_valid,
-            validation_errors=validation_errors_for_composer_surface(
-                composer_meta=live_state.composer_meta,
-                is_valid=validation.is_valid,
-                validation_errors=_pending_validation_error_records(validation),
-            ),
+            validation_errors=_pending_validation_error_records(validation),
         )
         return SessionPendingInterpretationDecision(
             result_event_id=event_id,

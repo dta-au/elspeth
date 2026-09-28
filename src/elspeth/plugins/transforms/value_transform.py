@@ -362,7 +362,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f645e8e83a012f3f"
+    source_file_hash: str | None = "sha256:de648209de2ccdd6"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -533,10 +533,13 @@ class ValueTransform(BaseTransform):
             try:
                 result = parser.evaluate(working_row)
             except ExpressionEvaluationError as e:
+                # The evaluator's message is value-free (a computed key or index
+                # prints as a placeholder); ``kind`` is its stable classification.
                 return TransformResult.error(
                     {
                         "reason": "invalid_input",
                         "field": target,
+                        "error_type": e.kind,
                         "message": str(e),
                     }
                 )

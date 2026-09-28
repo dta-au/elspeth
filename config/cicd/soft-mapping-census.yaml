@@ -47,7 +47,7 @@ files:
   src/elspeth/contracts/composer_audit.py:
     dict[str, Any]: 1
   src/elspeth/contracts/composer_llm_audit.py:
-    dict[str, Any]: 2
+    dict[str, Any]: 1
   src/elspeth/contracts/composer_planner_audit.py:
     dict[str, Any]: 1
   src/elspeth/contracts/config/protocols.py:
@@ -251,6 +251,8 @@ files:
   src/elspeth/engine/executors/aggregation.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 4
+  src/elspeth/engine/executors/batch_violation_outcomes.py:
+    dict[str, object]: 1
   src/elspeth/engine/executors/replay_sink_effect.py:
     Mapping[str, object]: 1
     dict[str, object]: 1
@@ -296,7 +298,7 @@ files:
   src/elspeth/engine/processor.py:
     Mapping[str, object]: 1
     dict[str, Any]: 1
-    dict[str, object]: 3
+    dict[str, object]: 2
   src/elspeth/engine/spans.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
@@ -506,6 +508,8 @@ files:
     dict[str, object]: 1
   src/elspeth/plugins/transforms/batch_paired_preference.py:
     dict[str, Any]: 2
+  src/elspeth/plugins/transforms/batch_rank.py:
+    dict[str, Any]: 2
   src/elspeth/plugins/transforms/batch_replicate.py:
     dict[str, Any]: 4
   src/elspeth/plugins/transforms/batch_stats.py:
@@ -712,7 +716,7 @@ files:
     Mapping[str, object]: 1
     dict[str, Any]: 8
   src/elspeth/web/composer/_compose_loop_carriers.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 3
   src/elspeth/web/composer/_producer_resolver.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/_required_paths_validator.py:
@@ -722,14 +726,23 @@ files:
   src/elspeth/web/composer/_validation_probe.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
+  src/elspeth/web/composer/advisor_checkpoint.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 7
+  src/elspeth/web/composer/advisor_context.py:
+    Mapping[str, Any]: 4
+    dict[str, Any]: 1
   src/elspeth/web/composer/advisor_output.py:
     dict[str, object]: 1
+  src/elspeth/web/composer/advisor_policy.py:
+    Mapping[str, Any]: 1
+    dict[str, Any]: 1
   src/elspeth/web/composer/advisor_request.py:
     dict[str, object]: 2
   src/elspeth/web/composer/audit.py:
     Mapping[str, Any]: 8
     dict[str, Any]: 4
-    dict[str, object]: 7
+    dict[str, object]: 6
   src/elspeth/web/composer/audit_storage.py:
     dict[str, Any]: 1
     dict[str, object]: 6
@@ -740,60 +753,18 @@ files:
     dict[str, Any]: 5
   src/elspeth/web/composer/capability_skill.py:
     Mapping[str, Any]: 8
+  src/elspeth/web/composer/composition_completion.py:
+    Mapping[str, Any]: 4
+    dict[str, Any]: 5
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/discovery_cache.py:
     dict[str, Any]: 1
-  src/elspeth/web/composer/guided/_discovery.py:
-    Mapping[str, Any]: 1
-    dict[str, Any]: 3
-  src/elspeth/web/composer/guided/audit.py:
-    Mapping[str, Any]: 1
-    dict[str, Any]: 4
-  src/elspeth/web/composer/guided/chat_solver.py:
-    Mapping[str, Any]: 15
-    MutableMapping[str, Any]: 1
-    dict[str, Any]: 44
-  src/elspeth/web/composer/guided/deferred_intents.py:
-    Mapping[str, Any]: 1
-    dict[str, object]: 1
-  src/elspeth/web/composer/guided/emitters.py:
-    Mapping[str, Any]: 3
-    dict[str, Any]: 3
-    dict[str, object]: 3
-  src/elspeth/web/composer/guided/intent_management.py:
-    Mapping[str, object]: 2
-    dict[str, object]: 2
-  src/elspeth/web/composer/guided/planning.py:
-    Mapping[str, Any]: 37
-    Mapping[str, object]: 2
-    MutableMapping[str, Any]: 4
-    boundary: 2
-    dict[str, Any]: 16
-    dict[str, object]: 10
-  src/elspeth/web/composer/guided/profile.py:
-    dict[str, Any]: 2
-  src/elspeth/web/composer/guided/prompts.py:
-    Mapping[str, Any]: 1
-  src/elspeth/web/composer/guided/protocol.py:
-    Mapping[str, Any]: 22
-    boundary: 6
-  src/elspeth/web/composer/guided/resolved.py:
-    Mapping[str, Any]: 5
-    dict[str, Any]: 7
-  src/elspeth/web/composer/guided/stage_subjects.py:
-    Mapping[str, Any]: 1
-  src/elspeth/web/composer/guided/stage_transitions.py:
-    Mapping[str, Any]: 23
-    Mapping[str, object]: 1
-  src/elspeth/web/composer/guided/state_machine.py:
-    Mapping[str, Any]: 5
-    dict[str, Any]: 10
-  src/elspeth/web/composer/guided_blob_refs.py:
-    Mapping[str, object]: 4
   src/elspeth/web/composer/implicit_decisions.py:
     Mapping[str, Any]: 3
     dict[str, object]: 2
+  src/elspeth/web/composer/interpretation_surfacing.py:
+    Mapping[str, Any]: 2
   src/elspeth/web/composer/inventory_response_contracts.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/llm_response_parsing.py:
@@ -801,23 +772,27 @@ files:
     dict[str, Any]: 9
   src/elspeth/web/composer/no_tool_policy.py:
     Mapping[str, Any]: 1
+  src/elspeth/web/composer/path_canonicalization.py:
+    Mapping[str, Any]: 1
   src/elspeth/web/composer/pipeline_commit.py:
-    Mapping[str, Any]: 2
+    Mapping[str, Any]: 1
     boundary: 1
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_custody.py:
     Mapping[str, Any]: 6
   src/elspeth/web/composer/pipeline_planner.py:
-    Mapping[str, Any]: 41
-    dict[str, Any]: 21
+    Mapping[str, Any]: 29
+    dict[str, Any]: 20
     dict[str, object]: 2
   src/elspeth/web/composer/pipeline_proposal.py:
-    Mapping[str, Any]: 21
+    Mapping[str, Any]: 19
     dict[str, Any]: 18
   src/elspeth/web/composer/planner_authoring_aids.py:
     Mapping[str, object]: 5
     dict[str, Any]: 8
     dict[str, object]: 17
+  src/elspeth/web/composer/planning_application.py:
+    Mapping[str, Any]: 4
   src/elspeth/web/composer/prompts.py:
     Mapping[str, object]: 1
     dict[str, Any]: 5
@@ -826,17 +801,18 @@ files:
   src/elspeth/web/composer/protocol.py:
     Mapping[str, Any]: 2
     Mapping[str, object]: 1
-  src/elspeth/web/composer/provider_discovery_response.py:
-    Mapping[str, object]: 1
+  src/elspeth/web/composer/provider_gateway.py:
+    Mapping[str, Any]: 2
+    dict[str, Any]: 10
   src/elspeth/web/composer/provider_telemetry.py:
     Mapping[str, object]: 1
   src/elspeth/web/composer/reasoning.py:
     dict[str, object]: 1
   src/elspeth/web/composer/redaction.py:
-    Mapping[str, Any]: 14
+    Mapping[str, Any]: 1
     Mapping[str, object]: 3
     boundary: 1
-    dict[str, Any]: 35
+    dict[str, Any]: 18
     dict[str, object]: 6
   src/elspeth/web/composer/required_controls.py:
     Mapping[str, Any]: 9
@@ -848,10 +824,12 @@ files:
     Mapping[str, Any]: 1
     boundary: 2
   src/elspeth/web/composer/service.py:
-    Mapping[str, Any]: 25
+    Mapping[str, Any]: 2
     Mapping[str, object]: 1
+    dict[str, Any]: 10
+  src/elspeth/web/composer/session_tool.py:
     boundary: 1
-    dict[str, Any]: 38
+    dict[str, Any]: 4
   src/elspeth/web/composer/source_demand.py:
     Mapping[str, Any]: 7
     dict[str, Any]: 1
@@ -874,7 +852,7 @@ files:
     dict[str, object]: 1
   src/elspeth/web/composer/tools/_dispatch.py:
     Mapping[str, Any]: 12
-    dict[str, Any]: 6
+    dict[str, Any]: 4
   src/elspeth/web/composer/tools/_generation_responses.py:
     dict[str, object]: 1
   src/elspeth/web/composer/tools/_naming_disclosure.py:
@@ -1012,41 +990,29 @@ files:
     dict[str, object]: 2
   src/elspeth/web/sessions/audit_checkpoint.py:
     Mapping[str, Any]: 2
-  src/elspeth/web/sessions/guided_audit.py:
-    dict[str, Any]: 3
-  src/elspeth/web/sessions/guided_operations.py:
-    dict[str, Any]: 1
-  src/elspeth/web/sessions/guided_payloads.py:
-    Mapping[str, object]: 3
-  src/elspeth/web/sessions/guided_replay.py:
-    Mapping[str, Any]: 2
+  src/elspeth/web/sessions/fork_custody.py:
+    Mapping[str, Any]: 3
+  src/elspeth/web/sessions/mutation_capabilities.py:
+    Mapping[str, Any]: 4
+  src/elspeth/web/sessions/operation_receipts.py:
+    dict[str, Any]: 2
   src/elspeth/web/sessions/pending_interpretation.py:
     Mapping[str, Any]: 24
     boundary: 1
     dict[str, Any]: 6
     dict[str, object]: 1
+  src/elspeth/web/sessions/proposal_authority.py:
+    Mapping[str, Any]: 6
   src/elspeth/web/sessions/proposal_blob_refs.py:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/protocol.py:
-    Mapping[str, Any]: 60
-    dict[str, object]: 5
+    Mapping[str, Any]: 36
   src/elspeth/web/sessions/routes/_helpers.py:
     Mapping[str, Any]: 4
     dict[str, Any]: 1
     dict[str, object]: 12
   src/elspeth/web/sessions/routes/composer/compose.py:
     dict[str, Any]: 1
-  src/elspeth/web/sessions/routes/composer/guided.py:
-    Mapping[str, Any]: 11
-    dict[str, Any]: 4
-    dict[str, object]: 6
-  src/elspeth/web/sessions/routes/composer/guided_chat_atomic.py:
-    Mapping[str, Any]: 1
-    Mapping[str, object]: 1
-    dict[str, Any]: 1
-    dict[str, object]: 2
-  src/elspeth/web/sessions/routes/composer/guided_chat_intent_management.py:
-    Mapping[str, Any]: 1
   src/elspeth/web/sessions/routes/composer/pipeline_settlement.py:
     Mapping[str, object]: 2
   src/elspeth/web/sessions/routes/composer/proposals.py:
@@ -1054,24 +1020,19 @@ files:
   src/elspeth/web/sessions/routes/composer/state.py:
     boundary: 1
     dict[str, Any]: 1
-  src/elspeth/web/sessions/routes/guided_operations.py:
-    dict[str, object]: 1
   src/elspeth/web/sessions/routes/messages.py:
     dict[str, Any]: 1
   src/elspeth/web/sessions/routes/sessions.py:
-    Mapping[str, Any]: 2
-    dict[str, Any]: 3
-  src/elspeth/web/sessions/schemas.py:
-    dict[str, Any]: 1
+    Mapping[str, Any]: 1
+    dict[str, Any]: 2
   src/elspeth/web/sessions/service.py:
-    Mapping[str, Any]: 34
-    dict[str, Any]: 3
-    dict[str, object]: 2
+    Mapping[str, Any]: 13
+    dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 932
-  Mapping[str, object]: 311
-  MutableMapping[str, Any]: 13
-  boundary: 66
-  dict[str, Any]: 1180
-  dict[str, object]: 408
-  soft: 2844
+  Mapping[str, Any]: 738
+  Mapping[str, object]: 297
+  MutableMapping[str, Any]: 8
+  boundary: 58
+  dict[str, Any]: 1061
+  dict[str, object]: 375
+  soft: 2479

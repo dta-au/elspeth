@@ -63,7 +63,7 @@ def _fence_trial(index: int, **overrides: object) -> FenceConflictTrial:
         fence_epoch_before=index,
         fence_epoch_after=index + 1,
         fence_owner_after=winner,
-        guided_operation_rows=1,
+        message_ingress_receipt_rows=1,
         dispatch_spread_ms=1.5,
     )
     return dataclasses.replace(trial, **overrides)  # type: ignore[arg-type]
@@ -164,10 +164,10 @@ class TestFenceConflict:
         trials[2] = dataclasses.replace(trials[2], fence_owner_after=RB)  # trial 2's winner is RA
         assert "trial[2]:fence_owner_is_not_the_winner" in decide_fence_conflict(trials).reasons
 
-    def test_exactly_one_guided_operation_row(self) -> None:
+    def test_exactly_one_message_ingress_receipt_row(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
-        trials[9] = dataclasses.replace(trials[9], guided_operation_rows=2)
-        assert "trial[9]:guided_operation_rows:2!=1" in decide_fence_conflict(trials).reasons
+        trials[9] = dataclasses.replace(trials[9], message_ingress_receipt_rows=2)
+        assert "trial[9]:message_ingress_receipt_rows:2!=1" in decide_fence_conflict(trials).reasons
 
     def test_dispatch_window_is_enforced(self) -> None:
         trials = [_fence_trial(index) for index in range(20)]
@@ -419,7 +419,7 @@ class _FakeObserver(EvidenceObserver):
     def fence_owner(self, session_id: str) -> str | None:
         return self.owner
 
-    def guided_operation_rows(self, session_id: str, *, since_epoch: int) -> int:
+    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int:
         return 1
 
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]:
@@ -504,13 +504,20 @@ class TestDriver:
     def test_fence_conflict_trial_records_both_instances_and_the_fence_facts(self) -> None:
         observer = _FakeObserver()
         driver = _driver(observer, _RecordedReplicas(observer))
-        trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {"text": "go"}))
+        trial = driver.fence_conflict_trial(
+            "session-1",
+            ProbeRequest(
+                "POST",
+                "/api/sessions/session-1/messages",
+                {"content": "Build a pipeline", "client_request_id": "00000000-0000-4000-8000-000000000001"},
+            ),
+        )
         statuses = sorted(response.status for response in trial.responses)
         assert statuses == [202, 409]
         assert {response.instance_id for response in trial.responses} == {RA, RB}
         assert trial.fence_epoch_after == trial.fence_epoch_before + 1
         assert trial.fence_owner_after == next(response.instance_id for response in trial.responses if response.status == 202)
-        assert trial.guided_operation_rows == 1
+        assert trial.message_ingress_receipt_rows == 1
         assert trial.dispatch_spread_ms >= 0
 
     def test_run_start_trial_reads_the_run_rows(self) -> None:

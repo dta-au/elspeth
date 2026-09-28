@@ -3,7 +3,7 @@ import {
   pluginDisplayName,
   titleCaseLabel,
 } from "@/components/catalog/pluginDisplayName";
-import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
+import { PipelineGloss } from "@/components/chat/PipelineGloss";
 import { OptionRows } from "@/components/inspector/OptionRows";
 import { DISCARD_CONNECTION } from "@/lib/graphTopology";
 import { useShowAdvanced } from "@/stores/preferencesStore";
@@ -245,11 +245,8 @@ function nodeRows(state: CompositionState): SpecRow[] {
     //     a fixed string that names none of them.
     //   * barrier kinds: `timeout_seconds` bounds how long the wait holds.
     //
-    // `scope_name` is NOT private here. The "authored scope_name stays
-    // private" note in types/guided.ts governs the GUIDED PROPOSAL payload
-    // sent to the planner, where server stable ids replace canonical names.
-    // This view renders the session owner's own accepted CompositionState,
-    // which serialises scope_name openly (composer/state.py:866,894).
+    // `scope_name` is an accepted CompositionState field and belongs in the
+    // session owner's spec, alongside the other collector scope bindings.
     //
     // `condition` stays out. The "shows only non-null authoritative routing
     // fields" test asserts its absence — deliberately, since it is the one

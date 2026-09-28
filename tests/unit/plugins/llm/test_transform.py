@@ -1109,7 +1109,8 @@ class TestMultiQueryJSONExtraction:
         assert result.reason is not None
         assert result.reason["reason"] == "missing_output_field"
         assert result.reason["field"] == "missing_field"
-        assert "score" in result.reason["available_fields"]
+        # The response's own keys are external content: never listed (C3).
+        assert "available_fields" not in result.reason
 
     def test_output_fields_json_parse_failure_returns_error(self) -> None:
         """When LLM returns invalid JSON and output_fields expects JSON, return error."""
@@ -2038,11 +2039,13 @@ class TestMultiQueryFieldTypeValidation:
     def test_integer_field_rejects_string(self) -> None:
         """String value for integer field must be rejected."""
         transform, provider = self._make_typed_query_transform([{"suffix": "score", "type": "integer"}])
-        result = self._execute_with_content(transform, provider, '{"score": "high"}')
+        result = self._execute_with_content(transform, provider, '{"score": "SENTINEL_HIGH"}')
         assert result.status == "error"
         assert result.reason["reason"] == "field_type_mismatch"
         assert result.reason["field"] == "score"
         assert "expected integer" in result.reason["error"]
+        # The model's value is external content echoing row data: never in the reason (C3).
+        assert "SENTINEL_HIGH" not in repr(result.reason)
 
     def test_integer_field_rejects_boolean(self) -> None:
         """Boolean value for integer field must be rejected (bool is subclass of int)."""

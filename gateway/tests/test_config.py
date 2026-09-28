@@ -47,7 +47,7 @@ def test_load_config_happy_path_uses_defaults_for_optional_vars():
     assert config.oauth_scopes == ("read", "write")
     assert config.oauth_fixed_lifetime_seconds is None
     assert config.refresh_skew_seconds == 60
-    assert config.request_timeout_seconds == 60.0
+    assert config.request_timeout_seconds == 300.0
     assert config.max_body_bytes == 1_048_576
     assert config.max_response_bytes == 4_194_304
     assert config.bounds.max_messages == 50

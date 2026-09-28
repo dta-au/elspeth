@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import String, select, tuple_, update
+from sqlalchemy import String, bindparam, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, RowMapping
@@ -25,6 +25,7 @@ from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.core.ids import generate_id
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -144,16 +145,21 @@ def record_group_losses(
     expected_ids = {value["loss_id"] for value in values}
     if not set(inserted).issubset(expected_ids) or len(inserted) != len(set(inserted)):
         raise AuditIntegrityError("Group-loss insert returned unexpected loss_id")
-    existing_rows = (
-        conn.execute(
+    # One batch may name any number of members (a whole expansion's lost
+    # children), so the read-back runs in chunks of the shared bind budget,
+    # three binds per natural key, on this one connection.
+    existing_rows = [
+        row
+        for chunk in bind_budget_chunks(tuple(by_key), binds_per_item=3)
+        for row in conn.execute(
             select(group_losses_table).where(
                 group_losses_table.c.run_id == run_id,
-                tuple_(group_losses_table.c.closer_name, group_losses_table.c.group_id, group_losses_table.c.member_key).in_(tuple(by_key)),
+                tuple_(group_losses_table.c.closer_name, group_losses_table.c.group_id, group_losses_table.c.member_key).in_(chunk),
             )
         )
         .mappings()
         .all()
-    )
+    ]
     existing_by_key = {(row["closer_name"], row["group_id"], row["member_key"]): row for row in existing_rows}
     if len(existing_by_key) != len(by_key):
         raise AuditIntegrityError("Group-loss batch insertion left a missing natural key")
@@ -312,12 +318,16 @@ class GroupLossRepository:
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             verb="adopt_group_losses",
         ) as conn:
+            # A resume adopts every recorded loss of the run, so the mark is one
+            # executemany of a fixed-size statement (core/landscape/bind_budget.py);
+            # both dialects report the summed rowcount.
             result = conn.execute(
                 update(group_losses_table)
                 .where(group_losses_table.c.run_id == coordination_token.run_id)
-                .where(group_losses_table.c.loss_id.in_(tuple(loss_ids)))
+                .where(group_losses_table.c.loss_id == bindparam("b_loss_id"))
                 .where(group_losses_table.c.adopted_epoch.is_(None))
-                .values(adopted_epoch=coordination_token.leader_epoch)
+                .values(adopted_epoch=coordination_token.leader_epoch),
+                [{"b_loss_id": loss_id} for loss_id in loss_ids],
             )
             marked = result.rowcount
         return 0 if marked is None else int(marked)

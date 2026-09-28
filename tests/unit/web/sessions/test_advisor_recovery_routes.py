@@ -1,13 +1,12 @@
 """Advisor-only decisions survive real route, fenced write, and DB reload seams."""
 
 from dataclasses import replace
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from elspeth.web.composer.advisor_decision import AdvisorBlockCause, AdvisorGateBlocked, AdvisorGatePassed, AdvisorSignoffGateFact
-from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalKind, TerminalReason, TerminalState
 from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerResult
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.completion_gates import (
@@ -71,17 +70,18 @@ async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tm
 
     app.state.composer_service = InterruptedComposer()
     if route == "recompose":
-        await service.add_message(session.id, "user", "Revise the intent", writer_principal="route_user_message")
+        user_message = await service.add_message(session.id, "user", "Revise the intent", writer_principal="route_user_message")
+        request_body = {"expected_user_message_id": str(user_message.id)}
+    else:
+        request_body = {"content": "Revise the intent", "client_request_id": str(uuid4())}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            f"/api/sessions/{session.id}/{route}",
-            **({"json": {"content": "Revise the intent"}} if route == "messages" else {}),
-        )
+        response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
     assert response.status_code == 422, response.text
     after = await service.get_current_state(session.id)
     assert after is not None
     assert after.id != before.id
     assert after.version == before.version + 1
+    assert response.json()["detail"]["error_type"] == "convergence"
     assert response.json()["detail"]["partial_state"]["id"] == str(after.id)
     rebuilt = state_from_record(after)
     assert rebuilt.metadata == reviewed.with_metadata(patch).metadata
@@ -102,21 +102,10 @@ async def test_metadata_recovery_save_does_not_reattribute_prior_advisor_note(tm
 @pytest.mark.parametrize("route", ["messages", "recompose"])
 @pytest.mark.parametrize("cause", [AdvisorBlockCause.UNAVAILABLE, AdvisorBlockCause.MALFORMED, AdvisorBlockCause.MESSAGE_REJECTED])
 @pytest.mark.parametrize("adjudicates", [True, False], ids=["clean-decision", "validation-only"])
-@pytest.mark.parametrize("guided_terminal", [False, True], ids=["freeform", "guided-exit"])
-async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp_path, route, cause, adjudicates, guided_terminal):
+async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp_path, route, cause, adjudicates):
     app, service = _make_app(tmp_path)
     session = await service.create_session("alice", "Advisor recovery", "local")
     state = _make_authoring_valid_partial("advisor-recovery")
-    if guided_terminal:
-        state = replace(
-            state,
-            guided_session=GuidedSession(
-                step=GuidedStep.STEP_1_SOURCE,
-                history=(),
-                transition_consumed=False,
-                terminal=TerminalState(kind=TerminalKind.EXITED_TO_FREEFORM, reason=TerminalReason.USER_PRESSED_EXIT, pipeline_yaml=None),
-            ),
-        )
     fingerprint = completion_gate_fingerprint(state)
     facts = CompletionGateFacts(
         advisor_signoff=AdvisorSignoffGateFact(
@@ -141,7 +130,6 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
             composer_meta={
                 "completion_gates": completion_gates_meta_from_facts(facts),
                 "repair_turns_used": 2,
-                **({"guided_session": state.guided_session.to_dict()} if state.guided_session is not None else {}),
             },
         ),
         provenance="session_seed",
@@ -167,12 +155,12 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
 
     app.state.composer_service = DecisionComposer()
     if route == "recompose":
-        await service.add_message(session.id, "user", "Please retry the review", writer_principal="route_user_message")
+        user_message = await service.add_message(session.id, "user", "Please retry the review", writer_principal="route_user_message")
+        request_body = {"expected_user_message_id": str(user_message.id)}
+    else:
+        request_body = {"content": "Please retry the review", "client_request_id": str(uuid4())}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(
-            f"/api/sessions/{session.id}/{route}",
-            **({"json": {"content": "Please retry the review"}} if route == "messages" else {}),
-        )
+        response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
     assert response.status_code == 200, response.text
     assert calls == [before.version]
     after = await service.get_current_state(session.id)
@@ -180,9 +168,6 @@ async def test_advisor_recovery_is_durable_only_with_explicit_clean_decision(tmp
     assert after.id != before.id
     assert after.version == before.version + 1
     rebuilt = state_from_record(after)
-    if guided_terminal:
-        assert rebuilt.guided_session is not None
-        assert rebuilt.guided_session.transition_consumed is True
     assert completion_gate_fingerprint(rebuilt) == fingerprint
     reloaded_facts = parse_completion_gates(after.composer_meta)
     response_body = response.json()
@@ -245,10 +230,11 @@ async def test_unchanged_graph_first_block_and_changed_failure_cause_are_saved(t
             (AdvisorBlockCause.MALFORMED, False),
         ):
             if route == "recompose":
-                await service.add_message(session.id, "user", "Retry review", writer_principal="route_user_message")
-            response = await client.post(
-                f"/api/sessions/{session.id}/{route}", **({"json": {"content": "Retry review"}} if route == "messages" else {})
-            )
+                user_message = await service.add_message(session.id, "user", "Retry review", writer_principal="route_user_message")
+                request_body = {"expected_user_message_id": str(user_message.id)}
+            else:
+                request_body = {"content": "Retry review", "client_request_id": str(uuid4())}
+            response = await client.post(f"/api/sessions/{session.id}/{route}", json=request_body)
             assert response.status_code == 200, response.text
             record = await service.get_current_state(session.id)
             assert record is not None

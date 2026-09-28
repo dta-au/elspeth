@@ -26,10 +26,13 @@ from typing import Any
 
 import pytest
 
-from elspeth.web.composer import service as service_module
+from elspeth.web.composer import composer_preflight as preflight_module
+from elspeth.web.composer import composition_completion as completion_module
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.protocol import ComposerResult
-from elspeth.web.composer.service import ComposerServiceImpl, _preflight_verdict
+from elspeth.web.composer.composer_preflight import _preflight_verdict
+from elspeth.web.composer.composition_completion import _MAX_REPAIR_TURNS
+from elspeth.web.composer.protocol import ComposerResult, ComposerRuntimePreflightError
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 
@@ -74,9 +77,9 @@ class TestCachedRuntimePreflightTelemetry:
         interpretation_tolerant: bool = False,
     ) -> list[tuple[int, dict[str, Any]]]:
         counter = _FakeCounter()
-        monkeypatch.setattr(service_module, "_RUNTIME_PREFLIGHT_COUNTER", counter)
+        monkeypatch.setattr(preflight_module, "_RUNTIME_PREFLIGHT_COUNTER", counter)
         monkeypatch.setattr(
-            service_module,
+            preflight_module,
             "validate_pipeline",
             _RecordingValidatePipeline(strict=strict, tolerant=_valid_result()),
         )
@@ -84,11 +87,11 @@ class TestCachedRuntimePreflightTelemetry:
             catalog=_mock_catalog(),
             settings=_make_settings(data_dir=tmp_path),
         )
-        await service._cached_runtime_preflight(
+        await service._preflight.cached_runtime_preflight(
             _empty_state(),
             user_id="alice",
             session_id=None,
-            cache=service._new_runtime_preflight_cache(),
+            cache=service._preflight.new_cache(),
             initial_version=1,
             session_scope="session:test",
             interpretation_tolerant=interpretation_tolerant,
@@ -129,22 +132,22 @@ class TestCachedRuntimePreflightTelemetry:
         a call that threw never produced one. The AWS dashboard queries this
         exact dimension (deploy/aws-ecs/.../iam_observability.tf)."""
         counter = _FakeCounter()
-        monkeypatch.setattr(service_module, "_RUNTIME_PREFLIGHT_COUNTER", counter)
+        monkeypatch.setattr(preflight_module, "_RUNTIME_PREFLIGHT_COUNTER", counter)
 
         def _boom(*_args: Any, **_kwargs: Any) -> ValidationResult:
             raise ValueError("validator exploded")
 
-        monkeypatch.setattr(service_module, "validate_pipeline", _boom)
+        monkeypatch.setattr(preflight_module, "validate_pipeline", _boom)
         service = ComposerServiceImpl.for_trained_operator(
             catalog=_mock_catalog(),
             settings=_make_settings(data_dir=tmp_path),
         )
-        with pytest.raises(service_module.ComposerRuntimePreflightError):
-            await service._cached_runtime_preflight(
+        with pytest.raises(ComposerRuntimePreflightError):
+            await service._preflight.cached_runtime_preflight(
                 _empty_state(),
                 user_id="alice",
                 session_id=None,
-                cache=service._new_runtime_preflight_cache(),
+                cache=service._preflight.new_cache(),
                 initial_version=1,
                 session_scope="session:test",
             )
@@ -171,9 +174,9 @@ class TestPreflightInvalidFinalizeTelemetry:
         message: str = "build it",
     ) -> tuple[list[tuple[int, dict[str, Any]]], ComposerResult]:
         counter = _FakeCounter()
-        monkeypatch.setattr(service_module, "_PREFLIGHT_INVALID_FINALIZE_COUNTER", counter)
+        monkeypatch.setattr(completion_module, "_PREFLIGHT_INVALID_FINALIZE_COUNTER", counter)
         monkeypatch.setattr(
-            service_module,
+            preflight_module,
             "validate_pipeline",
             _RecordingValidatePipeline(strict=strict, tolerant=_valid_result()),
         )
@@ -191,7 +194,7 @@ class TestPreflightInvalidFinalizeTelemetry:
         # cases below need "no preflight ever ran this turn" (None) while the
         # patched validator still has to return something, and collapsing the
         # two would make that shape unreachable.
-        result = await service._surface_and_finalize_no_tools(
+        result = await service._completion._surface_and_finalize_no_tools(
             assistant_message=_AssistantMessage(),
             state=_non_empty_state() if state is None else state,
             session_id=None,
@@ -201,7 +204,7 @@ class TestPreflightInvalidFinalizeTelemetry:
             initial_version=1,
             user_id="alice",
             last_runtime_preflight=last_runtime_preflight,
-            runtime_preflight_cache=service._new_runtime_preflight_cache(),
+            runtime_preflight_cache=service._preflight.new_cache(),
             session_scope="session:test",
             message=message,
             mutation_success_seen=False,
@@ -226,9 +229,9 @@ class TestPreflightInvalidFinalizeTelemetry:
             monkeypatch,
             strict=red,
             last_runtime_preflight=red,
-            repair_turns_used=service_module._MAX_REPAIR_TURNS,
+            repair_turns_used=_MAX_REPAIR_TURNS,
         )
-        assert emitted == [(1, {"budget_exhausted": True, "repair_turns_used": service_module._MAX_REPAIR_TURNS})]
+        assert emitted == [(1, {"budget_exhausted": True, "repair_turns_used": _MAX_REPAIR_TURNS})]
 
     @pytest.mark.anyio
     async def test_green_verdict_emits_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

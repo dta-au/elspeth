@@ -143,10 +143,10 @@ describe("parseResponse execution error envelopes", () => {
     });
   });
 
-  it("carries failure_code from a guided terminal-failure envelope (F13-D)", async () => {
+  it("carries failure_code from a session operation terminal-failure envelope", async () => {
     const error = await parseApiError(
       {
-        error_type: "guided_operation_terminal_failure",
+        error_type: "session_operation_terminal_failure",
         failure_code: "policy_blocked",
         detail:
           "This pipeline is blocked by a deployment policy and cannot be built as configured. " +
@@ -158,7 +158,7 @@ describe("parseResponse execution error envelopes", () => {
 
     expect(error).toMatchObject({
       status: 422,
-      error_type: "guided_operation_terminal_failure",
+      error_type: "session_operation_terminal_failure",
       failure_code: "policy_blocked",
     });
     expect(error.detail).toContain("blocked by a deployment policy");

@@ -14,10 +14,9 @@ Two surfaces consume :class:`ComposerToolInvocation`:
    loop persists redacted assistant/tool responses, state revisions, and
    rejection evidence during phase P4. Those tool rows do not contain the
    invocation envelope; successful P4 clears the corresponding exception
-   replay trail. Guided settlement and legacy route drains instead persist
-   redacted invocation envelopes in chat-message ``tool_calls`` under the
-   ``_kind=audit`` discriminator, using ``role=audit`` or linked ``role=tool``
-   rows as appropriate.
+   replay trail. Other route drains persist redacted invocation envelopes in
+   chat-message ``tool_calls`` under the ``_kind=audit`` discriminator, using
+   ``role=audit`` or linked ``role=tool`` rows as appropriate.
 
 Buffered invocation fields and durable response fields are distinct contracts.
 P4 response content can retain a successful dispatch's Composer version and
@@ -292,10 +291,10 @@ class ComposerToolRecorder(Protocol):
       session_id is unresolved (the very first ``new_session`` call), the
       recorder buffers in memory and flushes on first resolution.
     - Web composer: in-memory buffer consumed by compose-loop processing,
-      guided settlement, and legacy route drains. P4 commits redacted
+      route drains. P4 commits redacted
       response/state/rejection evidence inside the loop; already persisted
       tool turns do not replay their invocations through exception carriers.
-      Guided settlement and legacy drains persist redacted invocation
+      Route drains persist redacted invocation
       envelopes through their own transactional storage paths.
 
     Recorder calls happen synchronously from the dispatch site. Every

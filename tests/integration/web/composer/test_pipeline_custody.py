@@ -7,26 +7,23 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.blobs.service import StagedInlineCustody, _blob_custody_session_lock, content_hash, prepare_inline_custody_blob
+from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.pipeline_custody import (
-    InlineCustodyPublication,
     PipelineCustodyPreparation,
     finalize_pipeline_custody,
-    finalize_pipeline_custody_on_connection,
     inline_custody_audit_projection,
     prepare_pipeline_custody,
     verify_finalized_pipeline_custody,
@@ -36,10 +33,9 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import sqlite_process_session_lock
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _prepared(
@@ -90,31 +86,6 @@ def _arguments(content: str = "private-inline-value\n42\n") -> dict[str, object]
     }
 
 
-def _commit_staged_custody(custody: PipelineCustodyPreparation, sessions: SessionServiceImpl, data_dir: Path) -> InlineCustodyPublication:
-    authority = sessions.session_operation_authority
-    context = authority.acquire(
-        session_id=custody.request.session_id,
-        operation_kind=SessionOperationKind.COMPOSE,
-        owner_instance_id=sessions.session_operation_owner_instance_id,
-        lease_seconds=120,
-    )
-    try:
-        with _blob_custody_session_lock(sessions._engine, str(custody.request.session_id)):
-            staged = prepare_inline_custody_blob(
-                data_dir=data_dir, request=custody.request, write_guard=partial(authority.compare_and_swap, context)
-            )
-            with sessions._engine.begin() as conn:
-                return finalize_pipeline_custody_on_connection(
-                    custody,
-                    conn=conn,
-                    staged=staged,
-                    max_storage_per_session=custody.max_storage_per_session,
-                    write_fence=None,
-                )
-    finally:
-        authority.release(context)
-
-
 def test_prepare_pipeline_custody_is_pure_and_hashes_only_safe_arguments(tmp_path: Path) -> None:
     prepared = _prepared(tmp_path)
     arguments = _arguments()
@@ -161,10 +132,6 @@ def test_finalize_refuses_ceiling_divergent_from_plan_time(tmp_path: Path) -> No
     consumed — a divergent ceiling can never be enforced, not even
     transiently.
     """
-    from typing import cast
-
-    from sqlalchemy import Connection
-
     prepared = _prepared(tmp_path)
     arguments = _arguments()
     custody = prepare_pipeline_custody(
@@ -174,54 +141,26 @@ def test_finalize_refuses_ceiling_divergent_from_plan_time(tmp_path: Path) -> No
         max_storage_per_session=500 * 1024 * 1024,
     )
 
+    context = SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=prepared.storage_path.parent.name,
+            operation_id="quota-check",
+            lease_token="quota-check-token",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
     with pytest.raises(AuditIntegrityError, match="diverges from the plan-time ceiling"):
-        finalize_pipeline_custody_on_connection(
-            custody,
-            conn=cast(Connection, object()),  # guard fires before the connection is touched
-            staged=cast(StagedInlineCustody, object()),  # the divergent ceiling precedes stage access too
-            max_storage_per_session=1024,
-            write_fence=None,
+        asyncio.run(
+            finalize_pipeline_custody(
+                custody,
+                engine=create_session_engine("sqlite:///:memory:"),
+                data_dir=tmp_path,
+                max_storage_per_session=1024,
+                session_operation_context=context,
+                session_operation_authority=object(),  # guard fires before authority methods are reached
+            )
         )
-
-
-@pytest.mark.asyncio
-async def test_failed_commit_reconciliation_preserves_a_committed_inline_stage(tmp_path: Path) -> None:
-    """A commit error is ambiguous: a durable row must win over cleanup."""
-    from elspeth.web.composer import pipeline_custody as pipeline_custody_module
-
-    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="test-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("test-user", "Ambiguous inline commit", "local")
-    message = await sessions.add_message(
-        session.id,
-        "user",
-        "Create the inline source.",
-        writer_principal="route_user_message",
-    )
-    session_id = str(session.id)
-    prepared = _prepared(tmp_path, session_id=session_id, created_from_message_id=str(message.id))
-    custody = prepare_pipeline_custody(
-        _arguments(),
-        prepared,
-        session_id=session_id,
-        max_storage_per_session=500 * 1024 * 1024,
-    )
-    publication = _commit_staged_custody(custody, sessions, tmp_path)
-
-    assert not publication.storage.exists()
-    assert publication.staging.exists()
-    primary = RuntimeError("commit outcome unknown")
-    pipeline_custody_module.reconcile_pipeline_custody_after_transaction_failure(
-        engine,
-        publication,
-        primary_exc=primary,
-    )
-
-    assert publication.storage.read_bytes() == custody.request.content
-    assert not publication.staging.exists()
 
 
 @pytest.mark.asyncio
@@ -244,7 +183,7 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="test-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    sessions = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     session = await sessions.create_session("test-user", "Blocked inline custody", "local")
     message = await sessions.add_message(
         session.id,
@@ -290,7 +229,6 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
             engine=engine,
             data_dir=tmp_path,
             max_storage_per_session=500 * 1024 * 1024,
-            write_fence=None,
             session_operation_context=operation_context,
             session_operation_authority=sessions.session_operation_authority,
         )
@@ -338,48 +276,6 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
     assert str(retried.id) == str(custody.blob_id)
     with engine.connect() as conn:
         assert conn.execute(select(blobs_table.c.id).where(blobs_table.c.session_id == session_id)).all() == [(str(custody.blob_id),)]
-
-
-@pytest.mark.asyncio
-async def test_failed_commit_reconciliation_removes_stage_when_committed_row_was_deleted(tmp_path: Path) -> None:
-    """A concurrent committed delete leaves no authority for staged bytes."""
-    from elspeth.web.composer import pipeline_custody as pipeline_custody_module
-
-    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
-    initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="test-user")
-    sessions = DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
-    session = await sessions.create_session("test-user", "Deleted inline commit", "local")
-    message = await sessions.add_message(
-        session.id,
-        "user",
-        "Create the inline source.",
-        writer_principal="route_user_message",
-    )
-    session_id = str(session.id)
-    prepared = _prepared(tmp_path, session_id=session_id, created_from_message_id=str(message.id))
-    custody = prepare_pipeline_custody(
-        _arguments(),
-        prepared,
-        session_id=session_id,
-        max_storage_per_session=500 * 1024 * 1024,
-    )
-    publication = _commit_staged_custody(custody, sessions, tmp_path)
-    publication = replace(publication, cleanup_after_rollback=False)
-    with engine.begin() as conn:
-        conn.execute(delete(blobs_table).where(blobs_table.c.id == str(custody.blob_id)))
-
-    assert publication.staging.exists()
-    primary = RuntimeError("commit outcome unknown")
-    pipeline_custody_module.reconcile_pipeline_custody_after_transaction_failure(
-        engine,
-        publication,
-        primary_exc=primary,
-    )
-
-    assert not publication.storage.exists()
-    assert not publication.staging.exists()
 
 
 def test_preparation_rejects_non_positive_or_inexact_ceiling(tmp_path: Path) -> None:

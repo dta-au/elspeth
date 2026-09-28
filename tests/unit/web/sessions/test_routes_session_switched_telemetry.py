@@ -78,7 +78,7 @@ def test_route_emits_session_switched_on_mode_change(test_client: TestClient) ->
     assert observed_value(telemetry.session_switched_total) == 1
 
     # Attribute contract: ``from_mode`` / ``to_mode`` drawn from the
-    # per-session vocabulary (NOT ``guided`` / ``freeform``).  Narrow
+    # per-session vocabulary. Narrow
     # the type via isinstance against ``_FakeCounter`` rather than
     # ``hasattr`` (unconditionally banned — engine-patterns-reference skill
     # §hasattr Alternatives) — see the

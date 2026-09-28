@@ -20,6 +20,7 @@ from litellm.exceptions import InternalServerError
 
 import elspeth.web.composer.boot_probe as bp
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.advisor_request import build_advisor_request_options
 from elspeth.web.composer.llm_response_parsing import apply_anthropic_cache_markers
 from elspeth.web.composer.pipeline_planner import (
@@ -27,7 +28,7 @@ from elspeth.web.composer.pipeline_planner import (
     planner_terminal_tool_definition,
     planner_tool_definitions,
 )
-from elspeth.web.composer.service import composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
 from elspeth.web.config import WebSettings
 
 _CLEAN = '{"verdict":"CLEAN","category":"other","steps":[],"findings":"","note":null}'
@@ -394,7 +395,7 @@ async def test_tool_surfaces_pass_on_any_accepted_response(monkeypatch: pytest.M
         sent.append(kwargs)
         return _ok_response(content=None, tool_calls=[object()])
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     request = _request(settings_factory(composer_model="gpt-5.5"), surface)
 
     assert await bp.probe_composer_config(request) is True
@@ -427,7 +428,7 @@ async def test_bad_request_names_the_surface_and_owned_request_facts(
     async def complete(**_kwargs: object) -> object:
         raise provider_error
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     request = _request(settings_factory(composer_model="gpt-5.5"), surface)
     with pytest.raises(bp.ComposerBootConfigError) as caught:
         await bp.probe_composer_config(request)
@@ -479,7 +480,7 @@ async def test_probe_rejection_reports_only_sent_option_presence(
     async def complete(**_kwargs: object) -> object:
         raise BadRequestError(message="rejected", model="m", llm_provider="openai")
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     with pytest.raises(bp.ComposerBootConfigError) as caught:
         await bp.probe_composer_config(_request(settings_factory(**overrides), surface))
     text = str(caught.value)
@@ -503,7 +504,7 @@ async def test_transient_failures_are_nonfatal(monkeypatch: pytest.MonkeyPatch, 
     async def complete(**_kwargs: object) -> object:
         raise failure()
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
 
     assert await bp.probe_composer_config(_request(settings_factory(), surface)) is False
 
@@ -513,7 +514,7 @@ async def test_probe_propagates_programmer_errors(monkeypatch: pytest.MonkeyPatc
     async def complete(**_kwargs: object) -> object:
         raise TypeError("signature drift")
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
 
     with pytest.raises(TypeError, match="signature drift"):
         await bp.probe_composer_config(_request(settings_factory(), "loop_tools"))
@@ -531,7 +532,7 @@ async def test_probe_sends_a_copy_and_leaves_the_request_unchanged(monkeypatch: 
         kwargs["tools"].append({"type": "function", "function": {"name": "mutated"}})
         return _ok_response()
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     request = _request(settings_factory(), "loop_tools")
     before = copy.deepcopy(request.to_litellm_kwargs())
 
@@ -560,7 +561,7 @@ async def test_advisor_probe_rejects_nonconforming_content(monkeypatch: pytest.M
     async def complete(**_kwargs: object) -> object:
         return _ok_response(content=content)
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     with pytest.raises(bp.ComposerBootConfigError, match=r"advisor.*probe-model.*structured-output"):
         await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
 
@@ -583,7 +584,7 @@ async def test_advisor_probe_rejects_malformed_provider_response(
     async def complete(**_kwargs: object) -> object:
         return response
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     with pytest.raises(bp.ComposerBootConfigError, match="structured-output"):
         await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
 
@@ -593,7 +594,7 @@ async def test_advisor_probe_rejects_excessively_nested_json(monkeypatch: pytest
     async def complete(**_kwargs: object) -> object:
         return _ok_response(content="[" * 10_000 + "0" + "]" * 10_000)
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     with pytest.raises(bp.ComposerBootConfigError, match="JSON/schema admission"):
         await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
 
@@ -615,7 +616,7 @@ async def test_advisor_probe_accepts_schema_valid_without_requiring_checkpoint_s
     async def complete(**_kwargs: object) -> object:
         return _ok_response(content=content)
 
-    monkeypatch.setattr(bp, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     try:
         accepted = await bp.probe_composer_config(_request(settings_factory(composer_advisor_model="probe-model"), "advisor"))
     except bp.ComposerBootConfigError:

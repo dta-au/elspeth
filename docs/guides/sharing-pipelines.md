@@ -70,15 +70,10 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.8.1, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=68` and
-`SQLITE_SCHEMA_EPOCH=48`. Session epoch 29 introduced durable guided
-operations, session epoch 30 added the closed `quota_exceeded` terminal failure
-code used for stable HTTP 413 fork replay, and later session epochs completed
-proposal admission, retryable blob cleanup, ordinary guided-plan decline
-settlement, the decline replay message locator, the eager cutovers for
-persisted coalesce timeout metadata and the projected node option summary, and
-run-diagnostics writer-principal attribution and operator-profiled
-Textract document authoring. Landscape epoch 30 adds durable row_union barrier
+contract. The candidate currently expects `SESSION_SCHEMA_EPOCH=71` and
+`SQLITE_SCHEMA_EPOCH=48`; confirm both against the deployed service's live
+schema constants before recreating a store. Landscape epoch 30 adds durable
+row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public
 six-state vocabulary. Epoch 32 adds atomic, durable aggregation result receipts
 for transform, passthrough, and empty outputs so recovery does not replay a
@@ -105,9 +100,8 @@ policy limits to 64-bit integers and makes token-ledger prompt/completion measur
 nullable: unknown usage is NULL, never zero. Landscape epoch 42 requires
 admission evidence v2 with per-principal token quota usage and limits; stored
 v1 evidence is incompatible. Session epoch 59 adds timestamp-leading indexes for
-container-wide quota scans. Session epoch 60 persists guided fork failure diagnostics.
-Session epoch 61 defaults new Composer preferences to freeform and removes the
-retired default-change banner field; recreate predecessor session databases.
+container-wide quota scans. Session epoch 61 established freeform as the
+Composer default; recreate predecessor session databases.
 Session epoch 62 requires nullable backend suggestions in durable advisor
 completion gates and rejects older stores at startup before session reload.
 Session epoch 63 makes the `blob_inline_resolutions.content_hash` CHECK and the
@@ -119,7 +113,7 @@ It also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
-A Landscape store below epoch 48 is stale and must be recreated. When
+A Landscape store below the deployed epoch is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

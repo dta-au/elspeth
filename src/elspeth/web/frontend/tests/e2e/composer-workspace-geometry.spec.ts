@@ -87,16 +87,6 @@ async function assertScenario(
       await expectIntendedPaneScrollers(page, { transcriptMustScroll: true });
       await expectResizeGeometry(page, composer, page.viewportSize()!.width);
       break;
-    case "active-guided-decision":
-      await expect(
-        composer.authoringPane().getByRole("log", { name: "Step chat history" }),
-      ).toBeVisible();
-      await expect(
-        composer.authoringPane().getByRole("log", { name: "Guided wizard step" }),
-      ).toBeVisible();
-      await expect(page.getByTestId("completion-bar")).toHaveCount(0);
-      await expect(composer.catalogButton()).toHaveCount(0);
-      break;
     case "validation-audit-issues": {
       await expect(composer.checksTab()).toHaveAccessibleName(
         "Checks: 25 issues",
@@ -294,8 +284,8 @@ test.describe("Composer deterministic workspace geometry", () => {
           await expectNoDocumentHorizontalOverflow(page);
           await assertScenario(scenario, composer);
           await expectPrimaryControlsInViewport(page, composer, {
-            completion: scenario !== "active-guided-decision",
-            catalog: scenario !== "active-guided-decision",
+            completion: true,
+            catalog: true,
             importYaml: false,
           });
           await expectIntendedPaneScrollers(page, {

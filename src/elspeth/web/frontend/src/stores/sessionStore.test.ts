@@ -15,7 +15,7 @@ import type {
 } from "@/types/api";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
-import { clearAllGuidedRetries } from "./guidedOperationRetry";
+import { clearAllSessionOperationRetries } from "./sessionOperationRetry";
 
 const clearValidationMock = vi.hoisted(() => vi.fn());
 const validateMock = vi.hoisted(() => vi.fn());
@@ -40,26 +40,8 @@ vi.mock("@/api/client", () => ({
   fetchStateVersions: vi.fn(),
   archiveSession: vi.fn(),
   renameSession: vi.fn(),
-  getGuided: vi.fn(),
-  respondGuided: vi.fn(),
-  // The three WRITING guided-entry routes. Mocked (rather than absent) so the
-  // goal-first tests below can assert they were NOT called: "nothing is
-  // persisted before the user states a goal" is the whole point of the
-  // GET-first probe, and an unmocked export makes that assertion impossible
-  // to state.
-  startGuidedSession: vi.fn(),
-  convertToGuided: vi.fn(),
-  reenterGuided: vi.fn(),
-  reconcileGuidedStartOperation: vi.fn(),
-  chatGuided: vi.fn(),
-  GuidedResponseReceiptError: class extends Error {},
-  // Phase 1B — sessionStore.createSession calls resolveDefaultMode() on the
-  // preferencesStore, which falls back to fetchUserComposerPreferences()
-  // when the prefs store hasn't been bootstrapped. The default mock returns
-  // freeform so existing createSession-touching tests (which preceded this
-  // change and assert non-guided behaviour) keep passing.
+  // Preference bootstrap is independent of session creation.
   fetchUserComposerPreferences: vi.fn().mockResolvedValue({
-    default_mode: "freeform",
     tutorial_completed_at: null,
     tutorial_stage: null,
     tutorial_session_id: null,
@@ -111,37 +93,6 @@ function makeCompositionState(version: number, nodeIds: string[] = []): Composit
   };
 }
 
-/**
- * The lazy in-memory stub GET /guided returns for a session with no persisted
- * guided state (get_guided's docstring): the first step-1 turn, an empty
- * transcript, and `composition_state: null`. Nothing has been written — which
- * is exactly what a guided-default session looks like before its goal.
- */
-function guidedStubResponse() {
-  return {
-    guided_session: {
-      step: "step_1_source",
-      history: [],
-      terminal: null,
-      chat_history: [],
-      chat_turn_seq: 0,
-      reviewed_components: { sources: [], outputs: [] },
-      profile: null,
-    },
-    next_turn: {
-      type: "single_select",
-      step_index: 0,
-      turn_token: "a".repeat(64),
-      payload: {
-        question: "Which source plugin should we use?",
-        options: [{ id: "csv", label: "CSV", hint: null }],
-        allow_custom: false,
-      },
-    },
-    terminal: null,
-    composition_state: null,
-  };
-}
 
 function makePendingInterpretationEvent(id: string): InterpretationEvent {
   return {
@@ -241,25 +192,18 @@ describe("sessionStore", () => {
   beforeEach(async () => {
     vi.resetAllMocks();
     window.sessionStorage.clear();
-    clearAllGuidedRetries();
+    clearAllSessionOperationRetries();
     resetStore(useSessionStore);
-    // Phase 1B: keep existing createSession-touching tests on the pre-change
-    // behaviour by pinning preferences to freeform-loaded. The new
-    // "createSession honours default mode" describe overrides this per test
-    // to exercise guided / unloaded paths explicitly.
+    // Keep preferences isolated between store tests.
     const { usePreferencesStore } = await import("@/stores/preferencesStore");
     resetStore(usePreferencesStore);
     usePreferencesStore.setState({
       loaded: true,
-      defaultMode: "freeform",
       writing: false,
     });
-    // Reseed the @/api/client mock that vi.resetAllMocks() cleared so the
-    // preferences-bootstrap fallback path in resolveDefaultMode() still
-    // resolves under tests that drive an unloaded prefs store.
+    // Reseed the API mock cleared by vi.resetAllMocks().
     const apiMod = await import("@/api/client");
     (apiMod.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue({
-      default_mode: "freeform",
       tutorial_completed_at: null,
       tutorial_stage: null,
       tutorial_session_id: null,
@@ -289,6 +233,260 @@ describe("sessionStore", () => {
       // the #/{id}/yaml gate all depend on this).
       expect(state.sessionsLoaded).toBe(false);
       expect(state.compositionStateLoaded).toBe(false);
+    });
+  });
+
+  describe("freeform send identity", () => {
+    it("retains refresh-only retry when polling canonicalizes the user before an accepted 409", async () => {
+      const api = await import("@/api/client");
+      const send = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+      vi.mocked(api.sendMessage).mockReturnValueOnce(send.promise);
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
+      useSessionStore.setState({activeSessionId: "session-1"});
+      const pending = useSessionStore.getState().sendMessage("hello");
+      const optimistic = useSessionStore.getState().messages[0];
+      const canonical: ChatMessage = {
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: optimistic.client_request_id, tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      };
+      vi.mocked(api.fetchMessages).mockResolvedValue([canonical]);
+      await useSessionStore.getState().loadInflightMessages("session-1");
+      expect(useSessionStore.getState().messages[0].id).toBe("canonical-user");
+      vi.mocked(api.fetchCompositionState).mockRejectedValueOnce(new TypeError("offline"));
+      send.reject({status: 409, error_type: "message_already_accepted",
+        client_request_id: optimistic.client_request_id, user_message_id: "canonical-user",
+        detail: "Already accepted"});
+      await pending;
+      const unresolved = useSessionStore.getState().messages[0];
+      expect(unresolved.id).toBe("canonical-user");
+      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
+      expect(unresolved.local_status).toBe("failed");
+
+      vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      await useSessionStore.getState().retryMessage("canonical-user");
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(api.recompose).not.toHaveBeenCalled();
+    });
+
+    it("does not let a progress tick invalidate a slow accepted-receipt snapshot", async () => {
+      const api = await import("@/api/client");
+      const stateRead = deferred<CompositionState | null>();
+      vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) => Promise.reject({
+        status: 409, error_type: "message_already_accepted",
+        client_request_id: requestId, user_message_id: "canonical-user", detail: "Already accepted",
+      }));
+      vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2], tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      vi.mocked(api.fetchCompositionState).mockReturnValueOnce(stateRead.promise);
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
+      useSessionStore.setState({activeSessionId: "session-1"});
+
+      const pending = useSessionStore.getState().sendMessage("hello");
+      await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+      // This is the interval callback's read shape. It must be inert while
+      // the owned receipt read is in progress.
+      await useSessionStore.getState().loadComposerProgress("session-1");
+      stateRead.resolve(null);
+      await pending;
+      const canonical = useSessionStore.getState().messages[0];
+      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.local_accepted_user_message_id).toBeUndefined();
+      expect(useSessionStore.getState().error).toContain("saved without a reply");
+    });
+
+    it("keeps a canonical accepted message refresh-only when ambiguous transport reconciliation cannot load state", async () => {
+      const api = await import("@/api/client");
+      vi.mocked(api.sendMessage).mockRejectedValueOnce(new TypeError("offline"));
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({phase: "idle", inflight_requests: 0} as ComposerProgressSnapshot);
+      vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2], tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      vi.mocked(api.fetchCompositionState).mockRejectedValue(new TypeError("state offline"));
+      vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+      useSessionStore.setState({activeSessionId: "session-1"});
+      await useSessionStore.getState().sendMessage("hello");
+      const unresolved = useSessionStore.getState().messages[0];
+      expect(unresolved.id).toBe("canonical-user");
+      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
+      expect(unresolved.local_status).toBe("failed");
+      await useSessionStore.getState().retryMessage("canonical-user");
+      expect(api.sendMessage).toHaveBeenCalledTimes(1);
+      expect(api.recompose).not.toHaveBeenCalled();
+    });
+
+    it("attaches provider failure to a canonical user published before the POST fails", async () => {
+      const api = await import("@/api/client");
+      const send = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+      vi.mocked(api.sendMessage).mockReturnValueOnce(send.promise);
+      useSessionStore.setState({activeSessionId: "session-1"});
+      const pending = useSessionStore.getState().sendMessage("hello");
+      const requestId = useSessionStore.getState().messages[0].client_request_id;
+      vi.mocked(api.fetchMessages).mockResolvedValue([{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: requestId, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      await useSessionStore.getState().loadInflightMessages("session-1");
+      send.reject({status: 502, error_type: "llm_unavailable", detail: "Provider unavailable"});
+      await pending;
+      const canonical = useSessionStore.getState().messages[0];
+      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.local_status).toBe("failed");
+      expect(canonical.local_error).toContain("temporarily unavailable");
+    });
+
+    it("reuses the original UUID, content, and requested state when an uncertain local send is retried", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+        .mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
+          status: 409,
+          error_type: "message_already_accepted",
+          client_request_id: requestId,
+          user_message_id: "canonical-user",
+          detail: "Message already accepted",
+        }));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(makeCompositionState(1));
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({ phase: "idle" });
+      useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
+
+      await useSessionStore.getState().sendMessage("same words");
+      const failed = useSessionStore.getState().messages[0];
+      expect(failed.local_status).toBe("failed");
+      expect(failed.client_request_id).toMatch(/^[0-9a-f-]{36}$/);
+      useSessionStore.setState({ compositionState: makeCompositionState(2) });
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "same words",
+        client_request_id: failed.client_request_id, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      await useSessionStore.getState().retryMessage(failed.id);
+
+      const calls = (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[1].slice(0, 4)).toEqual(calls[0].slice(0, 4));
+      expect(apiMod.recompose).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().messages.map((message) => message.id)).toEqual(["canonical-user"]);
+    });
+
+    it("keeps an accepted receipt for refresh-only retry when reconciliation fails", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
+        status: 409, error_type: "message_already_accepted", client_request_id: requestId,
+        user_message_id: "canonical-user", detail: "Message already accepted",
+      }));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      const unresolved = useSessionStore.getState().messages[0];
+      expect(unresolved.local_accepted_user_message_id).toBe("canonical-user");
+      expect(unresolved.local_status).toBe("failed");
+
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: unresolved.client_request_id, tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({ phase: "idle" });
+      await useSessionStore.getState().retryMessage(unresolved.id);
+      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
+      expect(apiMod.recompose).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().messages[0].id).toBe("canonical-user");
+    });
+
+    it("offers a deliberate canonical recompose after acceptance with no assistant reply", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce({status: 502, error_type: "llm_unavailable", detail: "Model unavailable"})
+        .mockImplementationOnce((_session: string, _content: string, requestId: string) => Promise.reject({
+          status: 409, error_type: "message_already_accepted", client_request_id: requestId,
+          user_message_id: "canonical-user", detail: "Message already accepted",
+        }));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockImplementation(async () => [{
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string,
+        tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({phase: "failed", inflight_requests: 0});
+      useSessionStore.setState({activeSessionId: "session-1"});
+      await useSessionStore.getState().sendMessage("hello");
+      const local = useSessionStore.getState().messages[0];
+      await useSessionStore.getState().retryMessage(local.id);
+      const canonical = useSessionStore.getState().messages[0];
+      expect(canonical.id).toBe("canonical-user");
+      expect(canonical.local_status).toBe("failed");
+      expect(apiMod.recompose).not.toHaveBeenCalled();
+
+      (apiMod.recompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce({status: 502, detail: "Still unavailable"});
+      await useSessionStore.getState().retryMessage(canonical.id);
+      expect(apiMod.recompose).toHaveBeenCalledWith("session-1", "canonical-user", undefined);
+    });
+
+    it("does not match a local intent to another user's identical text", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([{
+        id: "other-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: "other-intent", tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+      } satisfies ChatMessage]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages.some((message) => message.id.startsWith("local-") && message.local_status === "failed")).toBe(true);
+    });
+
+    it("names the canonical user message in a deliberate recompose retry", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.recompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce({status: 409, error_type: "recompose_user_message_mismatch", detail: "Newer user message exists"});
+      useSessionStore.setState({ activeSessionId: "session-1", messages: [{
+        id: "user-1", session_id: "session-1", role: "user", content: "hello", tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z", local_status: "failed",
+      }] });
+      await useSessionStore.getState().retryMessage("user-1");
+      expect(apiMod.recompose).toHaveBeenCalledWith("session-1", "user-1", undefined);
+      expect(apiMod.sendMessage).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("recompose_user_message_mismatch");
+    });
+
+    it("marks a conflicting reuse as terminal instead of offering an impossible retry", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 409, error_type: "message_idempotency_conflict", detail: "This request identity belongs to another message.",
+      });
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages[0].local_failure_code).toBe("message_idempotency_conflict");
+    });
+
+    it("does not automatically replay a pending send after a page reload", async () => {
+      const apiMod = await import("@/api/client");
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new TypeError("offline"));
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().messages[0].client_request_id).toBeDefined();
+
+      // Pending identities are kept only in memory. A new store activation
+      // reads the server transcript and never invents a replacement key.
+      resetStore(useSessionStore);
+      (apiMod.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+      await useSessionStore.getState().selectSession("session-1");
+      expect(apiMod.sendMessage).toHaveBeenCalledTimes(1);
+      expect(useSessionStore.getState().messages).toEqual([]);
     });
   });
 
@@ -657,9 +855,7 @@ describe("sessionStore", () => {
     it("refreshes pending interpretation events after a successful freeform compose turn", async () => {
       // Regression: a freeform compose turn can create new pending
       // interpretation events (invented_source / llm_prompt_template /
-      // llm_model_choice / pipeline_decision). Unlike guided mode (review
-      // delivered as a guided turn) and the tutorial (explicit refreshAll),
-      // the freeform path had no trigger to pull them into the
+      // llm_model_choice / pipeline_decision). The compose path must pull them into the
       // interpretationEventsStore — so the inline review widgets and their
       // sign-off buttons never rendered mid-session, while the run-gate still
       // blocked execution on the pending rows. selectSession refreshes on
@@ -1087,6 +1283,7 @@ describe("sessionStore", () => {
       const sendPromise = useSessionStore
         .getState()
         .sendMessage("hello", controller.signal);
+      canonicalUser.client_request_id = (apiMod.sendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
       controller.abort("compose_user_cancel");
       await sendPromise;
 
@@ -1517,11 +1714,9 @@ describe("sessionStore", () => {
     });
 
     it("abandons the settle wait when a newer compose turn claims the poller", async () => {
-      // Guided chat sets guidedChatPending (not isComposing) and its route
-      // is not the freeform POST — a store-flag check cannot see it. Every
-      // compose entry point (sendMessage/retryMessage/chatGuided) claims
-      // the module-global progress poller via startComposerProgressPolling,
-      // so the poller generation is the mode-agnostic supersession signal:
+      // Every compose entry point claims the module-global progress poller
+      // via startComposerProgressPolling, so the poller generation is the
+      // supersession signal:
       // once a newer turn owns it, the aborted turn's resync must abandon
       // without fetching at all.
       vi.useFakeTimers();
@@ -1568,12 +1763,10 @@ describe("sessionStore", () => {
         controller.abort("compose_user_cancel");
         await vi.advanceTimersByTimeAsync(1_000); // waiter parked
 
-        // A guided chat turn starts in the same session: it claims the
-        // progress poller exactly as chatGuided does.
+        // A newer turn starts in the same session and claims the progress poller.
         useSessionStore.getState().startComposerProgressPolling("session-1");
-        // The registry then quiesces (the guided turn finished; guided
-        // requests are also counted server-side, but even a zero count
-        // must not revive the superseded resync).
+        // The registry then quiesces, but even a zero count must not revive
+        // the superseded resync.
         registry.phase = "complete";
         registry.inflight_requests = 0;
         await vi.advanceTimersByTimeAsync(2_000);
@@ -1754,8 +1947,11 @@ describe("sessionStore", () => {
         tool_calls: null,
         created_at: "2026-09-15T00:00:01Z",
       };
-      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new TypeError("Failed to fetch"),
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        (_session: string, _content: string, requestId: string) => {
+          canonicalUser.client_request_id = requestId;
+          return Promise.reject(new TypeError("Failed to fetch"));
+        },
       );
       (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
         canonicalUser,
@@ -1765,6 +1961,7 @@ describe("sessionStore", () => {
         makeCompositionState(3, ["new-node"]),
       );
       (apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (apiMod.fetchComposerProgress as ReturnType<typeof vi.fn>).mockResolvedValue({phase: "complete", inflight_requests: 0});
 
       useSessionStore.setState({
         activeSessionId: "session-1",
@@ -1784,7 +1981,7 @@ describe("sessionStore", () => {
         true,
       );
       expect(state.compositionState?.version).toBe(3);
-      expect(state.error).toContain("Your request was saved");
+      expect(state.error).toContain("Your message was saved");
       expect(clearValidationMock).toHaveBeenCalled();
     });
 
@@ -1833,6 +2030,20 @@ describe("sessionStore", () => {
       );
       expect(state.error).toContain("Provider status: 402");
       expect(state.messages[0].local_error).toBe(state.error);
+    });
+
+    it("shows the gateway's safe retry guidance instead of generic immediate retry copy", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 502,
+        error_type: "llm_unavailable",
+        detail: "BadGatewayError",
+        guidance: "Retry later; if this continues, ask an administrator to investigate the model gateway.",
+      });
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+      expect(useSessionStore.getState().error).toContain("Retry later; if this continues");
+      expect(useSessionStore.getState().error).not.toContain("try again in a moment");
     });
 
     it("opens recovery state for recovery-shaped compose failures", async () => {
@@ -2069,6 +2280,7 @@ describe("sessionStore", () => {
 
         useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
         const sendPromise = useSessionStore.getState().sendMessage("hello");
+        canonicalUser.client_request_id = (mockSendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
 
         // Drain the optimistic-append microtask.
         await Promise.resolve();
@@ -2206,6 +2418,7 @@ describe("sessionStore", () => {
 
           useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
           const sendPromise = useSessionStore.getState().sendMessage("hi");
+          pollUser.client_request_id = (mockSendMessage as ReturnType<typeof vi.fn>).mock.calls[0][2] as string;
           await Promise.resolve();
           await vi.advanceTimersByTimeAsync(1500);
           expect(fetchMessages).toHaveBeenCalledTimes(1);
@@ -2286,9 +2499,6 @@ describe("sessionStore", () => {
       // explicit post-settle sync must still land on its return.
       async function armSelectSessionReads(): Promise<void> {
         const api = await import("@/api/client");
-        (api.getGuided as ReturnType<typeof vi.fn>).mockRejectedValue(
-          new Error("no guided state"),
-        );
         (api.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(
           null,
         );
@@ -2299,6 +2509,38 @@ describe("sessionStore", () => {
           api.fetchComposerPreferences as ReturnType<typeof vi.fn>
         ).mockResolvedValue(null);
       }
+
+      it("does not publish an old accepted receipt over a newer A turn after A->B->A", async () => {
+        const api = await import("@/api/client");
+        await armProgressIdle();
+        await armSelectSessionReads();
+        const oldPost = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+        const newPost = deferred<{ message: ChatMessage; state: null; proposals: CompositionProposal[] }>();
+        vi.mocked(api.sendMessage)
+          .mockReturnValueOnce(oldPost.promise)
+          .mockReturnValueOnce(newPost.promise);
+        vi.mocked(api.fetchMessages).mockResolvedValue([]);
+        useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+
+        const oldTurn = useSessionStore.getState().sendMessage("old");
+        const oldRequestId = vi.mocked(api.sendMessage).mock.calls[0][2];
+        await useSessionStore.getState().selectSession("session-2");
+        await useSessionStore.getState().selectSession("session-1");
+        const newTurn = useSessionStore.getState().sendMessage("new");
+        oldPost.reject({
+          status: 409, error_type: "message_already_accepted",
+          client_request_id: oldRequestId, user_message_id: "old-user",
+          detail: "Message already accepted",
+        });
+        await oldTurn;
+        expect(useSessionStore.getState().isComposing).toBe(true);
+        expect(useSessionStore.getState().error).toBeNull();
+        expect(useSessionStore.getState().messages.map((message) => message.id)).not.toContain("old-user");
+
+        newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+        await newTurn;
+        expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
+      });
 
       const pollTool: ChatMessage = {
         id: "msg-poll-tool",
@@ -2417,7 +2659,8 @@ describe("sessionStore", () => {
           async (id: string) => {
             if (id !== "session-1") return [];
             sessionOneFetches += 1;
-            // 1 = reselect load; 2 = the OLD turn's post-settle sync.
+            // A reselect read is the only read needed once a newer turn has
+            // claimed this session's compose state.
             return sessionOneFetches === 1
               ? [pollUser]
               : [pollUser, staleSentinel];
@@ -2437,7 +2680,7 @@ describe("sessionStore", () => {
         firstSend.resolve({ message: pollReply, state: null });
         await firstPromise;
 
-        expect(sessionOneFetches).toBe(2);
+        expect(sessionOneFetches).toBe(1);
         expect(useSessionStore.getState().messages.map((m) => m.id)).not.toContain(
           "msg-stale-sentinel",
         );
@@ -2445,6 +2688,178 @@ describe("sessionStore", () => {
         secondSend.resolve({ message: pollReply, state: null });
         await secondPromise;
       });
+
+      it.each(["send", "retry"] as const)(
+        "keeps the newer A turn when an old %s POST succeeds after A->B->A",
+        async (oldOperation) => {
+          const api = await import("@/api/client");
+          await armProgressIdle();
+          await armSelectSessionReads();
+          const oldPost = deferred<{
+            message: ChatMessage;
+            state: CompositionState;
+            proposals: CompositionProposal[];
+          }>();
+          const newPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          vi.mocked(api.sendMessage).mockReturnValueOnce(
+            oldOperation === "send" ? oldPost.promise : newPost.promise,
+          );
+          if (oldOperation === "send") {
+            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
+          } else {
+            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
+          }
+          vi.mocked(api.fetchMessages).mockImplementation(async (id: string) =>
+            id === "session-1" ? [pollUser] : [],
+          );
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
+          const oldTurn = oldOperation === "send"
+            ? useSessionStore.getState().sendMessage("old")
+            : useSessionStore.getState().retryMessage(pollUser.id);
+          await useSessionStore.getState().selectSession("session-2");
+          await useSessionStore.getState().selectSession("session-1");
+          const currentState = makeCompositionState(3, ["new-node"]);
+          const currentProposal = makeCompositionProposal({ id: "new-proposal" });
+          useSessionStore.setState({
+            compositionState: currentState,
+            compositionProposals: [currentProposal],
+          });
+          const newTurn = useSessionStore.getState().sendMessage("new");
+          expect(useSessionStore.getState().isComposing).toBe(true);
+
+          oldPost.resolve({
+            message: { ...pollReply, id: "old-reply" },
+            state: makeCompositionState(2, ["old-node"]),
+            proposals: [makeCompositionProposal({ id: "old-proposal" })],
+          });
+          await oldTurn;
+          const duringNewTurn = useSessionStore.getState();
+          expect(duringNewTurn.isComposing).toBe(true);
+          expect(duringNewTurn.compositionState).toBe(currentState);
+          expect(duringNewTurn.compositionProposals).toEqual([currentProposal]);
+          expect(duringNewTurn.messages.map((message) => message.id)).not.toContain("old-reply");
+          expect(duringNewTurn.error).toBeNull();
+
+          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+          await newTurn;
+          expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
+          expect(useSessionStore.getState().isComposing).toBe(false);
+        },
+      );
+
+      it.each(["send", "retry"] as const)(
+        "keeps the newer A turn when an old %s POST fails after A->B->A",
+        async (oldOperation) => {
+          const api = await import("@/api/client");
+          await armProgressIdle();
+          await armSelectSessionReads();
+          const oldPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          const newPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          vi.mocked(api.sendMessage).mockReturnValueOnce(
+            oldOperation === "send" ? oldPost.promise : newPost.promise,
+          );
+          if (oldOperation === "send") {
+            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
+          } else {
+            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
+          }
+          vi.mocked(api.fetchMessages).mockImplementation(async (id: string) =>
+            id === "session-1" ? [pollUser] : [],
+          );
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
+          const oldTurn = oldOperation === "send"
+            ? useSessionStore.getState().sendMessage("old")
+            : useSessionStore.getState().retryMessage(pollUser.id);
+          await useSessionStore.getState().selectSession("session-2");
+          await useSessionStore.getState().selectSession("session-1");
+          const newTurn = useSessionStore.getState().sendMessage("new");
+          oldPost.reject({ status: 502, error_type: "llm_unavailable", detail: "old failure" });
+          await oldTurn;
+          const duringNewTurn = useSessionStore.getState();
+          expect(duringNewTurn.isComposing).toBe(true);
+          expect(duringNewTurn.error).toBeNull();
+          expect(duringNewTurn.messages.find((message) => message.id === pollUser.id)?.local_status).toBeUndefined();
+
+          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+          await newTurn;
+          expect(useSessionStore.getState().messages.map((message) => message.id)).toContain("new-reply");
+        },
+      );
+
+      it.each(["send", "retry"] as const)(
+        "drops an old %s POST metadata after its message sync is superseded",
+        async (oldOperation) => {
+          const api = await import("@/api/client");
+          await armProgressIdle();
+          await armSelectSessionReads();
+          const oldPost = deferred<{
+            message: ChatMessage;
+            state: CompositionState;
+            proposals: CompositionProposal[];
+          }>();
+          const oldSync = deferred<ChatMessage[]>();
+          const newPost = deferred<{
+            message: ChatMessage;
+            state: null;
+            proposals: CompositionProposal[];
+          }>();
+          vi.mocked(api.sendMessage).mockReturnValueOnce(
+            oldOperation === "send" ? oldPost.promise : newPost.promise,
+          );
+          if (oldOperation === "send") {
+            vi.mocked(api.sendMessage).mockReturnValueOnce(newPost.promise);
+          } else {
+            vi.mocked(api.recompose).mockReturnValueOnce(oldPost.promise);
+          }
+          let readsForA = 0;
+          vi.mocked(api.fetchMessages).mockImplementation((id: string) => {
+            if (id !== "session-1") return Promise.resolve([]);
+            readsForA += 1;
+            return readsForA === 2 ? oldSync.promise : Promise.resolve([pollUser]);
+          });
+
+          useSessionStore.setState({ activeSessionId: "session-1", messages: [pollUser] });
+          const oldTurn = oldOperation === "send"
+            ? useSessionStore.getState().sendMessage("old")
+            : useSessionStore.getState().retryMessage(pollUser.id);
+          await useSessionStore.getState().selectSession("session-2");
+          await useSessionStore.getState().selectSession("session-1");
+          oldPost.resolve({
+            message: { ...pollReply, id: "old-reply" },
+            state: makeCompositionState(2, ["old-node"]),
+            proposals: [makeCompositionProposal({ id: "old-proposal" })],
+          });
+          await vi.waitFor(() => expect(readsForA).toBe(2));
+          const currentState = makeCompositionState(3, ["new-node"]);
+          const currentProposal = makeCompositionProposal({ id: "new-proposal" });
+          useSessionStore.setState({ compositionState: currentState, compositionProposals: [currentProposal] });
+          const newTurn = useSessionStore.getState().sendMessage("new");
+          oldSync.resolve([pollUser, { ...pollReply, id: "old-reply" }]);
+          await oldTurn;
+          const duringNewTurn = useSessionStore.getState();
+          expect(duringNewTurn.isComposing).toBe(true);
+          expect(duringNewTurn.compositionState).toBe(currentState);
+          expect(duringNewTurn.compositionProposals).toEqual([currentProposal]);
+          expect(duringNewTurn.messages.map((message) => message.id)).not.toContain("old-reply");
+
+          newPost.resolve({ message: { ...pollReply, id: "new-reply" }, state: null, proposals: [] });
+          await newTurn;
+        },
+      );
 
       it("applies the aborted turn's resync message sync after an A->B->A switch stopped the poller", async () => {
         const { sendMessage: mockSendMessage, fetchMessages } = await import(
@@ -2990,6 +3405,126 @@ describe("sessionStore", () => {
   });
 
   describe("composer proposals", () => {
+    it.each(["none", "tool", "reply"] as const)(
+      "keeps accepted-message retry only when %s assistant evidence has no genuine reply",
+      async (evidence) => {
+        const api = await import("@/api/client");
+        vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
+          Promise.reject({
+            status: 409, error_type: "message_already_accepted",
+            client_request_id: requestId, user_message_id: "canonical-user",
+            detail: "Already accepted",
+          }),
+        );
+        vi.mocked(api.fetchMessages).mockImplementation(async () => {
+          const rows: ChatMessage[] = [{
+            id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+            client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+            tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+          }];
+          if (evidence !== "none") rows.push({
+            id: "assistant", session_id: "session-1", role: "assistant",
+            content: evidence === "tool" ? "Inspecting your source" : "Done",
+            tool_calls: evidence === "tool"
+              ? [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }]
+              : null,
+            created_at: "2026-09-27T00:00:01Z",
+          });
+          return rows;
+        });
+        vi.mocked(api.fetchCompositionState).mockResolvedValue(null);
+        vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+          phase: "failed", inflight_requests: 0,
+        } as ComposerProgressSnapshot);
+        useSessionStore.setState({ activeSessionId: "session-1" });
+
+        await useSessionStore.getState().sendMessage("hello");
+
+        expect(api.recompose).not.toHaveBeenCalled();
+        expect(useSessionStore.getState().messages[0].local_status).toBe(
+          evidence === "reply" ? undefined : "failed",
+        );
+      },
+    );
+
+    it("keeps saved-message retry metadata when a poll sees only tool-call narration", async () => {
+      const api = await import("@/api/client");
+      const user: ChatMessage = {
+        id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+        client_request_id: "request-1", tool_calls: null,
+        created_at: "2026-09-27T00:00:00Z",
+      };
+      vi.mocked(api.fetchMessages).mockResolvedValueOnce([
+        user,
+        {
+          id: "tool-narration", session_id: "session-1", role: "assistant",
+          content: "Inspecting your source",
+          tool_calls: [{ id: "call", type: "function", function: { name: "list_plugins", arguments: "{}" } }],
+          created_at: "2026-09-27T00:00:01Z",
+        },
+      ]);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [{ ...user, local_status: "failed", local_error: "Retry saved message" }],
+      });
+      useSessionStore.getState().startInflightMessagesPolling("session-1");
+
+      await useSessionStore.getState().loadInflightMessages("session-1");
+
+      expect(useSessionStore.getState().messages[0].local_status).toBe("failed");
+      useSessionStore.getState().stopInflightMessagesPolling("session-1");
+    });
+
+    it.each(["reject", "accept"] as const)(
+      "keeps a newer %s receipt and state over a delayed accepted-message snapshot",
+      async (decision) => {
+        const api = await import("@/api/client");
+        const slowState = deferred<CompositionState | null>();
+        const pending = makeCompositionProposal();
+        const receipt = makeCompositionProposal({ status: decision === "accept" ? "committed" : "rejected" });
+        vi.mocked(api.sendMessage).mockImplementationOnce((_session, _content, requestId) =>
+          Promise.reject({
+            status: 409, error_type: "message_already_accepted",
+            client_request_id: requestId, user_message_id: "canonical-user",
+            detail: "Already accepted",
+          }),
+        );
+        vi.mocked(api.fetchMessages).mockImplementation(async () => [{
+          id: "canonical-user", session_id: "session-1", role: "user", content: "hello",
+          client_request_id: vi.mocked(api.sendMessage).mock.calls[0][2],
+          tool_calls: null, created_at: "2026-09-27T00:00:00Z",
+        }]);
+        vi.mocked(api.fetchCompositionState)
+          .mockReturnValueOnce(slowState.promise)
+          .mockResolvedValue(makeCompositionState(2));
+        vi.mocked(api.fetchCompositionProposals)
+          .mockResolvedValueOnce([pending])
+          .mockResolvedValue([receipt]);
+        vi.mocked(api.fetchComposerProgress).mockResolvedValue({
+          phase: "failed", inflight_requests: 0,
+        } as ComposerProgressSnapshot);
+        vi.mocked(decision === "accept" ? api.acceptCompositionProposal : api.rejectCompositionProposal)
+          .mockResolvedValue(receipt);
+        useSessionStore.setState({
+          activeSessionId: "session-1", compositionState: makeCompositionState(1),
+          compositionStateLoaded: true, compositionProposals: [pending],
+        });
+
+        const send = useSessionStore.getState().sendMessage("hello");
+        await vi.waitFor(() => expect(api.fetchCompositionState).toHaveBeenCalled());
+        await useSessionStore.getState()[decision === "accept" ? "acceptProposal" : "rejectProposal"](pending.id);
+        expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
+        if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
+
+        slowState.resolve(makeCompositionState(1));
+        await send;
+
+        expect(useSessionStore.getState().compositionProposals[0].status).toBe(receipt.status);
+        if (decision === "accept") expect(useSessionStore.getState().compositionState?.version).toBe(2);
+      },
+    );
+
     it.each([409, 500])("retains confirmed staleness when rejection fails (%s)", async (status) => {
       const api = await import("@/api/client");
       const pending = makeCompositionProposal();
@@ -3192,9 +3727,6 @@ describe("sessionStore", () => {
         interpretation_review_disabled: false,
         updated_at: "2026-05-14T00:00:00Z",
       });
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockRejectedValue(
-        new Error("guided unavailable"),
-      );
 
       await useSessionStore.getState().selectSession("session-1");
 
@@ -3251,10 +3783,8 @@ describe("sessionStore", () => {
       const apiClient = await import("@/api/client");
       const proposal = makeCompositionProposal({
         pipeline_metadata: {
-          surface: "freeform",
           draft_hash: "d".repeat(64),
           base: { kind: "absent" },
-          reviewed_anchor_hash: "a".repeat(64),
           repair_count: 0,
           skill_hash: "s".repeat(64),
           audit_payload_hash: "p".repeat(64),
@@ -3286,13 +3816,13 @@ describe("sessionStore", () => {
   });
 
   describe("applyResolvedInterpretation", () => {
-    it.each([false, true])("guards delayed approval publication across activation changes (guided=%s)", async (guided) => {
+    it("guards delayed approval publication across activation changes", async () => {
       const api = await import("@/api/client");
       vi.mocked(api.fetchMessages).mockResolvedValue([]);
       vi.mocked(api.fetchCompositionState).mockResolvedValue(makeCompositionState(2));
       vi.mocked(api.fetchCompositionProposals).mockResolvedValue([]);
       useSessionStore.setState({ activeSessionId: "session-1", compositionState: makeCompositionState(1) });
-      const resolve = createInterpretationResolutionHandler("session-1", guided);
+      const resolve = createInterpretationResolutionHandler("session-1");
       await useSessionStore.getState().selectSession("session-2");
       const destination = useSessionStore.getState().compositionState;
       validateMock.mockClear();
@@ -3305,11 +3835,11 @@ describe("sessionStore", () => {
       resolve(makeCompositionState(3));
       expect(useSessionStore.getState().compositionState).toBe(reactivated);
       expect(validateMock).not.toHaveBeenCalled();
-      const currentResolve = createInterpretationResolutionHandler("session-1", guided);
+      const currentResolve = createInterpretationResolutionHandler("session-1");
       const accepted = makeCompositionState(4);
       currentResolve(accepted);
       expect(useSessionStore.getState().compositionState).toBe(accepted);
-      if (!guided) expect(validateMock).toHaveBeenCalledWith("session-1");
+      expect(validateMock).toHaveBeenCalledWith("session-1");
     });
 
     it("applies the patched composition state and re-validates so the run-gate can reopen", () => {
@@ -3513,12 +4043,6 @@ describe("sessionStore", () => {
       (apiClient.fetchSessions as ReturnType<typeof vi.fn>).mockResolvedValue([
         { ...session, id: "00000000-0000-4000-8000-000000000702" },
       ]);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null,
-        next_turn: null,
-        terminal: null,
-        composition_state: null,
-      });
 
       const seedRecovery = () =>
         useSessionStore.setState({
@@ -3708,126 +4232,6 @@ describe("sessionStore", () => {
     });
   });
 
-  // ── Reload of a guided session that has not stated its goal ───────────────
-  //
-  // Goal-first (elspeth-378cfa0e18) removed the write that used to make this
-  // work by accident: convert persisted a rootless checkpoint, so a reload saw
-  // a real composition state and restored guided. With nothing persisted the
-  // probe returns the same lazy stub it returned the first time, and the only
-  // evidence that this session belongs on the guided surface is the account's
-  // default mode. Getting this wrong drops the user into freeform with the
-  // goal card gone — the failure the stub adoption exists to prevent.
-  describe("selectSession restores a goal-less guided-default session", () => {
-    async function setDefaultMode(mode: "guided" | "freeform"): Promise<void> {
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: mode,
-        writing: false,
-      });
-    }
-
-    async function selectWithStub(
-      messages: ReadonlyArray<Record<string, unknown>> = [],
-    ): Promise<void> {
-      const apiClient = await import("@/api/client");
-      (apiClient.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue(
-        messages,
-      );
-      (
-        apiClient.fetchCompositionState as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(null);
-      (
-        apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>
-      ).mockResolvedValue([]);
-      (
-        apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>
-      ).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue(
-        guidedStubResponse(),
-      );
-      await useSessionStore.getState().selectSession("sess-goal");
-    }
-
-    it("re-adopts the stub under a guided default so the session reopens on the goal card", async () => {
-      await setDefaultMode("guided");
-
-      await selectWithStub();
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).not.toBeNull();
-      expect(state.guidedNextTurn).not.toBeNull();
-      // Still nothing persisted: re-adopting must not be a write either.
-      expect(state.compositionState).toBeNull();
-      const apiClient = await import("@/api/client");
-      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
-      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
-    });
-
-    it("ignores the stub under a freeform default (a stub is not evidence of guided use)", async () => {
-      // The stub is returned for ANY session with no persisted guided state,
-      // including a brand-new freeform one. Adopting it unconditionally would
-      // flip a freeform-preferring user onto the guided surface on first load.
-      await setDefaultMode("freeform");
-
-      await selectWithStub();
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).toBeNull();
-      expect(state.guidedNextTurn).toBeNull();
-    });
-
-    it("leaves a worked freeform session in freeform even under a guided default", async () => {
-      // The stub is not a per-session signal — GET /guided answers with it for
-      // ANY session with no composition state, including a freeform session
-      // whose conversation never produced one (a message that triggered no
-      // compose tool call). Adopting on the preference alone would hide that
-      // real transcript behind the goal card, because the guided surface
-      // renders guided chat_history and not `messages`, and would do it
-      // retroactively to every message-only session the moment the user
-      // switched their default to guided. The adoption needs evidence about
-      // THIS session as well: an untouched one has no messages.
-      await setDefaultMode("guided");
-
-      await selectWithStub([
-        {
-          id: "user-1",
-          session_id: "sess-goal",
-          role: "user",
-          content: "what plugins can read a CSV?",
-          tool_calls: null,
-          created_at: "2026-09-03T00:00:00Z",
-        },
-      ]);
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).toBeNull();
-      expect(state.guidedNextTurn).toBeNull();
-      expect(state.messages).toHaveLength(1);
-    });
-
-    it("degrades to freeform when the default mode cannot be resolved", async () => {
-      // resolveDefaultMode throws when the preferences bootstrap produced no
-      // mode. Session selection must not become an error, and must not guess
-      // guided: the fallback is the same one createSession degrades to.
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: null,
-        writing: false,
-      });
-
-      await selectWithStub();
-
-      const state = useSessionStore.getState();
-      expect(state.activeSessionId).toBe("sess-goal");
-      expect(state.guidedSession).toBeNull();
-      expect(state.error).toBeNull();
-    });
-  });
 
   describe("retryMessage abort handling", () => {
     it("drops stale retryMessage responses after the active session changes", async () => {
@@ -4090,9 +4494,7 @@ describe("sessionStore", () => {
   describe("resetForTutorialSession", () => {
     it("binds activeSessionId and hydrates every field a stale session could leave behind", () => {
       // Dirty every field resetForTutorialSession is responsible for
-      // clearing, mirroring a completed guided session left over from a
-      // previously active (non-tutorial) session — the exact scenario
-      // TutorialGuidedShell's mount effect must recover from.
+      // clearing after another session was active.
       useSessionStore.setState({
         activeSessionId: "old-session",
         messages: [{ id: "old-message" } as unknown as ChatMessage],
@@ -4112,19 +4514,6 @@ describe("sessionStore", () => {
         isComposing: true,
         error: "some stale error",
         selectedNodeId: "old-node",
-        guidedSession: {
-          step: "step_4_wire",
-          history: [],
-          terminal: { kind: "completed", reason: null },
-          chat_history: [],
-          chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] },
-          profile: null,
-        } as never,
-        guidedNextTurn: {} as never,
-        guidedTerminal: { kind: "completed", reason: null } as never,
-        guidedChatPending: true,
-        guidedResponsePending: true,
         recoveryError: makeRecoveryError(),
         recoveryStartedCompositionVersion: 3,
       });
@@ -4144,11 +4533,6 @@ describe("sessionStore", () => {
       expect(state.isComposing).toBe(false);
       expect(state.error).toBeNull();
       expect(state.selectedNodeId).toBeNull();
-      expect(state.guidedSession).toBeNull();
-      expect(state.guidedNextTurn).toBeNull();
-      expect(state.guidedTerminal).toBeNull();
-      expect(state.guidedChatPending).toBe(false);
-      expect(state.guidedResponsePending).toBe(false);
       expect(state.recoveryError).toBeNull();
       expect(state.recoveryStartedCompositionVersion).toBeNull();
     });
@@ -4206,318 +4590,7 @@ describe("sessionStore", () => {
     });
   });
 
-  describe("guided source lifecycle rejection", () => {
-    it("removes the rejected exact UUID even when authoritative blob refresh fails", async () => {
-      const sessionId = "00000000-0000-4000-8000-000000000101";
-      const rejectedId = "00000000-0000-4000-8000-000000000901";
-      const otherId = "00000000-0000-4000-8000-000000000902";
-      const detail =
-        "Selected source blob is no longer a ready upload for this session.";
-      const apiMod = await import("@/api/client");
-      (apiMod.respondGuided as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
-        status: 400,
-        detail,
-      });
-      (apiMod.listBlobs as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new Error("authoritative refresh failed"),
-      );
-      useBlobStore.getState().reset();
-      useBlobStore.getState().activateSession(sessionId);
-      const blobFixture = {
-        id: rejectedId,
-        session_id: sessionId,
-        filename: "rejected.csv",
-        mime_type: "text/csv",
-        size_bytes: 16,
-        content_hash: "a".repeat(64),
-        created_at: "2026-07-27T00:00:00Z",
-        created_by: "user",
-        source_description: null,
-        status: "ready",
-        creation_modality: "verbatim",
-        created_from_message_id: null,
-        creating_model_identifier: null,
-        creating_model_version: null,
-        creating_provider: null,
-        creating_composer_skill_hash: null,
-        creating_arguments_hash: null,
-      } satisfies BlobMetadata;
-      useBlobStore.setState({
-        blobs: [
-          blobFixture,
-          {
-            ...blobFixture,
-            id: otherId,
-            filename: "other.csv",
-            content_hash: "b".repeat(64),
-          },
-        ],
-      });
-      useSessionStore.setState({
-        activeSessionId: sessionId,
-        guidedSession: {
-          step: "step_1_source",
-          history: [],
-          terminal: null,
-          chat_history: [],
-          chat_turn_seq: 0,
-          reviewed_components: { sources: [], outputs: [] },
-          profile: null,
-        },
-        guidedNextTurn: {
-          type: "single_select",
-          step_index: 0,
-          turn_token: "a".repeat(64),
-          payload: {
-            question: "Choose a source",
-            options: [{ id: "csv", label: "CSV", hint: null }],
-            allow_custom: false,
-          },
-        },
-      });
 
-      const outcome = await useSessionStore.getState().respondGuided({
-        chosen: ["csv"],
-        source_blob_id: rejectedId,
-        edited_values: null,
-        custom_inputs: null,
-        proposal_id: null,
-        draft_hash: null,
-        edit_target: null,
-        control_signal: null,
-      });
-
-      expect(apiMod.listBlobs).toHaveBeenCalledWith(sessionId);
-      expect(useBlobStore.getState().blobs.map((blob) => blob.id)).toEqual([
-        otherId,
-      ]);
-      expect(useBlobStore.getState().error).toBe("Failed to load files.");
-      expect(outcome).toEqual({
-        status: "not_applied",
-        reason: "rejected",
-        message: detail,
-      });
-      expect(useSessionStore.getState().error).toBe(detail);
-    });
-  });
-
-  // ── Phase 1B: createSession honours composer default-mode preference ──
-  describe("createSession honours default mode", () => {
-    it("leaves guidedSession null when default mode is freeform", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: "freeform",
-        writing: false,
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-1",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      await useSessionStore.getState().createSession();
-
-      expect(enterGuided).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().guidedSession).toBeNull();
-      expect(useSessionStore.getState().activeSessionId).toBe("sess-1");
-    });
-
-    it("enters guided mode when default mode is guided", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: "guided",
-        writing: false,
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-2",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      await useSessionStore.getState().createSession();
-
-      expect(enterGuided).toHaveBeenCalledTimes(1);
-      // The intent-less call is the contract: a brand-new session has no goal
-      // yet, so entry must land on the goal card (see the end-to-end pin
-      // below) rather than starting or converting anything.
-      expect(enterGuided).toHaveBeenCalledWith();
-    });
-
-    it("guided default: lands on the goal card by adopting the GET stub, writing NOTHING", async () => {
-      // The defect this pins (goal-first, elspeth-378cfa0e18): createSession's
-      // guided arm called enterGuided(), which called convertToGuided(), whose
-      // "no persisted state" branch PERSISTS a fresh rootless wizard. Every
-      // guided-default session was therefore created with a planner-reachable
-      // wizard behind no stated intent, and — because composition state was
-      // then non-null — the goal card could never render for it.
-      //
-      // enterGuided is deliberately NOT spied here: the sibling test above
-      // mocks it out and so proves only that the arm fires. This one runs the
-      // real action against a mocked GET so the routing itself is pinned.
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      usePreferencesStore.setState({
-        loaded: true,
-        defaultMode: "guided",
-        writing: false,
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-goal",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-        guidedStubResponse(),
-      );
-
-      await useSessionStore.getState().createSession();
-
-      const state = useSessionStore.getState();
-      expect(apiClient.getGuided).toHaveBeenCalledWith("sess-goal", undefined, true);
-      expect(apiClient.convertToGuided).not.toHaveBeenCalled();
-      expect(apiClient.startGuidedSession).not.toHaveBeenCalled();
-      expect(state.guidedSession).not.toBeNull();
-      expect(state.guidedNextTurn).not.toBeNull();
-      // Null composition state IS the goal card's condition in ChatPanel, and
-      // it is the honest description of the session: nothing is persisted.
-      expect(state.compositionState).toBeNull();
-      expect(state.error).toBeNull();
-    });
-
-    it("prefs-bootstrap failure does NOT mask successful session creation (Panel M1)", async () => {
-      // Regression pin for the createSession try-block split. Earlier shape:
-      // single try wrapped both api.createSession() and resolveDefaultMode();
-      // a prefs-bootstrap rejection was attributed to "Failed to create
-      // session" even though the session had already been created and
-      // activated. New shape: separate try blocks per concern.
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      // Unloaded prefs, bootstrap rejects with a network error.
-      resetStore(usePreferencesStore);
-      (apiClient.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new Error("Network error"),
-      );
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-prefs-fail",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-
-      await useSessionStore.getState().createSession();
-
-      const state = useSessionStore.getState();
-      // Session was created and is the active session — NOT masked.
-      expect(state.activeSessionId).toBe("sess-prefs-fail");
-      expect(state.sessions[0]?.id).toBe("sess-prefs-fail");
-      // The error message names the *secondary* failure, not the false
-      // "Failed to create session" attribution.
-      expect(state.error).toMatch(/couldn't apply your default mode/i);
-      expect(state.error).not.toMatch(/failed to create session/i);
-      // No guided entry attempted because resolveDefaultMode threw before
-      // returning a mode value.
-      expect(state.guidedSession).toBeNull();
-    });
-
-    it("session-create failure still surfaces 'Failed to create session' (no regression)", async () => {
-      const apiClient = await import("@/api/client");
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-        new Error("500"),
-      );
-
-      await useSessionStore.getState().createSession();
-
-      const state = useSessionStore.getState();
-      expect(state.error).toMatch(/failed to create session/i);
-      // No session was added; the early-return prevented the activation
-      // set() from running.
-      expect(state.activeSessionId).toBeNull();
-    });
-
-    it("bootstrap race: createSession before bootstrap resolves still enters guided when prefs resolve to guided", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      // Start with unloaded prefs — resolveDefaultMode() must await bootstrap.
-      resetStore(usePreferencesStore);
-      (apiClient.fetchUserComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        default_mode: "guided",
-        tutorial_completed_at: null,
-        tutorial_stage: null,
-        tutorial_session_id: null,
-        tutorial_run_id: null,
-        tutorial_source_data_hash: null,
-        updated_at: "2026-05-15T00:00:00Z",
-      });
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-3",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      await useSessionStore.getState().createSession();
-
-      expect(apiClient.fetchUserComposerPreferences).toHaveBeenCalled();
-      expect(enterGuided).toHaveBeenCalledTimes(1);
-      expect(usePreferencesStore.getState().loaded).toBe(true);
-    });
-
-    it("drops delayed guided default when active session changes before prefs resolve", async () => {
-      const apiClient = await import("@/api/client");
-      const { usePreferencesStore } = await import("@/stores/preferencesStore");
-      const prefs = deferred<"guided" | "freeform">();
-      vi.spyOn(usePreferencesStore.getState(), "resolveDefaultMode").mockReturnValue(prefs.promise);
-      (apiClient.createSession as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-        id: "sess-delayed-default",
-        title: "untitled",
-        created_at: "2026-05-14T00:00:00Z",
-        updated_at: "2026-05-14T00:00:00Z",
-      });
-      const enterGuided = vi
-        .spyOn(useSessionStore.getState(), "enterGuided")
-        .mockResolvedValue();
-
-      const createPromise = useSessionStore.getState().createSession();
-      await vi.waitFor(() => {
-        expect(useSessionStore.getState().activeSessionId).toBe("sess-delayed-default");
-      });
-
-      useSessionStore.setState({
-        activeSessionId: "sess-existing",
-        sessions: [
-          {
-            id: "sess-existing",
-            title: "existing",
-            created_at: "2026-05-13T00:00:00Z",
-            updated_at: "2026-05-13T00:00:00Z",
-          },
-          ...useSessionStore.getState().sessions,
-        ],
-      });
-      prefs.resolve("guided");
-      await createPromise;
-
-      expect(enterGuided).not.toHaveBeenCalled();
-      expect(useSessionStore.getState().activeSessionId).toBe("sess-existing");
-      expect(useSessionStore.getState().error).toBeNull();
-    });
-  });
 
   describe("session fork retry custody", () => {
     const parentId = "00000000-0000-4000-8000-000000000701";
@@ -4606,12 +4679,6 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null,
-        next_turn: null,
-        terminal: null,
-        composition_state: null,
-      });
       useSessionStore.setState({ activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -4635,9 +4702,6 @@ describe("sessionStore", () => {
         .mockResolvedValueOnce(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null, next_turn: null, terminal: null, composition_state: null,
-      });
       useSessionStore.setState({ activeSessionId: parentId });
 
       await useSessionStore.getState().forkFromMessage("message-1", "edited");
@@ -4649,27 +4713,6 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().activeSessionId).toBe(childId);
     });
 
-    it("keeps parent active and reuses the operation id when guided hydration returns 503", async () => {
-      const apiClient = await import("@/api/client");
-      (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mockResolvedValue({ session_id: childId });
-      (apiClient.fetchSessions as ReturnType<typeof vi.fn>).mockResolvedValue([child]);
-      (apiClient.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
-      (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>)
-        .mockRejectedValueOnce({ status: 503 })
-        .mockResolvedValueOnce({ guided_session: null, next_turn: null, terminal: null, composition_state: null });
-      useSessionStore.setState({ activeSessionId: parentId });
-
-      await useSessionStore.getState().forkFromMessage("message-1", "edited");
-      expect(useSessionStore.getState().activeSessionId).toBe(parentId);
-      await useSessionStore.getState().forkFromMessage("message-1", "edited");
-
-      const calls = (apiClient.forkFromMessage as ReturnType<typeof vi.fn>).mock.calls;
-      expect(calls[0]?.[1]).toBe(calls[1]?.[1]);
-      expect(useSessionStore.getState().activeSessionId).toBe(childId);
-    });
 
     it("retains retry custody for malformed 2xx fork responses", async () => {
       const apiClient = await import("@/api/client");
@@ -4694,9 +4737,6 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null, next_turn: null, terminal: null, composition_state: null,
-      });
       const renamedParent = { ...child, id: parentId, title: "Renamed while hydrating" };
       const archivedElsewhere = { ...child, id: "session-archived", title: "Archived elsewhere" };
       const createdElsewhere = { ...child, id: "session-created", title: "Created elsewhere" };
@@ -4765,9 +4805,6 @@ describe("sessionStore", () => {
       (apiClient.fetchCompositionState as ReturnType<typeof vi.fn>).mockResolvedValue(null);
       (apiClient.fetchCompositionProposals as ReturnType<typeof vi.fn>).mockResolvedValue([]);
       (apiClient.fetchComposerPreferences as ReturnType<typeof vi.fn>).mockResolvedValue(null);
-      (apiClient.getGuided as ReturnType<typeof vi.fn>).mockResolvedValue({
-        guided_session: null, next_turn: null, terminal: null, composition_state: null,
-      });
       useSessionStore.setState({ activeSessionId: parentId, sessions: [] });
 
       const pending = useSessionStore.getState().forkFromMessage("message-1", "edited");

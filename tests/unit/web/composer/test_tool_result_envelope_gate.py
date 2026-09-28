@@ -70,6 +70,7 @@ FENCE_PATH = Path(__file__).with_name("tool_result_envelope_fence.json")
 COMPOSER = WEB_SRC / "composer"
 COMMON = COMPOSER / "tools" / "_common.py"
 TOOL_BATCH = COMPOSER / "tool_batch.py"
+SESSION_TOOL = COMPOSER / "session_tool.py"
 TOOLS_DIR = COMPOSER / "tools"
 SHARED = "*"  # the ``tool`` column for surfaces every tool ships
 
@@ -92,8 +93,8 @@ _DATA_SITES_COUNTED_AT_THEIR_PRODUCER: dict[tuple[str, str], str] = {
         "merges two already-censused payloads; the one key the merge adds is yielded explicitly by _failure_data_sites"
     ),
     ("tool_batch.py", "run_tool_batch"): "two _FAILURE_DATA_HELPERS rows: the proposal payload and the rejection payload",
-    ("service.py", "_dispatch_session_aware_tool"): (
-        "review-blocked payload walked by _tool_data_sites over service.py in shipped_keys; attributed to request_interpretation_review"
+    ("session_tool.py", "_dispatch_session_aware_tool"): (
+        "review-blocked payload walked by _tool_data_sites over session_tool.py in shipped_keys; attributed to request_interpretation_review"
     ),
     ("discovery_cache.py", "result_from_cached_discovery_payload"): (
         "re-envelopes a cached discovery result's own data under the current state; adds no key, and every key it "
@@ -2228,8 +2229,7 @@ def _tools_calling(helper: str) -> frozenset[str]:
 def _tools_setting(field: str) -> frozenset[str]:
     """Tools whose handler constructs a ToolResult with ``field=`` set explicitly."""
     tools: set[str] = set()
-    service_path = COMPOSER / "service.py"
-    for path in [*(TOOLS_DIR / name for name in _TOOL_DATA_FILES), service_path]:
+    for path in [*(TOOLS_DIR / name for name in _TOOL_DATA_FILES), SESSION_TOOL]:
         tree = _parse(path)
         for node in ast.walk(tree):
             if (
@@ -2238,8 +2238,8 @@ def _tools_setting(field: str) -> frozenset[str]:
                 and any(kw.arg == field for kw in node.keywords)
             ):
                 fn_name = _enclosing_function(tree, node.lineno)
-                if path == service_path and fn_name != "_dispatch_session_aware_tool":
-                    continue  # Other service helpers return compose results or shared wrappers.
+                if path == SESSION_TOOL and fn_name != "_dispatch_session_aware_tool":
+                    continue  # Other session-tool helpers do not construct this tool's result.
                 if fn_name is not None:
                     tools.add(_tool_name_for(fn_name, f"{_display(path)}:{node.lineno}"))
     return frozenset(tools)
@@ -2270,7 +2270,7 @@ def shipped_keys() -> list[ShippedKey]:
         *_plugin_schema_sites(),
         *_failure_data_sites(),
         *_tool_data_sites(),
-        *_tool_data_sites(files=[COMPOSER / "service.py"]),
+        *_tool_data_sites(files=[SESSION_TOOL]),
     ]
 
 
@@ -2527,7 +2527,7 @@ def test_closed_provider_discovery_payload_is_a_subset_of_the_registry(include_d
         validation,
         (),
         1,
-        provider_discovery_response.surface_projection_failure() if include_data else None,
+        provider_discovery_response.schema_projection_failure() if include_data else None,
     )
     keys = set(envelope.to_wire())
     assert set(env.TOOL_RESULT_REQUIRED_KEYS) <= keys <= set(env.tool_result_keys(data=include_data)), "unregistered provider envelope keys"
@@ -2568,7 +2568,7 @@ def test_no_shared_envelope_key_is_unadmitted_on_a_mutation_tool() -> None:
 
 
 def test_review_blocked_payload_and_preflight_are_censused() -> None:
-    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(COMPOSER / 'service.py')}:")]
+    rows = [row for row in shipped_keys() if row.site.startswith(f"{_display(SESSION_TOOL)}:")]
     assert {(row.tool, row.key) for row in rows} == {
         ("request_interpretation_review", "data._kind"),
         ("request_interpretation_review", "data.message"),
@@ -2579,13 +2579,12 @@ def test_review_blocked_payload_and_preflight_are_censused() -> None:
 
 def test_review_blocked_census_rejects_an_untaught_payload_key(monkeypatch: pytest.MonkeyPatch) -> None:
     test_review_blocked_payload_and_preflight_are_censused()
-    service_path = COMPOSER / "service.py"
     original_parse = _parse
 
     def with_extra_key(path: Path) -> ast.Module:
         tree = original_parse(path)
-        if path == service_path:
-            fn = _function(tree, "_dispatch_session_aware_tool", in_class="ComposerServiceImpl")
+        if path == SESSION_TOOL:
+            fn = _function(tree, "_dispatch_session_aware_tool", in_class="SessionToolOwner")
             payloads = [
                 _data_expr(node)
                 for node in ast.walk(fn)
@@ -2728,12 +2727,12 @@ def test_names_two_modules_answer_to_reports_a_shadowed_name_for_both_attributio
     """
     shadowed = (
         _DataSite("sources.py", "tools/sources.py", "_execute_add_source", 1),
-        _DataSite("sources.py", "guided/sources.py", "_execute_shadow", 2),
+        _DataSite("sources.py", "alternate/sources.py", "_execute_shadow", 2),
         _DataSite("blobs.py", "tools/blobs.py", "_execute_delete_blob_locked", 3),
         _DataSite("sources.py", "tools/sources.py", "_execute_delete_blob_locked", 4),
     )
     by_file = ((site.file, site.module) for site in shadowed)
-    assert _names_two_modules_answer_to(by_file) == {"sources.py": ["guided/sources.py", "tools/sources.py"]}
+    assert _names_two_modules_answer_to(by_file) == {"sources.py": ["alternate/sources.py", "tools/sources.py"]}
     by_function = ((site.function, site.module) for site in shadowed)
     assert _names_two_modules_answer_to(by_function) == {"_execute_delete_blob_locked": ["tools/blobs.py", "tools/sources.py"]}
     clean = shadowed[:1] + shadowed[2:3]
@@ -3023,18 +3022,14 @@ def test_every_result_constructor_site_is_attributed() -> None:
 
     ``_all_data_sites`` walks the package recursively while ``_TOOL_DATA_FILES``
     names files under ``tools/``, so a base name does NOT identify a module. Two
-    distinct escapes came of keying on one, both measured against this file:
+    distinct escapes can come from keying on one:
 
-    * ``guided/sources.py`` shipping a ``data=`` payload counted itself as
-      walked — 33 passed, exit 0 — while ``_tool_data_sites`` only ever parsed
-      ``tools/sources.py``;
-    * ``guided/outputs.py`` did the same with no collision at all to notice,
-      because ``tools/outputs.py`` ships no ``data=`` site today, so the name is
-      one module's and the injectivity guard has nothing to refuse.
+    * another ``sources.py`` shipping a ``data=`` payload can count itself as
+      walked while ``_tool_data_sites`` parses only ``tools/sources.py``;
+    * another ``outputs.py`` can do the same with no collision to notice if
+      ``tools/outputs.py`` ships no ``data=`` site.
 
-    ``guided/`` already holds three base-name collisions with its parent package
-    (``audit.py``, ``prompts.py``, ``protocol.py``), so this is the tree's live
-    shape and not a hypothetical one. Hence ``walked`` keyed on the MODULE,
+    Hence ``walked`` is keyed on the MODULE,
     which is what the tool-data walker actually parses, plus an injectivity
     refusal for each bare name this file still attributes by, each with its own
     killing mutant:

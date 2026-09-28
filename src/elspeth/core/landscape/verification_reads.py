@@ -177,15 +177,26 @@ def iter_verification_decisions_for_run(conn: Connection, current_run_id: str, *
     """Validate verdicts in bounded keyset batches without per-verdict queries."""
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive exact integer")
+    # A stored run ID may have been corrupted even when the current call still
+    # belongs to this run. Check both parent kinds through their run indexes
+    # before paging by the stored run ID.
+    for parent, parent_id, parent_key in (
+        (node_states_table, node_states_table.c.state_id, calls_table.c.state_id),
+        (operations_table, operations_table.c.operation_id, calls_table.c.operation_id),
+    ):
+        misplaced = (
+            select(call_verifications_table.c.current_call_id)
+            .select_from(parent)
+            .join(calls_table, parent_key == parent_id)
+            .join(call_verifications_table, call_verifications_table.c.current_call_id == calls_table.c.call_id)
+            .where(parent.c.run_id == current_run_id, call_verifications_table.c.current_run_id != current_run_id)
+            .limit(1)
+        )
+        if conn.execute(misplaced).first() is not None:
+            raise AuditIntegrityError("verification current call belongs to another run")
     query = (
         _verification_query()
-        .where(
-            or_(
-                call_verifications_table.c.current_run_id == current_run_id,
-                node_states_table.c.run_id == current_run_id,
-                operations_table.c.run_id == current_run_id,
-            )
-        )
+        .where(call_verifications_table.c.current_run_id == current_run_id)
         .order_by(call_verifications_table.c.recorded_at, call_verifications_table.c.current_call_id)
         .limit(batch_size)
     )

@@ -305,7 +305,38 @@ async def _require_tutorial_launch_readiness(
             status_code=409,
             detail={"error_type": "tutorial_not_ready", "code": code, "detail": detail},
         )
+    pending_interpretations = await session_service.list_interpretation_events(
+        session_id,
+        status="pending",
+        composition_state_id=record.id,
+    )
+    if pending_interpretations:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_type": "tutorial_not_ready",
+                "code": "tutorial_interpretations_pending",
+                "detail": "Review the pending interpretation decisions before running this pipeline.",
+            },
+        )
     return record.id
+
+
+async def get_tutorial_readiness(
+    *,
+    request: Request,
+    user: UserIdentity,
+    session_id: UUID,
+) -> UUID:
+    """Inspect an owned session using the same admission decision as Run."""
+    await verify_session_ownership(session_id, user, request)
+    return await _require_tutorial_launch_readiness(
+        request=request,
+        user=user,
+        session_id=session_id,
+        settings=request.app.state.settings,
+        session_service=request.app.state.session_service,
+    )
 
 
 async def run_tutorial_pipeline(

@@ -47,7 +47,6 @@ import { useAuthStore } from "./stores/authStore";
 import { useMailboxStore } from "./stores/mailboxStore";
 import { initStoreSubscriptions, requestValidate } from "./stores/subscriptions";
 import { useSessionStore } from "./stores/sessionStore";
-import { isGuidedBuildActive } from "./components/chat/guided/guidedBuildActive";
 import { useExecutionStore } from "./stores/executionStore";
 import {
   selectTutorialCompleted,
@@ -66,7 +65,6 @@ import { SharedInspectView } from "./components/shared/SharedInspectView";
 import { SaveForReviewDialog } from "./components/composer/SaveForReviewDialog";
 import { ComposerWorkspace } from "./components/workspace/ComposerWorkspace";
 import { ArtifactWorkspace } from "./components/workspace/ArtifactWorkspace";
-import { WorkspaceInspector } from "./components/workspace/WorkspaceInspector";
 import { WorkspaceActionBar } from "./components/workspace/WorkspaceActionBar";
 import { useWorkspacePaneController } from "./components/workspace/WorkspacePaneContext";
 import { useCollapsedAuthoringStatus } from "./components/workspace/useCollapsedAuthoringStatus";
@@ -111,7 +109,7 @@ function App() {
   // dev disarms the feature) plus the stable-mismatch latch. Latched once
   // the polled frontend_build differs across STALE_BUILD_POLLS_REQUIRED
   // consecutive health checks; only a refresh clears it — never auto-reload
-  // (an in-flight guided operation must not be yanked).
+  // (an in-flight compose operation must not be yanked).
   const ownBuild = useMemo(() => ownFrontendBuild(), []);
   const staleBuildStreakRef = useRef(0);
   const [staleBuildDetected, setStaleBuildDetected] = useState(false);
@@ -198,12 +196,6 @@ function App() {
 
   const createSession = useSessionStore((s) => s.createSession);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  // Guided build on screen → ChatPanel renders the two-column workspace and
-  // this shell must drop the freeform SideRail (the workspace rail replaces
-  // it). Selector returns a primitive so zustand only re-renders on flips.
-  const guidedBuildActive = useSessionStore((s) =>
-    isGuidedBuildActive(s.guidedSession, s.guidedNextTurn),
-  );
   const compositionState = useSessionStore((s) => s.compositionState);
   const sessionsLoaded = useSessionStore((s) => s.sessionsLoaded);
   const hasLiveSessions = useSessionStore((s) =>
@@ -268,14 +260,12 @@ function App() {
   const runAdmissionAvailable =
     sharedToken === null &&
     !showTutorial &&
-    !showEmptyLanding &&
-    !guidedBuildActive;
-  const catalogAvailable = !guidedBuildActive;
+    !showEmptyLanding;
+  const catalogAvailable = true;
   const workspaceActionCapabilities = useMemo(
     () => ({
       // completion also admits the CompletionBar's Import YAML trigger; in
-      // this mount (shared/tutorial/empty all excluded above) it reduces to
-      // the same !guidedBuildActive fact a separate importYaml flag carried.
+      // this mount (shared/tutorial/empty all excluded above) it is available.
       // catalogAvailable is passed to ArtifactWorkspace directly — the
       // Plugin-catalog trigger lives in the artifact toolbar since the
       // More-actions popover was retired (2026-08-15 UX review).
@@ -300,7 +290,7 @@ function App() {
 
   // Phase 1B + I5: load account-level composer preferences once authenticated.
   // bootstrapPrefs() is contracted to NEVER reject — it catches failures
-  // internally, degrades to the guided default, and surfaces the failure
+  // internally and surfaces the failure
   // via the store's writeError (rendered by the role="alert" region wired
   // by Phase 1B-round-2). The earlier .catch(console.error) was silently
   // swallowing CorruptPreferencesError, the named backend integrity
@@ -392,8 +382,8 @@ function App() {
       // wall clock — a hard-coded client cap only satisfies the
       // client-outlives-server invariant for the checked-in defaults.
       // Latch the store readiness gate (the single source of truth) true once
-      // a known-good ceiling is applied: the Send affordances (freeform,
-      // guided, side-rail Apply) ungate only then, closing the bootstrap race
+      // a known-good ceiling is applied: chat Send and side-rail Apply ungate
+      // only then, closing the bootstrap race
       // where a send started before this fetch would schedule an abort from
       // the stale default. Only ever set true — the backend wall clock does
       // not change mid-session, so a later partial health response must not
@@ -861,7 +851,6 @@ function App() {
                   catalogAvailable={catalogAvailable}
                 />
               }
-              inspector={<WorkspaceInspector />}
               actionBar={
                 <WorkspaceActionBar
                   capabilities={workspaceActionCapabilities}

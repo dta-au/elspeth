@@ -45,7 +45,7 @@ from elspeth.contracts.enums import FrameKind, GroupSettlementReason, TerminalOu
 from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.scheduler import GroupLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID
 from elspeth.core.config import CoalesceSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.database import begin_write
@@ -70,6 +70,7 @@ from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
 from tests.fixtures.group_lineage import ensure_fork_group_record
+from tests.integration.pipeline.test_coalesce_sweep_escalation_durability import _mint_group_member_token
 from tests.unit.engine.test_processor import (
     _make_factory,
     _make_processor,
@@ -806,6 +807,115 @@ class TestBranchLossReplay:
             )
         assert sorted(failed_outcomes) == ["tok-branch-a", "tok-branch-b"]
         _assert_quiescent_and_finalize_ready(processor)
+
+    def test_replayed_failure_commits_its_escalated_outer_loss_with_the_release(self) -> None:
+        """The replay arm is an OUT-of-claim root: an escalation loss its
+        settlement walk stages has no claim to ride, so the replay drains it
+        and commits it in the SAME transaction as its own release
+        (``losses_ride_claim=False``, Rulings 39/43). Nested shape: merge_inner
+        (require_all over inner_a1/inner_a2) sits on merge_outer's outer_a
+        branch; inner_a1 is held, inner_a2's loss is follower-recorded, and
+        the leader's replay fails merge_inner, whose consumed token carries
+        the OUTER frame, so the walk escalates a loss for outer_a. Riding a
+        claim instead would leave that loss staged in the processor with no
+        committing consumer — the orphan the drain's pass-entry assertion
+        (Ruling 44) exists to catch."""
+        clock = MockClock(start=_T0)
+        db, factory = _make_factory()
+        executor = CoalesceExecutor(
+            execution=factory.execution,
+            span_factory=SpanFactory(),
+            token_manager=TokenManager(factory.data_flow, step_resolver=lambda node_id: 2),
+            run_id=RUN_ID,
+            step_resolver=lambda node_id: 2,
+            clock=clock,
+            data_flow=factory.data_flow,
+            barrier_restore_reads=factory.barrier_restore,
+        )
+        inner_node, outer_node = NodeID("coalesce::merge_inner"), NodeID("coalesce::merge_outer")
+        merge_inner, merge_outer = CoalesceName("merge_inner"), CoalesceName("merge_outer")
+        for name, branches, node, on_success in (
+            ("merge_inner", ["inner_a1", "inner_a2"], inner_node, "merge_outer"),
+            ("merge_outer", ["outer_a", "outer_b"], outer_node, "out"),
+        ):
+            executor.register_coalesce(
+                CoalesceSettings(name=name, branches=branches, policy="require_all", merge="union", on_success=on_success),
+                node,
+                output_schema=SchemaContract(mode="OBSERVED", fields=(), locked=False),
+            )
+        processor = _make_processor(
+            factory,
+            coalesce_executor=executor,
+            coalesce_node_ids={merge_inner: inner_node, merge_outer: outer_node},
+            branch_to_coalesce={
+                BranchName("inner_a1"): merge_inner,
+                BranchName("inner_a2"): merge_inner,
+                BranchName("outer_a"): merge_outer,
+                BranchName("outer_b"): merge_outer,
+            },
+            node_step_map={inner_node: 2, outer_node: 3},
+            coalesce_on_success_map={merge_inner: "merge_outer", merge_outer: "out"},
+            sink_names=frozenset({"out"}),
+            clock=clock,
+        )
+        outer_frame = LineageFrame(kind=FrameKind.FORK, group_id="fg-outer-row1", member_key="outer_a")
+        # The outer member tokens a real fork mints (the escalation's
+        # resolve_group_member_token targets), then the held inner_a1 sibling.
+        _mint_group_member_token(factory, row_id="row-1", token_id="tok-outer-a", group_id="fg-outer-row1", member_key="outer_a")
+        _mint_group_member_token(factory, row_id="row-1", token_id="tok-outer-b", group_id="fg-outer-row1", member_key="outer_b")
+        # The inner fork was opened FROM the outer_a member (the escalation
+        # cross-checks group_records.opener_token_id against it).
+        ensure_fork_group_record(factory, run_id=RUN_ID, group_id="fg-inner-row1", opener_token_id="tok-outer-a")
+        held = TokenInfo(
+            row_id="row-1",
+            token_id="tok-inner-a1",
+            row_data=make_row({"field": 1}),
+            lineage_path=(outer_frame, LineageFrame(kind=FrameKind.FORK, group_id="fg-inner-row1", member_key="inner_a1")),
+        )
+        _persist_blocked_scheduler_work(
+            factory, processor, held, node_id=inner_node, barrier_key="merge_inner", coalesce_name="merge_inner"
+        )
+        assert executor.accept(held, "merge_inner", coordination_token=processor._require_coordination_token()).held is True
+
+        lost = TokenInfo(
+            row_id="row-1",
+            token_id="tok-inner-a2",
+            row_data=make_row({}),
+            lineage_path=(outer_frame, LineageFrame(kind=FrameKind.FORK, group_id="fg-inner-row1", member_key="inner_a2")),
+        )
+        _persist_token_for_scheduler(factory, lost)
+        with begin_write(db.engine) as conn:
+            assert record_group_loss(
+                conn,
+                run_id=RUN_ID,
+                spec=GroupLossSpec(
+                    closer_name="merge_inner",
+                    group_id="fg-inner-row1",
+                    member_key="inner_a2",
+                    token_id="tok-inner-a2",
+                    reason="quarantined:boom",
+                ),
+                recorded_by="worker-follower",
+                now=clock.now_utc(),
+            )
+
+        ctx = make_context(
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=processor._require_coordination_token(),
+            member_token=processor._require_member_token(),
+        )
+        results = processor.run_barrier_intake(ctx)
+
+        assert [(r.token.token_id, r.outcome, r.path) for r in results] == [
+            ("tok-inner-a1", TerminalOutcome.FAILURE, TerminalPath.UNROUTED)
+        ]
+        assert _work_item_row(db, "tok-inner-a1")["status"] == TokenWorkStatus.TERMINAL.value
+        losses = {(row["closer_name"], row["group_id"], row["member_key"]): row for row in _loss_rows(db)}
+        assert set(losses) == {("merge_inner", "fg-inner-row1", "inner_a2"), ("merge_outer", "fg-outer-row1", "outer_a")}
+        # The escalated loss names the LOST outer member's own token (Ruling 42)
+        # and is committed, not merely staged.
+        assert losses[("merge_outer", "fg-outer-row1", "outer_a")]["token_id"] == "tok-outer-a"
+        assert processor._pending_group_losses == []
 
     def test_best_effort_merge_carries_branches_lost_from_the_table(self) -> None:
         clock = MockClock(start=_T0)

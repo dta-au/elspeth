@@ -55,7 +55,7 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _make_session(
@@ -149,7 +149,7 @@ def composer_test_client(tmp_path: Path) -> TestClient:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    session_service = DualFencedSessionServiceHarness(
+    session_service = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -264,6 +264,7 @@ def _build_audit_readiness_app(
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
+        composer_boot_probe_enabled=False,
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,
         plugin_allowlist=("transform:passthrough",),

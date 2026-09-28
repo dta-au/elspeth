@@ -22,6 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame, lineage_path_from_json, lineage_path_to_json
 from elspeth.contracts.scheduler import BarrierEmission, SchedulerEventType, TokenWorkItem, TokenWorkStatus
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.scheduler.events import SchedulerEventRecord
 from elspeth.core.landscape.schema import nodes_table, rows_table, token_work_items_table, tokens_table
@@ -310,15 +311,13 @@ def insert_work_items_idempotent(conn: Connection, *, values: list[dict[str, obj
         raise LandscapeRecordError(f"Scheduler {operation} failed; database rejected audit write") from exc
     if len(inserted) != len(set(inserted)) or not set(inserted).issubset(by_id):
         raise LandscapeRecordError(f"Scheduler {operation} returned unexpected work_item_id")
-    existing_rows = (
-        conn.execute(
-            select(token_work_items_table).where(
-                token_work_items_table.c.work_item_id.in_(tuple(by_id)),
-            )
-        )
-        .mappings()
-        .all()
-    )
+    # A transform may emit any number of children, so the read-back runs in
+    # chunks of the shared bind budget on this one connection.
+    existing_rows = [
+        row
+        for chunk in bind_budget_chunks(tuple(by_id))
+        for row in conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id.in_(chunk))).mappings().all()
+    ]
     if len(existing_rows) != len(by_id):
         raise LandscapeRecordError(f"Scheduler {operation} failed; no matching row could be read back")
     for row in existing_rows:

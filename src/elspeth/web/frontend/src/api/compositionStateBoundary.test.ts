@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import fixture from "../../../../../../tests/fixtures/web/composer/composition_state_validation_errors.json";
-import { decodeCompositionState, decodeCompositionStateVersions } from "./guidedDecoder";
+import { decodeCompositionState, decodeCompositionStateVersions } from "./compositionDecoder";
 
 describe("composition state decoder boundaries", () => {
   it("keeps ordinary metadata values without retaining the caller's objects", () => {

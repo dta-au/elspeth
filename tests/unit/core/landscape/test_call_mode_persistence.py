@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import replace
 from datetime import UTC, datetime
+from threading import Event
 
 import pytest
 from sqlalchemy import event, select, text
@@ -15,7 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataState
-from elspeth.core.landscape.schema import call_verifications_table, calls_table
+from elspeth.core.landscape.schema import call_verifications_table, calls_table, runs_table
 from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.helpers.state_engine import capture_state_engine_image
 
@@ -220,7 +222,7 @@ def test_verification_read_preserves_each_valid_verdict(is_match: bool | None) -
 
 @pytest.mark.parametrize("count", [1, 10])
 @pytest.mark.parametrize("batch_size", [None, 2, 3])
-def test_verification_run_read_uses_one_joined_query(count: int, batch_size: int | None) -> None:
+def test_verification_run_read_checks_parents_once_and_joins_each_page(count: int, batch_size: int | None) -> None:
     factory, source_operation, current_operation = _two_runs()
     expected_call_ids: list[str] = []
     for _ in range(count):
@@ -252,16 +254,58 @@ def test_verification_run_read_uses_one_joined_query(count: int, batch_size: int
             iterator = factory.execution.iter_verification_decisions_for_run("current", batch_size=batch_size)
             assert statements == []
             first = next(iterator)
-            assert sum(statement.startswith("SELECT") for statement in statements) == 1
+            assert sum(statement.startswith("SELECT") for statement in statements) == 3
             decisions = [first, *iterator]
         assert len(decisions) == count
         assert [decision.current_call_id for decision in decisions] == sorted(expected_call_ids)
     finally:
         event.remove(factory._db.engine, "before_cursor_execute", capture_statement)
-    expected_queries = 1 if batch_size is None else count // batch_size + 1
+    expected_queries = 3 if batch_size is None else count // batch_size + 3
     queries = [statement for statement in statements if statement.startswith("SELECT")]
     assert len(queries) == expected_queries
     assert all("LIMIT" in statement for statement in queries)
+    assert sum("ORDER BY" not in statement for statement in queries) == 2
+
+
+def test_verification_pages_follow_run_order_index() -> None:
+    factory, source_operation, current_operation = _two_runs()
+    for _ in range(3):
+        source_call = _record(factory, "source", source_operation)
+        current_call = _record(factory, "current", current_operation)
+        factory.execution.record_verification_decision(
+            current_run_id="current",
+            current_call_id=current_call.call_id,
+            source_run_id="source",
+            source_call_id=source_call.call_id,
+            is_match=True,
+            differences_json="{}",
+            coordination_token=leader_coordination_token(factory, "current"),
+        )
+    statements: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture_statement(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    event.listen(factory._db.engine, "before_cursor_execute", capture_statement)
+    try:
+        assert len(list(factory.execution.iter_verification_decisions_for_run("current", batch_size=2))) == 3
+    finally:
+        event.remove(factory._db.engine, "before_cursor_execute", capture_statement)
+    assert len(statements) == 4
+    with factory._db.read_only_connection() as conn:
+        for sql, parameters in statements[:2]:
+            plan = [row.detail for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql, parameters)]
+            assert any("SEARCH call_verifications USING INDEX sqlite_autoindex_call_verifications_1" in detail for detail in plan), plan
+            assert any(
+                "SEARCH node_states USING INDEX ix_node_states_run" in detail
+                or "SEARCH operations USING INDEX ix_operations_run_id" in detail
+                for detail in plan
+            ), plan
+        for sql, parameters in statements[2:]:
+            plan = [row.detail for row in conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql, parameters)]
+            assert any("SEARCH call_verifications USING INDEX ix_call_verifications_run" in detail for detail in plan), plan
+            assert not any("USE TEMP B-TREE FOR ORDER BY" in detail for detail in plan), plan
 
 
 @pytest.mark.parametrize("batch_size", [True, 0, -1, 1.5])
@@ -269,6 +313,30 @@ def test_verification_iterator_rejects_invalid_batch_size(batch_size: int) -> No
     factory, _, _ = _two_runs()
     with pytest.raises(ValueError, match="positive exact integer"):
         list(factory.execution.iter_verification_decisions_for_run("current", batch_size=batch_size))
+
+
+@pytest.mark.parametrize("reader", ["single", "run", "iterator"])
+def test_verification_read_waits_for_shared_connection_writer(reader: str) -> None:
+    factory, _, _ = _two_runs()
+    started = Event()
+
+    def read_verification():
+        started.set()
+        if reader == "single":
+            return factory.execution.get_verification_decision("absent")
+        if reader == "run":
+            return factory.execution.get_verification_decisions_for_run("current")
+        return list(factory.execution.iter_verification_decisions_for_run("current", batch_size=2))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with factory._db.write_connection() as conn:
+            conn.execute(runs_table.update().where(runs_table.c.run_id == "current").values(settings_json='{"probe":true}'))
+            future = pool.submit(read_verification)
+            assert started.wait(timeout=2)
+            assert not wait((future,), timeout=0.1).done, "verification read entered the writer's shared SQLite connection"
+        assert future.result(timeout=2) in (None, [])
+    with factory._db.read_only_connection() as conn:
+        assert conn.execute(select(runs_table.c.settings_json).where(runs_table.c.run_id == "current")).scalar_one() == '{"probe":true}'
 
 
 def test_repeated_source_loads_bind_transactional_occurrence() -> None:

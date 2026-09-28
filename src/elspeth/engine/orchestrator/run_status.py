@@ -194,7 +194,7 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     # per-outcome tally would over-report a multi-branch barrier failure.
     # The durable evidence is the FAILED node_states ``_fail_pending`` writes
     # at the run's coalesce nodes; one failed barrier == one DISTINCT
-    # (coalesce node, row_id) pair regardless of branch fan-in.  This is THE
+    # (coalesce node, fork group) pair regardless of branch fan-in.  This is THE
     # value (elspeth-7294de558e) — it is cumulative over run-1 AND resume
     # re-drives (same run_id), replacing the resume-only live-counter graft
     # that forgot run-1 failures.
@@ -264,30 +264,38 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 # ExecutionCounters is the authoritative field list. Every field is strict by
 # default; add an entry here only when the exception is documented and handled
 # below.
-# rows_coalesce_failed is EXCLUDED — tolerated and logged, never raised — for
-# TWO documented corners (ADR-030 §D, bug elspeth-ff6d48c180). The live counter
+# rows_coalesce_failed is ONE-SIDED, not strict: live exceeding audit raises
+# with the strict fields; audit exceeding live is tolerated and logged for ONE
+# documented corner (ADR-030 §D, bug elspeth-ff6d48c180). The live counter
 # otherwise uses the audit derive's own evidence: a failed barrier group is
 # counted where its FIRST FAILED node_state at the barrier is written — on the
 # first consumed token's result when the group failure consumed arrived
 # members, or on the first straggler's late-arrival result when the group
 # failed with none (``counts_failed_barrier``; ``first_failure_evidence`` on the
-# executors' late-arrival outcomes). The corners:
-#   1. a straggler into a group that failed with no arrived member counts only
-#      when THIS executor instance recorded that zero-arrival failure (its
-#      in-memory ``_failed_without_member_state``). Otherwise it cannot tell
-#      whether its state is the group's first, so it never counts — the audit
-#      MAY EXCEED live. Three ways to get there: the key was evicted from the
-#      bounded completed-key FIFO and is rediscovered through the Landscape
-#      fallback; a row_union straggler closes the group through accept()'s
-#      durable ``has_group_loss`` fallback (a loss recorded by another worker
-#      and not yet replayed here); or the zero-arrival failure was recorded
-#      in another process — before a resume, or by the leader a takeover
-#      replaced — so this instance never held the fact (the journal does not
-#      carry it; the coalesce restore also clears the set);
-#   2. the derive's unit is a DISTINCT (barrier node, row_id) pair, so several
-#      fork groups of ONE source row (a fork downstream of an expansion)
-#      failing at the same barrier collapse to one, while live counts each
-#      group — live MAY EXCEED audit.
+# executors' late-arrival outcomes). The corner: a straggler into a group that
+# failed with no arrived member counts only when THIS executor instance
+# recorded that zero-arrival failure (its in-memory
+# ``_failed_without_member_state``). Otherwise it cannot tell whether its state
+# is the group's first, so it never counts — the audit MAY EXCEED live. Four
+# ways to get there: the key was evicted from the bounded completed-key FIFO and
+# is rediscovered through the Landscape fallback; the coalesce end-of-input
+# ``flush_pending`` cleared the set (with the completed keys) before the
+# straggler arrived — the executor assumes nothing follows a flush, but
+# leader_drain's flush loop runs intake again after one, so the loop does not
+# enforce that; a row_union straggler closes the group through accept()'s
+# durable ``has_group_loss`` fallback (a loss recorded by another worker and not
+# yet replayed here); or the zero-arrival failure was recorded in another
+# process — before a resume, or by the leader a takeover replaced — so this
+# instance never held the fact (the journal does not carry it; the coalesce
+# restore also clears the set). The row_union executor never clears its set
+# wholesale. A second corner — the derive keyed on (barrier node, row_id),
+# collapsing the failed fork groups of one exploded row that live counted
+# separately — is closed: the derive keys on the executors' own (barrier node,
+# fork group). Nothing lets live exceed audit: every live count rides a result
+# whose FAILED barrier state the derive sees, and each group carries at most one
+# marker (``failed_barrier_group_results`` marks the first consumed token; a
+# straggler's ``first_failure_evidence`` is discarded from the set as it is
+# read). So live > audit is a broken bookkeeper and raises.
 # The audit value is the terminal record either way.
 #
 # collector_groups_failed is audit-only: live row accumulation has no
@@ -319,7 +327,9 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
     crash loudly rather than record an unexplained terminal status.
 
     Raises:
-        OrchestrationInvariantError: on any strict-field mismatch.
+        OrchestrationInvariantError: on any strict-field mismatch, or when the
+            live ``rows_coalesce_failed`` exceeds the audit's (the reverse is
+            the one tolerated corner — see ``_PARITY_EXCLUDED_FIELDS``).
     """
     strict_fields = (
         ("rows_processed", live.rows_processed, audit.rows_processed),
@@ -344,17 +354,19 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
             "live": dict(live.routed_destinations),
             "audit": dict(audit.routed_destinations),
         }
+    if live.rows_coalesce_failed > audit.rows_coalesce_failed:
+        mismatches["rows_coalesce_failed"] = {"live": live.rows_coalesce_failed, "audit": audit.rows_coalesce_failed}
     if mismatches:
         raise OrchestrationInvariantError(
             f"Live-vs-audit terminal counter mismatch for run {run_id!r}: {mismatches!r}. "
             "The audit derive is the terminal record (ADR-030 §D); an unexplained divergence "
             "from the live loop counters means one of the two bookkeepers is broken."
         )
-    if live.rows_coalesce_failed != audit.rows_coalesce_failed:
+    if audit.rows_coalesce_failed > live.rows_coalesce_failed:
         import structlog
 
         structlog.get_logger(__name__).warning(
-            "rows_coalesce_failed live/audit divergence (documented, tolerated)",
+            "rows_coalesce_failed live/audit divergence: audit exceeds live (documented corner, tolerated)",
             run_id=run_id,
             live=live.rows_coalesce_failed,
             audit=audit.rows_coalesce_failed,

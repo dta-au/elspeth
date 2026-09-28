@@ -33,10 +33,12 @@ from elspeth.web.catalog.schemas import (
     PluginSchemaInfo,
     PluginSummary,
 )
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import ComposerAvailability
 from elspeth.web.composer.state import (
     CompositionState,
     PipelineMetadata,
@@ -55,10 +57,10 @@ from tests.unit.web.composer._helpers import _composer_service_with_session
 def _composer_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bypass API-key check so tests focus on compose behavior, not credentials."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture(autouse=True)
@@ -188,7 +190,7 @@ def _make_settings(**overrides: Any) -> WebSettings:
 def _make_llm_response(
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-) -> _FakeLLMResponse:
+) -> _AdmittedLLMCompletion:
     fake_tool_calls: list[_FakeToolCall] | None = None
     if tool_calls:
         fake_tool_calls = [
@@ -202,7 +204,7 @@ def _make_llm_response(
             for tc in tool_calls
         ]
     message = _FakeMessage(content=content, tool_calls=fake_tool_calls)
-    return _FakeLLMResponse(choices=[_FakeChoice(message=message)])
+    return _admit_composer_llm_completion(_FakeLLMResponse(choices=[_FakeChoice(message=message)]))
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +268,7 @@ class TestUnknownToolNameComposeLoopAuditShape:
         # failure payload as a role=tool message.
         self_correction = _make_llm_response(content="I apologise — that tool does not exist. Let me try again.")
 
-        with patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm:
+        with patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as mock_llm:
             mock_llm.side_effect = [unknown_tool_call, self_correction]
             result = await service.compose("Build a pipeline", [], state, session_id=session_id)
 

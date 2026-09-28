@@ -69,6 +69,7 @@ from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids_on
+from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.collector_group_failure_holds import COLLECTOR_GROUP_FAILURE_TYPE
 from elspeth.core.landscape.data_flow.errors import insert_batch_transform_errors_on
 from elspeth.core.landscape.database import LandscapeDB
@@ -1085,14 +1086,7 @@ class ExecutionRepository:
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="complete_aggregation_result",
             ) as conn:
-                token_rows = conn.execute(
-                    select(tokens_table.c.token_id, tokens_table.c.run_id)
-                    .where(tokens_table.c.token_id.in_(member_token_ids))
-                    .order_by(tokens_table.c.token_id)
-                    .with_for_update(of=tokens_table)
-                ).all()
-                if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {(token_id, run_id) for token_id in member_token_ids}:
-                    raise AuditIntegrityError("aggregation result receipt references a missing or foreign member token")
+                self._lock_verdict_members_on(conn, run_id=run_id, member_token_ids=member_token_ids, subject="aggregation result receipt")
                 state = conn.execute(
                     select(
                         node_states_table.c.run_id,
@@ -1239,7 +1233,7 @@ class ExecutionRepository:
             if probe is _ReceiptProbeOutcome.MATCH:
                 return receipt
             error_type = LandscapePostCommitError if write_body_completed else LandscapeRecordError
-            raise error_type(f"complete_aggregation_result failed for batch_id={batch_id}: {type(exc).__name__}: {exc}") from exc
+            raise error_type(f"complete_aggregation_result failed for batch_id={batch_id}: {type(exc).__name__}") from exc
         try:
             probe = self._probe_existing_aggregation_receipt(
                 state_id=state_id,
@@ -1279,22 +1273,34 @@ class ExecutionRepository:
             aggregation_node_id=aggregation_node_id,
             retry_of_batch_id=retry_of_batch_id,
         )
-        live_rows = conn.execute(
-            select(token_outcomes_table.c.token_id)
-            .where(token_outcomes_table.c.run_id == run_id)
-            .where(token_outcomes_table.c.token_id.in_(member_token_ids))
-            .where(token_outcomes_table.c.completed == 0)
-            .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
-            .where(token_outcomes_table.c.batch_id.in_(lineage_batch_ids))
-        ).all()
+        # A batch has no row cap, so the member reads run in chunks of the
+        # shared bind budget; the retry-lineage filter is applied to the read
+        # rows rather than bound, keeping every chunk's bind count fixed.
+        lineage = frozenset(lineage_batch_ids)
+        live_rows = [
+            row
+            for chunk in bind_budget_chunks(member_token_ids)
+            for row in conn.execute(
+                select(token_outcomes_table.c.token_id, token_outcomes_table.c.batch_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.token_id.in_(chunk))
+                .where(token_outcomes_table.c.completed == 0)
+                .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
+            ).all()
+            if row.batch_id in lineage
+        ]
         if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(member_token_ids)):
             raise AuditIntegrityError(f"{subject} requires one live BUFFERED outcome for every member within the batch retry lineage")
-        terminal_rows = conn.execute(
-            select(token_outcomes_table.c.token_id)
-            .where(token_outcomes_table.c.run_id == run_id)
-            .where(token_outcomes_table.c.token_id.in_(member_token_ids))
-            .where(token_outcomes_table.c.completed == 1)
-        ).all()
+        terminal_rows = [
+            row
+            for chunk in bind_budget_chunks(member_token_ids)
+            for row in conn.execute(
+                select(token_outcomes_table.c.token_id)
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.token_id.in_(chunk))
+                .where(token_outcomes_table.c.completed == 1)
+            ).all()
+        ]
         if terminal_rows:
             terminal_token_ids = sorted(str(row.token_id) for row in terminal_rows)
             raise AuditIntegrityError(f"{subject} members already have terminal outcomes: {terminal_token_ids!r}")
@@ -1317,13 +1323,23 @@ class ExecutionRepository:
 
     @staticmethod
     def _lock_verdict_members_on(conn: Connection, *, run_id: str, member_token_ids: Sequence[str], subject: str) -> None:
-        """Lock a failure verdict's member tokens, refusing a missing or foreign one."""
-        token_rows = conn.execute(
-            select(tokens_table.c.token_id, tokens_table.c.run_id)
-            .where(tokens_table.c.token_id.in_(member_token_ids))
-            .order_by(tokens_table.c.token_id)
-            .with_for_update(of=tokens_table)
-        ).all()
+        """Lock a flush verdict's member tokens, refusing a missing or foreign one.
+
+        A batch or collector group has no row cap, so the lock read runs in
+        ascending chunks of the shared bind budget on the caller's connection:
+        every id in chunk N sorts before every id in chunk N+1, which keeps the
+        global ``tokens.token_id`` lock order.
+        """
+        token_rows = [
+            row
+            for chunk in bind_budget_chunks(sorted(member_token_ids))
+            for row in conn.execute(
+                select(tokens_table.c.token_id, tokens_table.c.run_id)
+                .where(tokens_table.c.token_id.in_(chunk))
+                .order_by(tokens_table.c.token_id)
+                .with_for_update(of=tokens_table)
+            ).all()
+        ]
         if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {(token_id, run_id) for token_id in member_token_ids}:
             raise AuditIntegrityError(f"{subject} references a missing or foreign member token")
 

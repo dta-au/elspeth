@@ -26,7 +26,7 @@ _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 _SCENARIO_B_STRUCTURAL_CHANGES = (
     f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
     f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
-    "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
+    "_blob_cleanup_row_union_barrier_and_coordination_schema"
 )
 
 
@@ -53,7 +53,7 @@ def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
             else None
         ),
         "structural_changes": (_SCENARIO_B_STRUCTURAL_CHANGES if scenario_id == "B" else "initial_create"),
-        "semantics_only_changes": ("guided_coalesce_timeout_seconds_and_node_options_summary_required" if scenario_id == "B" else "none"),
+        "semantics_only_changes": ("coalesce_timeout_seconds_and_node_options_summary_required" if scenario_id == "B" else "none"),
         "archive_export_decision": ("required_before_forward_migration" if scenario_id == "B" else "not_applicable"),
         "destructive_reset_required": False,
     }

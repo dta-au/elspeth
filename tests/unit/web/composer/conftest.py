@@ -93,7 +93,9 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import tools as tools_module
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMCompletion
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion
 from elspeth.web.composer.redaction import (
     MANIFEST,
     CreateBlobArgumentsModel,
@@ -125,7 +127,7 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.composer_lease import install_fenced_compose_adapter
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
 def _dict_strategy(thing: type) -> st.SearchStrategy[dict[Any, Any]]:
@@ -563,10 +565,10 @@ class _FakeComposeLLM:
         self._responses = list(responses)
         self.execute_tool_invocations = 0
 
-    async def __call__(self, _messages: Any, _tools: Any) -> _FakeLLMResponse:
+    async def __call__(self, _messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
         if not self._responses:
-            return _fake_llm_response(content="Done.")
-        return self._responses.pop(0)
+            return _admit_composer_llm_completion(_fake_llm_response(content="Done."))
+        return _admit_composer_llm_completion(self._responses.pop(0))
 
 
 def _fake_llm_response(
@@ -670,10 +672,10 @@ def _make_settings(data_dir: Path, **overrides: Any) -> WebSettings:
 def _composer_available_for_phase3(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep Phase 3 compose-loop harness tests independent of local API keys."""
 
-    def _available(self: ComposerServiceImpl) -> ComposerAvailability:
-        return ComposerAvailability(available=True, model=self._model, provider="test")
+    def _available(*, model: str, **_kwargs: object) -> ComposerAvailability:
+        return ComposerAvailability(available=True, model=model, provider="test")
 
-    monkeypatch.setattr(ComposerServiceImpl, "_compute_availability", _available)
+    monkeypatch.setattr("elspeth.web.composer.service.compute_availability", _available)
 
 
 @pytest.fixture
@@ -713,7 +715,7 @@ def build_test_sessions_service(
     )
     if engine is None:
         initialize_session_schema(resolved_engine)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         resolved_engine,
         data_dir=data_dir,
         telemetry=build_sessions_telemetry(),

@@ -1,18 +1,10 @@
 """Service layer for the user_preferences table.
 
-Read path: returns the user's row; falls back to 'freeform' when no row exists.
-Crashes on Tier-1 read of a corrupt mode value (any stored value outside
-{"guided", "freeform"} is a code bug, DB corruption, or tampering — never
-a recoverable situation; the DB-level CHECK constraint on
-``user_preferences_table.default_composer_mode`` is the first line of
-defence, but the read guard here catches the case where the CHECK was
-bypassed via direct SQL or schema-version drift).
+Read path: returns the user's row or an unwritten default response.
 
 Write path: upserts the row, touching only fields the caller actually set.
 Returns the response model built from the values just written rather than
-re-reading — this avoids the corrupt-mode PATCH lockout (Finding 7): a
-pre-existing corrupt row would crash a re-read even when the PATCH
-write succeeded and supplied a valid new mode.
+re-reading.
 
 SQLite and PostgreSQL both use ``ON CONFLICT ... DO UPDATE``, but SQLAlchemy's
 upsert construct is dialect-specific. The write path selects the matching
@@ -39,7 +31,6 @@ from sqlalchemy.engine import Engine
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.tutorial_telemetry import record_tutorial_completed_path
 from elspeth.web.preferences.models import (
-    ComposerMode,
     ComposerPreferences,
     TutorialStage,
     UpdateComposerPreferencesRequest,
@@ -104,7 +95,7 @@ class CorruptPreferencesError(RuntimeError):
         operator can confirm the corruption rather than re-derive it.
     """
 
-    def __init__(self, user_id: str, bad_value: object, *, field_name: str = "default_composer_mode") -> None:
+    def __init__(self, user_id: str, bad_value: object, *, field_name: str) -> None:
         super().__init__(f"user_preferences row for {user_id!r} has invalid {field_name}={bad_value!r}")
         self.user_id = user_id
         self.field_name = field_name
@@ -119,18 +110,14 @@ _meter = metrics.get_meter(__name__)
 _PREFERENCES_PATCH_COUNTER = _meter.create_counter(
     "composer.preferences.patch_total",
     description=(
-        "Composer-preferences PATCH operations. Attributes: mode_changed (bool), "
-        "tutorial_changed (bool), "
-        "tutorial_progress_changed (bool), wrote_row (bool)."
+        "Composer-preferences PATCH operations. Attributes: tutorial_changed (bool), tutorial_progress_changed (bool), wrote_row (bool)."
     ),
 )
 
-_DEFAULT_MODE: ComposerMode = "freeform"
-_VALID_MODES: frozenset[ComposerMode] = frozenset({"guided", "freeform"})
 # Tier-1 read-guard set for ``tutorial_stage``; lockstep with the
 # ``TutorialStage`` Literal (models.py) and the
 # ``ck_user_preferences_tutorial_stage`` CHECK (sessions/models.py).
-_VALID_TUTORIAL_STAGES: frozenset[TutorialStage] = frozenset({"guided", "run", "audit", "graduation"})
+_VALID_TUTORIAL_STAGES: frozenset[TutorialStage] = frozenset({"build", "run", "audit", "graduation"})
 
 
 def _utcnow() -> datetime:
@@ -156,7 +143,6 @@ def _select_preferences_for_user(user_id: str) -> Any:
     Tier-1 guard, so select it as text and parse it in `_row_to_prefs`.
     """
     return select(
-        user_preferences_table.c.default_composer_mode,
         user_preferences_table.c.freeform_intro_dismissed_at,
         sql_cast(user_preferences_table.c.tutorial_completed_at, String).label("tutorial_completed_at"),
         user_preferences_table.c.tutorial_stage,
@@ -201,14 +187,11 @@ class PreferencesService:
         self._now = now
 
     async def get_composer_preferences(self, user_id: str) -> ComposerPreferences:
-        """Return the user's preferences, falling back to 'freeform' if no row exists.
+        """Return the user's preferences or the unwritten defaults.
 
         Default policy:
-          - No row => 'freeform' (new-user default; the existing-user
-            session-count heuristic was retired under
-            ``project_db_migration_policy`` — see plan 12 Task 5).
-          - Row exists => use stored value; crash if stored value is
-            corrupt.
+          - No row => no write event or timestamp is fabricated.
+          - Row exists => decode and validate stored tutorial state.
         """
 
         def _sync() -> ComposerPreferences:
@@ -217,14 +200,13 @@ class PreferencesService:
                 if row is not None:
                     return self._row_to_prefs(row, user_id)
 
-            # No row: return the new-user freeform default. We do not write
+            # No row: return the unwritten defaults. We do not write
             # a row here (lazy — avoid write traffic for users who never
             # touch preferences). Panel U1: updated_at=None because no
             # write event exists to associate a timestamp with;
             # fabricating self._now() would put a value the system never
             # actually wrote into an audit-visible field.
             return ComposerPreferences(
-                default_mode=_DEFAULT_MODE,
                 freeform_intro_dismissed_at=None,
                 tutorial_completed_at=None,
                 tutorial_stage=None,
@@ -240,9 +222,8 @@ class PreferencesService:
     def _row_to_prefs(self, row: Any, user_id: str) -> ComposerPreferences:
         """Convert a DB row to the response model with a Tier-1 read guard.
 
-        A stored mode outside the validated set is a fault we caused
-        (bug, tampering, or DB corruption). Crash with the offending
-        value named so the operator can diagnose.
+        A stored tutorial stage outside the validated set is a fault we
+        caused (bug, tampering, or DB corruption).
 
         ``row: Any`` matches the established sessions/service.py
         convention (see lines 326, 346, 1945, 2836) and avoids
@@ -250,15 +231,11 @@ class PreferencesService:
         SQLAlchemy ``Row`` objects don't have a useful static type for
         the column attributes the engine exposes via dot access.
         """
-        mode = row.default_composer_mode
-        if mode not in _VALID_MODES:
-            raise CorruptPreferencesError(user_id, mode)
         tutorial_completed_at = _decode_tutorial_completed_at(user_id, row.tutorial_completed_at)
         stage = row.tutorial_stage
         if stage is not None and stage not in _VALID_TUTORIAL_STAGES:
             raise CorruptPreferencesError(user_id, stage, field_name="tutorial_stage")
         return ComposerPreferences(
-            default_mode=mode,
             freeform_intro_dismissed_at=row.freeform_intro_dismissed_at,
             tutorial_completed_at=tutorial_completed_at,
             tutorial_stage=stage,
@@ -277,9 +254,8 @@ class PreferencesService:
         nothing (Panel C2), so the GET side's lazy-write contract holds.
 
         Returns a ``ComposerPreferencesTransition``. ``current`` is built directly from the
-        written values, never re-read: a pre-existing corrupt ``default_mode`` row would crash
-        a re-read even when this PATCH just wrote a valid mode (Finding 7). The values passed
-        the Tier-3 boundary on ``payload``, so the Tier-1 read guard is not re-run on ``current``.
+        written values, never re-read, after validating the request at the
+        Tier-3 boundary.
 
         Concurrency guarantee, per dialect (elspeth-d336060892):
 
@@ -329,13 +305,7 @@ class PreferencesService:
             value is not None
             for value in (payload.tutorial_stage, payload.tutorial_session_id, payload.tutorial_run_id, payload.tutorial_source_data_hash)
         )
-        payload_is_empty = (
-            payload.default_mode is None
-            and not intro_in_payload
-            and not tutorial_in_payload
-            and not any_progress_in_payload
-            and not advanced_in_payload
-        )
+        payload_is_empty = not intro_in_payload and not tutorial_in_payload and not any_progress_in_payload and not advanced_in_payload
 
         def _sync() -> tuple[ComposerPreferences, bool, ComposerPreferences | None]:
             """Returns (current_prefs, wrote, prior_prefs)."""
@@ -363,7 +333,6 @@ class PreferencesService:
                 if payload_is_empty and prior_row is None:
                     return (
                         ComposerPreferences(
-                            default_mode=_DEFAULT_MODE,
                             freeform_intro_dismissed_at=None,
                             tutorial_completed_at=None,
                             tutorial_stage=None,
@@ -376,16 +345,6 @@ class PreferencesService:
                         False,
                         prior_prefs,
                     )
-
-                # Determine the mode to insert (NOT NULL column). On
-                # conflict, only fields the caller set are updated.
-                insert_mode: ComposerMode
-                if payload.default_mode is not None:
-                    insert_mode = payload.default_mode
-                elif prior_prefs is not None:
-                    insert_mode = prior_prefs.default_mode
-                else:
-                    insert_mode = _DEFAULT_MODE
 
                 if intro_in_payload:
                     resolved_intro: datetime | None = payload.freeform_intro_dismissed_at
@@ -432,7 +391,6 @@ class PreferencesService:
 
                 values: dict[str, object] = {
                     "user_id": user_id,
-                    "default_composer_mode": insert_mode,
                     "freeform_intro_dismissed_at": resolved_intro,
                     "tutorial_completed_at": resolved_tutorial,
                     "show_advanced": resolved_advanced,
@@ -451,8 +409,6 @@ class PreferencesService:
                         f"dialect {dialect!r}; supported dialects: sqlite, postgresql"
                     )
                 update_clause: dict[str, object] = {"updated_at": now}
-                if payload.default_mode is not None:
-                    update_clause["default_composer_mode"] = payload.default_mode
                 if intro_in_payload:
                     update_clause["freeform_intro_dismissed_at"] = payload.freeform_intro_dismissed_at
                 if tutorial_in_payload:
@@ -471,7 +427,6 @@ class PreferencesService:
                 stmt = stmt.on_conflict_do_update(index_elements=["user_id"], set_=update_clause, where=progress_allowed)
                 row = conn.execute(
                     stmt.returning(
-                        user_preferences_table.c.default_composer_mode,
                         user_preferences_table.c.freeform_intro_dismissed_at,
                         sql_cast(user_preferences_table.c.tutorial_completed_at, String).label("tutorial_completed_at"),
                         user_preferences_table.c.tutorial_stage,
@@ -487,7 +442,6 @@ class PreferencesService:
 
             returned = self._row_to_prefs(row, user_id)
             current = ComposerPreferences(
-                default_mode=payload.default_mode if payload.default_mode is not None else returned.default_mode,
                 freeform_intro_dismissed_at=(
                     payload.freeform_intro_dismissed_at if intro_in_payload else returned.freeform_intro_dismissed_at
                 ),
@@ -511,7 +465,6 @@ class PreferencesService:
         _PREFERENCES_PATCH_COUNTER.add(
             1,
             attributes={
-                "mode_changed": payload.default_mode is not None,
                 "freeform_intro_dismissed": payload.freeform_intro_dismissed_at is not None,
                 "tutorial_changed": tutorial_in_payload,
                 "tutorial_progress_changed": any_progress_in_payload,

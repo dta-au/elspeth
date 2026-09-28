@@ -159,14 +159,18 @@ class TestFieldMapper:
         assert "extra" not in result.row
 
     def test_missing_field_error(self, ctx: PluginContext) -> None:
-        """Error when required field is missing and strict mode enabled."""
+        """A missing mapping source routes ``missing_field``; the mapping is never skipped.
+
+        Every mapping source is a required input. Before the ``strict`` option
+        was retired, ``process`` skipped a missing normalized source and the
+        target vanished from a successful row; now every miss is an error.
+        """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
             {
                 "schema": DYNAMIC_SCHEMA,
                 "mapping": {"required_field": "output"},
-                "strict": True,
             }
         )
         row = {"other_field": "value"}
@@ -174,43 +178,29 @@ class TestFieldMapper:
         result = transform.process(make_pipeline_row(row), ctx)
 
         assert result.status == "error"
-        assert "required_field" in str(result.reason)
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_field"
+        assert result.reason["field"] == "required_field"
 
-    def test_missing_field_skip_non_strict(self, ctx: PluginContext) -> None:
-        """Skip missing fields when strict mode disabled."""
+    @pytest.mark.parametrize("strict", [True, False])
+    def test_retired_strict_option_is_refused(self, strict: bool) -> None:
+        """A config carrying ``strict`` is refused with the rule that replaced it.
+
+        ``strict: true`` and ``strict: false`` ran identically under ``elspeth
+        run`` (the engine never let a row reach ``process`` without a mapping
+        source), so the option was removed; the refusal names the replacement
+        rule rather than a bare ``extra_forbidden``.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
-        transform = FieldMapper(
-            {
-                "schema": DYNAMIC_SCHEMA,
-                "mapping": {"maybe_field": "output"},
-                "strict": False,
-            }
-        )
-        row = {"other_field": "value"}
+        with pytest.raises(PluginConfigError) as excinfo:
+            FieldMapper({"schema": DYNAMIC_SCHEMA, "mapping": {"a": "b"}, "strict": strict})
 
-        result = transform.process(make_pipeline_row(row), ctx)
-
-        assert result.status == "success"
-        assert result.row is not None
-        assert result.row.to_dict() == {"other_field": "value"}
-        assert "output" not in result.row
-
-    def test_default_is_non_strict(self, ctx: PluginContext) -> None:
-        """Default behavior is non-strict (skip missing)."""
-        from elspeth.plugins.transforms.field_mapper import FieldMapper
-
-        transform = FieldMapper(
-            {
-                "schema": DYNAMIC_SCHEMA,
-                "mapping": {"missing": "output"},
-            }
-        )
-        row = {"exists": "value"}
-
-        result = transform.process(make_pipeline_row(row), ctx)
-
-        assert result.status == "success"
+        message = str(excinfo.value)
+        assert "field_mapper has no 'strict' option" in message
+        assert "every mapping source is a required input" in message
+        assert "missing_field" in message
 
     def test_nested_field_access(self, ctx: PluginContext) -> None:
         """Access nested fields with dot notation."""
@@ -231,7 +221,7 @@ class TestFieldMapper:
         assert result.row["origin"] == "api"
         assert "meta" in result.row  # Original nested structure preserved
 
-    def test_nested_field_type_mismatch_routes_in_non_strict_mode(self, ctx: PluginContext) -> None:
+    def test_nested_field_type_mismatch_routes(self, ctx: PluginContext) -> None:
         """Non-dict intermediate on a dotted path routes to on_error — it does not crash.
 
         ELSPETH contracts are flat: they describe top-level fields, never nested shape.
@@ -241,6 +231,8 @@ class TestFieldMapper:
         *operation* failed on this row's value (the same class as a divide-by-zero on a
         type-valid divisor). That is operation-unsafe Tier-2 data, so the row routes to
         on_error and is recorded; one malformed nested value must not abort the run.
+        A type mismatch is never masked as a missing field: it keeps its distinct
+        ``type_mismatch`` reason.
         """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
@@ -248,33 +240,6 @@ class TestFieldMapper:
             {
                 "schema": DYNAMIC_SCHEMA,
                 "mapping": {"user.name": "origin"},
-                "strict": False,
-            }
-        )
-
-        result = transform.process(make_pipeline_row({"user": "string_not_dict"}), ctx)
-
-        assert result.status == "error"
-        assert result.reason is not None
-        assert result.reason["reason"] == "type_mismatch"
-        assert result.reason["field"] == "user.name"
-
-    def test_nested_field_type_mismatch_routes_in_strict_mode(self, ctx: PluginContext) -> None:
-        """Strict mode must never mask a type mismatch as a missing field (silent skip).
-
-        The original concern this test guarded — that a type mismatch must not be
-        swallowed as an absent field — is preserved: a non-navigable dotted path routes
-        to on_error with a distinct ``type_mismatch`` reason in BOTH modes. The only
-        behaviour change is that the failure no longer crashes the entire run on a single
-        malformed row; it is recorded and routed like any other per-row data fault.
-        """
-        from elspeth.plugins.transforms.field_mapper import FieldMapper
-
-        transform = FieldMapper(
-            {
-                "schema": DYNAMIC_SCHEMA,
-                "mapping": {"user.name": "origin"},
-                "strict": True,
             }
         )
 
@@ -633,20 +598,18 @@ class TestOutputSchemaConfig:
             {
                 "mapping": {"old_name": "new_name", "source": "target"},
                 "schema": {"mode": "observed"},
-                "strict": True,
             }
         )
         assert transform._output_schema_config is not None
         assert frozenset(transform._output_schema_config.guaranteed_fields) == frozenset({"new_name", "target"})
 
-    def test_non_strict_mapping_assertion_declares_and_guarantees_target(self) -> None:
-        """The mapping itself now requires its source, so every successful row has its target.
+    def test_mapping_assertion_declares_and_guarantees_target(self) -> None:
+        """The mapping itself requires its source, so every successful row has its target.
 
         ``declared_input_fields`` is enforced before ``process()`` by the
-        executor.  A row missing ``maybe_field`` therefore cannot become a
-        successful partial output, even though the transform's legacy direct
-        ``process()`` branch still skips a normalization-stable source when
-        called outside the executor.
+        executor, and ``process()`` itself routes a missing source.  A row
+        missing ``maybe_field`` therefore cannot become a successful partial
+        output.
         """
         from elspeth.contracts.errors import DeclaredRequiredInputFieldsViolation
         from elspeth.engine.executors.declared_output_fields import verify_declared_output_fields
@@ -657,7 +620,6 @@ class TestOutputSchemaConfig:
             {
                 "mapping": {"maybe_field": "output"},
                 "schema": {"mode": "observed"},
-                "strict": False,
             }
         )
         assert transform.declared_input_fields == frozenset({"maybe_field"})
@@ -691,15 +653,14 @@ class TestOutputSchemaConfig:
             token_id="token",
         )
 
-    def test_non_strict_mapping_from_guaranteed_source_declares_target(self) -> None:
-        """A non-strict mapping can guarantee its target when the source is guaranteed upstream."""
+    def test_mapping_from_guaranteed_source_declares_target(self) -> None:
+        """A mapping guarantees its target when the source is guaranteed upstream."""
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         transform = FieldMapper(
             {
                 "mapping": {"source": "target"},
                 "schema": {"mode": "observed", "guaranteed_fields": ["source", "kept"]},
-                "strict": False,
             }
         )
 
@@ -880,7 +841,7 @@ class TestOutputSchemaConfig:
         # Model the original-header lineage the test claims to exercise.  A
         # generic make_pipeline_row gives ``amount_usd`` the same original and
         # normalized name; under that fixture ``Amount USD`` is genuinely
-        # absent and the historical non-strict skip merely hid the mismatch.
+        # absent and the retired non-strict skip merely hid the mismatch.
         row = PipelineRow(
             {"amount_usd": 1.5, "kept": "x"},
             SchemaContract(
@@ -995,6 +956,7 @@ class TestOutputSchemaConfig:
         carries ``Name``. An undeclared target stays carried.
         """
         from elspeth.contracts.field_spelling import DeclaredSpellings
+        from elspeth.contracts.schema_contract import FieldContract, SchemaContract
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
         declared = FieldMapper({"mapping": mapping, "schema": {"mode": "flexible", "fields": ["Name: str"]}})
@@ -1009,6 +971,11 @@ class TestOutputSchemaConfig:
             DeclaredSpellings.of(reads=declared.declared_read_fields, creates=declared.declared_created_fields).in_row(
                 row_keys=frozenset({"id", "name"}),
                 forwarded_keys=frozenset({"id"}),
+                contract=SchemaContract(
+                    mode="OBSERVED",
+                    fields=(FieldContract("id", "ID", str, False, "inferred"), FieldContract("name", "Name", str, False, "inferred")),
+                    locked=True,
+                ),
             )
             == ()
         )
@@ -1215,7 +1182,6 @@ class TestOutputSchemaConfig:
             {
                 "mapping": {"old": "new"},
                 "schema": {"mode": "observed"},
-                "strict": True,
                 # No guaranteed_fields key → upstream is None (abstain)
             }
         )
@@ -1253,7 +1219,6 @@ class TestOutputSchemaConfig:
             {
                 "mapping": {"a": "b", "c": "d"},
                 "schema": {"mode": "observed"},
-                "strict": True,
             }
         )
         assert transform.declared_output_fields == frozenset({"b", "d"})
@@ -1266,7 +1231,6 @@ class TestOutputSchemaConfig:
             {
                 "mapping": {"score": "score", "name": "display_name"},
                 "schema": {"mode": "observed"},
-                "strict": True,
             }
         )
         # "score" → "score" is identity (excluded), "name" → "display_name" is a rename (included)
@@ -1458,7 +1422,14 @@ class TestFieldMapperDeclaredOutputFieldContracts:
         longer exercise the restamp. The guard being pinned is the restamp, not
         the declaration copying, so it moves onto a field the output really does
         promise.
+
+        ``process`` itself can no longer emit such a row: the mapping requires
+        ``cuisine``, so the miss routes ``missing_field`` (the retired
+        ``strict: false`` skip was what used to emit it). The restamp guard is
+        then pinned on the contract ``process`` would have built for that row,
+        through the same three steps ``process`` runs.
         """
+        from elspeth.contracts.contract_propagation import narrow_contract_to_output
         from elspeth.contracts.errors import SchemaConfigModeViolation
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
@@ -1480,12 +1451,18 @@ class TestFieldMapperDeclaredOutputFieldContracts:
 
         result = transform.process(row, ctx)
 
-        assert result.status == "success"
-        assert isinstance(result.row, PipelineRow)
-        assert "cuisine" not in result.row.to_dict()
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == "missing_field"
+        assert result.reason["field"] == "cuisine"
+
+        output = {"dish": "laksa"}
+        contract = narrow_contract_to_output(input_contract=row.contract, output_row=output, renamed_fields={"dish": "dish"})
+        emitted = PipelineRow(output, transform._align_output_contract(transform._apply_declared_output_field_contracts(contract)))
+        assert "cuisine" not in emitted.to_dict()
 
         with pytest.raises(SchemaConfigModeViolation) as exc_info:
-            _run_post_emission_check(transform, result.row)
+            _run_post_emission_check(transform, emitted)
 
         assert tuple(exc_info.value.payload["missing_required_fields"]) == ("cuisine",)
         # Absence is reported as a missing guarantee, not as metadata drift:
@@ -1642,7 +1619,6 @@ class TestFieldMapperOriginalHeaderClassification:
                 "schema": {"mode": "flexible", "fields": ["name: str", "keep: str"], "guaranteed_fields": ["name", "keep"]},
                 "mapping": {"Name": "full_name"},
                 "select_only": False,
-                "strict": True,
             }
         )
         row = PipelineRow(
@@ -1686,7 +1662,6 @@ class TestFieldMapperOriginalHeaderClassification:
                     "schema": {"mode": "flexible", "fields": ["name: str", "keep: str"], "guaranteed_fields": ["name", "keep"]},
                     "mapping": {source: "mapped"},
                     "select_only": False,
-                    "strict": True,
                 }
             )
             assert transform._output_schema_config is not None
@@ -2020,7 +1995,7 @@ class TestFieldMapperInputGuaranteesUseTheDocumentedPredicate:
         Construction cannot say whether ``Name`` resolves to ``name`` or an
         explicit source mapping, so the input declaration still abstains.  It
         need not know that key to promise ``nm`` on every *successful* row:
-        d4ae04b374 routes an unresolved source even when ``strict`` is false.
+        d4ae04b374 routes an unresolved source.
         """
         transform = self._built({"Name": "nm"}, ["Name: str"])
 
@@ -2107,14 +2082,14 @@ class TestSelectOnlyCannotTripTheCollisionGate:
             is False
         )
 
-    def test_strict_select_only_declares_without_any_schema_promise(self) -> None:
+    def test_select_only_declares_without_any_schema_promise(self) -> None:
         """The elspeth-6ea3619737 family-1 shape guarantees every target.
 
         No ``guaranteed_fields`` and no declared fields are needed: engine
         dispatch requires every configured mapping source before ``process``,
-        so each successful row contains every target. ``strict: true`` remains
-        in this regression shape but is no longer the authority. This is the
-        config that lost 100% of rows under the declaration-keyed gate; its
+        so each successful row contains every target. This is the family-1
+        config (it carried the since-retired ``strict: true``) that lost 100%
+        of rows under the declaration-keyed gate; its
         safety now lives in the capability key, pinned end-to-end in
         ``tests/unit/engine/test_executors.py::TestTransformExecutor::
         test_select_only_field_mapper_rename_onto_occupied_name_survives_preflight``.
@@ -2124,7 +2099,6 @@ class TestSelectOnlyCannotTripTheCollisionGate:
         transform = FieldMapper(
             {
                 "select_only": True,
-                "strict": True,
                 "mapping": {"a": "b"},
                 "schema": {"mode": "observed"},
             }
@@ -2355,18 +2329,17 @@ class TestFieldMapperDerivedInputRequirement:
         The contract cannot promise the nested leaf, but ``meta.origin`` can
         never resolve unless the top-level ``meta`` field arrives.  Omitting
         that root left the executor's pre-emission guard blind and allowed the
-        default non-strict path to drop the configured output silently.
+        since-retired non-strict path to drop the configured output silently.
         """
         config = self._config(mapping={"meta.origin": "origin", "colour": "colour"})
 
         assert config.declared_input_fields == frozenset({"colour", "meta"})
 
-    def test_fixed_schema_with_dotted_root_guarantees_target_without_strict(self) -> None:
+    def test_fixed_schema_with_dotted_root_guarantees_target(self) -> None:
         """The root makes the input contract coherent; missing leaves route.
 
-        ``strict`` is no longer the output-guarantee authority for a dotted
-        read.  Once d4ae04b374 made a missing leaf an error in non-strict mode,
-        every successful row necessarily contains ``origin``.
+        Since d4ae04b374 made a missing leaf an error, every successful row
+        necessarily contains ``origin``.
         """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
@@ -2375,7 +2348,6 @@ class TestFieldMapperDerivedInputRequirement:
                 "schema": {"mode": "fixed", "fields": ["meta: any"]},
                 "mapping": {"meta.origin": "origin"},
                 "select_only": True,
-                "strict": False,
             }
         )
 
@@ -2438,13 +2410,12 @@ class TestFieldMapperDerivedInputRequirement:
         assert transform.declared_input_fields == frozenset({"colour", "complementary_colour"})
 
     @pytest.mark.parametrize("source", ["meta.origin", "Name"])
-    def test_unrepresentable_missing_source_routes_even_when_non_strict(self, source: str) -> None:
+    def test_unrepresentable_missing_source_routes(self, source: str) -> None:
         """Every configured source is asserted even when flat metadata cannot name it.
 
         Dotted leaves and original-header aliases cannot be represented fully
         in ``declared_input_fields``.  Their runtime fallback must therefore
-        route a missing value instead of preserving the historical silent-skip
-        behaviour behind ``strict: false``.
+        route a missing value instead of the retired silent skip.
         """
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 
@@ -2452,7 +2423,6 @@ class TestFieldMapperDerivedInputRequirement:
             {
                 "schema": DYNAMIC_SCHEMA,
                 "mapping": {source: "target"},
-                "strict": False,
             }
         )
 
@@ -2471,7 +2441,6 @@ class TestFieldMapperDerivedInputRequirement:
             {
                 "schema": DYNAMIC_SCHEMA,
                 "mapping": {"Name": "display_name"},
-                "strict": False,
             }
         )
         row = PipelineRow(

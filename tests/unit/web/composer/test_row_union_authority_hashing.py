@@ -22,18 +22,17 @@ from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     composition_content_hash,
 )
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
-from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.proposal_authority import (
     _composition_state_data_content_hash,
     _pipeline_audit_payload_hash,
     _pipeline_private_arguments_hash,
 )
+from elspeth.web.sessions.protocol import CompositionStateData
 
 
 def _branches(order: Sequence[str]) -> dict[str, str]:
@@ -112,12 +111,8 @@ def _proposal(order: Sequence[str]) -> PipelineProposal:
     return PipelineProposal.create(
         pipeline=_pipeline(order),
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.GUIDED_FULL,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
 
 

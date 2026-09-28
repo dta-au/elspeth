@@ -6,7 +6,36 @@
 **Tags:** declaration-contract, transform, pre-emission, tier-1, audit-integrity
 **Supersedes:** None
 **Depends on:** [ADR-010](010-declaration-trust-framework.md)
-**Amended by:** [ADR-051](051-a-template-sees-only-its-declared-fields.md) — for a template transform (LLM, RAG) `required_input_fields` is also what the template can see: its render context holds exactly the declared fields (`[]` the whole row, omitted none)
+**Amended by:** [ADR-051](051-a-template-sees-only-its-declared-fields.md) — for a template transform (LLM, RAG) `required_input_fields` is also what the template can see: its render context holds exactly the declared fields (`[]` the whole row, omitted none); Amendment 2026-09-27 below — a runtime miss is Tier 1 only for what the build trusted; an unproven absence is routed
+
+> **Amendment 2026-09-27 (elspeth-5887fb7928 R2; operator ruling 2026-09-23 B2; Q4 doctrine §4 cond. 2).
+> Supersedes §"Batch scope" and §"Tier classification" below; the original prose is kept for the audit trail.**
+> The Tier-1 classification holds for the part of a declaration the build TRUSTED, and only that part. The build
+> trusts a declared input field when every live predecessor's presence vote participates and lists it (`fields` is a
+> lower bound, backed by the upstream vals of ADR-008/009, ADR-011 and ADR-016); the builder publishes that set per
+> node on the final graph (`ExecutionGraph.get_declared_input_proof`, computed by
+> `schema_validation.declared_input_disposition`, the same walk that refuses a certain miss). Explicit
+> `required_input_fields` and `schema.required_fields` are refused at build (Phase 1) unless the producer guarantees
+> them, so a field that passes that check is normally trusted too; the runtime never asks which surface a field came
+> from, only whether the build trusted it. A runtime
+> miss is Tier 1 when any missing field was trusted, or when the row's payload
+> carries a field its contract lacks (contract/payload divergence). Otherwise the declaration was derived from options
+> the build could not settle against an abstaining or open upstream (`url_field`, `conversions[].field`, `mapping`
+> sources, `array_field` …). That miss is a fact about the row: the engine refuses it before `process()` runs and
+> routes it through `on_error` as `DeclaredInputFieldAbsentViolation`, reason `missing_field` with the config field
+> names only — never a row value, key or id, so N rows record one reason. `DeclaredRequiredFieldsContract`, its
+> payload, negative example and manifest entry are unchanged, and it still sees the full missing set whenever the
+> miss is ours. The routing check is an engine preflight (`TransformExecutor._run_preflight`, classifier
+> `engine/executors/declared_input_miss.py`) and **not** an ADR-010 adopter: the `pre_emission_check` surface still has
+> exactly one `DeclarationContract` adopter with one Tier-1 `violation_class`, and a `DeclarationContract` never
+> routes. **Batch:** the same classifier applies at the aggregation and collector input seams
+> (`batch_contract_validation.validate_batch_inputs` over `schema_required_input_fields()`, whose proof the builder
+> publishes from `NodeInfo.batch_required_input_fields`): an unproven absence fails the batch through `on_error` (B2);
+> a proven or divergent miss is the Tier-1 `BatchDeclaredInputFieldsViolation`. Both seams record every buffered
+> token FAILURE before the abort through one recorder (`batch_violation_outcomes.record_batch_violation_failures`), so
+> no token is left without a terminal outcome; a collector also closes each member's hold FAILED first, since the WS3
+> settle seam never runs on a path that ends the run. Batch-aware transforms still cannot declare
+> `declared_input_fields`, and ADR-013's contract still does not dispatch at a batch seam.
 
 ## Context
 

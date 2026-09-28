@@ -121,10 +121,6 @@ describe("filled-button hover direction (elspeth-3b57d9025b)", () => {
     const primaryHover = luminance(rootToken("--color-btn-primary-bg-hover"));
     const dangerHover = luminance(rootToken("--color-btn-danger-bg-hover"));
 
-    // House direction on dark theme is LIGHTEN (outlined .btn hovers with a
-    // white wash). The primary hover token is shared by .btn-primary AND the
-    // accent-filled guided/chat buttons, so it must sit above both bases or
-    // one family keeps inverting.
     expect(primaryHover).toBeGreaterThan(
       luminance(rootToken("--color-btn-primary-bg")),
     );

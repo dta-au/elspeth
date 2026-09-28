@@ -11,7 +11,7 @@ from sqlalchemy import Connection, Engine, event, select
 from elspeth.contracts.blobs import BlobForkFenceLostError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.blobs.service import BlobServiceImpl
-from elspeth.web.sessions.models import blob_deletion_cleanups_table, blobs_table, guided_operations_table
+from elspeth.web.sessions.models import blob_deletion_cleanups_table, blobs_table, session_operation_receipts_table
 from tests.unit.web.blobs import test_service as fixtures
 
 blob_service = fixtures.blob_service
@@ -148,12 +148,12 @@ async def test_fork_commit_ack_loss_with_takeover_preserves_stage_and_fence_erro
             injected = True
             with db_engine.begin() as takeover:
                 changed = takeover.execute(
-                    guided_operations_table.update()
+                    session_operation_receipts_table.update()
                     .where(
-                        guided_operations_table.c.session_id == str(session_id),
-                        guided_operations_table.c.operation_id == stale_fence.operation_id,
-                        guided_operations_table.c.lease_token == stale_fence.lease_token,
-                        guided_operations_table.c.attempt == stale_fence.attempt,
+                        session_operation_receipts_table.c.session_id == str(session_id),
+                        session_operation_receipts_table.c.operation_id == stale_fence.operation_id,
+                        session_operation_receipts_table.c.lease_token == stale_fence.lease_token,
+                        session_operation_receipts_table.c.attempt == stale_fence.attempt,
                     )
                     .values(lease_token=successor.lease_token, attempt=successor.attempt)
                 ).rowcount

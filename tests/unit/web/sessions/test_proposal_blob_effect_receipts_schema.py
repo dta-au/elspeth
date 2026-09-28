@@ -17,14 +17,14 @@ def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
     # Paired with Landscape40: identity ownership and admission evidence.
     # Epoch 57 replaces the fallback prompt digest with the approved artifact anchor.
     # Epoch 58 adds 64-bit quota limits and nullable ledger usage measures.
-    # Epoch 60 preserves guided fork failure diagnostics.
     # Epoch 63 tightens the inline blob resolution hash CHECK to lowercase hex.
     # Epoch 65: completion_gates.advisor_signoff.note became a required key
     # (elspeth-032ec69c41), so an epoch-64 envelope cannot be read forward.
     # Epoch 66 rejects v1 control messages whose checksum omitted provenance.
     # Epoch 67 binds coalesce branch order and sources order in authority hashes.
-    # Epoch 68 adds guided and ordinary proposal checkpoint rebase reasons.
-    assert SESSION_SCHEMA_EPOCH == 68
+    # Epoch 68 adds ordinary proposal checkpoint rebase reasons.
+    # Epoch 71 adds mode-neutral fork/revert receipts.
+    assert SESSION_SCHEMA_EPOCH == 71
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

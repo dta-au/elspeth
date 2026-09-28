@@ -1,10 +1,11 @@
 """GateExecutor - wraps config-driven gates with audit recording and routing."""
 
-import hashlib
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -29,13 +30,12 @@ from elspeth.contracts.enums import (
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.node_state_context import GateEvaluationContext
 from elspeth.contracts.plugin_context import PluginContext
-from elspeth.contracts.secret_scrub import scrub_text_for_audit
-from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import GateSettings
 from elspeth.core.expression_parser import (
     ExpressionEvaluationError,
+    ExpressionEvaluationKind,
     ExpressionParser,
     ExpressionSecurityError,
     ExpressionSyntaxError,
@@ -51,50 +51,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 slog = structlog.get_logger(__name__)
 
-_GATE_VALUE_PREVIEW_CHARS = 80
+
+_HANDLED_GATE_EVALUATION_ERRORS: Mapping[ExpressionEvaluationKind, str] = MappingProxyType(
+    {
+        "missing_key": "gate expression evaluation failed: missing key",
+        "index_out_of_range": "gate expression evaluation failed: index out of range",
+        "incompatible_types": "gate expression evaluation failed: incompatible runtime types",
+        "division_by_zero": "gate expression evaluation failed: division by zero",
+        "arithmetic_overflow": "gate expression evaluation failed: arithmetic overflow",
+        "invalid_value": "gate expression evaluation failed: invalid runtime value",
+        "non_finite_result": "gate expression evaluation failed",
+        "unexpected_error": "gate expression evaluation failed",
+    }
+)
 
 
 def _classify_handled_gate_evaluation_error(exc: ExpressionEvaluationError) -> str:
-    """Return bounded failure evidence without copying row-derived exception text."""
-    cause_type = type(exc.__cause__)
-    if cause_type is KeyError:
-        return "gate expression evaluation failed: missing key"
-    if cause_type is IndexError:
-        return "gate expression evaluation failed: index out of range"
-    if cause_type is TypeError:
-        return "gate expression evaluation failed: incompatible runtime types"
-    if cause_type is ZeroDivisionError:
-        return "gate expression evaluation failed: division by zero"
-    if cause_type is OverflowError:
-        return "gate expression evaluation failed: arithmetic overflow"
-    if cause_type is ValueError:
-        return "gate expression evaluation failed: invalid runtime value"
-    return "gate expression evaluation failed"
+    """Return the closed classification of the failed arm (``exc.kind``).
 
-
-@observation_boundary(
-    tier=3,
-    source="row-derived gate expression result (ExpressionParser output over untrusted row data)",
-    source_param="value",
-    suppresses=("R5",),
-    invariant="Always returns bounded, scrubbed audit metadata for any value; never raises.",
-)
-def _describe_untrusted_gate_value(value: Any) -> str:
-    """Return bounded metadata for row-derived gate expression results."""
-    if isinstance(value, str):
-        raw_text = value
-    else:
-        try:
-            raw_text = repr(value)
-        except Exception:
-            raw_text = f"<unrepresentable {type(value).__name__}>"
-    scrubbed = scrub_text_for_audit(raw_text)
-    if len(scrubbed) > _GATE_VALUE_PREVIEW_CHARS:
-        preview = scrubbed[:_GATE_VALUE_PREVIEW_CHARS] + "..."
-    else:
-        preview = scrubbed
-    digest = hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest()[:16]
-    return f"type={type(value).__name__}, length={len(raw_text)}, sha256={digest}, preview={preview!r}"
+    The handled route records only this sentence, never the condition's
+    evaluation message: the reason is a closed set a reviewer can group by.
+    """
+    return _HANDLED_GATE_EVALUATION_ERRORS[exc.kind]
 
 
 @dataclass(frozen=True, slots=True)
@@ -415,9 +393,14 @@ class GateExecutor:
             elif isinstance(eval_result, str):
                 route_label = eval_result
             else:
+                # The result is row data (``row['category']`` returns the row's
+                # value): only its type and a label's length are audit text,
+                # never its content, a preview, or a digest (a hash of a
+                # low-entropy value is reversible). The row stays attributable
+                # through the token.
                 raise TypeError(
                     f"Gate '{gate_config.name}' expression returned unsupported route value "
-                    f"({_describe_untrusted_gate_value(eval_result)}), expected bool or str. "
+                    f"(type={type(eval_result).__name__}), expected bool or str. "
                     f"Expression: {gate_config.condition}"
                 )
 
@@ -425,7 +408,8 @@ class GateExecutor:
             if route_label not in gate_config.routes:
                 raise ValueError(
                     f"Gate '{gate_config.name}' condition returned unconfigured route label "
-                    f"({_describe_untrusted_gate_value(route_label)}); configured routes: {list(gate_config.routes.keys())}"
+                    f"(type=str, length={len(route_label)}); configured routes: {list(gate_config.routes.keys())}. "
+                    f"Expression: {gate_config.condition}"
                 )
 
             # Build routing action and process based on destination

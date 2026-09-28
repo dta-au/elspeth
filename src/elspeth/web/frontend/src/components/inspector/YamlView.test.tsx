@@ -120,7 +120,7 @@ describe("YamlView", () => {
     expect(screen.queryByRole("button", { name: /accept|reject/i })).not.toBeInTheDocument();
   });
 
-  it("does not fetch YAML for a metadata-only guided exit state", async () => {
+  it("does not fetch YAML for a metadata-only composition state", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockResolvedValue({
       yaml: "source:\n  plugin: text\n",

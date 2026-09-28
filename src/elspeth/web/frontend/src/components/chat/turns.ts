@@ -166,7 +166,7 @@ function extendAgentTurn(turn: MutableTurn, message: ChatMessage): void {
  *   - Per-tool audit records are separate role="tool"/"audit" rows; they never
  *     appear as an assistant row carrying tool_calls.
  */
-function isGenuineReply(message: ChatMessage): boolean {
+export function isGenuineReply(message: ChatMessage): boolean {
   return !(message.tool_calls && message.tool_calls.length > 0);
 }
 

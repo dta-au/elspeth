@@ -269,6 +269,7 @@ _GATEWAY_NON_RETRYABLE_CONFIG_CODES = frozenset(
         "model_not_allowed",
         "capability_unsupported",
         "upstream_unauthorized",
+        "upstream_request_rejected",
         "upstream_response_invalid",
         "internal_error",
         # ELSPETH's own static bearer was rejected by the gateway's inbound

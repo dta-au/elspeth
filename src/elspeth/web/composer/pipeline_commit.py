@@ -9,7 +9,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal, cast
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic import JsonValue
@@ -38,7 +38,6 @@ from elspeth.web.composer.authority_hashing import (
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
-    PlannerSurface,
     PresentBase,
     composition_content_hash,
     is_owned_composition_state_authority,
@@ -48,7 +47,6 @@ from elspeth.web.composer.pipeline_proposal import (
 from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, semantic_redacted_pipeline_arguments_hash
 from elspeth.web.composer.reviewed_source_authority import (
     resolve_owned_composition_source_authority,
-    resolve_reviewed_source_authority,
 )
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, ToolResult
@@ -366,7 +364,6 @@ def _bind_executor_content_hash(
 async def prepare_pipeline_proposal_commit(
     *,
     authority: AuthoritativePipelineProposal,
-    reviewed_facts: Mapping[str, Any],
     current_state: CompositionState,
     current_state_id: UUID | None,
     policy_catalog: PolicyCatalogView,
@@ -374,7 +371,6 @@ async def prepare_pipeline_proposal_commit(
     config: PipelineCommitConfig,
     recorder: BufferingRecorder,
     actor: str,
-    settlement_surface: Literal["generic", "guided"],
     recovery_dispatch: PipelineDispatchAuditBinding | None = None,
     recovery_executor_content_hash: str | None = None,
 ) -> PreparedPipelineCommit | RecoveredPipelineCommit:
@@ -383,15 +379,6 @@ async def prepare_pipeline_proposal_commit(
         raise TypeError("authority must be an exact AuthoritativePipelineProposal")
     if config.session_operation_context.fence.session_id != str(authority.row.session_id):
         raise AuditIntegrityError("pipeline commit context does not match the proposal session")
-    if settlement_surface not in {"generic", "guided"}:
-        raise ValueError("settlement_surface is outside the closed vocabulary")
-    if settlement_surface == "generic" and authority.proposal.surface in {
-        PlannerSurface.GUIDED_STAGED,
-        PlannerSurface.TUTORIAL_PROFILE,
-    }:
-        raise PipelineCommitError("generic route cannot settle staged pipeline proposals", code="SURFACE_REQUIRES_GUIDED")
-    if settlement_surface == "guided" and authority.proposal.surface is PlannerSurface.FREEFORM:
-        raise PipelineCommitError("guided route cannot settle freeform pipeline proposals", code="SURFACE_REQUIRES_GENERIC")
     if authority.row.status != "pending":
         raise PipelineCommitError("pipeline proposal is not pending", code="NOT_PENDING")
     if policy_catalog.snapshot is not plugin_snapshot:
@@ -451,14 +438,7 @@ async def prepare_pipeline_proposal_commit(
             state=proposed_state,
         )
     else:
-        reviewed_source_authority = await bounded(
-            resolve_reviewed_source_authority,
-            engine=config.session_engine,
-            session_id=str(authority.row.session_id),
-            user_id=config.user_id,
-            reviewed_facts=reviewed_facts,
-            expected_reviewed_anchor_hash=authority.proposal.reviewed_anchor_hash,
-        )
+        reviewed_source_authority = None
     context = ToolContext(
         catalog=policy_catalog,
         plugin_snapshot=plugin_snapshot,

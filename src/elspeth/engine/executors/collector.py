@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import structlog
@@ -30,6 +31,7 @@ from elspeth.contracts.enums import (
 )
 from elspeth.contracts.errors import (
     AuditIntegrityError,
+    BatchDeclaredInputFieldsViolation,
     ExecutionError,
     OrchestrationInvariantError,
     PluginContractViolation,
@@ -47,7 +49,12 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.aggregation_result import validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
-from elspeth.engine.executors.batch_contract_validation import validate_batch_inputs, validate_success_outputs
+from elspeth.engine.executors.batch_contract_validation import (
+    batch_declared_input_proof,
+    validate_batch_inputs,
+    validate_success_outputs,
+)
+from elspeth.engine.executors.batch_violation_outcomes import record_batch_violation_failures
 from elspeth.engine.executors.non_canonical_output import non_canonical_output_violation
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import CollectorJournalRestorer
@@ -140,6 +147,7 @@ class CollectorExecutor:
         clock: Clock | None = None,
         max_completed_keys: int = 10000,
         barrier_restore_reads: BarrierRestoreReadModel | None = None,
+        declared_input_proof: Mapping[NodeID, frozenset[str]] = MappingProxyType({}),
     ) -> None:
         if max_completed_keys <= 0:
             raise OrchestrationInvariantError(f"max_completed_keys must be > 0, got {max_completed_keys}")
@@ -147,6 +155,9 @@ class CollectorExecutor:
             raise OrchestrationInvariantError("barrier_restore_reads is required for collector roster/restore reads")
         self._execution = execution
         self._barrier_restore_reads = barrier_restore_reads
+        # The build's declared-input proof (ADR-013 Amendment 2026-09-27): the
+        # flush's input check classifies a required-field miss by this node's entry.
+        self._declared_input_proof = declared_input_proof
         self._data_flow = data_flow
         self._spans = span_factory
         self._token_manager = token_manager
@@ -1038,6 +1049,12 @@ class CollectorExecutor:
     # the executor renders, WS3 settles. Do not add escalation logic here, do
     # not reintroduce a direct `record_token_outcome` call for arrived
     # members in this method, and do not resurrect `outcomes_recorded`.
+    # The one carve-out is not a group failure at all: a Tier-1
+    # BatchDeclaredInputFieldsViolation in `_execute_flush` ends the run, so
+    # no CollectorOutcome ever reaches the settle seam; that arm closes the
+    # member holds and records each member FAILED itself
+    # (record_batch_violation_failures, shared with the aggregation seam)
+    # before the violation propagates.
 
     def _execute_flush(self, collector_name: str, key: tuple[str, str], pending: _PendingGroup, ctx: PluginContext) -> CollectorOutcome:
         """end_of_group flush: opener-ordinal order, transform-only, audit-guarded."""
@@ -1121,7 +1138,14 @@ class CollectorExecutor:
             # run. Nothing is minted before these checks; the Tier-1 subclasses
             # still abort.
             try:
-                validate_batch_inputs(transform, pipeline_rows, node_kind="Collector")
+                validate_batch_inputs(
+                    transform,
+                    pipeline_rows,
+                    node_kind="Collector",
+                    proven=batch_declared_input_proof(
+                        self._declared_input_proof, node_id=node_id, transform=transform, node_kind="Collector"
+                    ),
+                )
                 result = transform.process(pipeline_rows, ctx)
                 if result.status == "success":
                     if result.row is None and result.rows is None:
@@ -1148,6 +1172,44 @@ class CollectorExecutor:
                             result=result,
                             exc=exc,
                         ) from exc
+            except BatchDeclaredInputFieldsViolation as input_violation:
+                # Tier 1 (a required field the build proved present is missing,
+                # or a contract lost a field its payload carries): the run ends,
+                # but every member is recorded FAILED first, as at the
+                # aggregation seam, so no member is left without a terminal
+                # outcome (ADR-013 Amendment 2026-09-27). The WS3 settle seam
+                # never runs on this path — the run dies before this group's
+                # CollectorOutcome exists — so these writes are the only ones.
+                # Each member's accept()-time hold closes FAILED with the
+                # violation's value-free error first, as every other closure
+                # of a group closes it (success, quarantine, group verdict): a
+                # member recorded FAILED must not keep an open hold here.
+                hold_duration_ms = (self._clock.monotonic() - now) * 1000
+                hold_error = ExecutionError(
+                    exception=scrub_text_for_audit(str(input_violation)),
+                    exception_type=type(input_violation).__name__,
+                    phase="collector_flush",
+                    context=input_violation.to_audit_dict(),
+                )
+                for entry in entries:
+                    self._execution.complete_node_state(
+                        member_token=ctx.require_member_token(),
+                        state_id=entry.state_id,
+                        status=NodeStateStatus.FAILED,
+                        error=hold_error,
+                        duration_ms=hold_duration_ms,
+                    )
+                record_batch_violation_failures(
+                    self._data_flow,
+                    coordination_token=ctx.require_coordination_token(),
+                    run_id=self._run_id,
+                    tokens=members,
+                    violation=input_violation,
+                    transform_name=transform.name,
+                    node_id=node_id,
+                    triggering_token_id=None,
+                )
+                raise
             except contract_errors.TIER_1_ERRORS:
                 raise
             except PluginContractViolation as violation:

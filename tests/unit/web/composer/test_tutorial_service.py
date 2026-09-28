@@ -159,9 +159,8 @@ def _make_tutorial_settings(data_dir: Path, **overrides: Any) -> WebSettings:
 def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     """A committed source→sink pipeline with NO nodes gets its own blocker.
 
-    Regression for tutorial run 18 (session 07e8a3a8, committed v11): a guided
-    walk that accepts the step-3 auto-proposal without the transforms
-    instruction commits a valid source→sink passthrough, and the launch gate
+    A source→sink passthrough can be valid composition but lacks the
+    transforms required by this tutorial. The launch gate
     rejected it with the generic plugin-set message — indistinguishable from a
     wrong-plugin build. Emptiness is a distinct, actionable state: name it.
     """
@@ -375,6 +374,11 @@ async def test_tutorial_run_executes_the_exact_state_revision_readiness_approved
             state_id = approved_state_id if current_state_reads == 1 else newer_state_id
             return SimpleNamespace(id=state_id)
 
+        async def list_interpretation_events(self, _session_id: Any, *, status: str, composition_state_id: Any) -> list[Any]:
+            assert status == "pending"
+            assert composition_state_id == approved_state_id
+            return []
+
         async def get_run(self, requested_run_id: Any) -> Any:
             assert requested_run_id == run_id
             return SimpleNamespace(status="cancelled")
@@ -533,8 +537,7 @@ async def test_failed_live_tutorial_run_response_omits_raw_run_error(
 async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tmp_path: Path) -> None:
     """An unresolved interpretation review is a coded launch blocker, not a 500.
 
-    Session e1332b5a: the guided walk completed but the committed llm node
-    still carried a pending ``llm_prompt_template`` review, so
+    A committed llm node can still carry a pending ``llm_prompt_template`` review, so
     ``execution_service.execute`` raised
     ``UnresolvedInterpretationPlaceholderError`` — which the tutorial route
     surfaced as a raw 500 (and the run-turn UI rendered an EMPTY alert for the
@@ -590,6 +593,48 @@ async def test_pending_interpretation_reviews_block_tutorial_run_as_coded_409(tm
     assert detail["code"] == "tutorial_interpretations_pending"
     assert "review" in detail["detail"].lower()
     assert "SENTINEL_NODE_ID" not in repr(detail)
+
+
+@pytest.mark.asyncio
+async def test_readiness_refuses_pending_interpretations_before_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    session_id = uuid4()
+    state_id = uuid4()
+
+    class FakeSessionService:
+        async def get_current_state(self, requested_session_id: Any) -> Any:
+            assert requested_session_id == session_id
+            return SimpleNamespace(id=state_id)
+
+        async def list_interpretation_events(self, requested_session_id: Any, *, status: str, composition_state_id: Any) -> list[Any]:
+            assert requested_session_id == session_id
+            assert status == "pending"
+            assert composition_state_id == state_id
+            return [SimpleNamespace(id=uuid4())]
+
+    monkeypatch.setattr(tutorial_service_module, "state_from_record", lambda _record: SimpleNamespace())
+    monkeypatch.setattr(tutorial_service_module, "_tutorial_launch_blocker", lambda **_kwargs: None)
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                plugin_snapshot_factory=lambda _user: SimpleNamespace(),
+                web_plugin_policy=SimpleNamespace(),
+                operator_profile_registry=SimpleNamespace(),
+                catalog_service=SimpleNamespace(),
+            )
+        )
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await tutorial_service_module._require_tutorial_launch_readiness(
+            request=request,
+            user=SimpleNamespace(user_id="tutorial-user"),
+            session_id=session_id,
+            settings=_make_tutorial_settings(tmp_path),
+            session_service=FakeSessionService(),
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["code"] == "tutorial_interpretations_pending"
 
 
 @pytest.mark.asyncio

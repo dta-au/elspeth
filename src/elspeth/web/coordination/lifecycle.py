@@ -515,7 +515,7 @@ class SessionOperationLease:
 
         The hidden child is intentionally archived while staging, so generic
         session CAS/renew must continue to reject it. Validation and renewal
-        instead prove the parent fence, guided binding, child lineage, and
+        instead prove the parent fence, operation receipt, child lineage, and
         exact child fence together under canonical pair locks.
         """
         from elspeth.web.sessions.protocol import SessionForkAuthority as RuntimeSessionForkAuthority
@@ -1083,6 +1083,17 @@ class SessionOperationLease:
         except BaseException as cleanup_error:
             if exc_value is None:
                 raise
+            if (
+                isinstance(exc_value, asyncio.CancelledError)
+                and isinstance(cleanup_error, asyncio.CancelledError)
+                and self._close_task is not None
+                and self._close_task.done()
+                and not self._close_task.cancelled()
+                and self._close_task.exception() is None
+            ):
+                # A second cancellation interrupted only the waiter. The
+                # owned close finished; preserve the body's original signal.
+                return False
             if cleanup_error is not exc_value:
                 raise BaseExceptionGroup(
                     "Session operation body and cleanup both failed",

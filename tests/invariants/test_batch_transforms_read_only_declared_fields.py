@@ -62,8 +62,12 @@ _SENTINEL_VALUE = "SENTINEL-R1-value-5d0c2e"
 _MEASURED_ANCHORS = frozenset({"batch_threshold_summary", "batch_stats"})
 
 # Batch transforms whose every column is optional on the row, so they declare
-# no required input. A NEW name here is a decision to review, not a skip.
-_DECLARES_NO_REQUIRED_INPUT = frozenset({"batch_replicate"})
+# no required input. A NEW name here is a decision to review, not a skip:
+# * batch_replicate reads copies_field only when the row carries it;
+# * batch_rank treats a row without value_field as unranked, not as a contract
+#   violation: the row passes through with rank and percentile null and is left
+#   out of ranked_count, which is what keeps its flush one row per buffered row.
+_DECLARES_NO_REQUIRED_INPUT = frozenset({"batch_replicate", "batch_rank"})
 
 
 def _batch_transform_roster() -> list[Any]:
@@ -143,14 +147,14 @@ def test_a_batch_transform_reads_no_undeclared_field_unguarded(transform: Any) -
 @pytest.mark.parametrize("transform", [t for t in _ROSTER if t.schema_required_input_fields()], ids=lambda transform: transform.name)
 def test_every_declared_field_is_enforced_by_the_flush_preflight(transform: Any) -> None:
     rows = [make_pipeline_row({**row.to_dict(), _SENTINEL_FIELD: _SENTINEL_VALUE}) for row in _probe_batch(transform)]
-    validate_batch_inputs(transform, rows, node_kind="Aggregation")
+    validate_batch_inputs(transform, rows, node_kind="Aggregation", proven=frozenset())
 
     last = len(rows) - 1
     for field in sorted(transform.schema_required_input_fields()):
         with pytest.raises(PluginContractViolation) as excinfo:
-            validate_batch_inputs(transform, _without(rows, field, only_index=last), node_kind="Aggregation")
+            validate_batch_inputs(transform, _without(rows, field, only_index=last), node_kind="Aggregation", proven=frozenset())
         message = str(excinfo.value)
-        assert f"buffered row {last}:" in message
+        assert f"(buffered row {last})" in message
         assert repr(field) in message
         assert _SENTINEL_VALUE not in message
         # The row's own keys are row-derived under an observed source: only the

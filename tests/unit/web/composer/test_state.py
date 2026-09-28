@@ -4306,15 +4306,15 @@ class TestPromptTemplateUndeclaredRowFields:
         assert self._errors(self._state("Rate: {{ row.case_study }}", required_input_fields=["case_study_1", 5]))
 
     def test_advice_leads_with_rewrite_and_qualifies_declaring(self) -> None:
-        """Declaring a read name the producer does not guarantee is accepted at
-        config time and then fails every row (``verify_declared_required_fields``
-        is a plain set difference with no dual-name limb), so the ordering of
-        the two remedies is load-bearing."""
+        """Declaring a read name the producer does not guarantee is refused when
+        the pipeline is validated (``schema_contract_violation``), so a repair
+        that leads with it trades this error for another: the ordering of the
+        two remedies is load-bearing."""
         from elspeth.web.composer.state import _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX as fix
 
         assert fix.index("Rewrite each reference") < fix.index("Add a name to options.required_input_fields")
         assert "ONLY if the upstream producer guarantees that exact name" in fix
-        assert "fails every row at run time" in fix
+        assert "refused when the pipeline is validated" in fix
         assert "patch_node_options replaces the option's value, it does not append" in fix
 
     def test_both_authoring_surfaces_carry_the_same_substantive_advice(self) -> None:
@@ -4328,7 +4328,7 @@ class TestPromptTemplateUndeclaredRowFields:
         for text in (plugin_fix, composer_fix):
             assert text.index("Rewrite each reference") < text.index("Add a name to options.required_input_fields")
             assert "ONLY if the upstream producer guarantees that exact name" in text
-            assert "fails every row at run time" in text
+            assert "refused when the pipeline is validated" in text
             assert "withdraws the contract for every field" in text
 
 
@@ -5273,7 +5273,6 @@ class TestSchemaContractValidation:
                     },
                     "mapping": {"text": "body"},
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -5306,7 +5305,6 @@ class TestSchemaContractValidation:
                 "schema": {"mode": "fixed", "fields": ["body: str", "text: str"]},
                 "mapping": {"text": "body"},
                 "select_only": True,
-                "strict": True,
             },
         )
 
@@ -5574,7 +5572,6 @@ class TestSchemaContractValidation:
                 options={
                     "schema": {"mode": "observed"},
                     "mapping": {"text": "body"},
-                    "strict": True,
                 },
             )
         )
@@ -5813,7 +5810,6 @@ class TestSchemaContractValidation:
                 },
                 "mapping": {"text": "body"},
                 "select_only": True,
-                "strict": True,
             },
         )
         sink = OutputSpec(
@@ -6244,7 +6240,7 @@ class TestSchemaContractValidation:
         assert sink_contract.satisfied is True
 
     @pytest.mark.parametrize("proven_sources", [("raw_url", "raw_summary"), ("raw_url",)])
-    def test_guided_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
+    def test_select_only_mapper_declares_all_derived_target_guarantees(self, proven_sources: tuple[str, ...]) -> None:
         """Upstream schema lower bounds do not narrow successful-row outputs."""
         state = self._empty_state()
         state = state.with_source(
@@ -6334,7 +6330,7 @@ class TestSchemaContractValidation:
     def test_contract_probe_ignores_authoring_metadata(self) -> None:
         """Composer-only authoring keys must not break the contract probe.
 
-        The guided flow stages ``interpretation_requirements`` inside node
+        The composer stages ``interpretation_requirements`` inside node
         options; every plugin config rejects unknown keys, so probing with
         unstripped options is a guaranteed ValueError -> a spurious
         "Computed contract probe ... failed" warning surfaced to the user
@@ -6437,7 +6433,6 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": False,
                     "mapping": {"first_name": "fname", "user.name": "uname", "Name": "nm"},
                     "schema": {"mode": "flexible", "fields": ["fname: str", "uname: str", "nm: str"]},
                 },
@@ -6482,7 +6477,6 @@ class TestSchemaContractValidation:
                 plugin="field_mapper",
                 options={
                     "select_only": True,
-                    "strict": False,
                     "mapping": {"user.name": "uname"},
                     "schema": {"mode": "fixed", "fields": ["user: any"]},
                 },
@@ -6515,8 +6509,8 @@ class TestSchemaContractValidation:
         """The fixed input model names ``user``; the emitted target is not an input.
 
         The old target-only schema is rejected at construction. With the root
-        declared, a present leaf succeeds and a missing child routes in
-        non-strict mode, which is the behavior that makes ``uname`` guaranteed
+        declared, a present leaf succeeds and a missing child routes, which is
+        the behavior that makes ``uname`` guaranteed
         on every successful row. The historical regression identifier is kept
         for integration-matrix traceability.
         """
@@ -6524,7 +6518,6 @@ class TestSchemaContractValidation:
 
         incoherent = {
             "select_only": True,
-            "strict": True,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["uname: str"]},
         }
@@ -6533,7 +6526,6 @@ class TestSchemaContractValidation:
 
         coherent = {
             "select_only": True,
-            "strict": False,
             "mapping": {"user.name": "uname"},
             "schema": {"mode": "fixed", "fields": ["user: any"]},
         }
@@ -8584,7 +8576,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -8743,8 +8734,8 @@ class TestSchemaContractValidation:
     def test_rule_d_skips_a_select_only_field_mapper_that_cannot_overwrite(self) -> None:
         """Rule D is capability-keyed: a fresh-dict writer cannot overwrite (elspeth-6ea3619737).
 
-        A ``select_only`` + ``strict`` field_mapper declares its rename target
-        (an honest guarantee — strict promises the source), and the target name
+        A ``select_only`` field_mapper declares its rename target (an honest
+        guarantee — the mapping requires its source), and the target name
         definitely arrives on its input. But ``process`` builds its output from
         a fresh ``{}``: the arriving field is dropped, never overwritten —
         which is what select_only MEANS. Before the capability key this shape
@@ -8766,7 +8757,6 @@ class TestSchemaContractValidation:
                 options={
                     "mapping": {"a": "b"},
                     "select_only": True,
-                    "strict": True,
                     "schema": {"mode": "observed"},
                 },
             )
@@ -9210,7 +9200,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )
@@ -9315,7 +9304,6 @@ class TestSchemaContractValidation:
                         "sum": "sum",
                     },
                     "select_only": True,
-                    "strict": True,
                 },
             )
         )

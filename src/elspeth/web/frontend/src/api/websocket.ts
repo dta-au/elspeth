@@ -193,15 +193,16 @@ export function connectToRun(
       return;
     }
 
-    socket = new WebSocket(buildWsUrl(ticket));
+    const currentSocket = new WebSocket(buildWsUrl(ticket));
+    socket = currentSocket;
 
-    socket.onopen = (): void => {
-      // Reset backoff on successful connection
-      reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
+    currentSocket.onopen = (): void => {
+      if (closed || socket !== currentSocket) return;
       callbacks.onConnected?.();
     };
 
-    socket.onmessage = (messageEvent: MessageEvent): void => {
+    currentSocket.onmessage = (messageEvent: MessageEvent): void => {
+      if (closed || socket !== currentSocket) return;
       const event: RunEvent = JSON.parse(messageEvent.data as string);
       if (event.event_sequence != null) {
         if (!Number.isSafeInteger(event.event_sequence) || event.event_sequence < 1) return;
@@ -209,6 +210,9 @@ export function connectToRun(
       }
       dispatchEvent(event);
       if (event.event_sequence != null) lastSequence = event.event_sequence;
+      // A handshake can succeed while the backend cannot read a single run
+      // event (4503). Only a delivered event proves this stream is healthy.
+      reconnectDelay = INITIAL_RECONNECT_DELAY_MS;
 
       // Terminal events: stop reconnecting. The server will close
       // the connection with code 1000 after sending a terminal event.
@@ -217,14 +221,15 @@ export function connectToRun(
       }
     };
 
-    socket.onerror = (): void => {
+    currentSocket.onerror = (): void => {
       // The onerror event fires before onclose. Actual handling
       // (reconnect vs. stop) is determined by the close code in onclose.
       // No action needed here beyond the implicit close that follows.
     };
 
-    socket.onclose = (closeEvent: CloseEvent): void => {
-      if (closed) return;
+    currentSocket.onclose = (closeEvent: CloseEvent): void => {
+      if (closed || socket !== currentSocket) return;
+      socket = null;
 
       switch (closeEvent.code) {
         case RUN_STREAM_CLOSE_CODE.NORMAL:

@@ -143,25 +143,13 @@ def client_anonymous() -> Iterator[TestClient]:
 # ---------------------------------------------------------------------------
 
 
-def test_get_returns_freeform_default_for_brand_new_user(client_as_alice: TestClient) -> None:
+def test_get_returns_unwritten_defaults_for_brand_new_user(client_as_alice: TestClient) -> None:
     response = client_as_alice.get("/api/composer-preferences")
     assert response.status_code == 200
     body = response.json()
-    assert body["default_mode"] == "freeform"
+    assert "default_mode" not in body
     assert body["freeform_intro_dismissed_at"] is None
     assert body["tutorial_completed_at"] is None
-
-
-def test_patch_updates_default_mode(client_as_alice: TestClient) -> None:
-    response = client_as_alice.patch(
-        "/api/composer-preferences",
-        json={"default_mode": "freeform"},
-    )
-    assert response.status_code == 200
-    assert response.json()["default_mode"] == "freeform"
-
-    follow_up = client_as_alice.get("/api/composer-preferences")
-    assert follow_up.json()["default_mode"] == "freeform"
 
 
 def test_patch_persists_intro_dismissal(client_as_alice: TestClient) -> None:
@@ -191,7 +179,7 @@ def test_patch_persists_freeform_intro_dismissal(client_as_alice: TestClient) ->
 def test_patch_sets_tutorial_completed_at(client_as_alice: TestClient) -> None:
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"default_mode": "freeform", "tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T12:30:00Z"},
+        json={"tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T12:30:00Z"},
     )
     assert response.status_code == 200
     assert "2026-05-15T12:30:00" in response.json()["tutorial_completed_at"]
@@ -201,14 +189,13 @@ def test_patch_atomic_finalisation_payload(client_as_alice: TestClient) -> None:
     response = client_as_alice.patch(
         "/api/composer-preferences",
         json={
-            "default_mode": "freeform",
             "tutorial_completed_via": "complete",
             "tutorial_completed_at": "2026-05-15T12:35:00Z",
         },
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["default_mode"] == "freeform"
+    assert "default_mode" not in body
     assert "2026-05-15T12:35:00" in body["tutorial_completed_at"]
 
 
@@ -236,7 +223,7 @@ def test_patch_with_explicit_null_clears_intro_dismissal(client_as_alice: TestCl
 def test_patch_with_explicit_null_clears_tutorial(client_as_alice: TestClient) -> None:
     set_response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"default_mode": "freeform", "tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T12:40:00Z"},
+        json={"tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T12:40:00Z"},
     )
     assert set_response.status_code == 200
     assert set_response.json()["tutorial_completed_at"] is not None
@@ -257,7 +244,7 @@ def test_patch_rejects_non_datetime_tutorial(client_as_alice: TestClient) -> Non
     assert response.status_code == 422
 
 
-def test_patch_rejects_invalid_mode(client_as_alice: TestClient) -> None:
+def test_patch_rejects_any_mode_field(client_as_alice: TestClient) -> None:
     response = client_as_alice.patch(
         "/api/composer-preferences",
         json={"default_mode": "kiosk"},
@@ -282,7 +269,7 @@ def test_get_requires_auth(client_anonymous: TestClient) -> None:
 def test_patch_requires_auth(client_anonymous: TestClient) -> None:
     response = client_anonymous.patch(
         "/api/composer-preferences",
-        json={"default_mode": "freeform"},
+        json={"show_advanced": True},
     )
     assert response.status_code == 401
 
@@ -302,17 +289,17 @@ def test_users_cannot_see_each_others_preferences(
     fixture below puts both clients on one engine so the test actually
     exercises route-layer scoping.
     """
-    # Alice sets freeform on the shared DB.
+    # Alice changes detail level on the shared DB.
     resp = cross_user_alice.patch(
         "/api/composer-preferences",
-        json={"default_mode": "guided"},
+        json={"show_advanced": True},
     )
     assert resp.status_code == 200
 
-    # Bob on the SAME DB still sees the Freeform default.
+    # Bob on the SAME DB still sees the standard detail level.
     bob_resp = cross_user_bob.get("/api/composer-preferences")
     assert bob_resp.status_code == 200
-    assert bob_resp.json()["default_mode"] == "freeform"
+    assert bob_resp.json()["show_advanced"] is False
 
 
 def test_patch_enforces_rate_limit_returns_429() -> None:
@@ -324,11 +311,11 @@ def test_patch_enforces_rate_limit_returns_429() -> None:
 
     # Two PATCHes inside the 60s window succeed.
     for _ in range(2):
-        ok = client.patch("/api/composer-preferences", json={"default_mode": "freeform"})
+        ok = client.patch("/api/composer-preferences", json={"show_advanced": True})
         assert ok.status_code == 200, ok.text
 
     # Third within the window must 429.
-    over = client.patch("/api/composer-preferences", json={"default_mode": "guided"})
+    over = client.patch("/api/composer-preferences", json={"show_advanced": False})
     assert over.status_code == 429, over.text
 
 
@@ -400,15 +387,15 @@ def test_patch_persists_tutorial_progress_round_trip(client_as_alice: TestClient
     reload GETs them back and resumes at the persisted stage."""
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"tutorial_stage": "guided", "tutorial_session_id": "sess-http-1"},
+        json={"tutorial_stage": "build", "tutorial_session_id": "sess-http-1"},
     )
     assert response.status_code == 200
     body = response.json()
-    assert body["tutorial_stage"] == "guided"
+    assert body["tutorial_stage"] == "build"
     assert body["tutorial_session_id"] == "sess-http-1"
 
     follow_up = client_as_alice.get("/api/composer-preferences").json()
-    assert follow_up["tutorial_stage"] == "guided"
+    assert follow_up["tutorial_stage"] == "build"
     assert follow_up["tutorial_session_id"] == "sess-http-1"
 
 
@@ -423,8 +410,7 @@ def test_patch_rejects_invalid_tutorial_stage(client_as_alice: TestClient) -> No
 
 
 def test_e2e_reset_recipe_clears_tutorial_progress(client_as_alice: TestClient) -> None:
-    """The e2e harness reset recipe — PATCH {"tutorial_completed_at": null,
-    "default_mode": "guided"} — must restart the tutorial cleanly at Welcome
+    """The reset recipe — PATCH {"tutorial_completed_at": null} — must restart at Welcome
     even when a resume stage lingers from an interrupted tutorial."""
     client_as_alice.patch(
         "/api/composer-preferences",
@@ -433,7 +419,7 @@ def test_e2e_reset_recipe_clears_tutorial_progress(client_as_alice: TestClient) 
 
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"tutorial_completed_at": None, "default_mode": "guided"},
+        json={"tutorial_completed_at": None},
     )
     assert response.status_code == 200
     body = response.json()
@@ -456,7 +442,7 @@ def test_completion_clears_tutorial_progress_over_http(client_as_alice: TestClie
 
     response = client_as_alice.patch(
         "/api/composer-preferences",
-        json={"default_mode": "freeform", "tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T13:00:00Z"},
+        json={"tutorial_completed_via": "complete", "tutorial_completed_at": "2026-05-15T13:00:00Z"},
     )
     assert response.status_code == 200
     body = response.json()
@@ -474,30 +460,27 @@ def test_patch_persists_show_advanced(client_as_alice: TestClient) -> None:
 
 
 @pytest.mark.parametrize("intent", ["complete", "skip", "exit"])
-def test_completion_requires_intent_and_freeform_over_http(client_as_alice: TestClient, intent: str) -> None:
+def test_completion_requires_intent_over_http(client_as_alice: TestClient, intent: str) -> None:
     payload = {
         "tutorial_completed_at": "2026-09-20T00:00:00Z",
         "tutorial_completed_via": intent,
-        "default_mode": "freeform",
     }
-    for missing in ("tutorial_completed_via", "default_mode"):
+    for missing in ("tutorial_completed_via",):
         response = client_as_alice.patch(
             "/api/composer-preferences",
             json={key: value for key, value in payload.items() if key != missing},
         )
         assert response.status_code == 422
-    response = client_as_alice.patch("/api/composer-preferences", json={**payload, "default_mode": "guided"})
-    assert response.status_code == 422
     response = client_as_alice.patch("/api/composer-preferences", json=payload)
     assert response.status_code == 200
-    assert response.json()["default_mode"] == "freeform"
+    assert "default_mode" not in response.json()
     assert response.json()["tutorial_completed_at"] is not None
     assert "tutorial_completed_via" not in response.json()
 
 
 @pytest.mark.parametrize(
     "progress",
-    [{"tutorial_stage": "guided"}, {"tutorial_session_id": "stale"}, {"tutorial_run_id": "stale"}, {"tutorial_source_data_hash": "stale"}],
+    [{"tutorial_stage": "build"}, {"tutorial_session_id": "stale"}, {"tutorial_run_id": "stale"}, {"tutorial_source_data_hash": "stale"}],
 )
 def test_late_progress_cannot_resurrect_completed_tutorial(client_as_alice: TestClient, progress: dict[str, str]) -> None:
     endpoint = "/api/composer-preferences"
@@ -506,12 +489,11 @@ def test_late_progress_cannot_resurrect_completed_tutorial(client_as_alice: Test
         json={
             "tutorial_completed_at": "2026-09-20T00:00:00Z",
             "tutorial_completed_via": "exit",
-            "default_mode": "freeform",
         },
     )
     assert completed.status_code == 200
     stored_before = client_as_alice.get(endpoint).json()
-    response = client_as_alice.patch(endpoint, json={**progress, "default_mode": "guided"})
+    response = client_as_alice.patch(endpoint, json=progress)
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "tutorial_progress_conflict"
     assert client_as_alice.get(endpoint).json() == stored_before

@@ -127,8 +127,6 @@ describe("ExecuteButton", () => {
       activeSessionId: null,
       compositionState: null,
       isComposing: false,
-      guidedChatPending: false,
-      guidedResponsePending: false,
     } as never);
     resetStore(useInterpretationEventsStore);
     resetStore(useAuditReadinessStore);
@@ -161,9 +159,7 @@ describe("ExecuteButton", () => {
     ).toBeInTheDocument();
   });
 
-  it.each(["isComposing", "guidedChatPending", "guidedResponsePending"] as const)(
-    "blocks Run and its shortcut while %s, then re-enables Run",
-    (pendingFlag) => {
+  it("blocks Run and its shortcut while composing, then re-enables Run", () => {
       useExecutionStore.setState({
         validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS },
         runDisclosureAckBySession: { "sess-1": true },
@@ -173,7 +169,7 @@ describe("ExecuteButton", () => {
       const button = screen.getByRole("button", { name: "Run pipeline" });
       expect(button).toBeEnabled();
 
-      act(() => useSessionStore.setState({ [pendingFlag]: true }));
+      act(() => useSessionStore.setState({ isComposing: true }));
       expect(button).toBeDisabled();
       expect(button).toHaveAttribute("aria-disabled", "true");
       expect(screen.getByText("Wait for the composer to finish thinking.")).toBeInTheDocument();
@@ -182,13 +178,12 @@ describe("ExecuteButton", () => {
       expect(useExecutionStore.getState().execute).not.toHaveBeenCalled();
       expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
 
-      act(() => useSessionStore.setState({ [pendingFlag]: false }));
+      act(() => useSessionStore.setState({ isComposing: false }));
       expect(button).toBeEnabled();
       expect(button).not.toHaveAttribute("aria-disabled");
       fireEvent.click(button);
       expect(useExecutionStore.getState().execute).toHaveBeenCalledWith("sess-1");
-    },
-  );
+  });
 
   it("blocks an open Run confirmation when Composer starts thinking", () => {
     useExecutionStore.setState({

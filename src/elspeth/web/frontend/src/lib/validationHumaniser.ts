@@ -1,19 +1,3 @@
-// ============================================================================
-// validationHumaniser — plain-language rendering of backend validation dumps.
-//
-// Relocated out of components/chat/guided/PipelineValidationSummary.tsx
-// (elspeth-d9e5d157cb) so NON-component layers can share it. The chat
-// validation-failure injection lives in a store (stores/subscriptions.ts) and
-// could not reach the humaniser while it lived in the component tree, so it
-// leaked raw engine dumps + a "[type] id:" internal-id prefix into chat. This
-// pure module (no React, no store) is importable by the store, the audit panel
-// (ReadinessRowDetail), and the chat components alike — so all four
-// novice-register surfaces name steps and phrase failures identically.
-//
-// Depends only on pure leaves (pipelineGloss, interpretationStepLabel,
-// catalog/pluginDisplayName) + types/utils — none of them import React, a
-// store, or this module, so there is no import cycle.
-// ============================================================================
 
 import {
   buildPlainPhraseMap,
@@ -31,7 +15,7 @@ import {
   WRITE_CSV_PHRASE,
   WRITE_JSON_PHRASE,
   WRITE_RESULTS_PHRASE,
-} from "@/components/chat/guided/pipelineGloss";
+} from "@/components/chat/pipelineGloss";
 import {
   descriptionLabel,
   isPluginDerivedId,
@@ -535,21 +519,4 @@ export function formatFindingBody(
   return prefix !== null
     ? `${count} ${label} — '${prefix}': ${finding.headline}`
     : `${count} ${label} — ${finding.headline}`;
-}
-
-/** Closed status `_guided_persisted_validity` stamps on every guided
- *  pre-commit checkpoint: under deferred guided commit the composition
- *  state stays empty until Confirm wiring commits the accepted proposal,
- *  so this status describes the placeholder that the confirm action itself
- *  replaces — never a defect the user can act on. Gating the wire-stage
- *  Confirm on it deadlocks guided authoring (elspeth-859e2702dd); the wire
- *  turn's own server-computed `can_confirm`/`blockers` — validated against
- *  the proposal candidate — remain the authoritative confirm gate. */
-export const GUIDED_DEFERRED_COMMIT_STATUS = "guided_composition_invalid";
-
-/** Persisted composition errors that should gate the wire-stage Confirm
- *  client-side (elspeth-3b35abf148 variant 3), with the guided
- *  deferred-commit placeholder excluded. */
-export function clientWireBlockerMessages(errors: readonly CompositionValidationError[]): CompositionValidationError[] {
-  return errors.filter((error) => error.error_code !== GUIDED_DEFERRED_COMMIT_STATUS);
 }

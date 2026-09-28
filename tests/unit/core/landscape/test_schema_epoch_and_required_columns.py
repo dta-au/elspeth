@@ -24,6 +24,7 @@ from elspeth.core.landscape.schema import (
     aggregation_results_table,
     artifacts_table,
     batches_table,
+    call_verifications_table,
     checkpoints_table,
     metadata,
     node_states_table,
@@ -52,10 +53,14 @@ def test_epoch_is_forty_seven() -> None:
     # Epoch 43 gives every digest column a shape CHECK (SQLite ignores VARCHAR width).
     # Epoch 44 adds replay/verify evidence. Epoch 45 records collector-group failures.
     # Epoch 46 stores each valid source row's exact contract.
+    # Epoch 47 gives verification reads indexed run ordering and parent checks.
     # Epoch 48 gives source quarantine a durable PENDING_SINK handoff, deletes
     # source-row replay, and admits the resume_refused coordination event.
     assert SQLITE_SCHEMA_EPOCH == 48
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
+    assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)
+    index = next(index for index in call_verifications_table.indexes if index.name == "ix_call_verifications_run")
+    assert [column.name for column in index.columns] == ["current_run_id", "recorded_at", "current_call_id"]
 
 
 def test_epoch_45_collector_group_failure_reason_is_the_closed_vocabulary() -> None:

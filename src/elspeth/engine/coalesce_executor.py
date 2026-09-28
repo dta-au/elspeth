@@ -83,9 +83,9 @@ class CoalesceOutcome:
             evidence of its group — the group failed closed with ZERO arrived
             members (a loss or timeout before any arrival), so nothing was
             written at the barrier when it failed. The audit derive counts a
-            failed barrier per (node, row) pair with a FAILED state, so this
-            straggler is where the live ``rows_coalesce_failed`` must count
-            that group, exactly once.
+            failed barrier per (node, fork group) pair with a FAILED state, so
+            this straggler is where the live ``rows_coalesce_failed`` must
+            count that group, exactly once.
     """
 
     held: bool
@@ -560,7 +560,7 @@ class CoalesceExecutor:
         # (``CoalesceOutcome.first_failure_evidence``). Bounded with
         # ``_completed_keys`` — an evicted key is dropped here too, and a
         # straggler rediscovered through the Landscape fallback then reports
-        # False (the one tolerated live/audit rows_coalesce_failed corner).
+        # False (the one tolerated rows_coalesce_failed corner: audit exceeds live).
         self._failed_without_member_state: set[tuple[str, str]] = set()
 
     def register_coalesce(

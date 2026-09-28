@@ -49,7 +49,6 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.prompt_artifact import approved_prompt_artifact_hash
-from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -95,7 +94,7 @@ from elspeth.web.sessions.service import (
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
 # Fixtures and helpers
@@ -115,7 +114,7 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    instance = DualFencedSessionServiceHarness(
+    instance = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1154,7 +1153,7 @@ def _runtime_preflight_result(*, is_valid: bool, messages: tuple[str, ...] = ())
 
 
 def _preflight_service(engine, runtime_preflight) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1332,7 +1331,7 @@ async def test_pending_inline_reference_uses_prepared_bytes_in_runtime_preflight
         preflight_bytes.append(blob_get_content(blob_id)[1])
         return _runtime_preflight_result(is_valid=True)
 
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1379,7 +1378,7 @@ async def test_resolve_inline_reference_uses_prepared_bytes(engine) -> None:
         preflight_bytes.append(blob_get_content(blob_id)[1])
         return _runtime_preflight_result(is_valid=True)
 
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1428,7 +1427,7 @@ async def test_pending_inline_reference_refuses_blob_row_changed_after_read(engi
             conn.execute(update(blobs_table).where(blobs_table.c.id == str(blob_id)).values(**blob_update))
         return record_holder[0], content
 
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
@@ -1652,27 +1651,8 @@ async def test_opt_out_auto_resolve_persists_runtime_preflight_verdict(engine) -
     assert _GRAPH_STRUCTURE_ERROR in [error.message for error in current_state.validation_errors or ()]
 
 
-@pytest.mark.parametrize(
-    ("composer_meta", "expected_errors"),
-    [
-        (
-            {"guided_session": GuidedSession.initial().to_dict()},
-            (CompositionValidationError(message="guided_composition_invalid", error_code="guided_composition_invalid", component=None),),
-        ),
-        (
-            None,
-            (CompositionValidationError(message="/srv/private.csv token=VALIDATION-CREDENTIAL-CANARY", error_code=None, component="node"),),
-        ),
-    ],
-    ids=("guided-closes-validator-text", "freeform-preserves-validator-text"),
-)
 @pytest.mark.asyncio
-async def test_resolve_interpretation_normalizes_validation_for_its_composer_surface(
-    service,
-    monkeypatch,
-    composer_meta,
-    expected_errors,
-) -> None:
+async def test_resolve_interpretation_preserves_validator_text(service, monkeypatch) -> None:
     session_id = uuid4()
     surfacing_state = await _seed_state_with_llm_node(service, session_id=session_id)
     event = await service.create_pending_interpretation_event(
@@ -1696,7 +1676,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
             metadata_={"name": "Phase 5b Test", "description": ""},
             is_valid=False,
             validation_errors=[CompositionValidationError(message="stale unresolved placeholder", error_code=None, component=None)],
-            composer_meta=composer_meta,
+            composer_meta=None,
         ),
         provenance="session_seed",
     )
@@ -1718,7 +1698,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
         actor="user:alice",
     )
 
-    assert new_state.validation_errors == expected_errors
+    assert new_state.validation_errors == (CompositionValidationError(message=canary, error_code=None, component="node"),)
 
 
 @pytest.mark.asyncio
@@ -1797,7 +1777,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
     alias.  Validating that authored shape directly cannot construct the LLM
     pass-through transform and therefore collapses its output guarantees to
     empty.  The interpretation writer must use the same transient profile
-    lowering as guided composition before persisting its new validity state.
+    lowering as ordinary composition before persisting its new validity state.
     """
     from pathlib import Path
 
@@ -1842,7 +1822,7 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         selected_profile_aliases=((llm_id, "tutorial"),),
         binding_generation_fingerprint="profiled-interpretation-test-generation",
     )
-    policy_service = DualFencedSessionServiceHarness(
+    policy_service = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),

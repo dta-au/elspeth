@@ -1,33 +1,3 @@
-// src/lib/compositionContent.ts
-//
-// "Did the AUTHORED pipeline actually change?" — the content question the
-// frontend previously answered with `compositionState.version`, which is a
-// write counter, not a content identity.
-//
-// Why this exists (elspeth-986801d218). Every settlement writes a new
-// `composition_states` row and bumps `version`, including settlements that
-// author nothing: a post-completion guided chat persists a byte-identical
-// row so the reply has a state to hang off. Two version-keyed subscribers in
-// `stores/subscriptions.ts` then fired on that bump — one cleared the
-// validation verdict, the other POSTed `/validate` — and until the
-// re-validation landed `useCompletionOutcome` read `executionReady=false` and
-// the completed heading flipped "Pipeline ready" → "Pipeline updated". Asking
-// a question about a pipeline must not un-verify it.
-//
-// The field set is the SAME one the backend hashes into
-// `composition_content_hash` (`web/composer/pipeline_proposal.py:796-805`):
-// `sources`, `nodes`, `edges`, `outputs`, `metadata` — authored content,
-// excluding `version`, `id`, timestamps, validation results and guided
-// metadata. Keep the two in step: a field the backend starts hashing is a
-// field a change to which must re-validate here.
-//
-// SAFE DIRECTION — when unsure, return FALSE. A false "not equal" costs one
-// redundant `/validate` (exactly today's behaviour, so no regression); a
-// false "equal" suppresses a clear + re-validate that a REAL edit needed and
-// leaves a stale verdict on screen. Every branch below therefore resolves an
-// unknown shape to "not equal". Skipping the frontend validate never widens
-// admission either way: the server re-runs the full preflight at execute
-// (`web/execution/service.py`), so the run gate is unaffected.
 
 import type { CompositionState } from "@/types/index";
 

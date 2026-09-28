@@ -35,19 +35,18 @@ from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
     PipelineProposal,
-    PlannerSurface,
     composition_content_hash,
 )
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
-from elspeth.web.sessions.protocol import CompositionStateData
-from elspeth.web.sessions.service import (
+from elspeth.web.sessions.proposal_authority import (
     _composition_state_data_content_hash,
     _pipeline_audit_payload_hash,
     _pipeline_private_arguments_hash,
 )
+from elspeth.web.sessions.protocol import CompositionStateData
 from tests.unit.web.composer.conftest import _fake_llm_response, _FakeComposeLLM
 
 _COALESCE_TAG = "composer.coalesce-ordered-branches.v1"
@@ -167,12 +166,8 @@ def _proposal(pipeline: dict[str, Any]) -> PipelineProposal:
     return PipelineProposal.create(
         pipeline=pipeline,
         base=AbsentBase(),
-        reviewed_facts={},
-        surface=PlannerSurface.GUIDED_FULL,
         repair_count=0,
         skill_hash=stable_hash("planner-skill"),
-        covered_deferred_intent_ids=(),
-        supersedes_draft_hash=None,
     )
 
 
@@ -408,8 +403,8 @@ def test_restore_of_empty_projected_coalesce_map_is_an_empty_map() -> None:
 
 
 def test_runtime_preflight_key_differs_for_coalesce_reorder(fake_composer_service: ComposerServiceImpl) -> None:
-    abc = fake_composer_service._runtime_preflight_key(_state(("a", "b", "c")), session_scope="s", plugin_snapshot=None)
-    acb = fake_composer_service._runtime_preflight_key(_state(("a", "c", "b")), session_scope="s", plugin_snapshot=None)
+    abc = fake_composer_service._preflight.key(_state(("a", "b", "c")), session_scope="s", plugin_snapshot=None)
+    acb = fake_composer_service._preflight.key(_state(("a", "c", "b")), session_scope="s", plugin_snapshot=None)
     assert abc.state_version == acb.state_version
     assert abc.state_content_hash != acb.state_content_hash
     assert abc != acb

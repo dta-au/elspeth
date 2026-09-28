@@ -86,8 +86,8 @@ class RowUnionOutcome:
             evidence of its group — the group was closed by a branch loss
             before any sibling arrived, so nothing was written at the barrier.
             The live ``rows_coalesce_failed`` counts that group here, exactly
-            once (the audit derive's unit is a (node, row) pair with a FAILED
-            state).
+            once (the audit derive's unit is a (node, fork group) pair with a
+            FAILED state).
     """
 
     held: bool

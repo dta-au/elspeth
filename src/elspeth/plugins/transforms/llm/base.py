@@ -46,21 +46,23 @@ _MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
 # remedies for one error code (elspeth-920bd88299).
 #
 # Rewrite-the-reference leads DELIBERATELY. Declaring the read name is correct
-# only when the producer guarantees that exact spelling, and config time cannot
+# only when the producer guarantees that exact spelling, and the template cannot
 # tell: ``SchemaContract.find_name`` matches a field's ``normalized_name`` OR
 # its ``original_name``, so ``{{ row.Name }}`` may resolve against a header
-# ``Name`` while the row key is ``name`` — and ``verify_declared_required_fields``
-# is a plain set difference over row keys with NO dual-name limb. Measured:
-# declaring the read name there is ACCEPTED at config time and then raises
-# DeclaredRequiredInputFieldsViolation on EVERY row. Leading with it would hand
-# the planner a repair that clears this error and breaks the run.
+# ``Name`` while the row key is ``name``. Declaring a name the producer does not
+# guarantee is REFUSED when the pipeline is validated: an explicit
+# ``required_input_fields`` entry is checked against the producer's guarantees
+# (Phase 1, which fails closed against an observed producer), and a header
+# spelling of a carried field is refused by the field-name spelling rule. It
+# used to be accepted and then fail every row at run time. Leading with it
+# would still hand the planner a repair that trades this error for another.
 _UNDECLARED_ROW_FIELDS_REMEDY: Final[str] = (
     "Rewrite each reference to a field the node already declares — that always applies, and a "
     "spelling the declaration does not carry works at best by accident of the producer's original "
     "header. Add a name to options.required_input_fields ONLY if the upstream producer guarantees "
     "that exact name (declare the parenthesised form where one is shown; the bracket literal itself "
-    "is not a legal declaration entry). Declaring a name the producer does not guarantee is accepted "
-    "here and then fails every row at run time. Do not empty required_input_fields to silence this: "
+    "is not a legal declaration entry). Declaring a name the producer does not guarantee is refused "
+    "when the pipeline is validated. Do not empty required_input_fields to silence this: "
     "[] withdraws the contract for every field the node reads, including the unconditional ones."
 )
 
@@ -975,14 +977,31 @@ class LLMConfig(TransformDataConfig):
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
-        """``required_input_fields`` plus every ``image_inputs`` field/format_field.
+        """``required_input_fields`` plus every REQUIRED ``image_inputs`` field/format_field.
 
-        Mirrors ``AWSTextractInlineAnalysisConfig.declared_input_fields``: an
-        image input column is consumed the same as any other authored input
-        column, so the DAG must see it in the requiredness contract even
+        Mirrors ``AWSTextractInlineAnalysisConfig.declared_input_fields``: a
+        required image input column is consumed the same as any other authored
+        input column, so the DAG must see it in the requiredness contract even
         though nothing in ``prompt_template`` interpolates it.
+
+        An image the author marked ``required: false`` is NOT declared: the
+        plugin treats its absence as a valid row and sends the call without it
+        (``image_inputs.resolve_image_parts``), and its ``format_field`` is read
+        only when the image is present. Declaring it made the engine refuse
+        that valid row before ``process()`` (a run abort, and after R2 a routed
+        ``missing_field``). The column is still READ when present, so
+        ``LLMTransform.consumed_input_fields`` keeps it (``image_input_fields``).
         """
         if self.image_inputs is None:
             return super().declared_input_fields
-        image_field_names = {name for spec in self.image_inputs for name in (spec.field, spec.format_field) if name is not None}
-        return super().declared_input_fields | frozenset(image_field_names)
+        required_image_fields = {
+            name for spec in self.image_inputs if spec.required for name in (spec.field, spec.format_field) if name is not None
+        }
+        return super().declared_input_fields | frozenset(required_image_fields)
+
+    @property
+    def image_input_fields(self) -> frozenset[str]:
+        """Every column an ``image_inputs`` entry reads — ``field`` and ``format_field``, required or not."""
+        if self.image_inputs is None:
+            return frozenset()
+        return frozenset(name for spec in self.image_inputs for name in (spec.field, spec.format_field) if name is not None)

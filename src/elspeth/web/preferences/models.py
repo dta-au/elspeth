@@ -19,22 +19,8 @@ string→datetime coercion entirely), which is too aggressive for a
 Tier-3 boundary whose contract is "validate, coerce where the standard
 wire format permits, never fabricate".
 
-The Literal ``ComposerMode`` still rejects ``"kiosk"`` and any other
-out-of-set value on both models, and ``extra="forbid"`` rejects typos.
-
-The Literal ``ComposerMode`` is the single source of truth for the
-permitted-values set. It is paired with:
-  - the DB-level CHECK constraint on ``user_preferences_table``
-  - the Tier-1 read guard in ``PreferencesService._row_to_prefs``
-  - the ``MODES`` Record in the frontend's
-    ``api/preferencesDecoder.ts``, which is keyed by the ``ComposerMode``
-    TS union so a frontend-side addition is a compile error there
-
-Extending the set requires updating all four call sites in lockstep —
-the Literal here, the CHECK in ``sessions/models.py``, the service read
-guard, and the decoder's Record. Only the first three are Python; the
-decoder is the cross-language one, and adding a value here without it
-makes the decoder reject a now-valid payload.
+The Composer has one authoring surface, freeform, so preferences carry no
+mode selector. ``extra="forbid"`` rejects retired mode-setting requests.
 
 Separately from the permitted-VALUES covenant above, the FIELD SET of
 ``ComposerPreferences`` is itself a closed cross-language contract. The
@@ -52,8 +38,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-ComposerMode = Literal["guided", "freeform"]
-
 # First-run tutorial resume stage (elspeth-918f4434b3). Mirrors the frontend
 # ``TutorialStep`` union (tutorialMachine.ts) minus ``"welcome"`` — the
 # Welcome bookend is never persisted (nothing has started; ``None`` is the
@@ -62,10 +46,10 @@ ComposerMode = Literal["guided", "freeform"]
 # ``sessions/models.py``, the Tier-1 read guard in
 # ``PreferencesService._row_to_prefs``, and the ``STAGES`` Record in the
 # frontend's ``api/preferencesDecoder.ts`` in lockstep — same rule, and the
-# same four sites, as ``ComposerMode`` above. The decoder fails closed on an
+# same four sites. The decoder fails closed on an
 # unlisted stage, so adding a value here without it makes the frontend reject
 # a payload the server considers valid.
-TutorialStage = Literal["guided", "run", "audit", "graduation"]
+TutorialStage = Literal["build", "run", "audit", "graduation"]
 
 
 class ComposerPreferences(BaseModel):
@@ -83,7 +67,6 @@ class ComposerPreferences(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
-    default_mode: ComposerMode
     freeform_intro_dismissed_at: datetime | None
     tutorial_completed_at: datetime | None
     # In-progress tutorial resume state. All four are NULL when no tutorial
@@ -103,7 +86,7 @@ class ComposerPreferences(BaseModel):
 class UpdateComposerPreferencesRequest(BaseModel):
     """Partial-update payload for PATCH.
 
-    Fields are optional except for the coupled completion intent and mode;
+    Fields are optional except for the coupled completion intent;
     the service writes only the
     fields the caller actually set. An empty PATCH is a no-op (the
     request succeeds; ``updated_at`` is bumped if any row already
@@ -115,7 +98,7 @@ class UpdateComposerPreferencesRequest(BaseModel):
       - Field absent from JSON → unchanged.
       - JSON ``null`` → clear/reset the tutorial completion gate.
       - ISO-8601 datetime string → set to that value; requires an explicit
-        ``tutorial_completed_via`` and ``default_mode="freeform"``.
+        ``tutorial_completed_via``.
 
     This field uses ``model_fields_set`` in the service so the reset
     affordance can distinguish "not mentioned" from "clear it".
@@ -133,7 +116,6 @@ class UpdateComposerPreferencesRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    default_mode: ComposerMode | None = None
     freeform_intro_dismissed_at: datetime | None = None
     tutorial_completed_at: datetime | None = None
     tutorial_stage: TutorialStage | None = None
@@ -141,7 +123,7 @@ class UpdateComposerPreferencesRequest(BaseModel):
     tutorial_run_id: str | None = None
     tutorial_source_data_hash: str | None = None
     show_advanced: bool | None = None
-    # Request-only intent; completion and the Freeform default are one write.
+    # Request-only completion intent.
     tutorial_completed_via: Literal["complete", "skip", "exit"] | None = None
 
     @model_validator(mode="after")
@@ -154,8 +136,6 @@ class UpdateComposerPreferencesRequest(BaseModel):
         if self.tutorial_completed_at is not None:
             if self.tutorial_completed_via is None:
                 raise ValueError("tutorial_completed_at requires tutorial_completed_via")
-            if self.default_mode != "freeform":
-                raise ValueError("tutorial completion requires default_mode=freeform")
         elif "tutorial_completed_via" in self.model_fields_set:
             raise ValueError("tutorial_completed_via requires a non-null tutorial_completed_at in the same PATCH")
         return self

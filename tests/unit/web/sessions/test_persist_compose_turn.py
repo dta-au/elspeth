@@ -20,19 +20,19 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.audit import llm_call_audit_envelope
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
-from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._persist_payload import StatePayload
 from elspeth.web.sessions.models import session_operation_fences_table
-from elspeth.web.sessions.service import SessionServiceImpl, _valid_compartment_ingress_metadata
+from elspeth.web.sessions.proposal_authority import _valid_compartment_ingress_metadata
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.unit.web.conftest import _make_session as _make_session_row
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _TEST_FENCE_NAMESPACE = UUID("6794cf0c-4b9d-40b9-ad19-d6f9afff30dd")
 
 
-def test_guided_checkpoint_ingress_requires_exact_digest_and_sorted_markings() -> None:
+def test_compartment_ingress_requires_exact_digest_and_sorted_markings() -> None:
     valid = {"text_sha256": "a" * 64, "foreign_compartment_ids": ["foreign-a", "foreign-b"]}
     assert _valid_compartment_ingress_metadata(valid)
     assert not _valid_compartment_ingress_metadata({**valid, "text_sha256": "A" * 64})
@@ -89,46 +89,6 @@ def _llm_call_envelope() -> dict[str, object]:
     )
 
 
-@pytest.mark.asyncio
-async def test_transition_response_takeover_rolls_back_state_and_assistant(service) -> None:
-    """A stale COMPOSE owner must not publish either half of the response."""
-    from uuid import uuid4
-
-    from sqlalchemy import update
-
-    from elspeth.web.sessions.protocol import CompositionStateData
-
-    session_id = uuid4()
-    stale_context = _test_compose_context(str(session_id))
-    with service._engine.begin() as conn:
-        _make_session(conn, session_id=str(session_id))
-        conn.execute(
-            update(session_operation_fences_table)
-            .where(session_operation_fences_table.c.session_id == str(session_id))
-            .values(
-                operation_id="successor-operation",
-                lease_token="successor-token",
-                operation_epoch=2,
-                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
-            )
-        )
-
-    with pytest.raises(SessionOperationFenceLost):
-        await service.commit_transition_response(
-            session_id=session_id,
-            expected_current_state_id=None,
-            state=CompositionStateData(
-                composer_meta={"guided_session": {"transition_consumed": True}},
-            ),
-            assistant_content="must not persist",
-            raw_content=None,
-            session_operation_context=stale_context,
-        )
-
-    assert await service.get_current_state(session_id) is None
-    assert await service.get_messages(session_id, limit=None) == []
-
-
 @pytest.fixture
 def service(engine, tmp_path) -> SessionServiceImpl:
     """Use the shared in-memory SQLite ``engine`` fixture from
@@ -142,7 +102,7 @@ def service(engine, tmp_path) -> SessionServiceImpl:
     """
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-    instance = DualFencedSessionServiceHarness(
+    instance = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -409,7 +369,7 @@ def test_file_backed_sqlite_sequence_allocator_smoke(tmp_path):
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service = DualFencedSessionServiceHarness(
+    service = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -439,7 +399,7 @@ def test_file_backed_sqlite_lock_serializes_independent_connections(tmp_path):
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service: SessionServiceImpl = DualFencedSessionServiceHarness(
+    service: SessionServiceImpl = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
@@ -804,7 +764,7 @@ def test_file_backed_sqlite_lock_serializes_same_session_state_version_allocatio
     db_path = tmp_path / "sessions.db"
     engine = create_session_engine(f"sqlite:///{db_path}")
     initialize_session_schema(engine)
-    service: SessionServiceImpl = DualFencedSessionServiceHarness(
+    service: SessionServiceImpl = FencedSessionServiceHarness(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),

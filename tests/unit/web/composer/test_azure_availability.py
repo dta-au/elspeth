@@ -43,7 +43,15 @@ def test_azure_readiness_uses_provider_credentials(
         composer_advisor_reasoning_effort="none",
     )
     service = ComposerServiceImpl.for_trained_operator(catalog=MagicMock(spec=CatalogService), settings=settings)
-    result = compute_availability(service)
+    result = compute_availability(
+        model=service._model,
+        advisor_model=service._settings.composer_advisor_model,
+        advisor_provider=service._advisor_provider,
+        endpoint_base_url=service._endpoint_base_url,
+        endpoint_api_key=service._endpoint_api_key,
+        advisor_endpoint_base_url=service._advisor_endpoint_base_url,
+        advisor_endpoint_api_key=service._advisor_endpoint_api_key,
+    )
     assert result.available is available
     if not available:
         assert result.missing_keys == (("AZURE_API_KEY",) if provider == "azure" else ("AZURE_AI_API_KEY",))

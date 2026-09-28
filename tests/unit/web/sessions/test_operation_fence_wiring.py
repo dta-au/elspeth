@@ -23,7 +23,6 @@ from elspeth.contracts.blobs import (
     BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
-    BlobGuidedOperationWriteFence,
     BlobRecord,
     BlobReplacementPlan,
     BlobRunLinkDirection,
@@ -44,7 +43,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.approval_authority import ApprovalGateInputs
 from elspeth.web.coordination.contracts import SessionOperationContext
@@ -57,7 +56,6 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes import interpretation as interpretation_routes
 from elspeth.web.sessions.routes import messages as message_routes
-from elspeth.web.sessions.routes.guided_operations import reserve_or_replay_guided_operation
 from elspeth.web.sessions.service import SessionServiceImpl
 
 
@@ -70,8 +68,8 @@ def _required_parameter(owner: type[Any] | Any, method_name: str, parameter_name
 
 
 @pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
-def test_guided_reservation_requires_the_exact_parent_session_context(owner: type[Any]) -> None:
-    parameter = _required_parameter(owner, "reserve_guided_operation", "session_operation_context")
+def test_operation_receipt_reservation_requires_the_exact_parent_session_context(owner: type[Any]) -> None:
+    parameter = _required_parameter(owner, "reserve_operation_receipt", "session_operation_context")
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
 
 
@@ -81,14 +79,6 @@ def test_run_admission_requires_the_exact_session_context(owner: type[Any], meth
     parameter = _required_parameter(owner, method_name, "session_operation_context")
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.annotation is SessionOperationContext or parameter.annotation == "SessionOperationContext"
-
-
-def test_route_guided_reservation_adapter_cannot_omit_parent_authority() -> None:
-    source = textwrap.dedent(inspect.getsource(reserve_or_replay_guided_operation))
-    assert "SessionOperationLease.acquire" in source
-    assert "SessionOperationKind.COMPOSE" in source
-    assert "SessionOperationKind.SESSION_FORK" in source
-    assert "session_operation_context=session_lease.context" in source
 
 
 def test_send_message_acquires_compose_authority_before_state_or_message_access() -> None:
@@ -301,17 +291,6 @@ def test_pending_interpretation_callers_forward_existing_authority() -> None:
     assert "session_operation_context=" in state_source
 
 
-def test_guided_atomic_transaction_exposes_interpretation_capability_without_connection_callback() -> None:
-    transaction = sessions_protocol.SessionOperationMutationTransaction
-    interpretations_property = transaction.interpretations
-    assert interpretations_property.fget is not None
-    interpretations = inspect.signature(interpretations_property.fget, eval_str=True).return_annotation
-    assert interpretations is sessions_protocol.SessionOperationInterpretationMutations
-    source = inspect.getsource(SessionServiceImpl.settle_guided_state_operation)
-    assert "Callable[[Connection], InterpretationEventRecord]" not in source
-    assert ".interpretations.create_or_reconcile_pending(" in source
-
-
 def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
     source = textwrap.dedent(inspect.getsource(interpretation_routes.register_interpretation_routes))
     tree = ast.parse(source)
@@ -337,7 +316,7 @@ def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
 def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
     batch_source = textwrap.dedent(inspect.getsource(tool_batch.run_tool_batch))
     assert "session_operation_context=ctx.session_operation_context" in batch_source
-    dispatch_source = textwrap.dedent(inspect.getsource(ComposerServiceImpl._dispatch_session_aware_tool))
+    dispatch_source = textwrap.dedent(inspect.getsource(SessionToolOwner._dispatch_session_aware_tool))
     assert "session_operation_context=session_operation_context" in dispatch_source
 
 
@@ -659,14 +638,7 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     BlobReplacementPlan,
                 ),
                 "discard_pending_blob": (
-                    (
-                        ("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),
-                        (
-                            "guided_operation_write_fence",
-                            inspect.Parameter.KEYWORD_ONLY,
-                            BlobGuidedOperationWriteFence | None,
-                        ),
-                    ),
+                    (("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     bool,
                 ),
                 "finalize_pending_output_blob": (
@@ -720,14 +692,7 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     BlobReplacementPlan,
                 ),
                 "mark_blob_ready": (
-                    (
-                        ("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),
-                        (
-                            "guided_operation_write_fence",
-                            inspect.Parameter.KEYWORD_ONLY,
-                            BlobGuidedOperationWriteFence | None,
-                        ),
-                    ),
+                    (("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     BlobRecord,
                 ),
                 "mark_run_output_blob_error": (
@@ -792,11 +757,6 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                         ("record", inspect.Parameter.KEYWORD_ONLY, BlobRecord),
                         ("max_storage_per_session", inspect.Parameter.KEYWORD_ONLY, int),
                         ("idempotent", inspect.Parameter.KEYWORD_ONLY, bool),
-                        (
-                            "guided_operation_write_fence",
-                            inspect.Parameter.KEYWORD_ONLY,
-                            BlobGuidedOperationWriteFence | None,
-                        ),
                     ),
                     bool,
                 ),

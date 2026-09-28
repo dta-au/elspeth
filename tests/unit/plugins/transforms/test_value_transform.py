@@ -199,6 +199,48 @@ class TestValueTransformBehavior:
         assert result.reason.get("reason") == "invalid_input"
         assert "missing" in result.reason.get("message", "").lower()
 
+    def test_computed_key_miss_reason_is_value_free(self, ctx: "PluginContext") -> None:
+        """A key computed from the row never reaches the audit reason (C3, review r1 F1)."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "operations": [{"target": "region", "expression": "row[row['code']]"}],
+            }
+        )
+        result = transform.process(make_pipeline_row({"code": "CUSTOMER_PRIVATE_739"}), ctx)
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "invalid_input",
+            "field": "region",
+            "error_type": "missing_key",
+            "message": "Key <a key the expression does not spell out> not found in PipelineRow",
+        }
+
+    def test_format_key_miss_reason_is_value_free(self, ctx: "PluginContext") -> None:
+        """``str % mapping`` names a row-derived key the mapping lacks (C3, review r2).
+
+        Its KeyError used to crash through evaluate() with the key as its text; it
+        is a routable missing-key row error whose reason never names the key.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "operations": [{"target": "label", "expression": "row['fmt'] % {'a': 1}"}],
+            }
+        )
+        result = transform.process(make_pipeline_row({"fmt": "%(CUSTOMER_PRIVATE_739)s"}), ctx)
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "invalid_input",
+            "field": "label",
+            "error_type": "missing_key",
+            "message": "%-format key not found in dict (Mod operation)",
+        }
+
     def test_type_error_in_expression(self, ctx: "PluginContext") -> None:
         from elspeth.plugins.transforms.value_transform import ValueTransform
 

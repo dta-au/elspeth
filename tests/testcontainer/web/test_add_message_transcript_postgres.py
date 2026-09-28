@@ -11,18 +11,22 @@ its own insert regardless — the non-vacuous post-fix contract.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import structlog
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import chat_messages_table
+from elspeth.web.sessions.models import chat_messages_table, message_ingress_receipts_table, sessions_table
+from elspeth.web.sessions.protocol import MessageIngressAccepted, MessageIngressFresh
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -90,13 +94,17 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
         # seed row — the pooled-stale-reader condition from production.
         assert _count(stale_reader) == 1
 
-        record, transcript = await postgres_service.add_message_with_transcript(
+        result = await postgres_service.add_message_with_transcript(
             session.id,
             "user",
             "hello",
+            client_request_id=uuid4(),
+            requested_state_id=None,
             writer_principal="route_user_message",
             session_operation_context=context,
         )
+        assert isinstance(result, MessageIngressFresh)
+        record, transcript = result.message, result.transcript
 
         # The REPEATABLE READ snapshot still cannot see the committed
         # insert — the stale-reader condition is real...
@@ -114,3 +122,92 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
 
     # After the pinned transaction ends, a fresh read converges.
     assert [message.content for message in await postgres_service.get_messages(session.id, limit=None)] == ["seed", "hello"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_two_service_instances_accept_one_receipt_for_same_key_and_session_cascade(
+    postgres_service: SessionServiceImpl,
+    postgres_engine: Engine,
+    tmp_path: Path,
+) -> None:
+    with postgres_engine.begin() as conn:
+        ensure_test_identity(conn, identity_id="alice")
+    session = await postgres_service.create_session("alice", "PG ingress race", "local")
+    second = SessionServiceImpl(
+        postgres_engine,
+        data_dir=tmp_path,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.add-message-transcript.second"),
+        session_operation_authority=postgres_service.session_operation_authority,
+        owner_instance_id=postgres_service.session_operation_owner_instance_id,
+    )
+    context = postgres_service.session_operation_authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=postgres_service.session_operation_owner_instance_id,
+        lease_seconds=postgres_service.session_operation_lease_seconds,
+    )
+    request_id = uuid4()
+    try:
+        results = await asyncio.gather(
+            postgres_service.add_message_with_transcript(
+                session.id,
+                "user",
+                "one admission",
+                client_request_id=request_id,
+                requested_state_id=None,
+                writer_principal="route_user_message",
+                session_operation_context=context,
+            ),
+            second.add_message_with_transcript(
+                session.id,
+                "user",
+                "one admission",
+                client_request_id=request_id,
+                requested_state_id=None,
+                writer_principal="route_user_message",
+                session_operation_context=context,
+            ),
+        )
+        assert sorted(type(result).__name__ for result in results) == ["MessageIngressAccepted", "MessageIngressFresh"]
+        fresh = next(result for result in results if isinstance(result, MessageIngressFresh))
+        accepted = next(result for result in results if isinstance(result, MessageIngressAccepted))
+        assert accepted.user_message_id == fresh.message.id
+        with postgres_engine.connect() as conn:
+            assert (
+                conn.scalar(
+                    select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))
+                )
+                == 1
+            )
+            assert (
+                conn.scalar(
+                    select(func.count())
+                    .select_from(message_ingress_receipts_table)
+                    .where(message_ingress_receipts_table.c.session_id == str(session.id))
+                )
+                == 1
+            )
+        with postgres_engine.begin() as conn:
+            with pytest.raises(IntegrityError), conn.begin_nested():
+                conn.execute(
+                    update(message_ingress_receipts_table)
+                    .where(message_ingress_receipts_table.c.session_id == str(session.id))
+                    .values(requested_state_id=None)
+                )
+            with pytest.raises(IntegrityError), conn.begin_nested():
+                conn.execute(delete(message_ingress_receipts_table).where(message_ingress_receipts_table.c.session_id == str(session.id)))
+    finally:
+        postgres_service.session_operation_authority.release(context)
+
+    with postgres_engine.begin() as conn:
+        conn.execute(delete(sessions_table).where(sessions_table.c.id == str(session.id)))
+    with postgres_engine.connect() as conn:
+        assert (
+            conn.scalar(
+                select(func.count())
+                .select_from(message_ingress_receipts_table)
+                .where(message_ingress_receipts_table.c.session_id == str(session.id))
+            )
+            == 0
+        )

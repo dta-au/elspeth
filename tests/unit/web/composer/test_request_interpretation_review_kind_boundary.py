@@ -1,7 +1,7 @@
 """Trust-boundary test for ``_request_interpretation_review_kind_from_arguments``.
 
 Binds the ``@trust_boundary(tier=3, source_param="arguments", suppresses=("R5",))``
-decorator on the helper in ``web/composer/service.py``. The function builds the
+decorator on the helper in ``web/composer/session_tool.py``. The function builds the
 ``InterpretationKind`` discriminator for an audit row from the LLM tool-call
 payload (Tier 3); a non-string ``kind`` must be REJECTED with a typed
 ``AuditIntegrityError`` rather than coerced or written into a fabricated row.
@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.service import _request_interpretation_review_kind_from_arguments
+from elspeth.web.composer.session_tool import _request_interpretation_review_kind_from_arguments
 
 
 def test_non_str_kind_raises_audit_integrity_error() -> None:

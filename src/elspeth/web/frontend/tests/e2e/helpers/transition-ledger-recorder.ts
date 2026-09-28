@@ -1,7 +1,6 @@
 // Playwright glue for the per-transition tutorial ledger (harness/transition-ledger.ts).
 //
-// Intercepts every transition request (POST guided/start|respond|chat and
-// POST /api/tutorial/run) with page.route, forwards it to the deployment, and
+// Intercepts freeform authoring requests and POST /api/tutorial/run, forwards them, and
 // HOLDS the response back from the browser until the backend's durable audit
 // rows have been re-read. The browser cannot fire the next gesture before the
 // held response arrives, so every audit row first seen after a request is the
@@ -34,8 +33,7 @@ import {
 } from "../harness/transition-ledger";
 import { fetchLlmAuditMessages } from "./tutorial-harness";
 
-// A guided transition can legitimately take minutes (two multi-minute planner
-// runs on the pre-remediation tutorial); route.fetch's 30 s default would
+// A Composer transition can legitimately take minutes; route.fetch's 30 s default would
 // abort the walk. Matches the driver's own 900 s walk deadline.
 const TRANSITION_FETCH_TIMEOUT_MS = 900_000;
 // How long finalize() waits for an in-flight transition before reporting it
@@ -47,23 +45,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function summarizeRequest(endpoint: TransitionEndpoint, body: unknown): TransitionRequestView {
-  const view: TransitionRequestView = {
-    start_profile: null,
-    respond_shape: null,
-    control_signal: null,
-    chat_message_chars: null,
-  };
+  const view: TransitionRequestView = { chat_message_chars: null };
   if (!isRecord(body)) return view;
-  if (endpoint === "guided/start") {
-    view.start_profile = typeof body.profile === "string" ? body.profile : null;
-  } else if (endpoint === "guided/respond") {
-    const arms = (["chosen", "custom_inputs", "edited_values"] as const).filter(
-      (arm) => body[arm] !== null && body[arm] !== undefined,
-    );
-    view.control_signal = typeof body.control_signal === "string" ? body.control_signal : null;
-    view.respond_shape = arms.length > 0 ? arms.join("+") : view.control_signal === null ? "empty" : "control_signal";
-  } else if (endpoint === "guided/chat") {
-    view.chat_message_chars = typeof body.message === "string" ? body.message.length : null;
+  if (endpoint === "freeform/compose") {
+    view.chat_message_chars = typeof body.content === "string" ? body.content.length : null;
   }
   return view;
 }
@@ -72,39 +57,30 @@ function summarizeResponse(
   endpoint: TransitionEndpoint,
   status: number | null,
   body: unknown,
-  previousTurnToken: string | null,
-): { view: TransitionResponseView; turnToken: string | null | undefined } {
+): TransitionResponseView {
   const view: TransitionResponseView = {
     status,
-    step_after: null,
     next_turn_type: null,
     new_turn_occurrence: false,
-    terminal: null,
-    assistant_message_kind: null,
     run_id: null,
   };
-  if (!isRecord(body)) return { view, turnToken: undefined };
+  if (!isRecord(body)) return view;
   if (endpoint === "tutorial/run") {
     view.run_id = typeof body.run_id === "string" ? body.run_id : null;
-    return { view, turnToken: undefined };
+    return view;
   }
-  const session = body.guided_session;
-  if (isRecord(session) && typeof session.step === "string") view.step_after = session.step;
-  const terminal = body.terminal;
-  if (isRecord(terminal) && typeof terminal.kind === "string") view.terminal = terminal.kind;
-  if (typeof body.assistant_message_kind === "string") view.assistant_message_kind = body.assistant_message_kind;
-  const nextTurn = body.next_turn;
-  let turnToken: string | null = null;
-  if (isRecord(nextTurn)) {
-    if (typeof nextTurn.type === "string") view.next_turn_type = nextTurn.type;
-    if (typeof nextTurn.turn_token === "string") turnToken = nextTurn.turn_token;
+  if (endpoint === "freeform/compose") {
+    const proposals = body.proposals;
+    if (Array.isArray(proposals) && proposals.length > 0) {
+      view.next_turn_type = "freeform_proposal";
+      view.new_turn_occurrence = true;
+    } else if (isRecord(body.state)) {
+      view.next_turn_type = "freeform_state";
+      view.new_turn_occurrence = true;
+    }
+    return view;
   }
-  view.new_turn_occurrence = turnToken !== null && turnToken !== previousTurnToken;
-  return { view, turnToken };
-}
-
-export interface TransitionLedgerRecorderOptions {
-  legacyAutoRun: boolean;
+  return view;
 }
 
 export class TransitionLedgerRecorder {
@@ -114,7 +90,6 @@ export class TransitionLedgerRecorder {
   private readonly knownIds = new Set<string>();
   private afterUnavailable = false;
   private lastRespondedAt: number | null = null;
-  private lastTurnToken: string | null = null;
   private phase: string | null = null;
   private bundle: string | null = null;
   // Route handlers run concurrently per request; chain them so the pending
@@ -127,7 +102,6 @@ export class TransitionLedgerRecorder {
   constructor(
     private readonly page: Page,
     private readonly ctx: APIRequestContext,
-    private readonly options: TransitionLedgerRecorderOptions,
   ) {}
 
   async install(): Promise<void> {
@@ -215,7 +189,7 @@ export class TransitionLedgerRecorder {
     } catch (error) {
       const failed = {
         ...base,
-        response: summarizeResponse(endpoint, null, null, this.lastTurnToken).view,
+        response: summarizeResponse(endpoint, null, null),
         responded_at_ms: null,
         wall_clock_ms: null,
         error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
@@ -233,8 +207,7 @@ export class TransitionLedgerRecorder {
     } catch {
       responseBody = null;
     }
-    const { view, turnToken } = summarizeResponse(endpoint, response.status(), responseBody, this.lastTurnToken);
-    if (turnToken !== undefined && response.ok()) this.lastTurnToken = turnToken;
+    const view = summarizeResponse(endpoint, response.status(), responseBody);
 
     // The durable read happens BEFORE the browser sees this response.
     const evidence = await this.readEvidence();
@@ -256,7 +229,7 @@ export class TransitionLedgerRecorder {
   private async readEvidence(): Promise<TransitionEvidence> {
     if (this.sessionId === null) {
       this.afterUnavailable = true;
-      return unavailableTransitionEvidence("session id not yet observed on a guided request");
+      return unavailableTransitionEvidence("session id not yet observed on a composer request");
     }
     try {
       const rows = summarizeLlmAuditRows(await fetchLlmAuditMessages(this.ctx, this.sessionId));
@@ -300,7 +273,7 @@ export class TransitionLedgerRecorder {
     const totals = ledgerTotals(entries, postGestures, finalRows);
     return {
       schema: TRANSITION_LEDGER_SCHEMA,
-      deployment: { bundle: this.bundle, legacy_auto_run: this.options.legacyAutoRun },
+      deployment: { bundle: this.bundle },
       session_id: this.sessionId,
       entries,
       post_gestures: postGestures,

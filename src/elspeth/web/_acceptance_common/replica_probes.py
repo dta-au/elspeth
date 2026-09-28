@@ -12,8 +12,9 @@ the ``mechanism`` that produced its evidence from a closed set, each probe may
 only claim the mechanisms the tree actually has for it, and P4b cannot be
 constructed with any outcome but ``cannot_pass``:
 
-- **P1** concurrent guided operations on one session from two replicas end in
-  a fence conflict, never a double dispatch — ``session_operation_fence``.
+- **P1** concurrent freeform message ingress on one session from two replicas
+  ends in a fence conflict and one durable ingress receipt, never a double
+  dispatch — ``session_operation_fence``.
 - **P2** concurrent run starts end in one run and one 409 —
   ``session_operation_fence_execute``. The result has no field for a
   ``run_start_permits`` row: the legacy receipt measures fence contention,
@@ -50,6 +51,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Final, Literal, TypedDict
+from uuid import UUID
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -203,13 +205,13 @@ class ReplicaResponse:
 
 @dataclass(frozen=True)
 class FenceConflictTrial:
-    """P1: one concurrent pair of guided operations and the fence facts around it."""
+    """P1: one concurrent freeform message pair and its durable fence facts."""
 
     responses: tuple[ReplicaResponse, ReplicaResponse]
     fence_epoch_before: int
     fence_epoch_after: int
     fence_owner_after: str | None
-    guided_operation_rows: int
+    message_ingress_receipt_rows: int
     dispatch_spread_ms: float
 
 
@@ -311,8 +313,8 @@ def decide_fence_conflict(
             reasons.append(f"trial[{index}]:fence_epoch_not_advanced_by_one")
         if trial.fence_owner_after != winner:
             reasons.append(f"trial[{index}]:fence_owner_is_not_the_winner")
-        if trial.guided_operation_rows != 1:
-            reasons.append(f"trial[{index}]:guided_operation_rows:{trial.guided_operation_rows}!=1")
+        if trial.message_ingress_receipt_rows != 1:
+            reasons.append(f"trial[{index}]:message_ingress_receipt_rows:{trial.message_ingress_receipt_rows}!=1")
         if trial.dispatch_spread_ms > max_dispatch_spread_ms:
             reasons.append(f"trial[{index}]:dispatch_spread_ms:{trial.dispatch_spread_ms:.3f}>{max_dispatch_spread_ms}")
     if trials and len(winners) < 2:
@@ -520,7 +522,7 @@ class EvidenceObserver(ABC):
     def fence_owner(self, session_id: str) -> str | None: ...
 
     @abstractmethod
-    def guided_operation_rows(self, session_id: str, *, since_epoch: int) -> int: ...
+    def message_ingress_receipt_rows(self, session_id: str, *, client_request_id: str) -> int: ...
 
     @abstractmethod
     def runs_row_ids(self, session_id: str) -> tuple[str, ...]: ...
@@ -622,7 +624,18 @@ class ReplicaProbeDriver:
         return responses, spread_ms
 
     def fence_conflict_trial(self, session_id: str, request: ProbeRequest) -> FenceConflictTrial:
-        """One P1 trial: read the fence, fire the pair, read the fence and the operation rows again."""
+        """One P1 trial: fire one freeform request on both replicas and read its receipt."""
+
+        body = request.json_body
+        if type(body) is not dict or type(body.get("client_request_id")) is not str:
+            raise AcceptanceInputError("P1 requires a client_request_id in the freeform message body")
+        request_id = body["client_request_id"]
+        try:
+            parsed_request_id = UUID(request_id)
+        except ValueError as exc:
+            raise AcceptanceInputError("P1 client_request_id must be a canonical UUID") from exc
+        if str(parsed_request_id) != request_id:
+            raise AcceptanceInputError("P1 client_request_id must be a canonical UUID")
 
         epoch_before = self._observer.fence_epoch(session_id)
         responses, spread_ms = self.fire_pair(request, expected_statuses={200, 202, 409})
@@ -631,7 +644,7 @@ class ReplicaProbeDriver:
             fence_epoch_before=epoch_before,
             fence_epoch_after=self._observer.fence_epoch(session_id),
             fence_owner_after=self._observer.fence_owner(session_id),
-            guided_operation_rows=self._observer.guided_operation_rows(session_id, since_epoch=epoch_before),
+            message_ingress_receipt_rows=self._observer.message_ingress_receipt_rows(session_id, client_request_id=request_id),
             dispatch_spread_ms=spread_ms,
         )
 

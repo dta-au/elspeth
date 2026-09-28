@@ -1,7 +1,7 @@
 """Persisted-shape pins for the mid-turn compose writer (elspeth-67c6fa691d).
 
 Two writers share ``composition_states.is_valid``: the mid-turn compose
-writer (``ComposerServiceImpl._state_payload_for_compose_turn``, Stage-1
+writer (``turn_audit._state_payload_for_compose_turn``, Stage-1
 authoring lane) and the strict turn-end writer
 (``_composition_state_data_for_persist``). These tests pin the mid-turn
 lane's persisted shape:
@@ -18,7 +18,7 @@ lane's persisted shape:
 from __future__ import annotations
 
 import hashlib
-from typing import Any, cast
+from typing import Any
 
 import pytest
 
@@ -26,7 +26,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.compartments import ChatIngressInput
 from elspeth.web.composer.protocol import ComposerHistoryMessage
-from elspeth.web.composer.service import ComposerServiceImpl, _chat_ingress_inputs_for_compose
+from elspeth.web.composer.service import _chat_ingress_inputs_for_compose
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -35,6 +35,7 @@ from elspeth.web.composer.state import (
     ValidationSummary,
 )
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.composer.turn_audit import _state_payload_for_compose_turn
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
@@ -103,9 +104,7 @@ def _payload_for(state: CompositionState, validation: ValidationSummary) -> Any:
         validation=validation,
         affected_nodes=("rate_coolness",),
     )
-    # The method deletes ``self`` before use; invoke it unbound so the pin
-    # does not need a fully wired service instance.
-    return ComposerServiceImpl._state_payload_for_compose_turn(cast(Any, None), tool_result)
+    return _state_payload_for_compose_turn(tool_result)
 
 
 def test_mid_turn_state_binds_exact_chat_input_and_foreign_markings() -> None:
@@ -115,9 +114,7 @@ def test_mid_turn_state_binds_exact_chat_input_and_foreign_markings() -> None:
 
     from elspeth.web.compartments import compartment_ingress_record
 
-    payload = ComposerServiceImpl._state_payload_for_compose_turn(
-        cast(Any, None), result, ingress=compartment_ingress_record(submitted, own_compartment_id="own")
-    )
+    payload = _state_payload_for_compose_turn(result, ingress=compartment_ingress_record(submitted, own_compartment_id="own"))
 
     assert deep_thaw(payload.data.composer_meta) == {
         "validation_lane": "authoring_only",
@@ -145,7 +142,7 @@ def test_mid_turn_state_retains_prior_chat_paste_after_confirmation() -> None:
         },
     ]
 
-    payload = ComposerServiceImpl._state_payload_for_compose_turn(cast(Any, None), result, chat_ingress_inputs=inputs)
+    payload = _state_payload_for_compose_turn(result, chat_ingress_inputs=inputs)
 
     assert deep_thaw(payload.data.composer_meta)["chat_ingress_inputs"] == inputs
     assert pasted not in repr(deep_thaw(payload.data.composer_meta))

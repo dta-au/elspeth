@@ -7,7 +7,6 @@ import tomllib
 from pathlib import Path
 
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
-from elspeth.web.composer.guided.state_machine import GUIDED_SESSION_SCHEMA_VERSION
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -34,7 +33,6 @@ def test_readme_operational_cutover_states_the_live_schema_epochs() -> None:
 
     assert f"session epoch 53 to {SESSION_SCHEMA_EPOCH} " in text
     assert f"Landscape epoch 38 to {SQLITE_SCHEMA_EPOCH};" in text
-    assert f"guided schema remains at {GUIDED_SESSION_SCHEMA_VERSION}." in text
     assert "recreate both stale databases in the same service-stop window" in text
     assert f"install {version}." in text
 

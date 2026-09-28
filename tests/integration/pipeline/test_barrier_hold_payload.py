@@ -182,7 +182,7 @@ def build_pipeline(
     output_path = tmp_path / "out.jsonl"
     settings = load_settings_from_yaml_string((_SOURCE_AND_SINK + body_yaml).format(input_path=input_path, output_path=output_path))
     # A processing section may name the test-only passthrough-capable batch
-    # plugin: output_mode: passthrough admits no shipped plugin.
+    # plugin, an identity that adds no fields (the shipped batch_rank adds four).
     with passthrough_batch_plugins():
         bundle = instantiate_plugins_from_config(settings, preflight_mode=True, sink_effect_purpose=SinkEffectExecutionPurpose.FRESH)
     sinks = execution_sinks_for_runtime(settings, bundle.sinks)

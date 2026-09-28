@@ -8,7 +8,7 @@ import pytest
 from litellm import ModelResponse, Usage
 
 from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.composer import service as service_module
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
@@ -42,16 +42,16 @@ async def test_direct_service_call_uses_role_pricing_identity(tmp_path: Path, mo
         response._hidden_params = {}
         return response
 
-    monkeypatch.setattr(service_module, "_litellm_acompletion", complete)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
     recorder = BufferingRecorder()
     if surface == "advisor":
-        await service._call_advisor_with_audit(
+        await service._advisor_checkpoint._call_advisor_with_audit(
             {"trigger": "reactive", "problem_summary": "stuck", "recent_errors": [], "attempted_actions": []}, recorder=recorder
         )
     elif surface == "text":
-        await service._call_text_llm_with_audit([{"role": "user", "content": "Explain."}], timeout=5.0, recorder=recorder)
+        await service._provider_gateway._call_text_llm_with_audit([{"role": "user", "content": "Explain."}], timeout=5.0, recorder=recorder)
     else:
-        await service._call_llm_with_audit([{"role": "user", "content": "Explain."}], [], timeout=5.0, recorder=recorder)
+        await service._provider_gateway._call_llm_with_audit([{"role": "user", "content": "Explain."}], [], timeout=5.0, recorder=recorder)
     routing_model = "openai/advisor-datazone" if surface == "advisor" else "openai/primary-datazone"
     assert len(requests) == 1
     assert requests[0]["model"] == routing_model

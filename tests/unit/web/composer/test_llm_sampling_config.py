@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import elspeth.web.composer.service as svc
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
 
@@ -48,9 +48,9 @@ async def test_call_llm_omits_sampling_when_settings_are_none(monkeypatch: pytes
         captured.update(kwargs)
         return _response()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_llm([{"role": "user", "content": "hi"}], [])
+    await _service(tmp_path)._provider_gateway._call_llm([{"role": "user", "content": "hi"}], [])
 
     assert "temperature" not in captured
     assert "seed" not in captured
@@ -65,9 +65,9 @@ async def test_call_llm_sends_configured_sampling(monkeypatch: pytest.MonkeyPatc
         captured.update(kwargs)
         return _response()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path, composer_temperature=0.0, composer_seed=42)._call_llm(
+    await _service(tmp_path, composer_temperature=0.0, composer_seed=42)._provider_gateway._call_llm(
         [{"role": "user", "content": "hi"}],
         [],
     )
@@ -84,9 +84,9 @@ async def test_text_llm_omits_sampling_when_settings_are_none(monkeypatch: pytes
         captured.update(kwargs)
         return _response("text")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_text_llm([{"role": "user", "content": "hi"}])
+    await _service(tmp_path)._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
 
     assert "temperature" not in captured
     assert "seed" not in captured
@@ -100,9 +100,9 @@ async def test_advisor_omits_sampling_when_settings_are_none(monkeypatch: pytest
         captured.update(kwargs)
         return _response("advice")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path)._call_advisor_with_audit(
+    await _service(tmp_path)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -124,9 +124,9 @@ async def test_advisor_sends_configured_sampling(monkeypatch: pytest.MonkeyPatch
         captured.update(kwargs)
         return _response("advice")
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
 
-    await _service(tmp_path, composer_temperature=0.0, composer_seed=42)._call_advisor_with_audit(
+    await _service(tmp_path, composer_temperature=0.0, composer_seed=42)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",

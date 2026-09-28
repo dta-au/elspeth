@@ -11,7 +11,6 @@ import type {
   RunAccounting,
   ValidationResult,
 } from "@/types";
-import type { GetGuidedResponse } from "@/types/guided";
 import type {
   InterpretationEvent,
   ListInterpretationEventsResponse,
@@ -37,7 +36,6 @@ export const DESKTOP_VIEWPORTS = [
 export const WORKSPACE_SCENARIOS = [
   "empty-freeform",
   "populated-long-transcript",
-  "active-guided-decision",
   "validation-audit-issues",
   "pending-acknowledgement",
   "active-completed-run",
@@ -290,51 +288,6 @@ function longTranscript(sessionId: string): ChatMessage[] {
   });
 }
 
-function guidedFixture(
-  sessionId: string,
-  compositionState: CompositionState,
-): GetGuidedResponse {
-  return {
-    guided_session: {
-      step: "step_1_source",
-      history: [],
-      terminal: null,
-      chat_history: [
-        {
-          role: "assistant",
-          content: "Choose the authoritative input for this pipeline.",
-          seq: 0,
-          step: "step_1_source",
-          ts_iso: FIXED_TIME,
-          assistant_message_kind: "assistant",
-          synthetic_failure_reason: null,
-          turn_token: null,
-        },
-      ],
-      chat_turn_seq: 1,
-      // Server-projected reviewed ledger (elspeth-f2a8550b3d): required on
-      // the wire. Empty at step 1 before the first review turn.
-      reviewed_components: { sources: [], outputs: [] },
-      profile: { coaching: true, bookends: true },
-    },
-    next_turn: {
-      type: "single_select",
-      step_index: 0,
-      turn_token: "a".repeat(64),
-      payload: {
-        question: "Which source should the pipeline use?",
-        options: [
-          { id: "csv", label: "CSV", hint: "Use the uploaded CSV fixture." },
-          { id: "inline_blob", label: "Inline rows", hint: null },
-        ],
-        allow_custom: false,
-      },
-    },
-    terminal: null,
-    composition_state: { ...compositionState, session_id: sessionId },
-  };
-}
-
 function validationIssues(): ValidationResult {
   const errors = Array.from({ length: 24 }, (_, index) => ({
     component_id: "source",
@@ -359,6 +312,7 @@ function validationIssues(): ValidationResult {
         component_type: "source",
         detail: `Deterministic validation issue ${index + 1}`,
         suggestion: null,
+        note: null,
       })),
     },
   };
@@ -471,14 +425,6 @@ async function fulfillWorkspaceRoute(
 
   if (pathname === `/api/sessions/${sessionId}/messages` && method === "GET") {
     await route.fulfill({ json: scenario === "populated-long-transcript" ? longTranscript(sessionId) : [] });
-    return true;
-  }
-  if (pathname === `/api/sessions/${sessionId}/guided` && method === "GET") {
-    await route.fulfill({
-      json: scenario === "active-guided-decision" && compositionState !== null
-        ? guidedFixture(sessionId, compositionState)
-        : { guided_session: null, next_turn: null, terminal: null, composition_state: null },
-    });
     return true;
   }
   if (pathname === `/api/sessions/${sessionId}/interpretations` && method === "GET") {

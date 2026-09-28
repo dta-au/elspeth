@@ -80,16 +80,18 @@ export type {
 // (trust_mode / density_default) re-exported above. The name disambiguator is
 // the `User*` prefix — see plan 13 Task 1 review history for the rationale.
 
-export type ComposerMode = "guided" | "freeform";
-
 // First-run tutorial resume stage (elspeth-918f4434b3). Mirrors the
 // backend `TutorialStage` Literal (preferences/models.py) — the frontend
 // TutorialStep union minus "welcome" (never persisted; null is the
 // no-in-progress-tutorial state).
-export type PersistedTutorialStage = "guided" | "run" | "audit" | "graduation";
+export type PersistedTutorialStage = "build" | "run" | "audit" | "graduation";
+
+/** Runtime-served sample pages for the ordinary freeform tutorial brief. */
+export interface TutorialSampleResponse {
+  sample_urls: string[];
+}
 
 export interface UserComposerPreferencesPayload {
-  default_mode: ComposerMode;
   freeform_intro_dismissed_at: string | null;
   tutorial_completed_at: string | null;
   // In-progress tutorial resume state; all four null when no tutorial is
@@ -110,7 +112,6 @@ export interface UserComposerPreferencesPayload {
 }
 
 export interface UpdateUserComposerPreferencesPayload {
-  default_mode?: ComposerMode;
   freeform_intro_dismissed_at?: string | null;
   tutorial_completed_at?: string | null;
   // Absent = unchanged; explicit null = clear. Setting (or clearing)
@@ -122,7 +123,7 @@ export interface UpdateUserComposerPreferencesPayload {
   tutorial_source_data_hash?: string | null;
   show_advanced?: boolean;
   // Request-only completion provenance. A non-null completion requires this
-  // discriminator and default_mode="freeform" together; never echoed back.
+  // discriminator for a non-null completion; never echoed back.
   tutorial_completed_via?: "complete" | "skip" | "exit";
 }
 
@@ -130,6 +131,11 @@ export interface UpdateUserComposerPreferencesPayload {
 
 export interface TutorialRunRequest {
   session_id: string;
+}
+
+/** Read-only admission of the exact saved state that Run will recheck. */
+export interface TutorialReadinessResponse {
+  state_id: string;
 }
 
 /** Response of POST /api/tutorial/cancel. Idempotent best-effort cancel:

@@ -20,7 +20,8 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolOutcomeResponse,
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError
-from elspeth.web.composer.service import ComposerServiceImpl, _MalformedLLMResponseError, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import _admit_composer_llm_completion, _MalformedLLMResponseError, composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ToolResult
 from tests.unit.web.composer._helpers import (
@@ -168,6 +169,9 @@ def test_persist_outcome_rejects_current_dispatch_identity_without_committed_row
             persisted_assistant_matches_current_dispatch=True,
             unwind_audit_failed=False,
             failed_turn=None,
+            redacted_assistant_tool_calls=(),
+            redacted_tool_rows=(),
+            audit_outcome=None,
         )
 
 
@@ -206,7 +210,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         return _mutating_set_source_tool(tool_name, *args, **kwargs)
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", return_value=provider_response),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", return_value=provider_response),
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_execute_admitted_tool),
     ):
         outcome = await service._call_model_turn(
@@ -233,7 +237,7 @@ async def test_model_turn_admits_one_snapshot_and_discards_raw_provider_objects(
         assert outcome.completion.message.content == "admitted content"
         assert [call.id for call in outcome.completion.tool_batch.calls] == ["call-admitted"]
 
-        plugin_snapshot, policy_catalog = service._plugin_policy_context(None)
+        plugin_snapshot, policy_catalog = service._policy_context.build(None)
         llm_messages: list[dict[str, Any]] = []
         dispatch, _advisor_calls_used = await service._dispatch_tool_batch(
             call_model=outcome,
@@ -291,7 +295,7 @@ async def test_malformed_model_turn_retains_only_admitted_provider_facts() -> No
     recorder = BufferingRecorder()
 
     with (
-        patch("elspeth.web.composer.service._litellm_acompletion", return_value=provider_response),
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", return_value=provider_response),
         pytest.raises(_MalformedLLMResponseError) as exc_info,
     ):
         await service._call_model_turn(
@@ -381,7 +385,7 @@ async def test_provider_timeout_carries_caller_turn_context() -> None:
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm_with_audit", new=_time_out),
+        patch.object(service._provider_gateway, "_call_llm_with_audit", new=_time_out),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
         await service._call_llm_before_deadline(
@@ -444,13 +448,13 @@ async def _run_mutate_then_timeout(service: ComposerServiceImpl, session_id: str
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            return _make_llm_response(
-                tool_calls=[{"id": "c1", "name": "set_source", "arguments": _SET_SOURCE_ARGUMENTS}],
+            return _admit_composer_llm_completion(
+                _make_llm_response(tool_calls=[{"id": "c1", "name": "set_source", "arguments": _SET_SOURCE_ARGUMENTS}])
             )
         raise TimeoutError
 
     with (
-        patch.object(service, "_call_llm", new=_first_tool_then_timeout),
+        patch.object(service._provider_gateway, "_call_llm", new=_first_tool_then_timeout),
         patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=_mutating_set_source_tool),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):

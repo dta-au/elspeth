@@ -692,35 +692,6 @@ def _proof_gate_state(
     )
 
 
-def _guided_sentinel_proof_gate_state(*, source_path: Path, blob_id: UUID) -> Any:
-    """Observed CSV numeric gate retaining the verified materializer's blob identity."""
-    from dataclasses import replace
-
-    from elspeth.web.composer.guided.resolved import SourceResolved
-    from elspeth.web.composer.guided.state_machine import GuidedSession
-
-    live_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
-    stable_id = str(uuid4())
-    guided = replace(
-        GuidedSession.initial(),
-        source_order=(stable_id,),
-        reviewed_sources={
-            stable_id: SourceResolved(
-                name="source",
-                plugin="csv",
-                options={
-                    "path": f"blob:{blob_id}",
-                    "schema": {"mode": "observed"},
-                },
-                observed_columns=("amount",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-    )
-    return replace(live_state, guided_session=guided)
-
-
 def _install_ready_proof_blob(
     service: ExecutionServiceImpl,
     *,
@@ -2022,22 +1993,28 @@ class TestExecutionFlow:
 
 class TestAuthoritativeProofDiagnostics:
     @pytest.mark.asyncio
-    async def test_guided_sentinel_with_valid_custody_reads_once_and_rejects_numeric_gate(
+    async def test_freeform_claimed_blob_with_wrong_session_fails_closed_without_reading(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
     ) -> None:
         session_id = uuid4()
         blob_id = uuid4()
-        source_path = tmp_path / "guided-sentinel-amounts.csv"
+        source_path = tmp_path / "freeform-claimed-amounts.csv"
         source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        blob_service.get_blob.return_value = _blob_record_stub(
             blob_id=blob_id,
-            source_path=source_path,
+            session_id=uuid4(),
+            filename=source_path.name,
+            mime_type="text/csv",
+            size_bytes=source_path.stat().st_size,
+            content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            storage_path=str(source_path),
+            status="ready",
         )
+        service._blob_service = blob_service
 
         with patch(
             "elspeth.web.execution.validation.validate_pipeline",
@@ -2049,135 +2026,52 @@ class TestAuthoritativeProofDiagnostics:
         assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
         assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
-        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
-            blob_id,
-            prefix_bytes=8 * 1024,
-            session_operation_context=context,
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("terminal_kind", ["live", "completed", "exited_to_freeform"])
-    async def test_guided_terminal_kind_never_removes_the_authoritative_source_proof(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-        terminal_kind: str,
-    ) -> None:
-        """elspeth-3b45cdb41e: the three-terminal table must reject identically.
-
-        Varying ONLY the guided terminal on an otherwise identical state, the
-        admission proof must resolve custody and reject the numeric gate the
-        same way. EXITED_TO_FREEFORM previously hit the export-family identity
-        return, ran zero resolver calls, and recorded a fabricated passing
-        proof check.
-        """
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
-
-        session_id = uuid4()
-        blob_id = uuid4()
-        source_path = tmp_path / f"terminal-{terminal_kind}-amounts.csv"
-        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
-        if terminal_kind == "completed":
-            terminal = TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}")
-        elif terminal_kind == "exited_to_freeform":
-            terminal = TerminalState(
-                kind=TerminalKind.EXITED_TO_FREEFORM,
-                reason=TerminalReason.USER_PRESSED_EXIT,
-                pipeline_yaml=None,
-            )
-        else:
-            terminal = None
-        if terminal is not None:
-            assert state.guided_session is not None
-            state = replace(state, guided_session=replace(state.guided_session, terminal=terminal))
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
-            blob_id=blob_id,
-            source_path=source_path,
-        )
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is False
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is False
-        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
-        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
-        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
-            blob_id,
-            prefix_bytes=8 * 1024,
-            session_operation_context=context,
-        )
-
-    @pytest.mark.asyncio
-    async def test_exited_history_that_cannot_bind_fails_closed_without_reading(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-    ) -> None:
-        """A diverged exited session blocks with a FAILED proof check, never a pass."""
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
-
-        session_id = uuid4()
-        blob_id = uuid4()
-        source_path = tmp_path / "exited-renamed-amounts.csv"
-        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        base = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
-        assert base.guided_session is not None
-        state = replace(
-            base,
-            sources={"renamed": base.sources["source"]},
-            guided_session=replace(
-                base.guided_session,
-                terminal=TerminalState(
-                    kind=TerminalKind.EXITED_TO_FREEFORM,
-                    reason=TerminalReason.USER_PRESSED_EXIT,
-                    pipeline_yaml=None,
-                ),
-            ),
-        )
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
-            blob_id=blob_id,
-            source_path=source_path,
-        )
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is False
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is False
-        assert "unavailable" in result.checks[23].detail
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
-        assert result.readiness.execution_ready is False
-        blob_service.get_blob.assert_not_awaited()
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_freeform_blob_with_valid_custody_reads_once_and_rejects_numeric_gate(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "freeform-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            context = make_blob_read_context(session_id)
+            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[23].name == "proof_diagnostics"
+        assert result.checks[23].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+            session_operation_context=context,
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "custody_failure",
         ["wrong_session", "wrong_path", "not_ready", "not_found"],
     )
-    async def test_guided_sentinel_with_failed_custody_is_invalid_without_reading(
+    async def test_freeform_blob_with_failed_custody_is_invalid_without_reading(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
@@ -2185,9 +2079,9 @@ class TestAuthoritativeProofDiagnostics:
     ) -> None:
         session_id = uuid4()
         blob_id = uuid4()
-        source_path = tmp_path / f"guided-sentinel-{custody_failure}.csv"
+        source_path = tmp_path / f"freeform-{custody_failure}.csv"
         source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
-        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
         blob_service = create_autospec(BlobServiceProtocol, instance=True)
         if custody_failure == "not_found":
             blob_service.get_blob.side_effect = BlobNotFoundError(str(blob_id))
@@ -2587,61 +2481,6 @@ class TestAuthoritativeProofDiagnostics:
         mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_guided_reviewed_source_binding_is_inspected_without_live_blob_ref(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-    ) -> None:
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.resolved import SourceResolved
-        from elspeth.web.composer.guided.state_machine import GuidedSession
-
-        session_id = uuid4()
-        blob_id = uuid4()
-        source_path = tmp_path / "guided-amounts.csv"
-        source_path.write_text("amount\n250.00\n", encoding="utf-8")
-        live_state = _proof_gate_state(source_path=source_path, blob_id=None)
-        stable_id = str(uuid4())
-        guided = replace(
-            GuidedSession.initial(),
-            source_order=(stable_id,),
-            reviewed_sources={
-                stable_id: SourceResolved(
-                    name="source",
-                    plugin="csv",
-                    options={
-                        "path": str(source_path),
-                        "blob_ref": str(blob_id),
-                        "schema": {"mode": "observed"},
-                    },
-                    observed_columns=("amount",),
-                    sample_rows=(),
-                    on_validation_failure="discard",
-                )
-            },
-        )
-        state = replace(live_state, guided_session=guided)
-        blob_service = _install_ready_proof_blob(
-            service,
-            session_id=session_id,
-            blob_id=blob_id,
-            source_path=source_path,
-        )
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is False
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
-        blob_service.get_blob.assert_awaited_once_with(blob_id, session_operation_context=context)
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize("schema_mode", ["fixed", "flexible"])
     async def test_explicit_numeric_source_schema_passes_proof(
         self,
@@ -2711,7 +2550,7 @@ class TestAuthoritativeProofDiagnostics:
         assert result.checks[23].passed is True
 
     @pytest.mark.asyncio
-    async def test_uninspectable_blob_source_abstains_with_passing_proof_check(
+    async def test_uninspectable_claimed_blob_source_fails_closed(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
@@ -2721,61 +2560,6 @@ class TestAuthoritativeProofDiagnostics:
         state = _proof_gate_state(
             source_path=source_path,
             blob_id=blob_id,
-        )
-        service._blob_service = None
-
-        with patch(
-            "elspeth.web.execution.validation.validate_pipeline",
-            return_value=_successful_core_validation_result(),
-        ):
-            session_id = uuid4()
-            context = make_blob_read_context(session_id)
-            result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
-
-        assert result.is_valid is True
-        assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is True
-        assert result.errors == []
-
-    @pytest.mark.asyncio
-    async def test_uninspectable_blob_source_with_exited_guided_claim_fails_closed(
-        self,
-        service: ExecutionServiceImpl,
-        tmp_path: Path,
-    ) -> None:
-        """elspeth-3b45cdb41e: exited review custody that cannot resolve must block.
-
-        Before the fix the exited sentinel claim was excluded from the
-        resolver's custody census (39c7fc635's parity with the export-family
-        skip), so an unresolvable claimed source abstained into a passing
-        proof check. Admission now keeps exited claims in the census and the
-        unresolvable claim surfaces as the blocking custody diagnostic.
-        """
-        from dataclasses import replace
-
-        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
-
-        blob_id = uuid4()
-        source_path = tmp_path / "not-authoritatively-resolved.csv"
-        state = _proof_gate_state(
-            source_path=source_path,
-            blob_id=blob_id,
-        )
-        historical_guided = _guided_sentinel_proof_gate_state(
-            source_path=source_path,
-            blob_id=blob_id,
-        ).guided_session
-        assert historical_guided is not None
-        state = replace(
-            state,
-            guided_session=replace(
-                historical_guided,
-                terminal=TerminalState(
-                    kind=TerminalKind.EXITED_TO_FREEFORM,
-                    reason=TerminalReason.USER_PRESSED_EXIT,
-                    pipeline_yaml=None,
-                ),
-            ),
         )
         service._blob_service = None
 
@@ -2793,7 +2577,7 @@ class TestAuthoritativeProofDiagnostics:
         assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
 
     @pytest.mark.asyncio
-    async def test_ambiguous_blob_path_binding_abstains_without_reading_bytes(
+    async def test_ambiguous_blob_path_binding_fails_without_reading_bytes(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
@@ -2832,9 +2616,10 @@ class TestAuthoritativeProofDiagnostics:
             context = make_blob_read_context(session_id)
             result = await service.validate_state(state, session_operation_context=context, user_id="alice", session_id=session_id)
 
-        assert result.is_valid is True
+        assert result.is_valid is False
         assert result.checks[23].name == "proof_diagnostics"
-        assert result.checks[23].passed is True
+        assert result.checks[23].passed is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
         blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
 
@@ -8389,20 +8174,7 @@ class TestBlobOwnership:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """Cross-session blob_ref raises ``BlobNotFoundError`` (IDOR collapse).
-
-        The exception type is load-bearing: the route handler relies
-        on cross-session and nonexistent blobs BOTH surfacing as
-        ``BlobNotFoundError`` so they produce byte-identical 404
-        responses.  Earlier this branch raised ``ValueError`` with a
-        "does not belong to session" message — a distinguishable
-        body AND a distinguishable status (404 vs the 500 that an
-        uncaught ``BlobNotFoundError`` produced for the nonexistent
-        case).  Do not revert to ``ValueError`` or add a specialised
-        subclass without also updating the route handler in
-        lockstep.
-        """
-        from elspeth.web.blobs.protocol import BlobNotFoundError
+        """The authoritative proof collapses cross-session custody to a generic rejection."""
 
         executing_session_id = uuid4()
         other_session_id = uuid4()
@@ -8425,8 +8197,11 @@ class TestBlobOwnership:
             "on_validation_failure": "quarantine",
         }
 
-        with pytest.raises(BlobNotFoundError):
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=executing_session_id)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert "session-owned path match" in str(exc_info.value)
+        assert str(other_session_id) not in str(exc_info.value)
 
         # Critical: create_run was never called (rejected before run creation)
         mock_session_service.create_run.assert_not_called()
@@ -8438,7 +8213,6 @@ class TestBlobOwnership:
         mock_session_service: MagicMock,
     ) -> None:
         """Cross-session blob_ref on a non-first named source preserves IDOR collapse."""
-        from elspeth.web.blobs.protocol import BlobNotFoundError
 
         executing_session_id = uuid4()
         other_session_id = uuid4()
@@ -8472,8 +8246,9 @@ class TestBlobOwnership:
             },
         }
 
-        with pytest.raises(BlobNotFoundError):
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=executing_session_id)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
 
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
@@ -8516,24 +8291,7 @@ class TestBlobOwnership:
 
 
 class TestBlobSourcePathReadGuard:
-    """Runtime read guard for composer-stored blob source paths.
-
-    The composer's write-side defenses make wrong-shape blob source paths
-    impossible to persist going forward, but the audit-integrity contract
-    also requires that runtime crash informatively if a previously-
-    persisted state row carries a path that disagrees with the canonical
-    ``BlobRecord.storage_path``.  Per docs/guides/data-trust-and-error-handling.md
-    §The Defensive Programming Prohibition,
-    the runtime must not silently coerce or fall back to ``FileNotFoundError``.
-
-    Bug-verification protocol (cf.
-    ``tests/integration/pipeline/test_composer_runtime_agreement.py``
-    module docstring lines 76-88): manually revert the
-    ``if stored_path != canonical_path: raise BlobSourcePathMismatchError``
-    block in ``ExecutionServiceImpl._execute_locked`` and confirm the
-    mismatch test below fails with the canonical-path branch silently
-    accepting the divergent stored path.  Then restore.
-    """
+    """Authoritative preflight rejects noncanonical blob paths before creating a run."""
 
     @pytest.mark.asyncio
     async def test_diverging_stored_path_raises_structured_error(
@@ -8541,21 +8299,7 @@ class TestBlobSourcePathReadGuard:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """Tier 1: stored path != blob.storage_path crashes at execute time.
-
-        Reproduces the captured staging defect (session
-        588b94c8-919c-43ab-ae2c-8a3033de8109): the persisted
-        ``source.options.path`` does not match the canonical
-        ``BlobRecord.storage_path``.  The captured shape was
-        ``data/blobs/<bid>/<filename>`` (rejected first by the source
-        path allowlist after the legacy resolver was removed); this test
-        exercises the divergence case where the path is allowlist-valid
-        but still not the canonical one (e.g. a stale absolute path
-        pointing at a different file under ``data_dir/blobs/``).  The
-        guard fires before the run record is created so the session is
-        not poisoned with a pending run.
-        """
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
+        """A stale allowlisted path is rejected before a run is created."""
 
         session_id = uuid4()
         blob_ref = str(uuid4())
@@ -8580,13 +8324,10 @@ class TestBlobSourcePathReadGuard:
             "on_validation_failure": "quarantine",
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.stored_path == diverging_path
-        assert exc_info.value.canonical_path == canonical_path
-        assert exc_info.value.blob_id == blob_ref
-        assert "bug in composer persistence" in str(exc_info.value)
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
+        assert "session-owned path match" in str(exc_info.value)
 
         # Critical: create_run was never called — the session is not
         # poisoned with a pending run that the operator must clean up.
@@ -8601,15 +8342,7 @@ class TestBlobSourcePathReadGuard:
         service: ExecutionServiceImpl,
         mock_session_service: MagicMock,
     ) -> None:
-        """Tier 1: stored path is None for a blob-backed source crashes.
-
-        A composition state with ``blob_ref`` set but no ``path`` is
-        structurally invalid — the blob binding requires the canonical
-        path to be present.  This branch protects against a regression
-        where a future composer-side bug omits the path entirely while
-        still persisting the blob_ref.
-        """
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
+        """A blob_ref with no stored path fails authoritative proof."""
 
         session_id = uuid4()
         blob_ref = str(uuid4())
@@ -8632,11 +8365,9 @@ class TestBlobSourcePathReadGuard:
             "on_validation_failure": "quarantine",
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.stored_path is None
-        assert exc_info.value.canonical_path == canonical_path
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
 
     @pytest.mark.asyncio
     async def test_named_blob_source_path_mismatch_raises_structured_error(
@@ -8645,7 +8376,6 @@ class TestBlobSourcePathReadGuard:
         mock_session_service: MagicMock,
     ) -> None:
         """Every named source blob_ref gets the same ownership/path guard."""
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
 
         session_id = uuid4()
         blob_ref = str(uuid4())
@@ -8671,11 +8401,9 @@ class TestBlobSourcePathReadGuard:
             }
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.stored_path == diverging_path
-        assert exc_info.value.canonical_path == canonical_path
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 
@@ -8686,7 +8414,6 @@ class TestBlobSourcePathReadGuard:
         mock_session_service: MagicMock,
     ) -> None:
         """A non-first named source must also match the canonical blob path."""
-        from elspeth.web.execution.errors import BlobSourcePathMismatchError
 
         session_id = uuid4()
         orders_blob = str(uuid4())
@@ -8720,12 +8447,9 @@ class TestBlobSourcePathReadGuard:
             },
         }
 
-        with pytest.raises(BlobSourcePathMismatchError) as exc_info:
+        with pytest.raises(PipelineValidationError) as exc_info:
             await _execute(service, session_id=session_id)
-
-        assert exc_info.value.blob_id == refunds_blob
-        assert exc_info.value.stored_path == refunds_diverging_path
-        assert exc_info.value.canonical_path == refunds_canonical_path
+        assert [error.error_code for error in exc_info.value.errors] == ["source_inspection_failed"]
         mock_session_service.create_run.assert_not_called()
         blob_service.link_blob_to_run.assert_not_called()
 
@@ -12277,20 +12001,27 @@ class TestInlineBlobPromptSurfaceModalityAdmission:
 def test_per_call_quota_admission_persists_pending_under_transferred_lease(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    del real_loop
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run admission entered async bridge"))
+    )
     run_uuid = uuid4()
     attempt = ProviderAttempt(attempt_id="provider-attempt", started_at=datetime.now(UTC))
-    mock_session_service.begin_provider_attempt.return_value = attempt
+    mock_session_service.begin_run_provider_attempt_sync.return_value = attempt
     assert service._admit_run_llm_call(run_uuid, _execute_lease()) == attempt.attempt_id
-    mock_session_service.begin_provider_attempt.assert_awaited_once_with(
-        session_operation_context=_execute_lease().context, source="run", run_id=run_uuid
+    mock_session_service.begin_run_provider_attempt_sync.assert_called_once_with(
+        session_operation_context=_execute_lease().context, run_id=run_uuid
     )
+    service._call_async.assert_not_called()
 
 
 def test_per_call_quota_refusal_propagates_before_dispatch(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    del real_loop
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run admission entered async bridge"))
+    )
     refusal = ChargeableAdmissionRefused(
         ChargeableAdmissionDecision(
             refusal_reason=AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE,
@@ -12299,17 +12030,21 @@ def test_per_call_quota_refusal_propagates_before_dispatch(
             ),
         )
     )
-    mock_session_service.begin_provider_attempt.side_effect = refusal
+    mock_session_service.begin_run_provider_attempt_sync.side_effect = refusal
     with pytest.raises(ChargeableAdmissionRefused) as caught:
         service._admit_run_llm_call(uuid4(), _execute_lease())
     assert caught.value is refusal
-    mock_session_service.settle_provider_attempt.assert_not_awaited()
+    mock_session_service.settle_run_provider_attempt_sync.assert_not_called()
+    service._call_async.assert_not_called()
 
 
 def test_per_call_settlement_uses_exact_durable_call_identity(
     service: ExecutionServiceImpl, mock_session_service: MagicMock, real_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(service, "_call_async", real_loop.run_until_complete)
+    del real_loop
+    monkeypatch.setattr(
+        service, "_call_async", create_autospec(service._call_async, side_effect=AssertionError("run settlement entered async bridge"))
+    )
     entry = TokenUsageEntry(
         model="model",
         prompt_tokens=3,
@@ -12326,6 +12061,7 @@ def test_per_call_settlement_uses_exact_durable_call_identity(
             service._settle_run_llm_call(
                 uuid4(), _execute_lease(), "pending-attempt", "unknown-call", landscape_db=db, landscape_run_id="run"
             )
-    mock_session_service.settle_provider_attempt.assert_awaited_once_with(
+    mock_session_service.settle_run_provider_attempt_sync.assert_called_once_with(
         session_operation_context=_execute_lease().context, attempt_id="pending-attempt", entry=entry
     )
+    service._call_async.assert_not_called()

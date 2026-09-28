@@ -510,7 +510,7 @@ def test_group_bindings_registry_identity_survives_processor_factory_wiring() ->
 
 
 def _settle_call_recorder(proc: Any, *, staged: tuple[Any, ...], cascaded: list[Any]) -> tuple[Mock, Any]:
-    manager = Mock()
+    manager = Mock(spec=["record", "take", "mark", "emit"])
     manager.record.return_value = cascaded
     manager.take.return_value = staged
     manager.mark.return_value = 2

@@ -1,17 +1,4 @@
-"""Fork blob custody pinned on the REAL path, not the helper.
-
-elspeth-f478b01787 / elspeth-d178282593. The sibling file
-``test_guided_operation_fork_service.py`` pins each fork-rewrite mechanism by
-calling ``_rewrite_fork_state_blob_custody`` directly. These tests drive the
-production chain the route runs -- ``fork_session`` -> ``copy_blobs_for_fork``
--> ``_rewrite_fork_state_blob_custody`` -> ``settle_guided_fork_operation``
--> ``get_current_state`` -- or the HTTP route itself, so that the rewriter's
-output is judged by the settlement verifier and the outbound projection, the
-two authorities that rejected or disclosed the parent's custody in the
-incidents. Real blobs come from ``BlobServiceImpl.create_blob``; nothing here
-hand-builds the settlement payload the verifier sees except where the test's
-purpose is to hand the verifier a payload the rewriter would never produce.
-"""
+"""Fork blob custody through staging, copy, rewrite, settlement, and projection."""
 
 from __future__ import annotations
 
@@ -20,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+import structlog
 from sqlalchemy import select, update
 from sqlalchemy.pool import StaticPool
 from structlog.testing import capture_logs
@@ -28,20 +16,30 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.blobs.protocol import BlobForkWriteFence
 from elspeth.web.blobs.service import BlobServiceImpl
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.fork_custody import _value_references_parent_blob
 from elspeth.web.sessions.models import blobs_table, composition_states_table, sessions_table
-from elspeth.web.sessions.protocol import CompositionStateData, CompositionValidationError, GuidedForkSettlementCommand
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionValidationError,
+    OperationReceiptClaimed,
+    OperationReceiptTakenOver,
+    SessionForkParentAuthority,
+    SessionForkSettlementCommand,
+)
 from elspeth.web.sessions.routes.sessions import _rewrite_fork_state_blob_custody
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import SessionServiceImpl, _value_references_parent_blob
+from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
 from tests.helpers.session_fences import create_blob_under_fence, get_blob_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
-from tests.unit.web.sessions.test_fork import _complete_guided_start_authority, _make_fork_app
-from tests.unit.web.sessions.test_guided_operation_fork_service import _claim_fork, _service_for
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
+from tests.unit.web.sessions.test_fork import _make_fork_app
 
 _PRE_STAGING_TEXT = "retains parent blob custody the fork rewriter does not model"
-_SETTLEMENT_TEXT = "Guided fork settlement state retains parent blob custody"
+_SETTLEMENT_TEXT = "Fork settlement state retains parent blob custody"
 
 
 @pytest.fixture()
@@ -55,6 +53,32 @@ def engine():
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
     return engine
+
+
+def _service_for(engine) -> SessionServiceImpl:
+    return FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.fork-custody"))
+
+
+async def _claim_fork(service: SessionServiceImpl, parent_id: UUID, *, operation_id: str | None = None) -> SessionForkParentAuthority:
+    parent_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=parent_id,
+            operation_kind=SessionOperationKind.SESSION_FORK,
+            owner_instance_id=service._owner_instance_id,
+            lease_seconds=service._session_operation_lease_seconds,
+        )
+    )
+    claimed = await service.reserve_operation_receipt(
+        session_id=parent_id,
+        operation_id=operation_id or str(uuid4()),
+        kind="session_fork",
+        request_hash="a" * 64,
+        actor="composer_route",
+        lease_seconds=service._session_operation_lease_seconds,
+        session_operation_context=parent_context,
+    )
+    assert type(claimed) in {OperationReceiptClaimed, OperationReceiptTakenOver}
+    return SessionForkParentAuthority(parent_context=parent_context, receipt_fence=claimed.fence)
 
 
 def _stale_report(entries: list[dict[str, object]]) -> dict[str, object]:
@@ -90,10 +114,8 @@ async def _stage_copy_rewrite(
     async def checkpoint() -> None:
         return None
 
-    # The route builds the blob write fence from the GUIDED fence inside the
-    # parent authority pair (``routes/sessions.py`` line ~983), not from the
-    # session-operation context that rides beside it.
-    guided_fence = parent_authority.guided_fence
+    # Blob copy is bound to the receipt inside the parent authority pair.
+    receipt_fence = parent_authority.receipt_fence
     source_blobs = {
         entry.source_blob_id: await blob_service.get_blob(entry.source_blob_id, session_operation_context=parent_authority.parent_context)
         for entry in staged.blob_plan
@@ -105,9 +127,9 @@ async def _stage_copy_rewrite(
         BlobForkWriteFence(
             source_session_id=parent_id,
             target_session_id=staged.session.id,
-            operation_id=guided_fence.operation_id,
-            lease_token=guided_fence.lease_token,
-            attempt=guided_fence.attempt,
+            operation_id=receipt_fence.operation_id,
+            lease_token=receipt_fence.lease_token,
+            attempt=receipt_fence.attempt,
         ),
         checkpoint=checkpoint,
     )
@@ -124,11 +146,8 @@ async def _stage_copy_rewrite(
     return staged, blob_map, rewritten
 
 
-def _settlement_command(staged, rewritten: CompositionStateData | None) -> GuidedForkSettlementCommand:
-    # The merged command carries the whole fork authority pair (parent guided
-    # fence + adopted child session-operation context) and derives the child
-    # session id from it, so neither may be passed alongside.
-    return GuidedForkSettlementCommand(
+def _settlement_command(staged, rewritten: CompositionStateData | None) -> SessionForkSettlementCommand:
+    return SessionForkSettlementCommand(
         authority=staged.authority,
         expected_current_state_id=staged.state.id,
         edited_message_id=staged.messages[-1].id,
@@ -147,7 +166,7 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
     """elspeth-f478b01787 on the production chain. The parent's state carries a
     stale ``implicit_decisions`` report naming its blob three ways (bare id,
     ``blob:`` sentinel, raw storage path). Before the fix the staged child kept
-    that report verbatim and ``settle_guided_fork_operation`` rejected it with
+    that report verbatim and settlement rejected it with
     the incident's exact error AFTER staging had committed. Now the child must
     SETTLE through the same verifier, its persisted state must reference no
     parent identity by the verifier's own predicate, and its re-derived report
@@ -201,7 +220,7 @@ async def test_incident_shaped_fork_settles_and_child_names_only_its_own_blob(en
     child_blob = blob_map[blob.id]
     assert rewritten is not None
 
-    settled = await service.settle_guided_fork_operation(_settlement_command(staged, rewritten))
+    settled = await service.settle_fork_operation_receipt(_settlement_command(staged, rewritten))
     assert settled.archived_at is None
 
     child_state = await service.get_current_state(staged.session.id)
@@ -231,7 +250,7 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
     KEY inside ``composer_meta`` names the parent exactly as a value does
     (red-team B2 on ee1ae108b: it crossed both guards and was served on a 200).
     The rewriter would now refuse this shape itself, so the payload is handed
-    straight to ``settle_guided_fork_operation`` -- the settlement authority
+    straight to settlement -- the settlement authority
     must reject it on its own, through the real plan and cohort checks.
     """
     service = _service_for(engine)
@@ -285,12 +304,12 @@ async def test_settlement_rejects_rewritten_state_keyed_by_parent_blob(engine, t
     )
 
     with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
-        await service.settle_guided_fork_operation(_settlement_command(staged, keyed_state))
+        await service.settle_fork_operation_receipt(_settlement_command(staged, keyed_state))
 
     assert (await service.get_session(staged.session.id)).archived_at is not None
 
 
-# --- T2: guided-native child served on GET /state ------------------------------
+# --- Child state served without raw storage paths ------------------------------
 
 
 def _wire_state_projection(app) -> None:
@@ -306,74 +325,25 @@ def _wire_state_projection(app) -> None:
 
 
 @pytest.mark.asyncio
-async def test_guided_native_fork_child_serves_no_raw_storage_path(tmp_path: Path) -> None:
-    """elspeth-d178282593 at the 200 boundary. A guided commit strips ``blob_ref``
-    from the executable source, so the raw storage path is the live source's
-    ONLY carrier and the stale parent report holds it too. Before the fix the
-    forked child's ``implicit_decisions`` still named the PARENT's raw path and
-    the projection -- keyed on the CHILD's live carrier -- could not mask it,
-    so ``GET /state`` disclosed a private path of another session on a 200.
-    Driven through the real route: POST /fork, then GET /state and
-    GET /state/versions on the child; neither body may carry the parent's raw
-    path nor the child's.
-    """
-    from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
-    from elspeth.web.composer.guided.resolved import SourceResolved
-    from elspeth.web.composer.guided.state_machine import GuidedSession, TurnRecord
-
+async def test_fork_child_serves_no_raw_storage_path(tmp_path: Path) -> None:
+    """Fork then GET state and versions; neither body may expose raw blob paths."""
     app, service, blob_service = _make_fork_app(tmp_path)
     _wire_state_projection(app)
     parent = await service.create_session("alice", "Parent", "local")
-    root = await service.add_message(parent.id, "user", "root", writer_principal="route_user_message")
     parent_blob = await create_blob_under_fence(service, blob_service, parent.id, "orders.csv", b"id,name\n1,Ada\n", "text/csv")
-    stable_id = str(uuid4())
-    # Reviewed snapshot RETAINS blob_ref; the committed source does not.
-    snapshot_options = {"path": parent_blob.storage_path, "blob_ref": str(parent_blob.id), "schema": {"mode": "observed"}}
     live_options = {"path": parent_blob.storage_path, "schema": {"mode": "observed"}}
-    guided = GuidedSession(
-        step=GuidedStep.STEP_2_SINK,
-        history=(
-            TurnRecord(
-                step=GuidedStep.STEP_2_SINK,
-                turn_type=TurnType.INSPECT_AND_CONFIRM,
-                payload_hash="a" * 64,
-                response_hash=None,
-                emitter="server",
-            ),
-        ),
-        source_order=(stable_id,),
-        reviewed_sources={
-            stable_id: SourceResolved(
-                name="orders",
-                plugin="csv",
-                options=snapshot_options,
-                observed_columns=("id", "name"),
-                sample_rows=({"id": 1, "name": "Ada"},),
-                on_validation_failure="discard",
-            )
-        },
-        root_intent_message_id=str(root.id),
-    )
     state_data = CompositionStateData(
         sources={"orders": {"plugin": "csv", "on_success": "out", "options": dict(live_options), "on_validation_failure": "discard"}},
         nodes=[],
         edges=[],
         outputs=[],
-        metadata_={"name": "Guided", "description": ""},
+        metadata_={"name": "Freeform", "description": ""},
         is_valid=True,
         composer_meta={
-            "guided_session": guided.to_dict(),
             "implicit_decisions": _stale_report([_entry("source.path", parent_blob.storage_path)]),
         },
     )
     state = await service.save_composition_state(parent.id, state_data, provenance="session_seed")
-    await _complete_guided_start_authority(
-        service,
-        session_id=parent.id,
-        root_message=root,
-        state=state,
-        state_data=state_data,
-    )
     fork_message = await service.add_message(
         parent.id,
         "user",
@@ -488,15 +458,15 @@ async def test_unrewritable_parent_custody_refuses_the_fork_before_any_child_row
         composition_state_id=state.id,
         writer_principal="route_user_message",
     )
-    settle_calls: list[GuidedForkSettlementCommand] = []
-    original_settle = service.settle_guided_fork_operation
+    settle_calls: list[SessionForkSettlementCommand] = []
+    original_settle = service.settle_fork_operation_receipt
 
-    async def _spy_settle(command: GuidedForkSettlementCommand):
+    async def _spy_settle(command: SessionForkSettlementCommand):
         settle_calls.append(command)
         return await original_settle(command)
 
     client = SyncASGITestClient(app, raise_server_exceptions=False)
-    with patch.object(service, "settle_guided_fork_operation", new=_spy_settle), capture_logs() as cap_logs:
+    with patch.object(service, "settle_fork_operation_receipt", new=_spy_settle), capture_logs() as cap_logs:
         response = client.post(
             f"/api/sessions/{parent.id}/fork",
             json={"operation_id": str(uuid4()), "from_message_id": str(message.id), "new_message_content": "edited"},
@@ -576,7 +546,7 @@ async def test_settlement_rejects_a_rewritten_state_whose_validation_errors_reta
     )
 
     with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
-        await service.settle_guided_fork_operation(_settlement_command(staged, tainted))
+        await service.settle_fork_operation_receipt(_settlement_command(staged, tainted))
 
 
 @pytest.mark.parametrize("entry_shape", ["exact", "embedded"])
@@ -626,7 +596,7 @@ async def test_settlement_rejects_a_staged_state_whose_validation_errors_retain_
         )
 
     with pytest.raises(AuditIntegrityError, match=_SETTLEMENT_TEXT):
-        await service.settle_guided_fork_operation(_settlement_command(staged, None))
+        await service.settle_fork_operation_receipt(_settlement_command(staged, None))
 
 
 # --- T6: the fork plan row never reaches GET /messages ------------------------

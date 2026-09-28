@@ -14,6 +14,7 @@ from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
@@ -116,7 +117,28 @@ def test_committed_ordinary_reject_logs_cleanup_fault_without_masking_success(te
 def test_precommit_conflict_records_cleanup_failure_outside_http_exception_notes(test_client: TestClient, monkeypatch) -> None:
     session, proposal = _create_ordinary_proposal(test_client)
     route = f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject"
-    assert test_client.post(route, json={}).status_code == 200
+    app = cast(FastAPI, test_client.app)
+    service = app.state.session_service
+
+    async def other_actor_reject() -> None:
+        lease = await SessionOperationLease.acquire(
+            service.session_operation_authority,
+            session_id=UUID(session["id"]),
+            operation_kind=SessionOperationKind.PROPOSAL,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            await service.reject_composition_proposal(
+                session_id=UUID(session["id"]),
+                proposal_id=proposal.id,
+                actor="system:auto_reject_validation_failed:user:alice",
+                session_operation_context=lease.context,
+            )
+        finally:
+            await lease.close()
+
+    asyncio.run(other_actor_reject())
     original_close = SessionOperationLease.close
 
     async def close_then_fail(lease: SessionOperationLease) -> None:
@@ -157,7 +179,7 @@ def test_committed_reject_survives_cleanup_and_logger_failures(test_client: Test
         monkeypatch.undo()
     response = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
     if integrity_failure:
-        assert response.status_code == 409
+        assert response.status_code == 200
         return
     assert response.status_code == 200
     assert response.json()["status"] == "rejected"
@@ -178,7 +200,7 @@ def test_committed_reject_propagates_cleanup_integrity_failure(test_client: Test
     assert caught.value is failure
     monkeypatch.undo()
     replay = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
-    assert replay.status_code == 409
+    assert replay.status_code == 200
 
 
 def test_committed_preferences_survive_telemetry_and_logger_failures(test_client: TestClient, monkeypatch) -> None:
@@ -282,7 +304,7 @@ async def test_cancellation_after_ordinary_accept_commit_drains_lease_cleanup(
     test_client: TestClient,
     monkeypatch,
 ) -> None:
-    session, proposal = await asyncio.to_thread(
+    session, proposal = await run_sync_in_worker(
         _create_ordinary_proposal,
         test_client,
         tool_name="set_metadata",
@@ -333,15 +355,12 @@ async def test_cancellation_after_ordinary_accept_commit_drains_lease_cleanup(
     persisted = await service.get_authoritative_composition_proposal(
         session_id=UUID(session["id"]),
         proposal_id=proposal.id,
-        reviewed_facts=None,
     )
     assert persisted.row.status == "committed"
 
 
 @pytest.mark.parametrize("rejection_fault", ["none", "terminal_race", "internal_value_error"])
 def test_validation_failure_auto_reject_cleanup_fault_cannot_mask_422(test_client: TestClient, monkeypatch, rejection_fault: str) -> None:
-    from elspeth.web.sessions.protocol import ProposalStateConflictError
-
     session, proposal = _create_ordinary_proposal(
         test_client,
         arguments_json={
@@ -375,11 +394,9 @@ def test_validation_failure_auto_reject_cleanup_fault_cannot_mask_422(test_clien
         if rejection_fault == "internal_value_error":
             raise ValueError("invalid database record")
         if rejection_fault == "terminal_race":
-            await original_reject(self, **kwargs)
-            # A second writer loses the pending-state CAS after the first
-            # transition is durable. Exercise the real service discriminator.
-            with pytest.raises(ProposalStateConflictError):
-                await original_reject(self, **kwargs)
+            await original_reject(self, **{**kwargs, "actor": "user:alice"})
+            # A different actor's already-durable decision remains a conflict
+            # for the validation auto-reject path; only exact retries replay.
             return await original_reject(self, **kwargs)
         return await original_reject(self, **kwargs)
 

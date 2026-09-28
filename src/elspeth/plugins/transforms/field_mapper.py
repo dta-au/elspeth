@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Annotated, Any
 
 from pydantic import Field, model_validator
@@ -171,13 +172,24 @@ class FieldMapperConfig(TransformDataConfig):
         description="Mapping from existing input field names to output field names.",
     )
     select_only: bool = Field(default=False, description="When true, emit only fields named in the mapping.")
-    strict: bool = Field(
-        default=False,
-        description=(
-            "Controls direct process() calls for a missing normalized source. Normal engine execution requires every "
-            "configured source before process(); dotted and unresolved original-header misses always route."
-        ),
-    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_retired_strict(cls, data: Any) -> Any:
+        """Refuse the retired ``strict`` option with the rule that replaced it.
+
+        ``strict`` decided only whether ``process`` skipped a missing mapping
+        source, and the engine never let a row reach ``process`` without one
+        (measured: ``strict: true`` and ``strict: false`` ran identically). The
+        option therefore promised a tolerance that did not exist. ``extra:
+        forbid`` would refuse it anyway; this names why.
+        """
+        if type(data) is not dict or "strict" not in data:
+            return data
+        raise ValueError(
+            "field_mapper has no 'strict' option: every mapping source is a required input, and a row missing "
+            "one routes to on_error as missing_field. Remove 'strict'."
+        )
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
@@ -188,8 +200,8 @@ class FieldMapperConfig(TransformDataConfig):
         the requirement is DERIVED here rather than restated by hand in
         ``required_input_fields`` (elspeth-d4ae04b374). Without it a mapping
         naming a field that never arrives produced no error and no quarantine:
-        ``process`` skips a ``MISSING`` source in non-strict mode, so the column
-        simply vanished from the output.
+        ``process`` skipped a ``MISSING`` source, so the column simply vanished
+        from the output.
 
         Joining ``declared_input_fields`` — rather than the explicit
         ``required_input_fields`` option — is what makes that enforceable.
@@ -209,8 +221,8 @@ class FieldMapperConfig(TransformDataConfig):
         still abstains because it reaches ``process`` through
         ``contract.resolve_name``, so which normalized key it names is
         unknowable until a row arrives (elspeth-f262a8c678). Missing sources in
-        that unrepresentable class route at runtime even when ``strict`` is
-        false; abstention is not permission to drop a configured output.
+        that unrepresentable class route at runtime; abstention is not
+        permission to drop a configured output.
 
         Note the DIRECTION. This requires mapping SOURCES only. Requiring rename
         TARGETS on input is the elspeth-d6eeb3a71d trap — they are fields this
@@ -307,14 +319,16 @@ class FieldMapper(BaseTransform):
             - Simple: {"old": "new"} renames old to new
             - Nested: {"meta.source": "origin"} extracts nested field
         select_only: If True, only include mapped fields (default: False)
-        strict: If True, error on missing source fields (default: False)
+
+    Every mapping source is a required input: a row missing one routes to
+    ``on_error`` as ``missing_field``; a configured mapping is never skipped.
     """
 
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b96c5b5e88bcd1eb"
+    source_file_hash: str | None = "sha256:1b322bc8e2f94c9e"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -345,7 +359,6 @@ class FieldMapper(BaseTransform):
             "mapping": {
                 "field_mapper_probe_source": "field_mapper_probe_target",
             },
-            "strict": True,
         }
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -354,7 +367,6 @@ class FieldMapper(BaseTransform):
         self._initialize_declared_input_fields(cfg)
         self._mapping: dict[str, str] = cfg.mapping
         self._select_only: bool = cfg.select_only
-        self._strict: bool = cfg.strict
         self._schema_config = cfg.schema_config
 
         self.declared_output_fields = self._derive_declared_output_fields(cfg)
@@ -414,6 +426,14 @@ class FieldMapper(BaseTransform):
             if self.forwards_input_fields
             else frozenset()
         )
+
+        # Every flat mapping moves the field its source names to the target and
+        # the output contract carries the field's recorded original name there
+        # (``process`` passes exactly these to ``narrow_contract_to_output``),
+        # so a lookup of any spelling of the old field reads the target. A
+        # dotted source is a nested extraction, not a rename: its root field
+        # stays where it is.
+        self.renamed_input_fields = MappingProxyType({source: target for source, target in cfg.mapping.items() if "." not in source})
 
         # Every mapping target is a created name (the field-name spelling rule,
         # operator ruling 2026-09-25). Where this node forwards its input but
@@ -559,7 +579,7 @@ class FieldMapper(BaseTransform):
         The mapping itself is now the promise. Normalization-stable sources and
         dotted roots are asserted through ``declared_input_fields`` and checked
         before ``process()``; unresolved original-header aliases and dotted
-        leaves route a missing value to error even under ``strict: false``.
+        leaves route a missing value to error.
         Consequently every successful row contains every mapped target. This
         is independent of how (or whether) the input schema repeats the source.
 
@@ -674,8 +694,8 @@ class FieldMapper(BaseTransform):
         # The mapping is the required-read authority. Every successful row has
         # every target: representable sources are checked before ``process()``,
         # while unresolved aliases and dotted leaves route on a miss. No
-        # separate ``strict`` or schema guarantee is needed to restate that
-        # promise (elspeth-d4ae04b374).
+        # schema guarantee is needed to restate that promise
+        # (elspeth-d4ae04b374).
         guaranteed_targets = set(cfg.mapping.values())
 
         if cfg.select_only:
@@ -793,7 +813,7 @@ class FieldMapper(BaseTransform):
                     if "." not in source and source in row
                 }
                 forwarded = frozenset(row_data) - removed
-                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded)
+                spellings = self._target_spellings.in_row(row_keys=forwarded, forwarded_keys=forwarded, contract=row.contract)
                 if spellings:
                     raise HeaderSpelledDeclarationViolation(component=f"Transform '{self.name}'", spellings=spellings)
 
@@ -814,9 +834,9 @@ class FieldMapper(BaseTransform):
                 # upstream type-contract violation. Route the offending row to on_error
                 # — recorded and attributable — rather than raising and crashing the
                 # whole run on a single malformed nested value. A genuinely absent
-                # intermediate still returns MISSING. The handling below routes
-                # it even in non-strict mode so a configured target cannot
-                # disappear from a successful row.
+                # intermediate still returns MISSING, which the handling below
+                # routes so a configured target cannot disappear from a
+                # successful row.
                 try:
                     value = get_nested_field(row_data, source)
                 except TypeError as exc:
@@ -834,17 +854,15 @@ class FieldMapper(BaseTransform):
                 value = MISSING
 
             if value is MISSING:
-                # Normalized top-level sources are asserted through
-                # declared_input_fields and the executor rejects them before
-                # process(). Dotted leaves and original-header aliases cannot
-                # be represented fully in that flat contract, so their runtime
-                # fallback must fail even under strict=False; otherwise a
-                # configured mapping silently disappears from the emitted row.
-                if self._strict or not self._is_static_normalized_source(source):
-                    return TransformResult.error(
-                        {"reason": "missing_field", "field": source, "message": f"Required field '{source}' not found in row"}
-                    )
-                continue  # Executor pre-emission normally makes this branch unreachable.
+                # Every mapping source is required. Normalized top-level
+                # sources are asserted through declared_input_fields, so in a
+                # pipeline the executor settles their miss before process().
+                # Dotted leaves and original-header aliases cannot be stated in
+                # that flat contract and are settled here. Either way a
+                # configured mapping never silently disappears from a row.
+                return TransformResult.error(
+                    {"reason": "missing_field", "field": source, "message": f"Required field '{source}' not found in row"}
+                )
 
             # Remove old key if it exists (for rename within same dict)
             if not self._select_only and "." not in source and source in row:
@@ -873,8 +891,10 @@ class FieldMapper(BaseTransform):
         # to the root's contract, so those targets must be inferred from the
         # output value. Contracts are flat — presenting "meta.source" as a
         # rename source would (correctly) fail narrow_contract_to_output's
-        # unknown-source invariant.
-        renamed_fields = {source: target for source, target in applied_mappings.items() if "." not in source}
+        # unknown-source invariant. The renames passed are the declared ones
+        # (``renamed_input_fields``) this row applied, so the identity the
+        # contract carries and the one the build resolves cannot diverge.
+        renamed_fields = {source: target for source, target in applied_mappings.items() if source in self.renamed_input_fields}
         output_contract = narrow_contract_to_output(
             input_contract=row.contract,
             output_row=output,
@@ -904,7 +924,8 @@ class FieldMapper(BaseTransform):
                 issue_code=None,
                 summary="Rename, drop, or reorder row fields. Stateless and shape-changing — declares new field names in output_schema.",
                 composer_hints=(
-                    "Config keys are 'mapping' (dict of source->target), 'select_only' (bool, default false), 'strict' (bool, default false), plus 'schema'. Rename with {old: new}; keep a field with {x: x}; drop a field by omitting it under select_only: true.",
+                    "Config keys are 'mapping' (dict of source->target), 'select_only' (bool, default false), plus 'schema'. Rename with {old: new}; keep a field with {x: x}; drop a field by omitting it under select_only: true.",
+                    "Every mapping source is required: a row missing one routes to on_error as missing_field.",
                     "field_mapper has no 'drop'/'include'/'rename_only' keys — dropping is done by omitting the field under select_only: true.",
                     "Use select_only: true when cleanup means 'save only these fields'; with select_only true, mapping should whitelist exactly the saved output fields.",
                     "A select_only whitelist must preserve every field required by the downstream sink; include each required field as a mapping target before routing the mapper to that sink.",

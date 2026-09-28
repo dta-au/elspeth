@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import cast
 from unittest.mock import patch
 from uuid import UUID
 
@@ -17,18 +17,14 @@ from elspeth.contracts.chargeable_admission import (
     QuotaDisposition,
 )
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
-from elspeth.web.composer import provider_quota
+from elspeth.web.composer import provider_gateway, provider_quota
 from elspeth.web.composer.audit import BufferingRecorder
-from elspeth.web.composer.guided.profile import EMPTY_PROFILE
-from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
-from elspeth.web.composer.pipeline_proposal import PresentBase, composition_content_hash
-from elspeth.web.composer.service import ComposerAdmissionRefused, ComposerServiceImpl
+from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
+from elspeth.web.composer.protocol import ComposerAdmissionRefused
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.sessions import _auto_title
-from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence, SessionServiceProtocol
+from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, SessionServiceProtocol
 
 _SESSION_ID = "00000000-0000-0000-0000-000000000001"
 _CONTEXT = SessionOperationContext(
@@ -69,7 +65,7 @@ class _AdmissionService:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["compose", "guided_full", "guided_delta", "diagnostics", "signoff"])
+@pytest.mark.parametrize("entry", ["compose", "diagnostics", "signoff"])
 @pytest.mark.parametrize("reason", [AdmissionRefusalReason.IDENTITY_DISABLED, AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE])
 async def test_public_entry_refuses_before_provider_work(
     composer_service_without_sessions_service: ComposerServiceImpl, entry: str, reason: AdmissionRefusalReason
@@ -77,16 +73,19 @@ async def test_public_entry_refuses_before_provider_work(
     service = composer_service_without_sessions_service
     authority = _AdmissionService(reason)
     service._sessions_service = cast(SessionServiceProtocol, authority)
-    origin = PlannerOriginatingMessage(_SESSION_ID, None, "Build a pipeline", "owner")
+    service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._planning_application._sessions_service_optional = service._sessions_service
+    service._planning_application._chargeable_admission = service._chargeable_admission
+    service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     # These later-stage dependencies deliberately fail if reached. The admission
     # boundary must precede planner preparation as well as outbound model calls.
-    unused: Any = None
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     with (
-        patch.object(service, "_call_llm", autospec=True) as tool_provider,
-        patch.object(service, "_call_text_llm", autospec=True) as text_provider,
-        patch("elspeth.web.composer.service.plan_pipeline", autospec=True) as planner,
-        patch.object(service, "_run_advisor_checkpoint", autospec=True) as advisor,
+        patch.object(service._provider_gateway, "_call_llm", autospec=True) as tool_provider,
+        patch.object(service._provider_gateway, "_call_text_llm", autospec=True) as text_provider,
+        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True) as planner,
+        patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True) as advisor,
         pytest.raises(ComposerAdmissionRefused, match=reason.value),
     ):
         if entry == "compose":
@@ -99,35 +98,10 @@ async def test_public_entry_refuses_before_provider_work(
                 user_message_id="00000000-0000-0000-0000-000000000002",
                 session_operation_context=_CONTEXT,
             )
-        elif entry == "guided_full":
-            await service.plan_guided_full_pipeline(
-                intent="Build a pipeline",
-                current_state=state,
-                originating_message=origin,
-                base=unused,
-                policy_catalog=unused,
-                plugin_snapshot=unused,
-                recorder=BufferingRecorder(),
-                operation_fence=unused,
-                session_operation_context=_CONTEXT,
-            )
-        elif entry == "guided_delta":
-            await service.plan_guided_pipeline(
-                intent="Build a pipeline",
-                current_state=state,
-                guided=unused,
-                originating_message=origin,
-                base=unused,
-                user_id="owner",
-                supersedes_draft_hash=None,
-                recorder=BufferingRecorder(),
-                operation_fence=unused,
-                session_operation_context=_CONTEXT,
-            )
         elif entry == "diagnostics":
             await service.explain_run_diagnostics({}, session_operation_context=_CONTEXT)
         else:
-            await service.run_signoff_checkpoint(
+            await service._advisor_checkpoint.run_signoff_checkpoint(
                 state=state,
                 session_id=_SESSION_ID,
                 recorder=BufferingRecorder(),
@@ -151,6 +125,11 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
     service = composer_service_without_sessions_service
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
+    service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._planning_application._sessions_service_optional = service._sessions_service
+    service._planning_application._chargeable_admission = service._chargeable_admission
+    service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
 
     async def explain(*args: object, **kwargs: object) -> str:
         scope = provider_quota._SCOPE.get()
@@ -159,7 +138,7 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
         assert scope.context is _CONTEXT
         return "Explanation"
 
-    with patch.object(service, "_call_text_llm_with_audit", autospec=True, side_effect=explain) as provider:
+    with patch.object(service._provider_gateway, "_call_text_llm_with_audit", autospec=True, side_effect=explain) as provider:
         assert await service.explain_run_diagnostics({}, session_operation_context=_CONTEXT) == "Explanation"
     provider.assert_awaited_once()
     assert authority.operations == [ChargeableOperation.COMPOSER]
@@ -169,7 +148,7 @@ async def test_allowed_diagnostics_reaches_provider(composer_service_without_ses
 @pytest.mark.asyncio
 async def test_auto_title_checks_admission_before_provider() -> None:
     authority = _AdmissionService(AdmissionRefusalReason.IDENTITY_DISABLED)
-    with patch.object(_auto_title, "_litellm_acompletion", autospec=True) as provider:
+    with patch.object(provider_gateway, "_litellm_acompletion", autospec=True) as provider:
         await _auto_title.maybe_auto_title_session(
             service=cast(SessionServiceProtocol, authority),
             session_id=UUID(_SESSION_ID),
@@ -211,7 +190,7 @@ async def test_rootless_admission_controls_actual_provider_transition(
     with (
         patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
-        patch("elspeth.web.composer.service._litellm_acompletion", autospec=True, side_effect=_ProviderReached) as provider,
+        patch("elspeth.web.composer.provider_gateway._litellm_acompletion", autospec=True, side_effect=_ProviderReached) as provider,
         pytest.raises(_ProviderReached if allowed else ComposerAdmissionRefused),
     ):
         await service.compose(
@@ -228,7 +207,7 @@ async def test_rootless_admission_controls_actual_provider_transition(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry", ["rootless", "guided_full", "guided_delta", "signoff"])
+@pytest.mark.parametrize("entry", ["rootless", "signoff"])
 @pytest.mark.parametrize("allowed", [True, False])
 async def test_same_valid_request_reaches_planner_only_when_admitted(
     composer_service_with_real_sessions: ComposerServiceImpl, entry: str, allowed: bool
@@ -247,38 +226,6 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     authority = _AdmissionService(None if allowed else AdmissionRefusalReason.IDENTITY_DISABLED)
     state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
     message_id = "00000000-0000-0000-0000-000000000002"
-    origin = PlannerOriginatingMessage(_SESSION_ID, message_id, "Build a CSV pipeline", "owner")
-    base = PresentBase(state_id=UUID(message_id), composition_content_hash=composition_content_hash(state))
-    fence = GuidedOperationFence(session_id=UUID(_SESSION_ID), operation_id="guided-operation", lease_token="token", attempt=1)
-    snapshot, catalog = service._plugin_policy_context("owner")
-    source_id = "11111111-1111-4111-8111-111111111111"
-    output_id = "22222222-2222-4222-8222-222222222222"
-    guided = GuidedSession(
-        step=GuidedStep.STEP_3_TRANSFORMS,
-        profile=EMPTY_PROFILE,
-        source_order=(source_id,),
-        reviewed_sources={
-            source_id: SourceResolved(
-                name="input",
-                plugin="csv",
-                options={"path": "/data/input.csv"},
-                observed_columns=("id",),
-                sample_rows=(),
-                on_validation_failure="discard",
-            )
-        },
-        output_order=(output_id,),
-        reviewed_outputs={
-            output_id: SinkOutputResolved(
-                name="results",
-                plugin="json",
-                options={"path": "/data/results.jsonl"},
-                required_fields=("id",),
-                schema_mode="observed",
-                on_write_failure="discard",
-            )
-        },
-    )
     preferences = ComposerSessionPreferencesRecord(
         session_id=UUID(_SESSION_ID),
         trust_mode="explicit_approve",
@@ -289,13 +236,13 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
     with (
         patch.object(sessions, "assess_chargeable_operation", new=authority.assess_chargeable_operation),
         patch.object(sessions, "get_composer_preferences", autospec=True, return_value=preferences),
-        patch("elspeth.web.composer.service.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
-        patch.object(service, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
+        patch("elspeth.web.composer.planning_application.plan_pipeline", autospec=True, side_effect=assert_scoped_planner) as planner,
+        patch.object(service._advisor_checkpoint, "_run_advisor_checkpoint", autospec=True, side_effect=assert_scoped_planner) as advisor,
         pytest.raises(_PlannerReached if allowed else ComposerAdmissionRefused),
     ):
         if entry == "rootless":
             await service.compose(
-                origin.content,
+                "Build a CSV pipeline",
                 [],
                 state,
                 session_id=_SESSION_ID,
@@ -303,33 +250,8 @@ async def test_same_valid_request_reaches_planner_only_when_admitted(
                 user_message_id=message_id,
                 session_operation_context=_CONTEXT,
             )
-        elif entry == "guided_full":
-            await service.plan_guided_full_pipeline(
-                intent=origin.content,
-                current_state=state,
-                originating_message=origin,
-                base=base,
-                policy_catalog=catalog,
-                plugin_snapshot=snapshot,
-                recorder=BufferingRecorder(),
-                operation_fence=fence,
-                session_operation_context=_CONTEXT,
-            )
-        elif entry == "guided_delta":
-            await service.plan_guided_pipeline(
-                intent=origin.content,
-                current_state=state,
-                guided=guided,
-                originating_message=origin,
-                base=base,
-                user_id="owner",
-                supersedes_draft_hash=None,
-                recorder=BufferingRecorder(),
-                operation_fence=fence,
-                session_operation_context=_CONTEXT,
-            )
         else:
-            await service.run_signoff_checkpoint(
+            await service._advisor_checkpoint.run_signoff_checkpoint(
                 state=state,
                 session_id=_SESSION_ID,
                 recorder=BufferingRecorder(),
@@ -348,6 +270,11 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
     service = composer_service_without_sessions_service
     authority = _AdmissionService(None)
     service._sessions_service = cast(SessionServiceProtocol, authority)
+    service._chargeable_admission = ComposerChargeableAdmission(cast(SessionServiceProtocol, authority))
+    service._planning_application._sessions_service_optional = service._sessions_service
+    service._planning_application._chargeable_admission = service._chargeable_admission
+    service._advisor_checkpoint._sessions_service = service._sessions_service
+    service._advisor_checkpoint._chargeable_admission = service._chargeable_admission
     second_context = SessionOperationContext(
         fence=SessionOperationFence(session_id="second-session", operation_id="second-operation", lease_token="token", operation_epoch=1),
         operation_kind=SessionOperationKind.COMPOSE,
@@ -372,7 +299,7 @@ async def test_concurrent_diagnostics_restore_separate_session_scopes(
 
     with (
         patch.object(authority, "assess_chargeable_operation", new=admit),
-        patch.object(service, "_call_text_llm_with_audit", autospec=True, side_effect=explain),
+        patch.object(service._provider_gateway, "_call_text_llm_with_audit", autospec=True, side_effect=explain),
     ):
         results = await asyncio.gather(
             service.explain_run_diagnostics({}, session_operation_context=_CONTEXT),

@@ -555,6 +555,8 @@ class TestProcessFlow:
         result = transform.process(row, ctx)
         assert result.status == "error"
         assert result.reason["reason"] == "no_results"
+        # The query is row data: the reason never repeats it (C3).
+        assert "obscure query" not in repr(result.reason)
 
     def test_zero_results_quarantine_preserves_skipped_metadata(self):
         transform, mock_provider = _setup_transform_with_mock_provider(
@@ -800,8 +802,12 @@ class TestProcessGuards:
 class TestNoResultsQuarantineContext:
     """Verify the no_results quarantine error includes full audit context."""
 
-    def test_no_results_error_includes_query_and_provider(self):
-        """The no_results error reason must include query and provider for audit traceability."""
+    def test_no_results_error_names_provider_not_query(self):
+        """The no_results reason names the provider; the query is row data (C3).
+
+        The query text stays traceable through the row carrier and the recorded
+        retrieval call, never through the reason.
+        """
         transform, _ = _setup_transform_with_mock_provider(on_no_results="quarantine")
 
         row = _make_row({"question": "obscure query"})
@@ -810,7 +816,7 @@ class TestNoResultsQuarantineContext:
         result = transform.process(row, ctx)
         assert result.status == "error"
         assert result.reason["reason"] == "no_results"
-        assert "query" in result.reason
+        assert "query" not in result.reason
         assert "provider" in result.reason
 
 

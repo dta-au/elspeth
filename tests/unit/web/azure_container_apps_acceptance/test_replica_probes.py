@@ -22,6 +22,7 @@ import dataclasses
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -121,9 +122,8 @@ class _FakeReader(SqlReader):
             return self._replicas.epoch
         if "owner_instance_id" in statement:
             return self._replicas.owner
-        if "clock_timestamp" in statement:
-            return datetime(2026, 9, 5, 10, 0, tzinfo=UTC)
-        if "count(*) FROM guided_operations" in statement:
+        if "count(*) FROM message_ingress_receipts" in statement:
+            assert parameters["client_request_id"]
             return 1
         raise AssertionError(statement)
 
@@ -213,9 +213,13 @@ class TestFenceConflictRecorded:
         trials = []
         for _ in range(20):
             replicas.reset()
+            request_id = str(uuid4())
             trials.append(
                 driver.fence_conflict_trial(
-                    "session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {"turn_token": "0" * 64})
+                    "session-1",
+                    ProbeRequest(
+                        "POST", "/api/sessions/session-1/messages", {"content": "Build a pipeline", "client_request_id": request_id}
+                    ),
                 )
             )
         for trial in trials:
@@ -232,7 +236,9 @@ class TestFenceConflictRecorded:
     def test_a_double_dispatch_fails_the_probe(self) -> None:
         replicas = _RecordedReplicas(both_win=True)
         driver, _reader = _driver(replicas)
-        trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {}))
+        trial = driver.fence_conflict_trial(
+            "session-1", ProbeRequest("POST", "/api/sessions/session-1/messages", {"client_request_id": str(uuid4())})
+        )
         assert [response.status for response in trial.responses] == [200, 200]
         result = decide_fence_conflict([trial])
         assert result.outcome == "fail" and "trial[0]:not_one_success_and_one_fence_refusal" in result.reasons
@@ -240,7 +246,9 @@ class TestFenceConflictRecorded:
     def test_two_labels_answered_by_one_instance_fail_the_probe(self) -> None:
         replicas = _RecordedReplicas(same_instance=True)
         driver, _reader = _driver(replicas)
-        trial = driver.fence_conflict_trial("session-1", ProbeRequest("POST", "/api/sessions/session-1/guided/respond", {}))
+        trial = driver.fence_conflict_trial(
+            "session-1", ProbeRequest("POST", "/api/sessions/session-1/messages", {"client_request_id": str(uuid4())})
+        )
         result = decide_fence_conflict([trial])
         assert "trial[0]:instances_not_distinct" in result.reasons
 
@@ -468,16 +476,13 @@ class TestController:
 
 
 class TestObserver:
-    def test_guided_operation_rows_needs_the_epoch_reading_taken_before_the_trial(self) -> None:
+    def test_message_ingress_receipt_rows_is_scoped_to_the_exact_request(self) -> None:
         replicas = _RecordedReplicas()
         reader = _FakeReader(replicas)
         observer = PostgresEvidenceObserver(sessions=reader, landscape=reader)
-        with pytest.raises(AcceptanceInputError):
-            observer.guided_operation_rows("session-1", since_epoch=3)
-        assert observer.fence_epoch("session-1") == 3
-        assert observer.guided_operation_rows("session-1", since_epoch=3) == 1
-        with pytest.raises(AcceptanceInputError):
-            observer.guided_operation_rows("session-1", since_epoch=2)
+        request_id = str(uuid4())
+        assert observer.message_ingress_receipt_rows("session-1", client_request_id=request_id) == 1
+        assert any("count(*) FROM message_ingress_receipts" in statement for statement in reader.statements)
 
     def test_membership_row_reads_the_owner_row_or_none(self) -> None:
         reader = _FakeReader(_RecordedReplicas())

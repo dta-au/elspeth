@@ -58,7 +58,7 @@ describe("compose timeout ceiling derivation", () => {
   });
 });
 
-describe("runComposeWithTimeout — the shared freeform/guided send primitive", () => {
+describe("runComposeWithTimeout — the composer send primitive", () => {
   beforeEach(() => {
     resetComposeTimeoutForTests();
   });

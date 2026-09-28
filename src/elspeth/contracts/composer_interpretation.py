@@ -93,8 +93,8 @@ class InterpretationSurfaceOrigin(StrEnum):
     over a state no LLM authored in that request, so their provenance is NULL
     rather than a label standing in for a model.
 
-    COMPOSER_LLM  — the compose loop, its repair pass, or a guided commit
-                    carrying the proposal row's planner identity.
+    COMPOSER_LLM  — the compose loop or its repair pass, carrying the
+                    proposal row's planner identity.
     STATE_REVERT  — ``POST state/revert`` re-raising the restored state's debt.
     YAML_IMPORT   — ``POST state/yaml`` raising the imported pipeline's debt.
     E2E_SEED      — the E2E state-seed route.

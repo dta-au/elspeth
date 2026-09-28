@@ -91,6 +91,12 @@ class AzureBlobRecordSerializationError(ValueError):
     row-independent config integrity failures — the CUSTOM header-mapping
     check raises bare ``ValueError`` outside the wraps and crashes, because
     it indicates a configuration bug rather than an unserializable row.
+
+    Its text becomes the recorded diversion reason, so it is value-free: an
+    encoder wrap carries only the wrapped exception's class name (an
+    encoder's own text quotes the row: ``UnicodeEncodeError`` names the
+    character, json's ``ValueError`` the non-finite float), with the cause
+    suppressed so an uncaught one prints no value either.
     """
 
 
@@ -390,7 +396,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:91dc2714aede9956"
+    source_file_hash: str | None = "sha256:0719093e3ea19a79"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -938,7 +944,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             else:
                 header_chunk = b""
         except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(str(exc)) from exc
+            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
         if header_chunk:
             yield header_chunk
 
@@ -949,14 +955,14 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
                 output.seek(0)
                 output.truncate(0)
             except (ValueError, TypeError, csv.Error, UnicodeError) as exc:
-                raise AzureBlobRecordSerializationError(str(exc)) from exc
+                raise AzureBlobRecordSerializationError(type(exc).__name__) from None
             if chunk:
                 yield chunk
 
         try:
             final_chunk = encoder.encode("", final=True)
         except (ValueError, TypeError, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(str(exc)) from exc
+            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
         if final_chunk:
             yield final_chunk
 
@@ -965,7 +971,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
         try:
             return json.dumps(rows, indent=2, allow_nan=False).encode("utf-8")
         except (ValueError, TypeError, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(str(exc)) from exc
+            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
 
     def _serialize_jsonl(self, rows: list[dict[str, Any]]) -> bytes:
         """Serialize rows to JSONL bytes (newline-delimited JSON)."""
@@ -973,7 +979,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
             lines = [json.dumps(row, allow_nan=False) for row in rows]
             return "\n".join(lines).encode("utf-8")
         except (ValueError, TypeError, UnicodeError) as exc:
-            raise AzureBlobRecordSerializationError(str(exc)) from exc
+            raise AzureBlobRecordSerializationError(type(exc).__name__) from None
 
     def set_resume_field_resolution(self, resolution_mapping: dict[str, str]) -> None:
         set_resume_field_resolution(self, resolution_mapping)

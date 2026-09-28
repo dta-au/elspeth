@@ -15,8 +15,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import elspeth.web.composer.service as svc
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
 
@@ -54,32 +54,34 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         captured.update(kwargs)
         return _response()
 
-    monkeypatch.setattr(svc, "_litellm_acompletion", fake_acompletion)
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", fake_acompletion)
     return captured
 
 
 @pytest.mark.asyncio
 async def test_tool_loop_call_carries_the_discovery_knob(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5")._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5")._provider_gateway._call_llm(
+        [{"role": "user", "content": "hi"}], tools=[]
+    )
     assert captured["reasoning_effort"] == "low"
 
 
 @pytest.mark.asyncio
 async def test_text_call_carries_the_discovery_knob(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="medium")._call_text_llm(
-        [{"role": "user", "content": "hi"}]
-    )
+    await _service(
+        tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="medium"
+    )._provider_gateway._call_text_llm([{"role": "user", "content": "hi"}])
     assert captured["reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio
 async def test_none_opt_out_leaves_calls_unhinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="none")._call_llm(
-        [{"role": "user", "content": "hi"}], tools=[]
-    )
+    await _service(
+        tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="none"
+    )._provider_gateway._call_llm([{"role": "user", "content": "hi"}], tools=[])
     assert "reasoning_effort" not in captured
     assert "reasoning" not in captured
 
@@ -87,7 +89,9 @@ async def test_none_opt_out_leaves_calls_unhinted(monkeypatch: pytest.MonkeyPatc
 @pytest.mark.asyncio
 async def test_openrouter_primary_model_gets_the_native_reasoning_object(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_model="openrouter/anthropic/claude-sonnet-5")._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    await _service(tmp_path, composer_model="openrouter/anthropic/claude-sonnet-5")._provider_gateway._call_llm(
+        [{"role": "user", "content": "hi"}], tools=[]
+    )
     assert captured["reasoning"] == {"effort": "low"}
     assert "reasoning_effort" not in captured
 
@@ -109,7 +113,7 @@ async def test_advisor_call_carries_the_advisor_knob(
     expected_value: object,
 ) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_advisor_model=advisor_model)._call_advisor_with_audit(
+    await _service(tmp_path, composer_advisor_model=advisor_model)._advisor_checkpoint._call_advisor_with_audit(
         {
             "trigger": "reactive",
             "problem_summary": "stuck",
@@ -128,6 +132,6 @@ async def test_bare_openai_surface_models_stay_unhinted(monkeypatch: pytest.Monk
     own, extra="forbid") do not serve — so OpenAI-surface models go unhinted
     until the gateway contract carries the field (elspeth-9a46553771)."""
     captured = _capture(monkeypatch)
-    await _service(tmp_path)._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    await _service(tmp_path)._provider_gateway._call_llm([{"role": "user", "content": "hi"}], tools=[])
     assert "reasoning_effort" not in captured
     assert "reasoning" not in captured

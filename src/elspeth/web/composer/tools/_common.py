@@ -665,9 +665,8 @@ def _semantic_contracts_payload(
 ) -> list[_SemanticEdgeContractPayload]:
     """Serialize a SemanticEdgeContract tuple to JSON-friendly dicts.
 
-    Centralized so ToolResult.to_dict and the guided stage emitter
-    (guided/emitters.py) emit identical shapes — and so adding a field
-    updates both surfaces in one place. (preview_pipeline no longer
+    Centralized so ToolResult.to_dict emits one consistent shape.
+    (preview_pipeline no longer
     co-emits it: its data stopped carrying a copy of the envelope's
     validation in elspeth-e405ad7cd2 R4.)
 
@@ -1801,9 +1800,8 @@ def canonicalize_source_validation_failure(value: str | None) -> str:
     "", ``set_source``/``set_source_from_blob`` passed it through to the
     engine plugin-config rejection, and the auto-wire pass refused the whole
     candidate as non-discard — an accepted-then-wedged repair defect. The
-    guided surface's hard reject of "" (``guided/resolved.py``
-    ``SourceResolved``) stays as an internal invariant, not a second owner:
-    with boundary canonicalization "" can no longer lawfully reach it. The
+    boundary canonicalization ensures "" cannot lawfully reach persisted
+    composer state. The
     engine-side plugin-config validator
     (``plugins/infrastructure/config_base.py``) still rejects "" for
     non-composer-authored configs; composer-persisted state is always
@@ -3375,7 +3373,7 @@ class ReviewedSourceAuthority:
     """Session-bound private authority for reusing already-reviewed sources.
 
     This object is deliberately not a serialisable planner or event payload.
-    Only the guided settlement path constructs it, and the candidate boundary
+    The owned-state commit path constructs it, and the candidate boundary
     accepts it only for the same session and an exact reviewed source record.
     """
 
@@ -3403,61 +3401,6 @@ class ReviewedSourceAuthority:
         ):
             raise TypeError("ReviewedSourceAuthority.verified_blob_paths is malformed")
         freeze_fields(self, "reviewed_sources", "verified_blob_paths")
-
-
-@dataclass(frozen=True, slots=True)
-class PendingCustodyBlobView:
-    """One deferred inline-custody blob, resolvable before it is settled.
-
-    Guided-full defers inline-custody finalization into the atomic staging
-    settlement (elspeth-1e3ad83d89), so at custody-safe revalidation time the
-    proposal's ``source.blob_id`` names a blob with no row and no storage
-    file yet. This view carries the settlement-equivalent row fields plus the
-    content bytes so ``_resolve_source_blob`` can resolve exactly that one
-    blob (elspeth-282f392fae). Every field is derived server-side from the
-    planner's own ``PipelineCustodyPreparation`` — never from tool arguments —
-    and resolution requires an exact ``blob_id`` AND ``session_id`` match; any
-    other reference falls through to the normal fail-closed database path.
-    """
-
-    blob_id: str
-    session_id: str
-    filename: str
-    mime_type: str
-    size_bytes: int
-    content_hash: str
-    storage_path: str
-    source_description: str | None
-    creation_modality: str
-    created_from_message_id: str
-    creating_model_identifier: str | None
-    creating_model_version: str | None
-    creating_provider: str | None
-    creating_composer_skill_hash: str | None
-    creating_arguments_hash: str | None
-    content: bytes
-
-    def __post_init__(self) -> None:
-        if type(self.blob_id) is not str or not self.blob_id:
-            raise TypeError("PendingCustodyBlobView.blob_id must be a non-empty exact string")
-        if type(self.session_id) is not str or not self.session_id:
-            raise TypeError("PendingCustodyBlobView.session_id must be a non-empty exact string")
-        if type(self.filename) is not str or not self.filename:
-            raise TypeError("PendingCustodyBlobView.filename must be a non-empty exact string")
-        if type(self.mime_type) is not str or not self.mime_type:
-            raise TypeError("PendingCustodyBlobView.mime_type must be a non-empty exact string")
-        if type(self.content_hash) is not str or not self.content_hash:
-            raise TypeError("PendingCustodyBlobView.content_hash must be a non-empty exact string")
-        if type(self.storage_path) is not str or not self.storage_path:
-            raise TypeError("PendingCustodyBlobView.storage_path must be a non-empty exact string")
-        if type(self.creation_modality) is not str or not self.creation_modality:
-            raise TypeError("PendingCustodyBlobView.creation_modality must be a non-empty exact string")
-        if type(self.size_bytes) is not int or self.size_bytes < 0:
-            raise TypeError("PendingCustodyBlobView.size_bytes must be a non-negative exact integer")
-        if type(self.content) is not bytes:
-            raise TypeError("PendingCustodyBlobView.content must be exact bytes")
-        if len(self.content) != self.size_bytes:
-            raise ValueError("PendingCustodyBlobView.size_bytes must equal len(content)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3575,12 +3518,6 @@ class ToolContext:
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
-    # Private server-owned field, set ONLY by the planner's deferred
-    # custody-safe revalidation (elspeth-282f392fae): the one inline-custody
-    # blob this plan will settle atomically at staging. _resolve_source_blob
-    # may resolve exactly this blob_id/session_id pair from the view; every
-    # other blob reference keeps the fail-closed database path.
-    _pending_custody: PendingCustodyBlobView | None = None
 
 
 ToolHandler = Callable[

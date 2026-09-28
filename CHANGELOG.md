@@ -7,12 +7,12 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
-to 68 for durable Composer progress, request lifecycle leases, identity owner
+to 71 for durable Composer progress, request lifecycle leases, identity owner
 foreign keys, approval revocation provenance, run admission decisions, sparse
 proposal arguments, structured validation errors, approved prompt artifact provenance,
 64-bit quota policy limits, nullable token-ledger prompt/completion measures
 (unknown usage is NULL, never zero), and timestamp-leading indexes for
-container-wide quota scans, durable guided fork failure diagnostics, the
+container-wide quota scans, durable fork failure diagnostics, the
 freeform default preference with removal of the retired mode banner field, and
 ordered coalesce branches and source order in composer authority hashes.
 Session epoch 62 requires nullable backend suggestions in durable advisor
@@ -25,9 +25,6 @@ It also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
 model, provider and `composer_skill_hash` columns.
-Session epoch 64 adds the distinct `cost_unavailable` guided-operation failure
-classification so missing model pricing directs administrators to repair pricing
-instead of asking users to retry an invalid provider response.
 Session epoch 65 makes `completion_gates.advisor_signoff.note` a required key in
 the persisted composer-meta envelope, so a blocked turn can show the advisory
 reviewer's own bounded words beside the block; the strict parser refuses an
@@ -45,6 +42,16 @@ Session epoch 68 adds `compose_checkpoint` and `ordinary_proposal_checkpoint`
 to the persisted proposal rebase reasons. These events keep pending proposals
 bound to the current composition head across checkpoints. Earlier readers
 reject the new reasons, so epoch-67 session databases must also be recreated.
+Session epoch 69 adds immutable freeform message ingress receipts that bind
+each accepted client request UUID to one user message and its originally
+requested nullable state. Exact transport retries can recover that acceptance
+without inserting another user message.
+Session epoch 70 stores the first-run tutorial Build stage. The tutorial
+composes through the ordinary freeform planner while retaining explicit Run,
+Audit and Graduation steps.
+Session epoch 71 removes mode-specific operation state and adds mode-neutral
+durable receipts for session fork and state revert. Earlier Sessions stores
+must be recreated; there is no compatibility reader or in-place migration.
 Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 48 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
@@ -70,6 +77,10 @@ of sparse source streams. Its scheduler event vocabulary also includes
 `resume_requeue_failed`; a Landscape store created from an earlier 0.8.1
 pre-release build at epoch 46 has the narrower `event_type` CHECK and is
 refused at startup; recreate it.
+Epoch 47 indexes verification decisions by run, time, and call ID for bounded
+exports and indexes node states by run to detect misplaced verdicts without a
+full verification-table scan. Populated epoch-46 Landscape stores must be
+recreated.
 Epoch 48 hands a source-quarantined row to its sink through a durable
 PENDING_SINK work item written in the same transaction that records it, and
 resume re-drives only scheduler work: it never re-derives a source row, and it
@@ -83,10 +94,10 @@ separate deployment requirement.
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 68 (including epoch 67) and Landscape databases below epoch 48 must be
+epoch 71 (including epoch 70) and Landscape databases below epoch 48 must be
 recreated together.
 Startup accepts an empty database or an existing database matching the exact
-current schema epoch (session 68, Landscape 48); these are not minimum versions.
+current schema epoch (session 71, Landscape 48); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service
@@ -161,15 +172,38 @@ drained and repair this release forward.
   `{id: Name}` or `{Name: ID}`, or two `value_transform` targets `total` and
   `Total` of one node, now refused at configuration), or crashed a csv/json sink's write (a header-spelled custom
   `headers` key). A `required_input_fields` verdict for a header spelling of a
-  guaranteed field now names the normalized spelling. Behaviour changes: a
+  guaranteed field now names the normalized spelling. A header the source's
+  `field_mapping` renames is a spelling of the rename's TARGET: under
+  `field_mapping: {name: b}` a declaration `Name`, `NAME` or the mapping key
+  `name` itself names `b` and is refused ("... and the source's field_mapping
+  renames 'name' to 'b'. Declare 'b'"). A headerless CSV source (csv with
+  `columns`, or aws_s3/azure_blob `format: csv` with
+  `csv_options: {has_header: false}`) matches `field_mapping`
+  keys against the column names as written, so under `columns: [Name]` and
+  `field_mapping: {Name: b}` the declaration `Name` names `b` and is refused
+  ("... renames its column 'Name' to 'b'. Declare 'b'"). Only the normalized form used to be
+  compared, so `field_mapper` `{Name: given}` with `Name: int?` under that
+  mapping delivered a str under a recorded `given: int` with exit 0, and both
+  `elspeth validate` and the Composer admitted it. The build and the Composer
+  resolve a declaration through the `field_mapping` of every source whose rows
+  reach the node, followed through every transform rename on the way; the run
+  time resolves it through the row's own contract, exactly as a lookup does. A
+  `field_mapper` rename carries the field's original header onto its new name,
+  so behind `{name: c}` (or a source `{name: b}` then `{b: c}`) a declaration
+  `Name` names `c` and is refused at validation ("... a transform upstream
+  renames the field it names to 'c' ... Declare 'c'"); with or without a source
+  `field_mapping`, that shape also delivered a str under a recorded
+  `given: int` with exit 0. Behaviour changes: a
   `type_coerce` with `schema: {mode: observed}` and `conversions: [{field:
   Price}]` over header `Price` worked as a lookup and now routes every row
   with `declared_field_is_header_spelling` — write `field: price`; and a
   conversion field is now a declared input, so one no
   row carries is refused at build against a `fixed` upstream and otherwise
-  ends the run as a `DeclaredRequiredInputFieldsViolation` with the row's
-  outcome recorded (it was routed `missing_field`), as `web_scrape`'s
-  `url_field` always has. The named scan `fields` of `keyword_filter` and
+  routes each row lacking it as `missing_field`, as before (see the
+  declared-input bullet below). The same holds for `json_explode`'s
+  `array_field`, now a declared input: `array_field: Name` over header `Name`
+  resolved by lookup and now routes every row with
+  `declared_field_is_header_spelling` — write `array_field: name`. The named scan `fields` of `keyword_filter` and
   of the Bedrock and Azure content-safety and prompt-shield guardrails are
   declarations too: `fields: [Count]` over a source typing `count` as `int`
   passed `elspeth validate` (while `fields: [count]` was refused as a
@@ -376,6 +410,38 @@ drained and repair this release forward.
   disagrees with its group's verdict is refused as audit corruption. A
   collector plugin's returned error is now scrubbed and stored structurally
   on the flush state, as the aggregation seam already did.
+- **A row missing an input field a transform's options name is routed, not
+  a run-ending error.** Behind an observed or open upstream the build cannot
+  prove that a field a transform derives from its options is present, so a
+  row lacking it used to end the run with exit 4
+  (`DeclaredRequiredInputFieldsViolation`, or a raw `KeyError` in
+  `json_explode`). Such a row is now refused before the transform runs and
+  routed through `on_error` with reason `missing_field`, naming only the
+  configured fields, never a row value (ADR-013 Amendment 2026-09-27). This
+  covers `field_mapper` mapping sources, `reference_join` `key_field`,
+  `blob_csv_expand` and `blob_json_expand` (`text_field`, `blob_ref_field`,
+  `content_type_field`), `blob_text_expand`, `pdf_rasterize` and
+  `aws_textract_inline_analysis` `blob_ref_field`,
+  `aws_textract_document_analysis` `key_field`/`bucket_field`/`version_field`,
+  `azure_document_intelligence` `source_field`, `rag_retrieval` and
+  `azure_ai_search` `query_field`, `blob_fetch` and `web_scrape` `url_field`,
+  `llm` `image_inputs` columns, and `json_explode` `array_field`. A field the build did prove present (every upstream
+  guarantees it), or one the row carries while its contract lost it, is still
+  our defect and ends the run. After a `merge: union` coalesce whose policy
+  can lose a branch (`best_effort`, `quorum`, `first`), a field counts as
+  proved only when every branch guarantees it: a branch that declares no
+  guarantees can be the whole merged row, so a field only another branch
+  creates is a fact about the row and a row without it routes. For the same
+  reason a `mode: fixed` consumer after such a coalesce is no longer refused
+  at build for a field only one branch guarantees; it checks each row.
+  Aggregations and collectors classify a buffered
+  row's missing `schema.required_fields` column with the same rule: an
+  unproven absence fails the batch through `on_error`, and a proven one ends
+  the run with every buffered row recorded `failed` first (aggregation
+  and collector alike). An
+  `llm` `image_inputs` entry marked `required: false` is no longer treated as
+  a required input, so a row without that image is sent without it instead of
+  being refused.
 - **A batch mixing rows with and without an optional field no longer ends
   the run.** A `batch_replicate` batch where some rows carry `copies_field`
   and others do not (each of those uses `default_copies`) used to end the run
@@ -398,12 +464,13 @@ drained and repair this release forward.
   is claimed quarantined. Every buffered row is recorded `failed` before the
   run ends.
 - **`output_mode: passthrough` admits only a batch plugin that emits one row
-  per buffered row; no shipped plugin does.** Every batch plugin now declares
+  per buffered row.** Every batch plugin now declares
   whether its flush emits exactly one row per buffered row
   (`flush_emits_one_row_per_buffered_row`), and `elspeth validate`, `elspeth
-  run` and the composer read that one declaration. None of the 13 shipped
-  batch plugins does: they reduce the batch, replicate rows (`batch_replicate`)
-  or skip rows (`batch_outlier_annotator` skips a null or non-finite value).
+  run` and the composer read that one declaration. None of the 13 existing
+  batch plugins does (the new `batch_rank`, below, does): they reduce the
+  batch, replicate rows (`batch_replicate`) or skip rows
+  (`batch_outlier_annotator` skips a null or non-finite value).
   So an aggregation of any of them under `output_mode: passthrough` is now
   refused at config with "Use output_mode: transform". Before, any batch
   plugin under `passthrough` passed `elspeth validate`. A flush that returned
@@ -437,6 +504,16 @@ drained and repair this release forward.
   it no longer logs a tolerated divergence for such a group (a group failed
   before any branch arrived is counted when its first straggler arrives, as
   the audit counts it).
+- **`rows_coalesce_failed` counts each failed coalesce or row_union group.**
+  The audit count keyed a failed group by its source row, so when a
+  `json_explode` fed a fork and two exploded items of one row each failed
+  their merge, the run reported one failed group (and logged a tolerated
+  live/audit divergence). It is now keyed by the fork group each merge
+  actually waits on — the key the coalesce and row_union executors use — so
+  that run reports two, matching the live count, and a resumed run
+  reconstructs the same number. A live count above the audit count is no
+  longer logged and tolerated: it ends the run as a counter-parity failure
+  (exit 4), like every other live/audit counter mismatch.
 - **A union coalesce whose branches certainly disagree on a field's type is
   refused at build.** When every branch merges on every row (`require_all`)
   and two branches each carry a field whose type is fixed before the first
@@ -465,6 +542,50 @@ drained and repair this release forward.
   `best_effort` and `first`, which can merge a single branch, are never
   refused. The composer cannot author this policy (its import is refused),
   so it has no second surface to agree with.
+- **New batch plugin `batch_rank`: rank rows within a batch and keep every
+  row.** It adds `<prefix>_rank`, `<prefix>_percentile`,
+  `<prefix>_ranked_count` and `<prefix>_batch_size` (default prefix `rank`)
+  to every buffered row, ranking a numeric `value_field` (`order:
+  descending|ascending`, `ties: competition|dense`), and emits exactly one row
+  per buffered row, in order. A null, absent or non-finite value keeps its row
+  with a null rank and percentile; a present text or boolean value fails the
+  whole batch (routed by `on_error`, value-free reason). It is the one shipped
+  batch plugin that declares `flush_emits_one_row_per_buffered_row`, so it
+  runs under `output_mode: passthrough`, where the same tokens continue
+  downstream, as well as under `transform`.
+  `examples/batch_rank_passthrough` ranks prompt candidates by judge score and
+  shortlists the top two per prompt, and contrasts the lineage of the two
+  modes.
+- **A large aggregation batch, sink write or expansion no longer stops the
+  run on the database's bound-parameter limit.** Audit statements bound one
+  or more parameters per row: the barrier release of an aggregation batch,
+  the member locks and outcome checks of its result or failure verdict, the
+  read of one sink write's members, the read-back of a flush's or an
+  expansion's children, and, on recovery, lease rotation, the resume re-drive
+  of failed work and group-loss adoption. SQLite refuses a statement above
+  32,766 bound parameters and PostgreSQL above 65,535, so a large enough
+  batch stopped the run with exit 4 and left every buffered row with no
+  outcome: measured, a 2,730-row `batch_rank` passthrough batch, a
+  33,000-row `batch_stats` batch, and a plain 40,000-row source-to-sink run.
+  Every such statement now binds a fixed number of parameters, as chunked
+  reads or one executemany inside the same transaction; multi-row inserts
+  stay paged by SQLAlchemy below the driver's ceiling. Measured on SQLite: a
+  40,000-row `batch_stats` batch completes with every row recorded; the
+  largest insert page bound 11,000 parameters and the largest other
+  statement 903.
+- **A database error is recorded without its SQL or bound values.** The
+  audit trail recorded a failing statement's driver text as the operation's
+  error message, bound row payloads included (up to 450,969 characters for
+  one refused batch release). Landscape connections no longer render bound
+  parameters into error text, and the audit trail records a database error
+  by its type name.
+- **Known limit: one local-file sink write of more than about 12,600 rows
+  still stops the run.** The json, csv, text and document sinks record every
+  row's ordinal in the write's recovery evidence, which is capped at 64 KiB,
+  so a single write that large fails with `safe_evidence canonical JSON
+  exceeds the 64 KiB limit` and leaves its rows with no outcome (measured: a plain
+  15,000-row run on release/0.8.1). Aggregation batches that emit a summary
+  row are not affected.
 - **A follower started with `elspeth join` retries transient failures.** It
   applies the run's `retry` settings, as `elspeth run` does, so an LLM 429, a
   network error or a lost template render worker is retried there instead of
@@ -548,6 +669,33 @@ drained and repair this release forward.
   runs, approvals, attestations and authentication events for the identities in
   their scope. With governance off — the default — none of this is enforced and
   runs are admitted without an approval, as before.
+- **People & access in one place.** Authorized administrators can find a person
+  and manage access, roles, approvers, usage limits and local sign-in from one
+  searchable panel. Live local administrators can manage local accounts, and
+  neither the web UI nor the operator CLI can remove the last administrator
+  who can still sign in.
+- **Freeform is the Composer default.** New users open in Freeform, and the
+  tutorial hands off to it. Composer puts
+  blocking readiness decisions and their next actions beside the conversation,
+  including the controls for requesting an approval.
+- **Review follows the content that will run.** Composer requires the complete
+  live prompt for approval and binds the approved artifact to the effective
+  system and query prompts. Advisor evidence and injection checks include the
+  shared system prompt and up to eight query templates, with further queries
+  marked as withheld. Stale review actions are rejected after the source or
+  prompt changes.
+- **Composer validation honors authored contracts.** It evaluates every
+  declared semantic requirement and accepts the documented string form of
+  explicit schema fields for authored LLM nodes.
+- **Advisor blocks preserve the conversation.** A blocked turn keeps the
+  Composer reply and shows the reviewer's bounded finding and repair action.
+  Structured verdicts distinguish a rejected graph from a transient review
+  failure: transient failures can be retried, while an unchanged rejected
+  graph is not reviewed repeatedly.
+- **Uploaded material is validated against its contents.** Composer can use
+  uploaded CSV or JSON reference tables in `reference_join` and uploaded text
+  in an LLM prompt. Readiness validation reads the authorized, pinned bytes;
+  missing, changed or invalid content is refused before execution.
 - **The "Save for review" gesture is renamed "Share inspect link".** The old
   name read as a request addressed to someone, which is what the new send-for-
   review verb actually does; this one mints a link that anyone holding it can
@@ -598,7 +746,22 @@ drained and repair this release forward.
   validation check is removed with it. See the
   [environment reference](docs/reference/environment-variables.md#azure-ai-search)
   and the [Container Apps runbook](docs/runbooks/azure-container-apps-cold-install.md).
+- **LLM costs use an explicit billing identity.** Operator profiles can name a
+  `pricing_model` separately from the model used for routing; accounting keeps
+  provider usage and price provenance, and reports an unknown price as
+  unavailable. Azure reasoning deployments now receive the required completion
+  token parameter. Set `temperature: null` on LLM nodes using those deployments
+  so Azure does not reject their row calls.
+- **Web run limits are operator configurable.**
+  `ELSPETH_WEB__EXECUTION_RATE_LIMIT` controls the external-call rate for
+  web-executed pipelines; the default remains 60 calls per minute per service.
 
+- **Web progress survives interrupted connections.** PostgreSQL-backed
+  replicas share Composer progress, run events, WebSocket tickets and rate
+  budgets, and an admitted run can recover after a replica is lost. The Run
+  view also recovers progress after a stream ends while the tab is closed;
+  temporary backend failures reconnect, and stale Composer poll responses
+  cannot roll progress backward.
 - **Coordination deadlines are decided from fresh post-lock database time.**
   Lease deadlines are now issued after locked admission rather than from a
   clock sampled before it, and sink-effect clocks are sampled after their lease
@@ -612,7 +775,17 @@ drained and repair this release forward.
   error reaches the audit trail instead of the rollback's own error.
 - **Blob custody stays fenced across durable effects and recovery.** Collector
   blob custody and fatal archive failures are preserved, and custody walkers
-  reject null canonical sections rather than treating them as empty.
+  reject null canonical sections rather than treating them as empty. Cleanup
+  metrics no longer expose session or blob identifiers as labels.
+- **Document and storage boundaries fail closed.** Azure safety scans reject
+  rows with no scannable text; Azure Blob reads and CSV writes enforce byte
+  limits, and replayed sink effects bind to the storage account. PDF
+  rasterization rejects missing or duplicate worker pages before emitting
+  results.
+- **Release signing stays under operator custody.** CI workflows no longer
+  bind the judge-metadata signing key. Push checks still require verification
+  and fail closed without it; authoritative verification requires an
+  operator-controlled context.
 - **SSO hardening.** Dormancy is enforced on bound identities, bound profiles
   refresh, database work is offloaded off the request path, and response
   streams carry size caps.
@@ -635,6 +808,61 @@ drained and repair this release forward.
   every composer authority hash and the advisor fingerprint (session epoch 67).
   A planner `set_pipeline` whose row_union branch value is not a string now
   persists as an argument error instead of failing audit persistence.
+- **Failure reasons no longer carry the row value.** `type_coerce` wrote the
+  offending value into its failure message (`'…' is not a valid integer
+  string`, `float … has fractional part`), and the engine copies that reason
+  into `transform_errors`, `node_states.error_json`, the scheduler's pending
+  error and the routing reason. The reason now names the field, the expected
+  and actual type and a stable `error_type` code (`not_integer_string`,
+  `fractional_float`, …); the value stays only in the row-data columns.
+  `blob_csv_expand`, `blob_json_expand`, `blob_text_expand` and
+  `pdf_rasterize` no longer echo a malformed `blob_ref` (arbitrary row text)
+  in their `invalid_blob_ref` reason; a well-formed payload-store hash is
+  still named where it identifies the stored blob. `reference_join` no longer
+  records the row's join key (`reference_key_value`, and the key inside the
+  miss message); the reason names the key field. `web_scrape` and
+  `blob_fetch` no longer name the row's URL anywhere in a reason or a
+  persisted error message (the `url` key, `HTTP 404: <url>`, `Connection
+  error fetching <url>` — the last reached `node_states.error_json` with the
+  query string unredacted), and an SSRF or DNS refusal no longer repeats the
+  host or resolved address; the URL stays in the row and the recorded call.
+  Which check refused the URL (always-blocked vs blocked address range,
+  malformed, forbidden scheme, credentials, DNS failure, …) is kept, value-free,
+  as the reason's `cause`.
+  The `llm` structured-output reasons no longer carry response content
+  (`raw_response_preview` becomes `content_length`; a type mismatch drops
+  `value`, an enum miss drops the value from its message, a missing field
+  drops the response's `available_fields`) — the response can echo the
+  prompt's row data and stays in the recorded call. `rag_retrieval`'s
+  `no_results` reason drops the query text, and `blob_json_expand`'s
+  `data_key_not_found` no longer lists the document's own keys.
+  An expression evaluation error (`value_transform`'s reason, a gate's failed
+  node state) no longer names a lookup key or index the expression computes
+  from the row (`row[row['code']]` wrote `Key 'CUSTOMER_…' not found`): it
+  prints `<a key the expression does not spell out>`, while a key written in
+  the expression is still named, and no Python operand error text is kept.
+  `value_transform` adds the arm as `error_type` (`missing_key`,
+  `index_out_of_range`, `incompatible_types`, …). A `%` format whose key the
+  mapping lacks (`row['fmt'] % {...}`) is now a `missing_key` evaluation error
+  that `on_error` routes; it used to end the run, even under `on_error`, with
+  the format key as a raw `KeyError` in the failed node state (in a
+  `reference_join` output it is an `on_miss` miss, as a subscript miss is,
+  instead of a crash while loading the table). A gate whose condition
+  returns an unconfigured route label or a value that is not a bool or string
+  no longer records a preview or a hash of that value (a short value printed
+  whole); the failure names its type, a string's length and the condition.
+  A source that passes an integer beyond the JSON safe range as a valid row
+  still ends the run at ingest, but the failure (the source operation's error
+  and the printed traceback) no longer is that integer: it names the row
+  index, a declared field and the error type, as the transform, aggregation
+  and collector seams already did. Sinks follow the same rule: `dataverse`
+  no longer prints the row's alternate-key or lookup value when it refuses a
+  duplicate, blank or non-string key or an unsafe `@odata.bind` reference
+  (it names the field, the failure and, for a duplicate, the two member
+  ordinals), and the `csv`, `json` and `azure_blob` sinks' encoding and
+  serialization diversion reasons carry the exception class instead of the
+  codec's text, which quoted the character it could not encode (`CSV
+  encoding (ascii) failed: UnicodeEncodeError`) or the non-finite float.
 
 ### Newly refused configurations
 
@@ -654,7 +882,8 @@ These ran and delivered rows before:
   `HeaderSpelledDeclarationViolation` and every token's outcome recorded.
   Before, the declaration was ignored (`value_transform` or sink `Name:
   int?`, `batch_stats` `group_by: Name`) or matched by lookup (`type_coerce`
-  `field: Price`, `keyword_filter` `fields: [Count]`), and every row was
+  `field: Price`, `keyword_filter` `fields: [Count]`, `json_explode`
+  `array_field: Name`), and every row was
   delivered. A `value_transform` target or `field_mapper` rename target
   spelled by the header of a differently spelled arriving field routes every
   row with `target_is_header_spelling` (refused with
@@ -666,11 +895,18 @@ These ran and delivered rows before:
   string. Declare the normalized name (`name`, `price`). Two `value_transform`
   targets of one node that spell one another (`total`, then `Total`) are
   refused at configuration ("target 'Total' is a header spelling of target
-  'total'"); before, both keys were written to the row.
-- **A `type_coerce` conversion field that some rows lack** ends the run
-  with `DeclaredRequiredInputFieldsViolation` at the first such row behind
-  an observed source, and is refused at build behind a `fixed` one. Before,
-  those rows were routed `missing_field` and the rest converted.
+  'total'"); before, both keys were written to the row. Re-creating the
+  normalized name of a field a `field_mapper` renamed away (a
+  `value_transform` target `name` behind `{name: c}` over a header `Name` or
+  `name`) is refused at build ("'name' is a header spelling of the arriving
+  field 'c'"). A rename now carries the field's original header onto `c`
+  (above), so behind header `name` a lookup of `name` reads `c` and a created
+  `name` would be a second field under that spelling; behind header `Name` it
+  would not, but the build cannot tell the two headers apart. Before, both
+  delivered `c` and `name`. Choose another name, or target `c`. Renaming a
+  field that no lookup of `name` reads (`{Name: c}` behind a source
+  `field_mapping: {x: Name}`, or behind a headerless `columns: [Name]`)
+  leaves `name` free, as keeping the field does.
 - **A template test or read of a field the node does not declare** (the
   ADR-051 bullets above). In an LLM prompt or query template, `'x' in row`
   or a `row.source_row` column read through a `set` alias fails each row
@@ -748,20 +984,29 @@ These ran and delivered rows before:
   to agree), and a field_mapper dotted extraction merged with a carried rename
   of a declared `int` delivered too; on this branch before the fix both failed
   every row. Declare the type on every branch.
+- **A `field_mapper` with a `strict` option** (either value) is refused at
+  configuration: "field_mapper has no 'strict' option: every mapping source
+  is a required input, and a row missing one routes to on_error as
+  missing_field". Before, the option was accepted and changed nothing under
+  `elspeth run` — `strict: true` and `strict: false` ran identically for
+  plain, dotted and header-spelled sources behind observed and fixed
+  sources, because the engine checks every mapping source before the
+  mapping runs. Remove the key.
 
-These already failed and are now refused earlier or routed, with no loss:
+These already failed, or recorded a false type, and are now refused earlier
+or routed, with no loss:
 `output_mode: passthrough` over a flush that did not return one row per
-buffered row (ended the run with the batch's rows left without an outcome);
-a `value_transform` target
-spelled exactly as the header of the field it would overwrite (crashed with
-`Duplicate original_name`, leaving the row without an outcome); a
-`union_collision_policy: fail` coalesce whose branches all guarantee a shared
-field (ended the run with exit 4 at the first row). Each of
-these failed every row: a template number literal that overflows to
-infinity; a `truncate` length shorter than its ending; a `<response>_usage`
-schema type other than `any`; a header-spelled scan field over a non-string
-column; and in a RAG `query_template`, a dynamic `row[...]` key or a
-top-level name other than `query` or `row`. A header-spelled `web_scrape`
+buffered row — every batch plugin but the new `batch_rank` (ended the run with
+the batch's rows left without an outcome); a `value_transform` or
+`field_mapper` target spelled as the header of the field it would overwrite
+(crashed with `Duplicate original_name` or recorded a false type, leaving the
+row without an outcome); a `union_collision_policy: fail` coalesce whose
+branches all guarantee a shared field (ended the run with exit 4 at the first
+row). Each of these failed every row: a template number literal that
+overflows to infinity; a `truncate` length shorter than its ending; a
+`<response>_usage` schema type other than `any`; a header-spelled scan field
+over a non-string column; and in a RAG `query_template`, a dynamic `row[...]`
+key or a top-level name other than `query` or `row`. A header-spelled `web_scrape`
 `url_field` or `blob_ref_field` now routes each row instead of ending the
 run. The composer now refuses an optional declared field whose upstream type
 the build already refused (`edge_field_type_incompatible`).

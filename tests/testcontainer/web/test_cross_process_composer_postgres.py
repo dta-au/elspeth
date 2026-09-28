@@ -13,7 +13,6 @@ from uuid import UUID, uuid4
 import pytest
 import structlog
 from fastapi import Depends, FastAPI, Request
-from fastapi.routing import APIRoute
 from httpx import ASGITransport, AsyncClient, Response
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import Engine, func, select, update
@@ -32,7 +31,7 @@ from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthor
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composer_inflight_requests_table, composer_progress_snapshots_table, identities_table
 from elspeth.web.sessions.routes import _helpers
-from elspeth.web.sessions.routes.composer import guided_plan, state
+from elspeth.web.sessions.routes.composer import state
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -62,7 +61,6 @@ async def _serve_lifecycle_commands(url: str, session_id: str, user_id: str, pip
     app.state.composer_progress_registry = registry
     app.dependency_overrides[_helpers.get_current_user] = lambda: UserIdentity(user_id=user_id, username="composer-pg-user")
     app.include_router(state.router)
-    app.include_router(guided_plan.router)
     entered: dict[str, asyncio.Event] = {}
     requests: dict[str, asyncio.Task[Response]] = {}
 
@@ -79,10 +77,6 @@ async def _serve_lifecycle_commands(url: str, session_id: str, user_id: str, pip
         # production lifecycle/heartbeat/publication/teardown remain intact.
         entered[request_id].set()
         await asyncio.Event().wait()
-
-    guided_routes = [route for route in app.routes if isinstance(route, APIRoute) and route.endpoint is guided_plan.post_guided_plan]
-    assert len(guided_routes) == 1
-    assert any(dependency.call is _helpers._track_compose_inflight for dependency in guided_routes[0].dependant.dependencies)
 
     try:
         with pytest.MonkeyPatch.context() as monkeypatch:

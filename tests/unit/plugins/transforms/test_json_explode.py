@@ -4,7 +4,9 @@ JSONExplode transforms one row containing an array field into multiple rows,
 one for each element in the array. This is the inverse of aggregation.
 
 ROW FAILURES (see the plugin's module docstring):
-- A missing array field raises ``KeyError``, which the engine does not convert
+- A missing array field never reaches ``process()``: ``array_field`` is a declared
+  input, so the engine refuses the row first (routed ``missing_field`` unless the
+  build proved the field present — R2, ADR-013 Amendment 2026-09-27)
 - A present field with the wrong value type is a row-level data failure
 - Wrong value types return ``TransformResult.error()`` so ``on_error`` can route
   them without coercing or fabricating array elements
@@ -225,7 +227,13 @@ class TestJSONExplodeHappyPath:
         assert "items" not in output
 
     def test_array_field_original_name_is_resolved(self, ctx: PluginContext) -> None:
-        """Configured original array_field names resolve through PipelineRow contract."""
+        """``process()`` itself still resolves an original array_field through the PipelineRow contract.
+
+        Plugin-level only: ``array_field`` is a declared input (R2), so in a
+        pipeline the engine refuses a header spelling of a field the row
+        carries before ``process()`` runs (field-name spelling rule;
+        tests/integration/pipeline/test_field_name_spelling_rule.py).
+        """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
         transform = JSONExplode(
@@ -292,9 +300,9 @@ class TestJSONExplodeHappyPath:
 
 
 class TestJSONExplodeTypeViolations:
-    """Distinguish the missing-field raise from wrong-type row failures.
+    """Distinguish the missing-field refusal from wrong-type row failures.
 
-    - A missing array field raises ``KeyError`` (not converted by the engine)
+    - A missing array field is refused by the engine before ``process()`` (declared input)
     - A present field with the wrong value type returns a non-retryable error
     - Strings and mappings are rejected rather than iterated into fabricated rows
     """
@@ -304,21 +312,19 @@ class TestJSONExplodeTypeViolations:
         """Create minimal plugin context."""
         return make_context()
 
-    def test_missing_field_crashes(self, ctx: PluginContext) -> None:
-        """A missing array field raises KeyError: the current, unconverted behaviour."""
+    def test_the_array_field_is_a_declared_input(self) -> None:
+        """The array field is the one column the transform cannot run without, so it is declared.
+
+        It used to reach ``row[array_field]`` as a raw KeyError that ended the
+        run; as a declared input the engine settles its presence before
+        ``process()`` (the routed arm is pinned end to end in
+        tests/integration/pipeline/test_declared_input_miss.py).
+        """
         from elspeth.plugins.transforms.json_explode import JSONExplode
 
-        transform = JSONExplode(
-            {
-                "schema": DYNAMIC_SCHEMA,
-                "array_field": "items",
-            }
-        )
+        transform = JSONExplode({"schema": DYNAMIC_SCHEMA, "array_field": "items", "output_field": "item"})
 
-        row = {"id": 1}  # Missing 'items' field
-
-        with pytest.raises(KeyError, match="items"):
-            transform.process(make_pipeline_row(row), ctx)
+        assert transform.declared_input_fields == frozenset({"items"})
 
     def test_none_value_routes_as_a_failed_row(self, ctx: PluginContext) -> None:
         """None for the array field is a ROW-level failure, routed via on_error.

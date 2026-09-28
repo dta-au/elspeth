@@ -8,6 +8,21 @@ instantiates. It exists because scoped-green commits kept breaking whole-tree ga
 elspeth-62a5aa4da8). When you land a new gate or convention, add the rule to CONTRIBUTING.md and the dated item here in
 the same commit; the rules live there, the history lives here.
 
+- **2026-09-28 — `field_mapper`'s `strict` option is retired and refused; older items that name it are history**
+  (elspeth-5887fb7928 B1, lane fix/5887-rebased, 286be0b92)
+  Real `elspeth run --execute` runs measured `strict: true` and `strict: false` identical on 42 case pairs (plain,
+  dotted and header-spelled sources, present and missing, observed and fixed upstreams). A normalized source is a
+  declared input that the executor checks before `process()`. A dotted or original-header source routed its miss inside
+  `process()` whichever value was set. So the option decided only a branch the engine never reached. Every mapping source
+  is now a required input, and a row missing one routes to `on_error` as `missing_field`. A config that still carries
+  `strict` (either value) is refused at load: "field_mapper has no 'strict' option ... Remove 'strict'." The 2026-08-21
+  and 2026-08-20 items below mention `strict` as history. Do not apply their `strict` remedies. For a dotted source
+  under a fixed input schema, the executable repair is to declare the source's top-level root in `schema.fields`
+  (`user: any` for `user.name`). The composer's `_TRANSFORM_DECLARED_NOT_GUARANTEED_FIX` gives that advice, and
+  `test_rule_c_nested_read_remedy_is_executable_and_the_old_one_was_not` in `tests/unit/web/composer/test_state.py`
+  pins it through the executor-shaped chain.
+  See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
+
 - **2026-09-26 — template renderers are pinned, and a spawned worker latches a Tier-1 instead of raising it**
   (elspeth-5887fb7928 S3, lane fix/5887-rebased)
   The bounded template worker used to let every exception outside a fixed catch tuple escape. The child died, the
@@ -2007,7 +2022,7 @@ the same commit; the rules live there, the history lives here.
   See [CONTRIBUTING: Convention: audit and lineage recording](../../CONTRIBUTING.md#convention-audit-and-lineage-recording).
 
 - **2026-08-21 — repair advice must be executed, not just re-validated: a transform's `schema` block is BOTH the composer contract and the runtime INPUT model**
-  Rule C's remedies each cleared `validate()` and were pinned there, and two of them left a node whose fixed-mode pydantic input model (`extra_forbidden`, checked in `_run_preflight` BEFORE `process()`) rejected the very field the mapping reads: the nested read's top-level container (`user` for `user.name`), or the normalized key (`name`) a row actually arrives under for a non-fixed-point mapping source (`Name`). A third remedy ("remove the target from `schema.fields`") hit `FieldMapperConfig`'s at-least-one-field invariant in the single-field shape, and "make upstream guarantee the literal" can NEVER clear because `_mapping_target_is_guaranteed` abstains for every non-fixed-point source, strict or not. Measured repairs: nested read -> `strict: true` PLUS `schema.mode: flexible`; non-fixed-point source -> target optional (`name: type?`) PLUS `schema.mode: flexible`, or upstream rename to the stable spelling PLUS rewriting the mapping key to that same spelling. Truth-pin advice by running it through the executor-shaped chain (`input_schema.model_validate(strict=True)` -> `process()` -> `verify_schema_config_mode`), not only through `validate()`; see `_run_field_mapper_as_the_executor_would` in `tests/unit/web/composer/test_state.py`.
+  Rule C's remedies each cleared `validate()` and were pinned there, and two of them left a node whose fixed-mode pydantic input model (`extra_forbidden`, checked in `_run_preflight` BEFORE `process()`) rejected the very field the mapping reads: the nested read's top-level container (`user` for `user.name`), or the normalized key (`name`) a row actually arrives under for a non-fixed-point mapping source (`Name`). A third remedy ("remove the target from `schema.fields`") hit `FieldMapperConfig`'s at-least-one-field invariant in the single-field shape, and "make upstream guarantee the literal" can NEVER clear because `_mapping_target_is_guaranteed` abstains for every non-fixed-point source, strict or not. Measured repairs: nested read -> `strict: true` PLUS `schema.mode: flexible` [superseded 2026-09-28: `strict` is retired and refused; declare the dotted source's top-level root instead — see the 2026-09-28 item]; non-fixed-point source -> target optional (`name: type?`) PLUS `schema.mode: flexible`, or upstream rename to the stable spelling PLUS rewriting the mapping key to that same spelling. Truth-pin advice by running it through the executor-shaped chain (`input_schema.model_validate(strict=True)` -> `process()` -> `verify_schema_config_mode`), not only through `validate()`; see `_run_field_mapper_as_the_executor_would` in `tests/unit/web/composer/test_state.py`.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-08-21 — a config-time DECLARATION check compares two name spaces, and the shortfall may be UNDECLARABLE** (elspeth-a9ba80cb0b)

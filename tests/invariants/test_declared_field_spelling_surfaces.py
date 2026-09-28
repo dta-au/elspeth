@@ -24,6 +24,7 @@ from typing import Any, cast
 import pytest
 
 from elspeth.contracts.field_spelling import DeclaredSpellings
+from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
@@ -63,7 +64,11 @@ def test_every_sink_exposes_its_schema_declaration(sink_name: str, tmp_path: Pat
     assert "Name" in reads, f"{sink_name!r} declares 'Name: int?' but its declared_read_fields {sorted(reads)} omit it"
     assert _probe_sink_declarations(sink_name, options).reads == reads
     [spelling] = [
-        s for s in DeclaredSpellings.of(reads=reads, creates=()).in_row(row_keys={"name"}, forwarded_keys=()) if s.literal == "Name"
+        s
+        for s in DeclaredSpellings.of(reads=reads, creates=()).in_row(
+            row_keys={"name"}, forwarded_keys=(), contract=_header_name_contract()
+        )
+        if s.literal == "Name"
     ]
     assert spelling.canonical == "name"
 
@@ -173,3 +178,8 @@ def test_keyword_filter_scan_fields_are_read_declarations() -> None:
     assert "Count" in named.declared_read_fields
     assert every.declared_string_input_fields == frozenset()
     assert every.declared_read_fields == frozenset()
+
+
+def _header_name_contract() -> SchemaContract:
+    """The contract a csv source records for header ``Name``: row key ``name``, original ``Name``."""
+    return SchemaContract(mode="OBSERVED", fields=(FieldContract("name", "Name", str, False, "inferred"),), locked=True)

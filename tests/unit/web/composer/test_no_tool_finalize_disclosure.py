@@ -91,14 +91,14 @@ async def _finalize(user_message: str) -> str:
     """Run the no-tool finalizer on an empty state with a failed build tool."""
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     state = _empty_state()
-    result = await service._finalize_no_tool_response(
+    result = await service._completion._finalize_no_tool_response(
         content=_MODEL_PROSE,
         state=state,
         initial_version=state.version,
         user_id="user-1",
         session_id=None,
         last_runtime_preflight=None,
-        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        runtime_preflight_cache=service._preflight.new_cache(),
         session_scope="session:test",
         user_message=user_message,
         tool_invocations=(_failed_set_pipeline_invocation(),),

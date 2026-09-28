@@ -25,6 +25,7 @@ from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 
 import pytest
+from structlog.testing import capture_logs
 
 from elspeth.contracts.audit import TokenOutcome
 from elspeth.contracts.checkpoint import ResumeRefusalCause
@@ -41,6 +42,7 @@ from elspeth.core.checkpoint.recovery import ResumeCheck as _ResumeCheck
 from elspeth.engine.orchestrator import run_status
 from elspeth.engine.orchestrator.run_status import (
     assert_bound_groups_settled_from_audit,
+    assert_terminal_counter_parity,
     cli_completion_for,
     derive_resume_terminal_status_from_audit,
     is_counted_coalesced_output,
@@ -217,6 +219,47 @@ def test_terminal_counter_parity_fields_follow_execution_counters() -> None:
     assert set(execution_counter_fields) == set(strict_fields) | excluded_fields
     assert strict_fields == tuple(field for field in execution_counter_fields if field not in excluded_fields)
     assert not [field for field in strict_fields if field not in run_result_fields]
+
+
+def _coalesce_failed_parity_pair(*, live: int, audit: int) -> tuple[RunResult, ExecutionCounters]:
+    """Live and audit counters identical except ``rows_coalesce_failed``."""
+
+    def _counters(coalesce_failed: int) -> ExecutionCounters:
+        return ExecutionCounters(rows_processed=3, rows_succeeded=1, rows_failed=2, rows_coalesce_failed=coalesce_failed)
+
+    return _counters(live).to_run_result("run-1", RunStatus.COMPLETED_WITH_FAILURES), _counters(audit)
+
+
+def test_coalesce_failed_live_exceeding_audit_raises() -> None:
+    """Live > audit has no documented cause: every live count rides a FAILED
+    barrier state the derive sees, one marker per group. The panel2 ruling is
+    live == audit, so this direction is a broken bookkeeper, never a warning."""
+    live, audit = _coalesce_failed_parity_pair(live=2, audit=1)
+
+    with pytest.raises(OrchestrationInvariantError, match=r"'rows_coalesce_failed': \{'live': 2, 'audit': 1\}"):
+        assert_terminal_counter_parity(live=live, audit=audit, run_id="run-1")
+
+
+def test_coalesce_failed_audit_exceeding_live_is_the_one_tolerated_corner() -> None:
+    """Corner 1 (``_PARITY_EXCLUDED_FIELDS``): a straggler whose executor never
+    held the zero-arrival failure cannot count it live, so the audit may exceed
+    live. Logged, not raised; the audit value is the terminal record."""
+    live, audit = _coalesce_failed_parity_pair(live=1, audit=2)
+
+    with capture_logs() as captured:
+        assert_terminal_counter_parity(live=live, audit=audit, run_id="run-1")
+
+    divergences = [entry for entry in captured if "rows_coalesce_failed" in entry["event"]]
+    assert [(entry["live"], entry["audit"], entry["log_level"]) for entry in divergences] == [(1, 2, "warning")]
+
+
+def test_coalesce_failed_live_equal_to_audit_is_silent() -> None:
+    live, audit = _coalesce_failed_parity_pair(live=2, audit=2)
+
+    with capture_logs() as captured:
+        assert_terminal_counter_parity(live=live, audit=audit, run_id="run-1")
+
+    assert not [entry for entry in captured if "rows_coalesce_failed" in entry["event"]]
 
 
 # ---------------------------------------------------------------------------

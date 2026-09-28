@@ -90,6 +90,7 @@ Arms characterised here (all in ``tool_batch.py``):
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -100,7 +101,8 @@ import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolStatus, ToolArgumentErrorCategory
 from elspeth.contracts.composer_llm_audit import ToolContractDialect
-from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
 from elspeth.web.sessions.models import sessions_table
 
@@ -322,6 +324,34 @@ async def test_arm_json_decode_failure_records_arg_error(
         "The JSON-decode ARG_ERROR arm may have been rerouted — inspect "
         "tool_batch.py (ARG_ERROR pre-dispatch site 1/3)."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["get_pipeline_state", "set_pipeline"])
+async def test_invalid_json_arg_error_sends_replayable_tool_call_history(
+    fake_composer_service: ComposerServiceImpl,
+    result_session_id: str,
+    tool_name: str,
+) -> None:
+    class CapturingLLM(_FakeComposeLLM):
+        def __init__(self) -> None:
+            first = _raw_tool_call_llm(name=tool_name, raw_arguments="{not valid json")._responses[0]
+            super().__init__((first, _fake_llm_response(content="Done.")))
+            self.requests: list[list[dict[str, Any]]] = []
+
+        async def __call__(self, messages: Any, tools: Any) -> Any:
+            self.requests.append(deepcopy(messages))
+            return await super().__call__(messages, tools)
+
+    llm = CapturingLLM()
+    result = await fake_composer_service._run_one_turn_for_test(llm=llm, session_id=result_session_id)
+
+    assert result.tool_outcomes[0].error_class == "JSONDecodeError"
+    assert len(llm.requests) >= 2
+    assistant = next(message for message in llm.requests[1] if message["role"] == "assistant" and message.get("tool_calls"))
+    arguments = assistant["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(json.loads(arguments), dict)
+    assert arguments != "{not valid json"
 
 
 @pytest.mark.asyncio
@@ -738,7 +768,7 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
     """Arm #17: successful get_plugin_schema records (type, name) in _schemas_loaded.
 
     tool_batch.py get_plugin_schema success branch.  After a successful ``get_plugin_schema`` dispatch,
-    the loop calls ``_mark_plugin_schema_loaded(session_id, plugin_type, plugin_name)``
+    the loop calls ``schema_disclosure.mark_plugin_schema_loaded(session_id, plugin_type, plugin_name)``
     so the LLM tool-list builder can surface schema-loaded state to the model.
 
     ``fake_composer_service`` uses a mock catalog whose ``get_schema`` returns a
@@ -746,13 +776,13 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
     dispatch succeed.
 
     This test pins the side-effect rather than the full audit row: if the
-    ``_mark_plugin_schema_loaded`` call is accidentally dropped or its arguments
-    transposed during the Phase-2 extraction, ``_schemas_loaded_for_session``
+    ``mark_plugin_schema_loaded`` call is accidentally dropped or its arguments
+    transposed during the Phase-2 extraction, ``schemas_loaded_for_session``
     will return an empty frozenset and the assertion will fail.
 
     Pinning:
     - exactly 1 SUCCESS invocation
-    - ``("source", "csv") in fake_composer_service._schemas_loaded_for_session(result_session_id)``
+    - ``("source", "csv") in fake_composer_service._schema_disclosure.schemas_loaded_for_session(result_session_id)``
     """
     first_response = _FakeLLMResponse(
         choices=[
@@ -781,9 +811,9 @@ async def test_arm_get_plugin_schema_success_marks_type_name_loaded(
         f"SUCCESS not in recorded statuses {statuses!r}; get_plugin_schema with valid args "
         "and a mock catalog that always returns a schema should record finish_success."
     )
-    schemas_loaded = fake_composer_service._schemas_loaded_for_session(result_session_id)
+    schemas_loaded = fake_composer_service._schema_disclosure.schemas_loaded_for_session(result_session_id)
     assert ("source", "csv") in schemas_loaded, (
-        f"('source', 'csv') not in _schemas_loaded_for_session({result_session_id!r}); "
-        f"got {schemas_loaded!r}.  _mark_plugin_schema_loaded must be called after a "
+        f"('source', 'csv') not in schemas_loaded_for_session({result_session_id!r}); "
+        f"got {schemas_loaded!r}.  mark_plugin_schema_loaded must be called after a "
         "successful get_plugin_schema dispatch — inspect tool_batch.py (get_plugin_schema success branch)."
     )

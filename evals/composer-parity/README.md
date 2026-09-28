@@ -1,9 +1,8 @@
 # Composer Capability Parity — canonical fixture corpus
 
-This directory holds the deterministic fixture corpus that drives the composer
-capability-parity verification. It is authoring-surface agnostic: the same
-fixtures are replayed through the freeform, guided-full, and guided-staged
-adapters and must derive equivalent committed graphs.
+This directory holds the deterministic fixture corpus that drives Composer
+capability verification. Each fixture is authored through the freeform path
+and checked against its committed graph and runtime assertions.
 
 ## What is here
 
@@ -15,8 +14,8 @@ adapters and must derive equivalent committed graphs.
   - `canonical_arguments` — a VALID `set_pipeline` payload that validates against
     `SetPipelineArgumentsModel` (`src/elspeth/web/composer/redaction.py`) and
     references only plugins available to a trained operator.
-  - `semantic_expectations` — the node/edge/output shape each surface must
-    derive. Semantic attributes are preserved while surface-specific identifiers
+  - `semantic_expectations` — the node/edge/output shape the Composer must
+    derive. Semantic attributes are preserved while generated identifiers
     and ordering are canonicalized for comparison.
   - `runtime_assertions` — behavioural claims the executed graph must satisfy.
 - `fixtures/two_llm_colour.csv` — the exact ten-row colour palette input for the
@@ -39,7 +38,7 @@ args -> `CompositionState` conversion inside the session-bound
 ## Real-path assumptions
 
 The real-path matrix (`tests/integration/web/composer/parity/`) drives these
-fixtures through the real freeform + guided-full production paths (web plugin
+fixtures through the real freeform production path (web plugin
 policy, operator-profile lowering, audited `set_pipeline`), which imposes two
 authoring-form requirements beyond structural argument validation:
 
@@ -59,20 +58,11 @@ authoring-form requirements beyond structural argument validation:
   `required_input_fields` is satisfiable at config time.
 - **`batch_stats` aggregations declare `output_mode: "transform"`.** The
   `aggregation` and `row_expansion` fixtures set `output_mode: "transform"` on
-  their `batch_stats` node. This is faithful, not a workaround: the runtime
-  `OutputMode` default is `TRANSFORM` ("emit transformed output from the
-  aggregation plugin"), so an unspecified `output_mode` already runs as
-  transform — the fixture just makes it explicit. It is also required for the
-  guided-staged wire projection, whose closed `output_mode` vocabulary
-  (`default` / `passthrough` / `transform`) rejects the `None` a bare
-  `set_pipeline` commit would persist.
+  their `batch_stats` node. This is faithful to the runtime `OutputMode`
+  default and makes the expected output contract explicit.
 
-### Guided-staged coverage
-
-The guided-staged column drives all ten fixtures. Queue fan-in, require-all
-coalesce, correlated require-all row union, and cross-sink write-failure
-fallback remain explicit real-path regressions for their repaired
-stage-protocol boundaries.
+Queue fan-in, require-all coalesce, correlated require-all row union, and
+cross-sink write-failure fallback remain explicit real-path regressions.
 
 ## Byte canonicalization
 

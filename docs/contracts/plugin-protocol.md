@@ -245,6 +245,18 @@ source boundary contract. Sources derive it from their effective
 source's observed-mode column heuristic must be reflected here, not only in the
 raw config dict.
 
+`field_renames: SourceFieldRenames` (a property; `BaseSource` provides it from
+the `_field_mapping` and `_field_mapping_keys` a mapping-bearing source sets at
+construction) is the source's `field_mapping` (key -> row key, empty when the
+source renames nothing) together with what the source matches those keys
+against: `normalized` — the normalized external name (a header row, JSON object
+keys, Dataverse attributes) — or `as_written` — the configured column names
+verbatim (headerless CSV: explicit `columns`, or the schema's field names). The
+field-name spelling rule resolves every downstream declaration through it at
+build time, in the pipeline build and the Web Composer alike, so a source that
+renames must expose its renames here, keyed exactly as its own
+`resolve_field_names` call keys them.
+
 #### Required Configuration
 
 ```yaml
@@ -541,8 +553,20 @@ passes_through_input: bool = False  # Set True only when every emitted row prese
 can_drop_rows: bool = False  # Set True only when pass-through transform may intentionally emit zero rows
 declared_input_fields: frozenset[str] = frozenset()  # Required input-field declaration (single-row only)
 declared_output_fields: frozenset[str] = frozenset()  # Guaranteed per-emitted-row output fields
+renamed_input_fields: Mapping[str, str] = MappingProxyType({})  # Identity-carrying renames (source spelling -> new name)
 _output_schema_config: SchemaConfig | None = None  # Required when output fields are declared
 ```
+
+`renamed_input_fields` names every field `process()` moves to a new key while
+its output contract carries the field's recorded original name onto that key
+(`narrow_contract_to_output(renamed_fields=...)` — field_mapper's flat
+`mapping`), so a lookup of any spelling of the old field reads the new one.
+The key is the rename's source as configured (a LOOKUP, which may be a header
+spelling). The field-name spelling rule's build-time resolution follows these
+renames between the sources and every declaring node, in the pipeline build
+and the Web Composer alike, so a transform that carries a field's identity to
+a new name must declare exactly the renames it passes to
+`narrow_contract_to_output`.
 
 #### Token Creation (Deaggregation)
 
@@ -677,7 +701,7 @@ class SummaryTransform(BaseTransform):
 - `is_batch_aware = False` (default): Transform implements `TransformProtocol`, receives single `PipelineRow`
 - `is_batch_aware = True`: Transform implements `BatchTransformProtocol`, receives `list[PipelineRow]` at aggregation nodes
 - The engine decides when to batch based on pipeline configuration
-- `declared_input_fields` is a single-row precondition surface today; batch-aware transforms must leave it empty until a batch pre-emission contract exists
+- `declared_input_fields` is a single-row precondition surface; batch-aware transforms must leave it empty. A batch transform states the columns every buffered row must carry through `schema.required_fields` (`schema_required_input_fields()`), and the flush's input check classifies a miss with the per-row rule (ADR-013 Amendment 2026-09-27): a field the build never proved present and the row does not carry fails the batch through `on_error` (`missing_field`); a proven field missing, or one the payload carries while the contract lost it, aborts (Tier 1)
 
 #### Error Routing (`on_error`)
 
@@ -1568,8 +1592,10 @@ aggregations:
   `flush_emits_one_row_per_buffered_row = True`. The default (`False`, on
   `BaseTransform`) is refused by `elspeth validate` and by the web composer
   under `output_mode: passthrough`, with the remedy "Use output_mode:
-  transform"; every shipped batch plugin declares `False`, because each reduces,
-  replicates or skips rows. A plugin that declares `True` and then returns a
+  transform". One shipped batch plugin declares `True`: `batch_rank`, which
+  emits every buffered row with its rank annotations (an unranked row with a
+  null rank). Every other shipped batch plugin declares `False`, because each
+  reduces, replicates or skips rows. A plugin that declares `True` and then returns a
   different row count, a single-row result, or `quarantined_indices` is a
   plugin bug: every buffered token is recorded as a failure with
   `BatchPassthroughShapeError` evidence, then the run aborts.

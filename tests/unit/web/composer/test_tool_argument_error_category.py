@@ -21,7 +21,9 @@ from elspeth.contracts.composer_llm_audit import ToolContractDialect
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.web.composer._compose_loop_carriers import AdvisorArgumentRejection
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.service import ComposerServiceImpl, composer_loop_tool_definitions
+from elspeth.web.composer.provider_gateway import composer_loop_tool_definitions
+from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.session_tool import SessionToolOwner
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _dispatch
 from elspeth.web.composer.tools._dispatch import (
@@ -31,6 +33,7 @@ from elspeth.web.composer.tools._dispatch import (
     get_tool_definitions,
     require_schema_valid_arguments,
 )
+from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.helpers.tree_gate import iter_gate_files
 
 from .conftest import (
@@ -264,7 +267,7 @@ def _pydantic_wraps_without_category(source: str) -> list[int]:
 
 
 def _scanned_files() -> list[Path]:
-    return [path for root in _SCANNED_ROOTS for path in iter_gate_files(root) if "guided" not in path.relative_to(root).parts]
+    return [path for root in _SCANNED_ROOTS for path in iter_gate_files(root)]
 
 
 class TestPydanticWrapCensus:
@@ -428,7 +431,7 @@ async def test_compose_loop_site_records_honest_class_and_category(
     assert (invocation.error_class, invocation.error_category) == (error_class, category)
     outcome = result.tool_outcomes[0]
     assert (outcome.error_class, outcome.error_category) == (error_class, category)
-    persisted = json.loads(fake_composer_service._phase3_last_redacted_tool_rows[-1].content)
+    persisted = json.loads(result.persisted_tool_row_content[-1])
     assert persisted["_redaction_status"] == "arg_error"
     assert persisted["error_category"] == category.value
     assert persisted["error_class"] == error_class
@@ -439,7 +442,7 @@ def test_advisor_prompt_budget_is_its_own_category() -> None:
 
     settings = _make_settings(composer_advisor_max_prompt_tokens=1)
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=settings)
-    rejection = service._validate_advisor_arguments(
+    rejection = service._advisor_checkpoint._validate_advisor_arguments(
         {"trigger": "proactive_security_safety", "problem_summary": "x" * 100, "recent_errors": [], "attempted_actions": []}
     )
     assert type(rejection) is AdvisorArgumentRejection
@@ -452,9 +455,9 @@ def test_advisor_model_rejection_after_schema_is_model_validation(monkeypatch: p
 
     # The flat schema and the pydantic model agree today, so skip S to reach
     # the model's own rejection arm, which must stay honestly labelled.
-    monkeypatch.setattr("elspeth.web.composer.service.require_schema_valid_arguments", lambda _name, _arguments: None)
+    monkeypatch.setattr("elspeth.web.composer.advisor_checkpoint.require_schema_valid_arguments", lambda _name, _arguments: None)
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
-    rejection = service._validate_advisor_arguments({"trigger": "not-a-trigger"})
+    rejection = service._advisor_checkpoint._validate_advisor_arguments({"trigger": "not-a-trigger"})
     assert type(rejection) is AdvisorArgumentRejection
     assert rejection.category is ToolArgumentErrorCategory.MODEL_VALIDATION
     assert rejection.error_class == "ValidationError"
@@ -508,11 +511,18 @@ async def test_missing_session_id_invariant_names_the_real_guard() -> None:
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.anti_anchor import AntiAnchorTracker
     from elspeth.web.composer.audit import BufferingRecorder, DispatchAudit
-    from tests.unit.web.composer._helpers import _make_settings, _mock_catalog
 
-    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    owner = SessionToolOwner(
+        sessions_service=None,
+        telemetry=build_sessions_telemetry(),
+        per_term_cap=1,
+        per_session_day_cap=1,
+        model_identifier="test-model",
+        provider=None,
+        composer_skill_hash="test-skill-hash",
+    )
     with pytest.raises(RuntimeError) as caught:
-        await service._dispatch_session_aware_tool(
+        await owner._dispatch_session_aware_tool(
             tool_name="request_interpretation_review",
             tool_call_id="call_1",
             arguments={},

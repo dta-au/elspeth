@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import Table, func, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.sql import Executable
 
 from elspeth.contracts import (
@@ -40,7 +41,13 @@ from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import batch_members_table, node_states_table, routing_events_table, transform_errors_table
 from elspeth.testing import make_pipeline_row
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    lowered_sqlite_variable_limit,
+    make_recorder_with_run,
+    record_statement_binds,
+    register_test_node,
+)
 
 _REASON: TransformErrorReason = {"reason": "batch_failed", "error": "flush failed"}
 _REASON_JSON = canonical_json(_REASON)
@@ -48,14 +55,14 @@ _DIVERT_EDGE = "edge-agg-error"
 _TOKENS = ("tok-0", "tok-1")
 
 
-def _setup() -> RecorderSetup:
+def _setup(tokens: tuple[str, ...] = _TOKENS) -> RecorderSetup:
     setup = make_recorder_with_run(run_id="run-1", source_node_id="source-0", source_plugin_name="csv")
     register_test_node(setup.data_flow, setup.run_id, "agg-1", node_type=NodeType.AGGREGATION, plugin_name="aggregator")
     register_test_node(setup.data_flow, setup.run_id, "sink-q", node_type=NodeType.SINK, plugin_name="csv")
     setup.data_flow.register_edge(
         "agg-1", "sink-q", "__error_agg__", RoutingMode.DIVERT, coordination_token=setup.coordination_token, edge_id=_DIVERT_EDGE
     )
-    for ordinal, token_id in enumerate(_TOKENS):
+    for ordinal, token_id in enumerate(tokens):
         setup.data_flow.create_row_with_token(
             setup.source_node_id,
             ordinal,
@@ -69,11 +76,11 @@ def _setup() -> RecorderSetup:
     return setup
 
 
-def _buffered_batch(setup: RecorderSetup, batch_id: str = "batch-1") -> None:
-    """A DRAFT batch holding both tokens, each with its live BUFFERED acceptance."""
+def _buffered_batch(setup: RecorderSetup, batch_id: str = "batch-1", tokens: tuple[str, ...] = _TOKENS) -> None:
+    """A DRAFT batch holding ``tokens`` (both by default), each with its live BUFFERED acceptance."""
     setup.execution.create_batch("agg-1", batch_id=batch_id, coordination_token=setup.coordination_token)
     with fenced_leader_transaction(setup.db.engine, token=setup.coordination_token, window_seconds=300, verb="test_verdict_setup") as conn:
-        for ordinal, token_id in enumerate(_TOKENS):
+        for ordinal, token_id in enumerate(tokens):
             add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=ordinal, expected_run_id=setup.run_id)
             record_buffered_outcome_guarded(conn, run_id=setup.run_id, token_id=token_id, batch_id=batch_id, recorded_at=datetime.now(UTC))
 
@@ -459,3 +466,37 @@ class TestTheRestoreReaderProvesTheVerdictWhole:
             setup.factory.barrier_restore.list_recorded_aggregation_failures(
                 setup.run_id, aggregation_node_id="agg-1", blocked_token_ids=list(_TOKENS)
             )
+
+
+# --- Bound-parameter budget (elspeth-5887 X2) ---------------------------------
+# Resume hands a recorded FAILED verdict's still-BLOCKED members back from this
+# read, and a batch has no row cap (batch_stats), so its per-member reads may
+# not bind a list that grows with the batch. SQLite here refuses a statement
+# over 999 binds and the batch holds 1,200 members: the members' error rows are
+# selected through the recorded membership, and the candidate read runs in
+# chunks.
+_BOUNDED_MEMBERS = tuple(f"tok-{index}" for index in range(1200))
+
+
+def test_the_restore_reader_binds_a_bounded_count_over_a_large_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.core.landscape.bind_budget import BIND_BUDGET_PER_STATEMENT
+
+    with lowered_sqlite_variable_limit(monkeypatch, 999):
+        setup = _setup(_BOUNDED_MEMBERS)
+        _buffered_batch(setup, tokens=_BOUNDED_MEMBERS)
+        state_id = _flush_state(setup, "batch-1", "state-1")
+        _record_verdict(setup, "batch-1", state_id, destination="quarantine", divert_edge_id=_DIVERT_EDGE, members=_BOUNDED_MEMBERS)
+        # Control: this connection refuses a statement that binds one parameter per member.
+        with setup.db.connection() as conn, pytest.raises(OperationalError, match="too many SQL variables"):
+            conn.execute(select(transform_errors_table.c.token_id).where(transform_errors_table.c.token_id.in_(_BOUNDED_MEMBERS)))
+
+        with record_statement_binds() as binds:
+            (verdict,) = setup.factory.barrier_restore.list_recorded_aggregation_failures(
+                setup.run_id, aggregation_node_id="agg-1", blocked_token_ids=list(_BOUNDED_MEMBERS)
+            )
+
+    assert verdict.batch_id == "batch-1"
+    assert verdict.member_token_ids == _BOUNDED_MEMBERS
+    assert verdict.destination == "quarantine"
+    assert binds.executions > 0
+    assert binds.max_binds <= BIND_BUDGET_PER_STATEMENT, binds.statement

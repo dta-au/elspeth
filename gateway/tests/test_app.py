@@ -224,7 +224,8 @@ def _tool_call_body(arguments: str) -> dict:
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "f", "arguments": arguments}}],
-            }
+            },
+            {"role": "tool", "content": "result", "tool_call_id": "call_1"},
         ],
     }
 
@@ -244,12 +245,34 @@ async def test_malformed_tool_call_arguments_returns_400_invalid_request():
 
 
 @respx.mock
-async def test_valid_tool_call_arguments_returns_200():
-    _mock_token()
-    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+async def test_empty_text_only_assistant_returns_safe_400_without_upstream_dispatch():
+    token_route = respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json={"access_token": "token"}))
+    upstream_route = respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "unexpected"}}))
+    body = {"model": "gpt-4o", "messages": [{"role": "assistant", "content": ""}]}
 
     async with _client_for(_config()) as client:
-        response = await client.post("/v1/chat/completions", json=_tool_call_body('{"a": 1}'), headers=_headers())
+        response = await client.post("/v1/chat/completions", json=body, headers=_headers())
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert error["retryable"] is False
+    assert error["message"] == "The request was malformed or failed validation."
+    assert error["request_id"] == response.headers[REQUEST_ID_HEADER]
+    assert not token_route.called
+    assert not upstream_route.called
+
+
+@pytest.mark.parametrize("content", [None, ""])
+@respx.mock
+async def test_valid_tool_call_arguments_returns_200(content):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"result": {"text": "hello"}, "halt": "complete"}))
+    body = _tool_call_body('{"a": 1}')
+    body["messages"][0]["content"] = content
+
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", json=body, headers=_headers())
 
     assert response.status_code == 200
 
@@ -302,6 +325,16 @@ async def test_capability_unsupported_returns_422_with_both_headers():
 
 
 # --- happy path ------------------------------------------------------------------
+
+
+@respx.mock
+async def test_oversized_integer_literal_is_invalid_request_not_internal_error():
+    raw = b'{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"n":' + b"9" * 5000 + b"}"
+    async with _client_for(_config()) as client:
+        response = await client.post("/v1/chat/completions", content=raw, headers=_headers())
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
 
 
 @respx.mock

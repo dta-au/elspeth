@@ -86,6 +86,9 @@ FINALIZE_BLOB_STATUSES: frozenset[str] = frozenset(get_args(FinalizeBlobStatus))
 BLOB_CREATORS: frozenset[str] = frozenset(get_args(BlobCreator))
 BLOB_RUN_LINK_DIRECTIONS: frozenset[str] = frozenset(get_args(BlobRunLinkDirection))
 
+# Public authoring sentinel used when a blob-backed source has no public path.
+BLOB_REF_PATH_PREFIX = "blob:"
+
 _FORK_BLOB_NAMESPACE = UUID("d9e427b4-6f14-59ba-9f45-2ad41a923fb7")
 _FORK_BLOB_SCHEMA = "elspeth.session-fork-blob.v1"
 
@@ -132,7 +135,7 @@ class BlobForkPlanEntry:
 
 @dataclass(frozen=True, slots=True)
 class BlobForkWriteFence:
-    """Exact guided-operation lease authorizing staged-child blob writes."""
+    """Exact session-operation receipt lease authorizing staged-child blob writes."""
 
     source_session_id: UUID
     target_session_id: UUID
@@ -149,26 +152,6 @@ class BlobForkWriteFence:
             raise ValueError("BlobForkWriteFence.lease_token must be a non-empty bounded string")
         if type(self.attempt) is not int or self.attempt < 1:
             raise TypeError("BlobForkWriteFence.attempt must be a positive exact integer")
-
-
-@dataclass(frozen=True, slots=True)
-class BlobGuidedOperationWriteFence:
-    """Exact ``guided_plan`` lease authorizing inline-custody blob writes."""
-
-    session_id: UUID
-    operation_id: str
-    lease_token: str
-    attempt: int
-
-    def __post_init__(self) -> None:
-        if type(self.session_id) is not UUID:
-            raise TypeError("BlobGuidedOperationWriteFence.session_id must be an exact UUID")
-        if type(self.operation_id) is not str or not 1 <= len(self.operation_id) <= 128:
-            raise ValueError("BlobGuidedOperationWriteFence.operation_id must be a non-empty bounded string")
-        if type(self.lease_token) is not str or not 1 <= len(self.lease_token) <= 256:
-            raise ValueError("BlobGuidedOperationWriteFence.lease_token must be a non-empty bounded string")
-        if type(self.attempt) is not int or self.attempt < 1:
-            raise TypeError("BlobGuidedOperationWriteFence.attempt must be a positive exact integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,20 +298,6 @@ class BlobForkFenceLostError(BlobError):
 
     def __init__(self, operation_id: str, *, attempt: int) -> None:
         super().__init__(f"Session fork {operation_id} attempt {attempt} no longer owns its blob-write fence")
-        self.operation_id = operation_id
-        self.attempt = attempt
-
-    def __setattr__(self, name: str, value: object) -> None:
-        _guard_frozen_attr(self, name, value)
-
-
-class BlobGuidedOperationFenceLostError(BlobError):
-    """Raised when ``guided_plan`` no longer owns an inline-custody write."""
-
-    _FROZEN_ATTRS: ClassVar[frozenset[str]] = frozenset({"operation_id", "attempt"})
-
-    def __init__(self, operation_id: str, *, attempt: int) -> None:
-        super().__init__(f"Guided operation {operation_id} attempt {attempt} no longer owns its blob-write fence")
         self.operation_id = operation_id
         self.attempt = attempt
 
@@ -526,8 +495,6 @@ class BlobServiceProtocol(Protocol):
     async def reserve_inline_custody(
         self,
         request: InlineCustodyRequest,
-        *,
-        write_fence: BlobGuidedOperationWriteFence | None = None,
     ) -> BlobRecord:
         """Idempotently materialize one deterministic inline-source blob."""
         ...
@@ -669,7 +636,7 @@ class BlobServiceProtocol(Protocol):
         """Copy exactly the frozen plan from source to target session.
 
         ``checkpoint`` is awaited around each potentially long content copy so
-        the caller can renew and verify its guided-operation fence.
+        the caller can renew and verify its operation receipt lease.
         """
         ...
 

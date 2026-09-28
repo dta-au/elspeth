@@ -11,7 +11,6 @@ import {
   ARTIFACT_TABS,
   type ArtifactTab,
   type AvailableArtifactTabs,
-  type InspectorTab,
   type PaneBounds,
   type StoredWorkspaceLayoutV1,
 } from "./workspaceTypes";
@@ -42,14 +41,10 @@ export interface WorkspacePaneState {
   authoringCollapsed: boolean;
   availableArtifactTabs: AvailableArtifactTabs;
   activeArtifactTab: ArtifactTab;
-  activeInspectorTab: InspectorTab | null;
-  inspectorOpen: boolean;
   resizeTransient: (width: number) => void;
   commitResize: (finalWidth: number) => void;
   setAuthoringCollapsed: (collapsed: boolean) => void;
   selectArtifactTab: (tab: ArtifactTab) => void;
-  openInspector: (tab: InspectorTab) => void;
-  closeInspector: () => void;
 }
 
 interface InitialWorkspaceLayout {
@@ -61,7 +56,6 @@ interface InitialWorkspaceLayout {
 interface EphemeralPaneState {
   sessionId: string | null;
   activeArtifactTab: ArtifactTab;
-  activeInspectorTab: InspectorTab | null;
 }
 
 interface CommittedPaneValues {
@@ -101,7 +95,6 @@ function defaultEphemeralPaneState(
   return {
     sessionId,
     activeArtifactTab: "graph",
-    activeInspectorTab: null,
   };
 }
 
@@ -268,7 +261,6 @@ export function useWorkspacePaneState({
     ephemeralStateForSession.activeArtifactTab,
     normalizedAvailableArtifactTabs,
   );
-  const activeInspectorTab = ephemeralStateForSession.activeInspectorTab;
 
   const storageRef = useRef(initialLayout.storage);
   const committedValuesRef = useRef<CommittedPaneValues>({
@@ -358,35 +350,6 @@ export function useWorkspacePaneState({
     });
   }, []);
 
-  const openInspector = useCallback((tab: InspectorTab): void => {
-    const committed = committedValuesRef.current;
-    setEphemeralPaneState((current) => {
-      const sessionState =
-        current.sessionId === committed.sessionId
-          ? current
-          : defaultEphemeralPaneState(committed.sessionId);
-      return {
-        ...sessionState,
-        activeInspectorTab: tab,
-      };
-    });
-  }, []);
-
-  const closeInspector = useCallback((): void => {
-    const committed = committedValuesRef.current;
-    setEphemeralPaneState((current) => {
-      const sessionState =
-        current.sessionId === committed.sessionId
-          ? current
-          : defaultEphemeralPaneState(committed.sessionId);
-      if (sessionState.activeInspectorTab === null) return sessionState;
-      return {
-        ...sessionState,
-        activeInspectorTab: null,
-      };
-    });
-  }, []);
-
   // Stable actions can run from descendant layout effects. Publish only the
   // newly committed values here, before those effects; state normalization
   // stays in the layout effect below and speculative renders never write it.
@@ -435,13 +398,9 @@ export function useWorkspacePaneState({
     authoringCollapsed,
     availableArtifactTabs: normalizedAvailableArtifactTabs,
     activeArtifactTab,
-    activeInspectorTab,
-    inspectorOpen: activeInspectorTab !== null,
     resizeTransient,
     commitResize,
     setAuthoringCollapsed,
     selectArtifactTab,
-    openInspector,
-    closeInspector,
   };
 }

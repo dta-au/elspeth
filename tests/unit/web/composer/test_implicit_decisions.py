@@ -4,14 +4,13 @@ elspeth-b5180a9630 (R2-F11): ``build_implicit_decisions_report`` flattens every
 source option verbatim into ``composer_meta.implicit_decisions.entries[].value``.
 For a blob-backed source that meant the absolute ``/var/lib/elspeth/blobs/...``
 storage path entered ``composer_meta`` at WRITE time, downstream of the
-``sources``-keyed ``redact_source_storage_path`` projection and outside the
-guided-only ``private_path_projections`` pass — so every state response and the
+``sources``-keyed ``redact_source_storage_path`` projection — so every state response and the
 convergence-422 body disclosed it.
 
 The fix is a can't-regress boundary rather than another outbound projection:
 when a source's options carry the structural ``blob_ref`` marker, the
 storage-path carrier keys are recorded as the ``blob:<blob_ref>`` wire sentinel
-(the guided schema_form precedent, ``BLOB_REF_PATH_PREFIX``). A raw path never
+(``BLOB_REF_PATH_PREFIX``). A raw path never
 enters ``composer_meta``, so no outbound serializer can regress field-by-field.
 """
 
@@ -178,8 +177,8 @@ def test_blob_ref_that_is_not_a_canonical_uuid_degrades_to_the_generic_sentinel(
     """``options`` is composer/LLM-authored (Tier 3): validate, then degrade.
 
     A ``str`` check alone is NOT sufficient. Every other consumer of this marker
-    requires a canonical UUID (the YAML-export guard, the guided reviewed-source
-    reader), and a path-shaped ``blob_ref`` passed through a bare ``str`` check
+    requires a canonical UUID (including the YAML-export guard), and a
+    path-shaped ``blob_ref`` passed through a bare ``str`` check
     would ride out as ``blob:/var/lib/elspeth/blobs/...`` — the leak reopened
     inside the sentinel that exists to close it. Anything failing validation
     must degrade to the generic sentinel rather than be interpolated.
@@ -196,9 +195,8 @@ def test_blob_ref_that_is_not_a_canonical_uuid_degrades_to_the_generic_sentinel(
 def test_named_sources_each_project_their_own_blob_ref() -> None:
     """Multiple blob-backed sources collapse onto ``source.path`` by design.
 
-    ``_source_entries`` hard-codes the ``source.`` prefix (the guided
-    projection at ``redaction.py`` keys on exactly ``source.path`` /
-    ``source.file``). Whichever entry wins, neither may be a raw path.
+    ``_source_entries`` hard-codes the ``source.`` prefix. Whichever entry
+    wins, neither may be a raw path.
     """
     other_ref = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
     state = CompositionState(
@@ -507,7 +505,7 @@ def test_server_stamped_source_metadata_attributes_to_the_server() -> None:
     assert by_path["source.source_authoring.content_hash"]["provenance"] == "server_stamped"
     assert by_path["source.interpretation_requirements"]["provenance"] == "server_stamped"
     # The path/file sentinel entries keep being emitted verbatim —
-    # ``redact_guided_snapshot_storage_paths`` keys on those exact paths.
+    # The report retains the source option's stable path key.
     assert by_path["source.path"]["value"] == f"blob:{_BLOB_REF}"
     # Sibling ordinary options are untouched.
     assert by_path["source.delimiter"]["provenance"] == "composer_selected"

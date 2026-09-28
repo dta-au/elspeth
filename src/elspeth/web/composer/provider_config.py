@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# One retry policy for Composer convergence and every planner surface.
+LLM_API_MAX_ATTEMPTS = 3
+LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
+
 PROVIDER_REQUIRED_ENV_KEYS: dict[str, tuple[str, ...]] = {
     "anthropic": ("ANTHROPIC_API_KEY",),
     "azure": ("AZURE_API_KEY",),

@@ -42,7 +42,7 @@ else:
     from composer_frontend_wire import census_frontend_wire
     from composer_teaching import argument_teaching
 
-# Explicitly emitted by _dispatch and intercepted by ComposerServiceImpl;
+# Explicitly emitted by _dispatch and intercepted by the advisor checkpoint owner;
 # absence from the callable registry must never silently admit another tool.
 _INTERCEPTED_TOOL_NAMES = frozenset({"request_advisor_hint"})
 
@@ -404,7 +404,7 @@ def census_model_wire() -> dict[str, ModelWireRow]:
 
 
 def _advisor_admission_handler() -> FunctionType:
-    """Bind the public interception to its called service admission method.
+    """Bind the public interception to its called advisor admission method.
 
     This deliberately supports the one owned batch adapter, not arbitrary
     method dispatch. A changed receiver, copied subset, or missing call fails
@@ -413,7 +413,7 @@ def _advisor_admission_handler() -> FunctionType:
     provider's wire form through ``wire_projection`` before any gate, so the
     advisor admission sees the semantic (S) form.
     """
-    from elspeth.web.composer.service import ComposerServiceImpl
+    from elspeth.web.composer.advisor_checkpoint import AdvisorCheckpointOwner
     from elspeth.web.composer.tool_batch import run_tool_batch
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(run_tool_batch)))
@@ -432,15 +432,15 @@ def _advisor_admission_handler() -> FunctionType:
     call = calls[0]
     assert isinstance(call.func, ast.Attribute)
     if (
-        ast.unparse(call.func.value) != "ctx.service"
+        ast.unparse(call.func.value) != "ctx.advisor_checkpoint"
         or call.keywords
         or len(call.args) != 1
         or not _input_expression(call.args[0], "arguments")
     ):
         raise CensusError("advisor interception does not forward the complete decoded arguments")
-    handler = vars(ComposerServiceImpl)[call.func.attr]
+    handler = vars(AdvisorCheckpointOwner)[call.func.attr]
     if not isinstance(handler, FunctionType):
-        raise CensusError("advisor admission is not an owned service method")
+        raise CensusError("advisor admission is not an owned advisor checkpoint method")
     return handler
 
 

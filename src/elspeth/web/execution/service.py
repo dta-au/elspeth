@@ -443,63 +443,6 @@ def _merge_authoritative_proof_diagnostics(
     )
 
 
-def _merge_unavailable_authoritative_proof(result: ValidationResult) -> ValidationResult:
-    """Record a FAILED proof check when no bounded source proof could run.
-
-    Fail-closed counterpart to ``_merge_authoritative_proof_diagnostics`` for
-    states whose retained guided review custody cannot be bound to the live
-    sources (elspeth-3b45cdb41e): admission must never record a passing
-    ``proof_diagnostics`` check without actually running the proof.
-    """
-    if not result.is_valid:
-        return result
-
-    detail = "Bounded source proof unavailable for this state: retained guided review custody could not be bound to the live sources."
-    proof_check = ValidationCheck(
-        name=CHECK_PROOF_DIAGNOSTICS,
-        passed=False,
-        detail=detail,
-        affected_nodes=(),
-        outcome_code=None,
-    )
-    checks = _insert_proof_check(result.checks, proof_check)
-    return result.model_copy(
-        update={
-            "is_valid": False,
-            "checks": checks,
-            "errors": [
-                *result.errors,
-                ValidationError(
-                    component_id=None,
-                    component_type="source",
-                    message=detail,
-                    suggestion=(
-                        "Re-select or re-upload the source and re-run validation, or "
-                        "re-enter guided review so the reviewed custody binds again."
-                    ),
-                    error_code="source_inspection_failed",
-                ),
-            ],
-            "readiness": ValidationReadiness(
-                authoring_valid=False,
-                execution_ready=False,
-                completion_ready=False,
-                blockers=[
-                    *result.readiness.blockers,
-                    ValidationReadinessBlocker(
-                        code="source_inspection_failed",
-                        suggestion=None,
-                        note=None,
-                        component_id=None,
-                        component_type="source",
-                        detail="Bounded source proof was unavailable; execution fails closed.",
-                    ),
-                ],
-            ),
-        }
-    )
-
-
 def _build_web_plugin_policy_evidence(
     *,
     snapshot: PluginAvailabilitySnapshot,
@@ -1340,25 +1283,13 @@ class ExecutionServiceImpl:
         session_operation_context: SessionOperationContext,
     ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
-        from elspeth.web.composer.guided_blob_refs import validate_guided_reviewed_blob_binding
         from elspeth.web.composer.tools.blobs import BlobToolRecord
         from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
         from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
-        # Admission direction (elspeth-3b45cdb41e): the sentinel-claim census
-        # deliberately includes EXITED_TO_FREEFORM history. A retained review
-        # claim whose live binding cannot be resolved must surface as the
-        # blocking UnresolvedClaimedProofBlob diagnostic, not silently abstain
-        # — excluding exited history here (39c7f) mirrored the export-family
-        # skip, whose failure direction is wrong for admission.
-        claimed_sentinel_blob_ids: set[str] = set()
-        guided = state.guided_session
-        if guided is not None:
-            for reviewed_source in guided.reviewed_sources.values():
-                binding = validate_guided_reviewed_blob_binding(reviewed_source.options)
-                if binding is not None and binding.is_sentinel:
-                    claimed_sentinel_blob_ids.add(binding.blob_ref)
-
+        # Every authored source blob_ref is a custody claim. If its live
+        # binding cannot be resolved, the bounded proof must fail closed.
+        claimed_blob_ids: set[str] = set()
         expected_paths_by_blob_id: dict[str, set[str]] = {}
         for source_name, source in state.sources.items():
             if "blob_ref" not in source.options:
@@ -1372,6 +1303,7 @@ class ExecutionServiceImpl:
                 raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a UUID") from exc
             if str(parsed_blob_id) != raw_blob_id:
                 raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
+            claimed_blob_ids.add(raw_blob_id)
             paths = {
                 value
                 for key in SOURCE_LOCAL_PATH_OPTION_KEYS
@@ -1386,7 +1318,7 @@ class ExecutionServiceImpl:
         resolved_by_blob_id: dict[str, ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
 
         def _unresolved(blob_id: str) -> UnresolvedClaimedProofBlob | None:
-            return UnresolvedClaimedProofBlob() if blob_id in claimed_sentinel_blob_ids else None
+            return UnresolvedClaimedProofBlob() if blob_id in claimed_blob_ids else None
 
         def _resolve(blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
             if blob_id in resolved_by_blob_id:
@@ -1463,7 +1395,6 @@ class ExecutionServiceImpl:
     ) -> ValidationResult:
         """Run the canonical 23 checks and bounded source proof in one worker."""
         from elspeth.web.composer.tools.generation import compute_proof_diagnostics
-        from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
         from elspeth.web.execution.validation import validate_pipeline
 
         def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
@@ -1505,19 +1436,11 @@ class ExecutionServiceImpl:
         if not result.is_valid:
             return result
 
-        # Admission-direction derivation (elspeth-3b45cdb41e): unlike the
-        # export-family consumers, an EXITED_TO_FREEFORM terminal must not
-        # skip the retained review custody — that skip fabricated a passing
-        # proof check for exactly the pipeline guided confirmation blocked.
-        derivation = derive_guided_blob_refs_for_admission_proof(state)
-        if derivation.custody_unavailable:
-            return _merge_unavailable_authoritative_proof(result)
-        proof_state = derivation.proof_state
         diagnostics = compute_proof_diagnostics(
-            proof_state,
+            state,
             session_id=str(session_id) if session_id is not None else None,
             blob_resolver=self._authoritative_proof_blob_resolver(
-                proof_state,
+                state,
                 session_id=session_id,
                 session_operation_context=session_operation_context,
             ),
@@ -4367,12 +4290,9 @@ class ExecutionServiceImpl:
     def _admit_run_llm_call(self, run_uuid: UUID, session_operation_lease: SessionOperationLease) -> str:
         """Persist an admitted pending attempt before the provider can spend."""
         session_operation_lease.guard_external_effect()
-        attempt = self._call_async(
-            self._session_service.begin_provider_attempt(
-                session_operation_context=session_operation_lease.context,
-                source="run",
-                run_id=run_uuid,
-            )
+        attempt = self._session_service.begin_run_provider_attempt_sync(
+            session_operation_context=session_operation_lease.context,
+            run_id=run_uuid,
         )
         return attempt.attempt_id
 
@@ -4393,12 +4313,10 @@ class ExecutionServiceImpl:
         )
         if len(entries) != 1:
             raise AuditIntegrityError(f"Run {run_uuid} provider outcome must identify exactly one durable LLM call")
-        self._call_async(
-            self._session_service.settle_provider_attempt(
-                session_operation_context=session_operation_lease.context,
-                attempt_id=attempt_id,
-                entry=entries[0],
-            )
+        self._session_service.settle_run_provider_attempt_sync(
+            session_operation_context=session_operation_lease.context,
+            attempt_id=attempt_id,
+            entry=entries[0],
         )
 
     def _record_run_token_usage(

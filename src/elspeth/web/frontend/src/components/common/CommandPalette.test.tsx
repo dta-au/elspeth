@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { type ReactNode, useState } from "react";
+import { type ButtonHTMLAttributes, type ReactNode, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CommandPalette } from "./CommandPalette";
 import {
@@ -19,7 +19,6 @@ import {
   READY_VALIDATION_READINESS,
 } from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
-import type { GuidedSession } from "@/types/guided";
 import type { ValidationResult } from "@/types/index";
 import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
 import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
@@ -34,6 +33,9 @@ vi.mock("@xyflow/react", () => ({
   Handle: () => null,
   Background: () => null,
   Controls: () => null,
+  ControlButton: ({ children, ...props }: ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" {...props}>{children}</button>
+  ),
   MiniMap: () => null,
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
@@ -60,10 +62,6 @@ vi.mock("@/api/client", () => ({
   revertToVersion: vi.fn(),
   fetchStateVersions: vi.fn(),
   archiveSession: vi.fn(),
-  getGuided: vi.fn(),
-  respondGuided: vi.fn(),
-  reenterGuided: vi.fn(),
-  chatGuided: vi.fn(),
   fetchYaml: vi.fn().mockResolvedValue({ yaml: "sources: {}" }),
 }));
 
@@ -79,21 +77,8 @@ vi.mock("@/stores/executionStore", () => ({
     selector(executionStoreState),
 }));
 
-const exitedGuidedSession: GuidedSession = {
-  step: "step_1_source",
-  history: [],
-  terminal: {
-    kind: "exited_to_freeform",
-    reason: "user_pressed_exit",
-    pipeline_yaml: null,
-  },
-  chat_history: [],
-  chat_turn_seq: 0,
-  reviewed_components: { sources: [], outputs: [] },
-  profile: null,
-};
 
-describe("CommandPalette guided-mode commands", () => {
+describe("CommandPalette commands", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     executionStoreState.validationResult = null;
@@ -133,7 +118,6 @@ describe("CommandPalette guided-mode commands", () => {
           <ComposerWorkspace
             authoring={<div>Authoring</div>}
             artifact={<ArtifactWorkspace />}
-            inspector={<div>Inspector</div>}
             actionBar={<div>Actions</div>}
           />
           <CommandPalette
@@ -161,32 +145,6 @@ describe("CommandPalette guided-mode commands", () => {
     );
   });
 
-  it("offers Re-enter guided mode for a user-exited guided session", async () => {
-    const user = userEvent.setup();
-    const reenterGuided = vi.fn().mockResolvedValue(undefined);
-    const onClose = vi.fn();
-    useSessionStore.setState({
-      activeSessionId: "session-1",
-      guidedSession: exitedGuidedSession,
-      guidedTerminal: exitedGuidedSession.terminal,
-      reenterGuided,
-    });
-
-    render(
-      <CommandPalette
-        isOpen
-        onClose={onClose}
-        runAdmissionAvailable
-      />,
-    );
-
-    await user.click(
-      screen.getByRole("option", { name: /re-enter guided mode/i }),
-    );
-
-    expect(reenterGuided).toHaveBeenCalledTimes(1);
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
 
   it("does not offer navigation to the removed Runs tab", () => {
     render(

@@ -72,7 +72,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, SessionOperation
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
-from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _USER_ID = "execution-lease-user"
 
@@ -843,7 +843,7 @@ async def test_completion_cancellation_still_joins_exact_close_once() -> None:
 
     shutdown = asyncio.create_task(service.shutdown())
     try:
-        await asyncio.wait_for(asyncio.to_thread(executor.shutdown_started.wait, 2), timeout=2)
+        await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
         await asyncio.sleep(0)
         assert not shutdown.done(), "shutdown lost the cancelled completion before its lease close/join"
     finally:
@@ -851,7 +851,7 @@ async def test_completion_cancellation_still_joins_exact_close_once() -> None:
         authority.release_allowed.set()
         await asyncio.wait_for(shutdown, timeout=2)
 
-    await asyncio.wait_for(asyncio.to_thread(authority.release_called.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(authority.release_called.wait, 2), timeout=2)
     assert authority.release_calls == [lease.context]
     assert lease.closed
 
@@ -863,10 +863,10 @@ async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
     worker: Future[object] = Future()
     worker.set_result(None)
     service._on_pipeline_done(cast(Any, worker), session_operation_lease=lease)
-    await asyncio.wait_for(asyncio.to_thread(authority.release_called.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(authority.release_called.wait, 2), timeout=2)
 
     shutdown = asyncio.create_task(service.shutdown())
-    await asyncio.wait_for(asyncio.to_thread(executor.shutdown_started.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
     await asyncio.sleep(0)
     assert not shutdown.done()
 
@@ -927,10 +927,10 @@ async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(error_t
     if peer_fails:
         peer_authority.release_error = peer_error
     service._on_pipeline_done(cast(Any, worker), session_operation_lease=peer_lease)
-    await asyncio.wait_for(asyncio.to_thread(peer_authority.release_called.wait, 2), timeout=2)
+    await asyncio.wait_for(run_sync_in_worker(peer_authority.release_called.wait, 2), timeout=2)
     shutdown = asyncio.create_task(service.shutdown())
     try:
-        await asyncio.wait_for(asyncio.to_thread(executor.shutdown_started.wait, 2), timeout=2)
+        await asyncio.wait_for(run_sync_in_worker(executor.shutdown_started.wait, 2), timeout=2)
         await asyncio.sleep(0)
         assert not shutdown.done(), "a failed cleanup must not abandon a peer's authority release"
     finally:
@@ -2870,7 +2870,7 @@ def _real_session_service(
 ) -> SessionServiceImpl:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id=_USER_ID)
-    return DualFencedSessionServiceHarness(
+    return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.execution-lease-uow"),

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, ClassVar, get_args
 
 import pytest
 
 from elspeth.contracts.enums import FrameKind, NodeType, RoutingMode
+from elspeth.contracts.field_spelling import NO_SOURCE_RENAMES, SourceFieldRenames
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import OutputFieldDeclaration
 from elspeth.contracts.types import GateName, NodeID, SinkName
@@ -47,6 +50,7 @@ class _BoundRegionMockSource:
     on_success = "source_out"
     _output_schema_config: SchemaConfig | None = None
     observed_value_type: str | None = None
+    field_renames: SourceFieldRenames = NO_SOURCE_RENAMES
 
 
 class _BoundRegionMockSink:
@@ -100,6 +104,7 @@ class _BoundRegionTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -140,6 +145,7 @@ class _BoundRegionMultiRowTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -167,6 +173,10 @@ class _BoundRegionCollectorPlugin:
     def carried_output_sources(self) -> dict[str, str]:
         return {}
 
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -180,6 +190,7 @@ class _BoundRegionCollectorPlugin:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
@@ -207,6 +218,10 @@ class _BoundRegionAggregationTransform:
     def carried_output_sources(self) -> dict[str, str]:
         return {}
 
+    def schema_required_input_fields(self) -> frozenset[str]:
+        # BatchTransformProtocol presence requirement: this fake requires no field.
+        return frozenset()
+
     input_schema = None
     output_schema = None
     on_error: str | None = None
@@ -219,6 +234,7 @@ class _BoundRegionAggregationTransform:
     preserves_input_values = False
     forwards_input_fields = False
     removed_input_fields = frozenset()
+    renamed_input_fields: Mapping[str, str] = MappingProxyType({})
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:
         self.name = name
