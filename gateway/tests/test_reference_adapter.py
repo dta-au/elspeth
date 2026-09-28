@@ -338,6 +338,40 @@ def test_build_invoke_tool_round_trip():
     assert plan.body["conversation"][2] == {"speaker": "tool", "text": "4", "operation_ref": "c1"}
 
 
+@pytest.mark.parametrize("content", ["", "model prose", "  "])
+def test_build_invoke_assistant_text_with_operations_omits_only_exact_empty_text(content):
+    request = CanonicalRequest(
+        model_target={"target": "backend-a"},
+        model_alias="gpt-4o",
+        messages=(
+            CanonicalMessage(
+                role="assistant",
+                content=content,
+                tool_calls=(
+                    CanonicalToolCall(call_id="c1", name="lookup", arguments_json='{"q": 1}'),
+                    CanonicalToolCall(call_id="c2", name="calculate", arguments_json='{"n": 2}'),
+                ),
+            ),
+        ),
+        temperature=None,
+        seed=None,
+        max_tokens=None,
+    )
+
+    plan = ReferenceV1InvokeAdapter().build_invoke(request)
+
+    expected_entry = {
+        "speaker": "assistant",
+        "operations": [
+            {"ref": "c1", "operation": "lookup", "payload": {"q": 1}},
+            {"ref": "c2", "operation": "calculate", "payload": {"n": 2}},
+        ],
+    }
+    if content:
+        expected_entry["text"] = content
+    assert plan.body["conversation"] == [expected_entry]
+
+
 # --- parse_success(): halt -> finish_reason -----------------------------------
 
 

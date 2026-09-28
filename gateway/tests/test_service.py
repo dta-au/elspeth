@@ -152,6 +152,46 @@ def test_to_canonical_request_json_object_format_has_no_strict():
     assert canonical.response_format.strict is None
 
 
+@pytest.mark.parametrize(
+    ("assistant_content", "expected_content"),
+    [("", None), (None, None), (" ", " "), ("ordinary prose", "ordinary prose")],
+)
+@respx.mock
+async def test_assistant_tool_turn_reaches_adapter_without_empty_text(client, assistant_content, expected_content):
+    _mock_token()
+    respx.post(UPSTREAM_URL).mock(return_value=httpx.Response(200, json={"ok": True}))
+
+    class CapturingAdapter(FakeAdapter):
+        def build_invoke(self, request):
+            self.canonical_request = request
+            return super().build_invoke(request)
+
+    adapter = CapturingAdapter(
+        capabilities=frozenset({Capability.TEXT, Capability.TOOLS}),
+        parse_success_result=CanonicalResponse(text="done", finish_reason=FinishReason.STOP),
+    )
+    service = _service(_config(), adapter, client)
+    request = _chat_request(
+        messages=[
+            {"role": "user", "content": "Look it up"},
+            {
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": [
+                    {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'}},
+                ],
+            },
+        ]
+    )
+
+    await service.complete(request, "req-tool-text")
+
+    assert adapter.canonical_request.messages[1].content == expected_content
+    assert adapter.canonical_request.messages[1].tool_calls == (
+        CanonicalToolCall(call_id="call-1", name="lookup", arguments_json='{"q":"x"}'),
+    )
+
+
 # --- happy path ---------------------------------------------------------------
 
 

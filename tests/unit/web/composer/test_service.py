@@ -4336,6 +4336,20 @@ class TestComposerSamplingConfig:
     """
 
     @pytest.mark.asyncio
+    async def test_freeform_tool_and_prose_calls_disable_hidden_sdk_retries(self) -> None:
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        completion = _make_raw_llm_response(content="acknowledged")
+
+        with patch("litellm.acompletion", new_callable=AsyncMock, return_value=completion) as mock_acomp:
+            await service._provider_gateway._call_llm([{"role": "user", "content": "Hello"}], [])
+            await service._provider_gateway._call_text_llm([{"role": "user", "content": "Hello"}])
+
+        assert mock_acomp.call_count == 2
+        for call in mock_acomp.call_args_list:
+            assert call.kwargs["num_retries"] == 0
+            assert call.kwargs["max_retries"] == 0
+
+    @pytest.mark.asyncio
     async def test_call_llm_sends_configured_temperature_and_seed(self) -> None:
         catalog = _mock_catalog()
         settings = _make_settings(composer_temperature=0.0, composer_seed=42)

@@ -46,9 +46,10 @@ something this adapter cannot read is refused at admission instead of
 failing every completion.
 
 A conversation entry carries ``text`` when the canonical message has
-content, ``operations`` when it is an assistant message requesting tool
-calls, and ``operation_ref`` when it is a tool-result message answering a
-prior call. ``directives`` is present only when the request declares tools;
+content, except exact-empty assistant text alongside tool calls. It carries
+``operations`` when an assistant requests tool calls, and ``operation_ref``
+when a tool-result message answers a prior call. ``directives`` is present
+only when the request declares tools;
 ``directive_policy`` is present only when the request sets ``tool_choice``
 (``mode`` mirrors it verbatim; ``operation`` is added, from
 ``tool_choice_function``, only when ``mode`` is ``"named"``); ``format`` is
@@ -138,7 +139,7 @@ def _conversation_entry(message: CanonicalMessage) -> dict:
     # field names for text/tool-calls/tool-results) will differ from this
     # fictional speaker/text/operations/operation_ref shape.
     entry: dict = {"speaker": message.role}
-    if message.content is not None:
+    if message.content is not None and not (message.role == "assistant" and message.content == "" and message.tool_calls):
         entry["text"] = message.content
     if message.tool_calls:
         entry["operations"] = [

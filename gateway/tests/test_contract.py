@@ -130,6 +130,41 @@ def test_chat_message_content_none_accepted_for_assistant_with_tool_calls():
     assert message.content is None
 
 
+@pytest.mark.parametrize(
+    "role,content,tool_calls,tool_call_id",
+    [
+        ("assistant", None, None, None),
+        ("assistant", "", None, None),
+        ("assistant", "", [], None),
+        ("user", "", None, None),
+        ("system", "", None, None),
+        ("tool", "", None, "call_1"),
+    ],
+)
+def test_chat_message_rejects_empty_text_without_tool_calls(role, content, tool_calls, tool_call_id):
+    with pytest.raises(ValidationError, match="content"):
+        ChatMessage(role=role, content=content, tool_calls=tool_calls, tool_call_id=tool_call_id)
+
+
+@pytest.mark.parametrize("content", [None, ""])
+def test_chat_message_accepts_assistant_tool_calls_without_text(content):
+    tool_calls = [ChatToolCall(id="call_1", type="function", function=ChatToolCallFunction(name="f", arguments="{}"))]
+
+    message = ChatMessage(role="assistant", content=content, tool_calls=tool_calls)
+
+    assert message.content == content
+    assert message.tool_calls == tool_calls
+
+
+@pytest.mark.parametrize("role", ["system", "user", "assistant", "tool"])
+def test_chat_message_preserves_whitespace_only_content(role):
+    kwargs = {"tool_call_id": "call_1"} if role == "tool" else {}
+
+    message = ChatMessage(role=role, content=" \t ", **kwargs)
+
+    assert message.content == " \t "
+
+
 # --- tool_choice: named choice must reference a declared tool ---------------
 
 

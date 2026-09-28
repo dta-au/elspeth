@@ -13841,6 +13841,82 @@ def test_augmented_assistant_history_treats_empty_raw_content_as_augmentation() 
     assert "[ELSPETH-SYSTEM]" not in history[0]["content"]
 
 
+@pytest.mark.parametrize("route", ("messages", "recompose"))
+def test_persisted_empty_assistant_prose_is_omitted_from_provider_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """Both entry routes project the same persisted dialogue without empty assistant text."""
+    from litellm.exceptions import BadGatewayError
+
+    from elspeth.web.sessions.routes import _composer_chat_history
+
+    app, service = _make_app(tmp_path)
+    app.state.settings = app.state.settings.model_copy(
+        update={"composer_model": "test/planner", "composer_boot_probe_enabled": False, "composer_planner_repair_budget": 0}
+    )
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.compute_availability",
+        lambda **_kwargs: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+    )
+    app.state.composer_service = ComposerServiceImpl(
+        app.state.catalog_service,
+        app.state.settings,
+        sessions_service=service,
+        session_engine=app.state.session_engine,
+        secret_service=app.state.scoped_secret_resolver,
+        plugin_snapshot_factory=app.state.plugin_snapshot_factory,
+        operator_profile_registry=app.state.operator_profile_registry,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    created = client.post("/api/sessions", json={"title": "Empty assistant prose"})
+    assert created.status_code == 201, created.text
+    session_id = uuid.UUID(created.json()["id"])
+
+    operator_suffix = "[ELSPETH-SYSTEM] Operator-facing state summary."
+    asyncio.run(service.add_message(session_id, "user", "First request", writer_principal="route_user_message"))
+    asyncio.run(
+        service.add_message(
+            session_id,
+            "assistant",
+            operator_suffix,
+            raw_content="",
+            writer_principal="compose_loop",
+        )
+    )
+    asyncio.run(service.add_message(session_id, "assistant", "Ordinary reply", writer_principal="compose_loop"))
+
+    if route == "recompose":
+        asyncio.run(service.add_message(session_id, "user", "Try again", writer_principal="route_user_message"))
+
+    persisted = asyncio.run(service.get_messages(session_id, limit=None))
+    assert _composer_chat_history(persisted)[1] == {"role": "assistant", "content": ""}
+    assert persisted[1].content == operator_suffix
+    assert persisted[1].raw_content == ""
+
+    provider_requests: list[dict[str, Any]] = []
+
+    async def rejected_provider(**kwargs: Any) -> None:
+        provider_requests.append(kwargs)
+        raise BadGatewayError(message="test provider refusal", llm_provider="test", model="test/planner")
+
+    monkeypatch.setattr("litellm.acompletion", rejected_provider)
+    if route == "recompose":
+        response = client.post(f"/api/sessions/{session_id}/recompose", json=_recompose_request(service, session_id))
+    else:
+        response = client.post(
+            f"/api/sessions/{session_id}/messages", json={"content": "Try again", "client_request_id": str(uuid.uuid4())}
+        )
+
+    assert response.status_code == 502, response.text
+    assert len(provider_requests) == 1
+    provider_history = provider_requests[0]["messages"]
+    assert {"role": "user", "content": "First request"} in provider_history
+    assert {"role": "assistant", "content": "Ordinary reply"} in provider_history
+    assert provider_history.count({"role": "user", "content": "Try again"}) == 1
+    assert not any(message["role"] == "assistant" and message["content"] == "" for message in provider_history)
+    assert operator_suffix not in str(provider_history)
+
+
 def test_composer_chat_history_skips_audit_tool_messages() -> None:
     from elspeth.web.sessions.routes import _composer_chat_history
 

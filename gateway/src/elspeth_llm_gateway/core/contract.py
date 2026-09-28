@@ -106,9 +106,9 @@ class ChatMessage(BaseModel):
 
     Fail-closed cross-field rules: ``tool_calls`` may only be set on an
     ``assistant`` message; ``tool_call_id`` is required exactly when the
-    role is ``tool``; ``content`` must be an actual string (not ``None``)
-    for every role except ``assistant``, where a tool-calls-only message
-    may omit it.
+    role is ``tool``; ``content`` must be nonempty for every role except
+    ``assistant`` with one or more tool calls, where it may be empty or
+    omitted.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -133,9 +133,9 @@ class ChatMessage(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_content_is_string_for_non_assistant(self) -> Self:
-        if self.role != "assistant" and self.content is None:
-            raise ValueError("content must be a string for non-assistant roles")
+    def _check_content_represents_message(self) -> Self:
+        if self.content in (None, "") and not (self.role == "assistant" and self.tool_calls):
+            raise ValueError("content must be nonempty unless an assistant message has tool calls")
         return self
 
 

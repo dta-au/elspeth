@@ -52,7 +52,9 @@ def _canonicalize_message(message: ChatMessage) -> CanonicalMessage:
     )
     return CanonicalMessage(
         role=message.role,
-        content=message.content,
+        # Empty assistant prose has no text block beside tool calls. Adapters
+        # that append text for non-None content can consume this safely.
+        content=None if message.role == "assistant" and message.content == "" and tool_calls else message.content,
         tool_calls=tool_calls,
         tool_call_id=message.tool_call_id,
     )
