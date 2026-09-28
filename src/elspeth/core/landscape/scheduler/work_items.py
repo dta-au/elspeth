@@ -21,9 +21,10 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame, lineage_path_from_json, lineage_path_to_json
-from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import BarrierEmission, SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.scheduler.events import SchedulerEventRecord
 from elspeth.core.landscape.schema import nodes_table, rows_table, token_work_items_table, tokens_table
 
 _SENSITIVE_MISMATCH_FIELDS = frozenset({"row_payload_json", "pending_error_message"})
@@ -336,3 +337,93 @@ def insert_work_items(conn: Connection, *, values: list[dict[str, object]], oper
         raise LandscapeRecordError(f"Scheduler {operation} failed; database rejected audit write") from exc
     if len(inserted) != len(expected) or frozenset(inserted) != frozenset(expected):
         raise LandscapeRecordError(f"Scheduler {operation} returned an unexpected work item identity set")
+
+
+def prepare_fresh_pending_sink_item(
+    conn: Connection,
+    *,
+    run_id: str,
+    emission: BarrierEmission,
+    context: Mapping[str, object],
+    database_now: datetime,
+    parked_lease_owner: str | None,
+    refusal_prefix: str,
+) -> tuple[dict[str, object], SchedulerEventRecord]:
+    """Build a fresh PENDING_SINK row on the node_id-NULL terminal lane, and its event.
+
+    A sink-bound output with no producer continuation is born parked: the row
+    carries the complete durable sink bundle and ONE ``MARK_PENDING_SINK``
+    event records its birth (``from_status`` NULL). Two writers share this
+    image — an atomic barrier completion's generated output and the fenced
+    source-quarantine ingest — so a resuming leader claims either through the
+    same ``claim_pending_sink`` predicate. ``parked_lease_owner`` is the
+    attributed-park stamp (ADR-030 strict pending-sink terminalization).
+    The caller inserts the values and records the event in its transaction.
+    """
+    if emission.node_id is not None:
+        raise AuditIntegrityError(
+            f"{refusal_prefix} received fresh pending-sink emission token_id={emission.token_id!r} with "
+            f"node_id={emission.node_id!r}; fresh sink-bound emissions live on the node_id-NULL terminal lane."
+        )
+    if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
+        raise AuditIntegrityError(
+            f"{refusal_prefix} fresh pending-sink emission token_id={emission.token_id!r} requires row_id, step_index "
+            "and ingest_sequence; the inserted journal row must be a complete resume cursor."
+        )
+    validate_work_item_references(
+        conn,
+        run_id=run_id,
+        token_id=emission.token_id,
+        row_id=emission.row_id,
+        ingest_sequence=emission.ingest_sequence,
+        node_id=None,
+        coalesce_node_id=emission.coalesce_node_id,
+    )
+    item_id = work_item_id(run_id, emission.token_id, None, emission.attempt)
+    values: dict[str, object] = {
+        "work_item_id": item_id,
+        "run_id": run_id,
+        "token_id": emission.token_id,
+        "row_id": emission.row_id,
+        "node_id": None,
+        "step_index": emission.step_index,
+        "ingest_sequence": emission.ingest_sequence,
+        "row_payload_json": emission.row_payload_json,
+        "status": TokenWorkStatus.PENDING_SINK.value,
+        "queue_key": emission.queue_key,
+        "barrier_key": emission.barrier_key,
+        "on_success_sink": emission.on_success_sink,
+        "pending_sink_name": emission.sink_name,
+        "pending_outcome": emission.outcome,
+        "pending_path": emission.path,
+        "pending_error_hash": emission.error_hash,
+        "pending_error_message": emission.error_message,
+        "join_group_id": emission.join_group_id,
+        "lineage_path_json": lineage_path_to_json(emission.lineage_path),
+        "coalesce_node_id": emission.coalesce_node_id,
+        "coalesce_name": emission.coalesce_name,
+        "row_union_name": emission.row_union_name,
+        "collector_name": emission.collector_name,
+        "attempt": emission.attempt,
+        "lease_owner": parked_lease_owner,
+        "lease_expires_at": None,
+        "available_at": database_now,
+        "created_at": database_now,
+        "updated_at": database_now,
+    }
+    event = SchedulerEventRecord(
+        event_type=SchedulerEventType.MARK_PENDING_SINK,
+        run_id=run_id,
+        token_id=emission.token_id,
+        work_item_id=item_id,
+        node_id=None,
+        from_status=None,
+        to_status=TokenWorkStatus.PENDING_SINK,
+        from_lease_owner=None,
+        to_lease_owner=parked_lease_owner,
+        from_attempt=None,
+        to_attempt=emission.attempt,
+        recorded_at=database_now,
+        context=context,
+    )
+    return values, event

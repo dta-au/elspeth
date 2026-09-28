@@ -85,7 +85,7 @@ from elspeth.contracts.call_data import (
     LLMCallResponse,
     RawCallPayload,
 )
-from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumedRow, ResumePoint
+from elspeth.contracts.checkpoint import CheckpointDraft, ResumeCheck, ResumePoint
 from elspeth.contracts.cli import ExecutionResult, ProgressEvent
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.coalesce_metadata import ArrivalOrderEntry, CoalesceMetadata
@@ -532,7 +532,6 @@ __all__ = [  # Grouped by category for readability
     "CheckpointDraft",
     "ResumeCheck",
     "ResumePoint",
-    "ResumedRow",
     # coalesce enums
     "CoalescePolicy",
     "MergeStrategy",

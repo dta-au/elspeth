@@ -41,7 +41,7 @@ from elspeth.engine.orchestrator.types import AggregationFlushResult, ExecutionC
 from elspeth.engine.processor import RowProcessor
 from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.engine.spans import SpanFactory
-from elspeth.testing import make_source_row, make_source_row_quarantined
+from elspeth.testing import make_source_quarantine_result, make_source_row, make_source_row_quarantined
 from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 
@@ -79,6 +79,7 @@ def _drive_quarantined_stream(
         ceremony=MagicMock(spec=RunCeremony),
     )
     driver._quarantine_router = MagicMock(spec=QuarantineRouter)
+    driver._quarantine_router.route.side_effect = lambda *a, **kw: make_source_quarantine_result(sink_name="default")
     lifecycle = MagicMock(spec=SourceLifecycleRecorder)
     lifecycle.record_field_resolution.return_value = ({}, None)
     driver._lifecycle_recorder = lifecycle

@@ -710,7 +710,7 @@ def scenario_run_is_not_completed_over_a_claim_that_died_mid_row(tmp_path: Path,
     assert run.outcomes() == []
 
     for success_status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY):
-        with pytest.raises(OrchestrationInvariantError, match="FAILED scheduler work whose token has no terminal outcome") as refused:
+        with pytest.raises(OrchestrationInvariantError, match=r"token\(s\) have no completed terminal outcome") as refused:
             run.factory.run_lifecycle.complete_run(success_status, coordination_token=run.leader)
         assert run.token_id in str(refused.value)
 

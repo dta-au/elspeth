@@ -29,7 +29,10 @@ from elspeth.contracts import (
     ReproducibilityGrade,
     RunStatus,
     SecretResolutionInput,
+    TerminalOutcome,
+    TerminalPath,
 )
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.declaration_contracts import (
@@ -1288,6 +1291,15 @@ class TestCompleteRunCrashPath:
             factory.execution.complete_node_state(
                 state.state_id, NodeStateStatus.COMPLETED, output_data={"value": 1}, duration_ms=1, member_token=authority.membership
             )
+            # The row reaches its recorded outcome before its work item closes:
+            # a success stamp never coexists with an outcomeless token (QR-4).
+            factory.data_flow.record_token_outcome(
+                TokenRef(token_id=token.token_id, run_id=run_id),
+                TerminalOutcome.SUCCESS,
+                TerminalPath.FILTER_DROPPED,
+                member_token=authority.membership,
+                work_item=item,
+            )
             factory.scheduler.mark_terminal(
                 member_token=authority.membership, work_item_id=item.work_item_id, expected_lease_owner=authority.worker_id
             )
@@ -1847,3 +1859,86 @@ class TestCompleteRunDiagnosisOrder:
         run = repo.get_run("run-diag-residual")
         assert run is not None
         assert run.status == RunStatus.RUNNING
+
+    @pytest.mark.parametrize("success_status", [RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_FAILURES, RunStatus.EMPTY])
+    def test_token_without_outcome_or_work_refuses_every_success_stamp(self, success_status: RunStatus) -> None:
+        """QR-4: a token with no completed outcome and NO scheduler work is invisible
+        to journal quiescence; the undecided-token arm refuses the success stamp and
+        names the token, while a FAILED stamp (resume's ceremony) still lands."""
+        from datetime import UTC, datetime
+
+        from elspeth.contracts.errors import OrchestrationInvariantError
+        from elspeth.core.landscape.schema import token_outcomes_table
+
+        run_id = f"run-qr4-{success_status.value}"
+        db, repo, token = _make_repo_with_token(run_id=run_id)
+        factory = make_factory(db)
+        source_node = register_test_node(factory.data_flow, run_id, "src-1", node_type=NodeType.SOURCE)
+        tokens = [
+            factory.data_flow.create_row_with_token(
+                coordination_token=token,
+                source_node_id=source_node,
+                row_index=index,
+                data={"id": index},
+                source_row_index=index,
+                ingest_sequence=index,
+            )[1]
+            for index in range(2)
+        ]
+        decided, undecided = tokens
+        with db.engine.begin() as conn:
+            conn.execute(
+                token_outcomes_table.insert().values(
+                    outcome_id="outcome-qr4-decided",
+                    run_id=run_id,
+                    token_id=decided.token_id,
+                    outcome="success",
+                    path="default_flow",
+                    completed=1,
+                    recorded_at=datetime.now(UTC),
+                )
+            )
+
+        with pytest.raises(OrchestrationInvariantError, match=r"1 token\(s\) have no completed terminal outcome") as refused:
+            repo.complete_run(success_status, coordination_token=token)
+        assert undecided.token_id in str(refused.value)
+        assert decided.token_id not in str(refused.value)
+        run = repo.get_run(run_id)
+        assert run is not None
+        assert run.status == RunStatus.RUNNING, "the refused stamp mutated nothing"
+
+        assert repo.complete_run(RunStatus.FAILED, coordination_token=token).status is RunStatus.FAILED
+
+    def test_every_token_decided_without_work_stamps_success(self) -> None:
+        """QR-4 negative control: every token carries a completed outcome and no work
+        remains — the undecided-token arm admits the success stamp."""
+        from datetime import UTC, datetime
+
+        from elspeth.core.landscape.schema import token_outcomes_table
+
+        run_id = "run-qr4-all-decided"
+        db, repo, token = _make_repo_with_token(run_id=run_id)
+        factory = make_factory(db)
+        source_node = register_test_node(factory.data_flow, run_id, "src-1", node_type=NodeType.SOURCE)
+        _row, only = factory.data_flow.create_row_with_token(
+            coordination_token=token,
+            source_node_id=source_node,
+            row_index=0,
+            data={"id": 0},
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        with db.engine.begin() as conn:
+            conn.execute(
+                token_outcomes_table.insert().values(
+                    outcome_id="outcome-qr4-only",
+                    run_id=run_id,
+                    token_id=only.token_id,
+                    outcome="success",
+                    path="default_flow",
+                    completed=1,
+                    recorded_at=datetime.now(UTC),
+                )
+            )
+
+        assert repo.complete_run(RunStatus.COMPLETED, coordination_token=token).status is RunStatus.COMPLETED

@@ -2467,7 +2467,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 47
+### Landscape schema epoch 48
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2540,14 +2540,20 @@ after the first row; older Landscape stores must be recreated.
 Epoch 47 gives verification exports an index ordered by run, recorded time,
 and call ID, and indexes node states by run for corrupt verdict ownership
 checks. Populated epoch-46 stores must be recreated.
+Epoch 48 writes a durable PENDING_SINK work item for every source-quarantined
+row in the transaction that records it, so resume re-drives quarantined rows
+like every other sink-bound token and never re-derives a source row. The
+`run_coordination_events.event_type` CHECK admits `resume_refused`, the
+value-free record of a resume refused because an undecided token has no
+covering scheduler work. Epoch-47 stores must be recreated.
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-47, either automatically at startup or through an operator migration command.
+48, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-47 database.
+an older epoch must not be rolled back over an epoch-48 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

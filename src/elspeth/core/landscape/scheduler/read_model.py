@@ -201,27 +201,6 @@ class SchedulerReadModel:
             ).scalar_one()
         return int(result)
 
-    def active_row_ids(self, *, run_id: str) -> frozenset[str]:
-        """Return row IDs represented by non-terminal scheduler work."""
-        active_statuses = (
-            TokenWorkStatus.READY.value,
-            TokenWorkStatus.LEASED.value,
-            TokenWorkStatus.BLOCKED.value,
-            TokenWorkStatus.PENDING_SINK.value,
-        )
-        with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    select(token_work_items_table.c.row_id)
-                    .distinct()
-                    .where(token_work_items_table.c.run_id == run_id)
-                    .where(token_work_items_table.c.status.in_(active_statuses))
-                )
-                .scalars()
-                .all()
-            )
-        return frozenset(rows)
-
     def count_unquiesced_work(self, *, run_id: str) -> int:
         """Count work items still able to deposit new barrier arrivals (§D step 2)."""
         with self._engine.connect() as conn:

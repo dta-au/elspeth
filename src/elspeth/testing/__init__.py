@@ -518,6 +518,8 @@ def make_row_result(
 
     Defaults to the ADR-019 happy path pair: (SUCCESS, DEFAULT_FLOW).
     Sink-targeting paths default sink_name to "default" for test convenience.
+    A sink-bound result carries its durable PENDING_SINK handoff, as every
+    real one does: the orchestrator refuses one without it.
     """
     from elspeth.contracts.results import RowResult
 
@@ -553,6 +555,30 @@ def make_row_result(
         path=resolved_path,
         sink_name=resolved_sink_name,
         error=error,
+        scheduler_pending_sink=resolved_sink_name is not None,
+    )
+
+
+def make_source_quarantine_result(
+    *,
+    sink_name: str = "quarantine",
+    error_hash: str = "0123456789abcdef",
+) -> RowResult:
+    """Build the sink-bound (FAILURE, QUARANTINED_AT_SOURCE) result the fenced quarantine ingest returns.
+
+    It carries the durable PENDING_SINK handoff flag and the audited error
+    hash, as ``RowProcessor.ingest_quarantined_row`` sets them.
+    """
+    from elspeth.contracts.results import RowResult
+
+    return RowResult(
+        token=make_token_info(),
+        final_data=make_pipeline_row({"_raw": "bad"}),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.QUARANTINED_AT_SOURCE,
+        sink_name=sink_name,
+        scheduler_pending_sink=True,
+        authoritative_error_hash=error_hash,
     )
 
 

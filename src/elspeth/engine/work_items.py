@@ -143,10 +143,8 @@ def resolve_merged_branch_barrier(
       makes
       ``_maybe_coalesce_token``'s "arrived at coalesce_node_id" guard
       re-hold the release at the SAME barrier (elspeth-0bd2cde19a / E1b);
-      this mirrors the ``classify_resume_start`` FORK_CHILD arm's precedent
-      (``processor.py`` — ``branch = spec.lineage_path[-1].member_key`` then
-      resolve fresh from ``_branch_to_coalesce``/``_branch_to_row_union``)
-      applied to the live coalesce-completion path. Resolves to
+      the branch is the innermost remaining frame's ``member_key``, resolved
+      fresh from ``_branch_to_coalesce``/``_branch_to_row_union``. Resolves to
       ``(None, None)`` when that outer branch is bound to neither map (fork
       directly to a sink, or an ordinary consumer — spec §7 E2): the
       continuation carries no barrier context. This arm is reachable today

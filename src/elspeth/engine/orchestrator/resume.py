@@ -3,9 +3,9 @@
 This module contains the full resume code path:
 - setup_resume_context: rebuild GraphArtifacts from existing Landscape records
   (the resume-path equivalent of graph node/edge registration)
-- run_resume_processing_loop: iterate the unprocessed rows of a resumed run,
-  transform/flush/accumulate, with end-of-source aggregation + coalesce flushes
-  honoured only when the resume source is truly exhausted
+- run_resume_processing_loop: re-drive a resumed run's durable scheduler work
+  (no source row is ever re-derived), then run the end-of-input barrier
+  flushes unless the resume was interrupted
 - ResumeCoordinator: the resume orchestration that wires the two functions
   above together (``reconstruct_resume_state``, ``resume``,
   ``process_resumed_rows``)
@@ -23,18 +23,17 @@ the resume orchestration off ``Orchestrator`` (which now delegates its public
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import PipelineRow, ResumedRow, ResumePoint, RunMode, RunStatus
+from elspeth.contracts import ResumePoint, RunMode, RunStatus
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import (
@@ -76,7 +75,6 @@ from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
 from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
-from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
 from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
@@ -101,7 +99,6 @@ from elspeth.engine.orchestrator.run_status import (
     derive_resume_terminal_status_from_audit,
 )
 from elspeth.engine.orchestrator.runtime_preflight import run_transform_runtime_preflights
-from elspeth.engine.orchestrator.schema_reconstruction import reconstruct_schema_from_json
 from elspeth.engine.orchestrator.shutdown import shutdown_handler_context
 from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
@@ -112,10 +109,9 @@ from elspeth.engine.orchestrator.validation import (
 from elspeth.engine.retry import RetryManager
 
 if TYPE_CHECKING:
-    from elspeth.contracts import SchemaContract
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.checkpoint import CheckpointManager
-    from elspeth.core.checkpoint.recovery import IncompleteTokenSpec, RecoveryManager
+    from elspeth.core.checkpoint.recovery import RecoveryManager
     from elspeth.core.config import ElspethSettings
     from elspeth.core.dag import ExecutionGraph
     from elspeth.core.events import EventBusProtocol
@@ -181,60 +177,30 @@ def setup_resume_context(
 
 def run_resume_processing_loop(
     loop_ctx: LoopContext,
-    unprocessed_rows: Sequence[ResumedRow],
     *,
-    schema_contracts_by_source: Mapping[NodeID, SchemaContract],
-    source_on_success_by_source: Mapping[NodeID, str] | None = None,
-    incomplete_by_row: Mapping[str, Sequence[IncompleteTokenSpec]],
-    recovery_manager: RecoveryManager,
-    payload_store: PayloadStore,
-    run_id: str,
-    resume_checkpoint_id: str,
     shutdown_event: threading.Event | None = None,
-    check_coordination_latch: Callable[[], None] | None = None,
 ) -> bool:
-    """Run the resume processing loop: iterate unprocessed rows, transform, flush, accumulate.
+    """Re-drive a resumed run's durable scheduler work, then flush barriers at end of input.
 
-    Includes end-of-loop aggregation/coalesce flushes only when the resume
-    source is actually exhausted. On graceful shutdown we keep buffered state
-    pending rather than forcing end-of-source semantics.
+    Resume never re-derives a source row. Every row the run ingested was
+    handed to the scheduler in the same fenced transaction that recorded it
+    (valid ingest: a claimed READY item; source quarantine: a born-parked
+    PENDING_SINK item). A fork, expand or collect product gets
+    its item when its producing work completes; a crash between the child's
+    mint and that completion leaves the producer open, and re-driving it
+    reconciles the committed children and emits their items. The recovered
+    work is therefore exactly the run's non-terminal scheduler items (READY /
+    LEASED / BLOCKED / PENDING_SINK) plus the barrier buffers restored from
+    the journal at processor construction; each item's payload carries its
+    own row and contract, so no source schema is consulted.
 
-    Simpler than the main loop:
-    - No quarantine handling (rows already validated)
-    - No field resolution (already recorded in original run)
-    - No schema contract recording (passed via parameter)
-    - No operation_id lifecycle (no source track_operation)
-    - No progress emission (known gap — see design doc)
-
-    Per-row dispatch (F1 fix):
-    - If the row has incomplete child tokens (partial fork/expand/coalesce):
-      drive ONLY the incomplete children via resume_incomplete_token.
-      Restarting from source (process_existing_row) would re-fork to ALL branches
-      and re-emit the completed ones (the F1 double-emission defect).
-    - Otherwise (never started, or fully linear): whole-row restart from source
-      via process_existing_row is correct.
-
-    Per ADR-025 §3, ``schema_contracts_by_source`` is the plural-by-source
-    resume contract surface. Every ``ResumedRow`` carries a non-optional
-    ``source_node_id``; missing entries are audit corruption and resume refuses
-    instead of choosing a default.
-
-    Parameters
-    ----------
-    check_coordination_latch:
-        Optional zero-argument callable that raises
-        :class:`~elspeth.contracts.errors.RunWorkerEvictedError` if the
-        heartbeat thread has detected seat deposition or registry eviction.
-        Called at the same boundary as the ``shutdown_event`` check — once
-        per row, after row processing completes.  Pass
-        ``RunHeartbeatThread.check_and_raise`` here.  ``None`` (the default)
-        disables latch polling (non-coordinated runs or tests that do not start
-        a heartbeat thread).
+    End-of-input barrier flushes run only when the resume is not interrupted:
+    on graceful shutdown buffered state stays pending rather than being forced
+    through end-of-source semantics.
 
     Returns:
         True if interrupted by shutdown, False otherwise.
     """
-    # Destructure loop_ctx for local access
     config = loop_ctx.config
     ctx = loop_ctx.ctx
     processor = loop_ctx.processor
@@ -242,23 +208,21 @@ def run_resume_processing_loop(
     pending_tokens = loop_ctx.pending_tokens
     coalesce_executor = loop_ctx.coalesce_executor
     coalesce_node_map = dict(loop_ctx.coalesce_node_map)
-    agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
     row_union_executor = processor.row_union_executor
 
-    # A buffered-only resume can have zero unprocessed rows but still carry
-    # restored aggregation/coalesce state. If shutdown is already requested,
-    # honor it before any end-of-source flush work so buffered state is
-    # checkpointed again instead of being flushed to sinks.
+    # A buffered-only resume carries restored aggregation/coalesce state. If
+    # shutdown is already requested, honor it before any end-of-source flush
+    # work so buffered state is checkpointed again instead of being flushed to
+    # sinks.
     interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
 
     # elspeth-0bffbd1af1 / elspeth-321f335ff2: restored pending groups carry
     # backdated arrival anchors, so a group whose timeout expired during
     # downtime is already stale HERE — sweep it closed before the scheduler
-    # drain or the source replay can supply its missing branch and complete
-    # it. Skipped on an already-requested shutdown so restored barrier state
-    # stays pending for the next checkpoint instead of being failed by the
-    # sweep. Coalesce before row_union: the same order as every other sweep
-    # boundary.
+    # drain can supply its missing branch and complete it. Skipped on an
+    # already-requested shutdown so restored barrier state stays pending for
+    # the next checkpoint instead of being failed by the sweep. Coalesce
+    # before row_union: the same order as every other sweep boundary.
     if not interrupted_by_shutdown and coalesce_executor is not None:
         handle_coalesce_timeouts(
             coalesce_executor=coalesce_executor,
@@ -278,159 +242,9 @@ def run_resume_processing_loop(
         )
 
     if not interrupted_by_shutdown and processor.has_scheduled_work():
-        recovered_row_ids = frozenset(row.row_id for row in unprocessed_rows)
-        scheduled_row_ids = processor.active_scheduled_row_ids()
-        uncovered_row_ids = recovered_row_ids - scheduled_row_ids
-        if uncovered_row_ids:
-            formatted_uncovered = ", ".join(sorted(uncovered_row_ids))
-            formatted_scheduled = ", ".join(sorted(scheduled_row_ids)) or "<none>"
-            raise AuditIntegrityError(
-                "Resume scheduler coverage is incomplete: active scheduler work exists, "
-                "but recovered rows are not represented by scheduler work items. "
-                f"Uncovered row_id(s): {formatted_uncovered}. "
-                f"Scheduled row_id(s): {formatted_scheduled}. "
-                "Refusing mixed scheduler/source replay to avoid skipped or duplicated rows."
-            )
         results = processor.drain_scheduled_work(ctx)
         counters.rows_processed += len({result.token.row_id for result in results})
         accumulate_row_outcomes(results, counters, pending_tokens)
-        unprocessed_rows = ()
-
-    # Process each unprocessed row. Rows already exist in DB; only tokens need to
-    # be created. Dispatch: partial-fork/expand/coalesce rows use mid-DAG continuation;
-    # never-started and fully-linear rows use whole-row restart (process_existing_row).
-    for resumed_row in unprocessed_rows:
-        if interrupted_by_shutdown:
-            break
-        row_id = resumed_row.row_id
-        source_node_id = resumed_row.source_node_id
-        row_data = resumed_row.row_data
-        if source_node_id not in schema_contracts_by_source:
-            raise OrchestrationInvariantError(
-                f"Cannot resume row {row_id!r} from source node {source_node_id!r}: "
-                "source-scoped schema contract is missing from resume state "
-                f"(available source_node_ids: {sorted(schema_contracts_by_source)}). "
-                "The audit trail recorded the row under a source whose contract was "
-                "not restored; resume refuses rather than validate under an arbitrary contract."
-            )
-        row_contract = schema_contracts_by_source[source_node_id]
-        if source_on_success_by_source is None or source_node_id not in source_on_success_by_source:
-            raise OrchestrationInvariantError(
-                f"Cannot resume row {row_id!r} from source node {source_node_id!r}: "
-                "source-scoped on_success routing is missing from resume state."
-            )
-        source_on_success = source_on_success_by_source[source_node_id]
-        counters.rows_processed += 1
-
-        # ─────────────────────────────────────────────────────────────────
-        # Check for timed-out aggregations BEFORE processing this row
-        # Ensures timeout flushes OLD batch before processing new row
-        # ─────────────────────────────────────────────────────────────────
-        # Call module function directly (no wrapper method)
-        timeout_result = check_aggregation_timeouts(
-            config=config,
-            processor=processor,
-            ctx=ctx,
-            pending_tokens=pending_tokens,
-            agg_transform_lookup=agg_transform_lookup,
-        )
-        counters.accumulate_flush_result(timeout_result)
-
-        # Wrap row_data in PipelineRow with contract. ResumedRow.row_data may be
-        # a frozen mapping; PipelineRow intentionally requires a plain dict at
-        # this boundary.
-        ctx.contract = row_contract
-        pipeline_row = PipelineRow(data=dict(row_data), contract=row_contract)
-
-        # F1 fix: dispatch on whether this row has incomplete fork/expand/coalesce child tokens.
-        #
-        # incomplete_by_row ⊆ unprocessed_rows by construction of the
-        # RecoveryManager resume work set: "incomplete non-delegation token" is
-        # Case 2 of row replay selection, so every partial-fork/expand/coalesce
-        # row IS visited by this loop and its specs are found here.
-        #
-        # Lineage-path filter: get_incomplete_tokens_by_row returns ALL incomplete
-        # non-delegation tokens — including linear-pipeline tokens that were interrupted
-        # mid-transform (empty lineage_path, join_group_id=None). Those linear tokens
-        # are correctly handled by process_existing_row (whole-row restart mints a fresh
-        # token); routing them to resume_incomplete_token raises OrchestrationInvariantError
-        # (F1 regression). Only dispatch specs that are provably fork/expand/coalesce
-        # children: at least one lineage frame, or a merge event (join_group_id).
-        # Direct key check (not .get()) — incomplete_by_row is our pre-built index
-        # (Tier-1 audit data), not an external boundary. A missing key is the normal
-        # "no incomplete children for this row" case.
-        fork_expand_coalesce_specs = (
-            [s for s in incomplete_by_row[row_id] if s.lineage_path or s.join_group_id is not None] if row_id in incomplete_by_row else []
-        )
-
-        if fork_expand_coalesce_specs:
-            # Partial fork/expand/coalesce completion: drive ONLY the incomplete
-            # children to completion under the original parent. Restarting from
-            # source (process_existing_row) would re-fork to ALL branches and
-            # re-emit the completed ones (F1 double-emission defect).
-            results = []
-            for spec in fork_expand_coalesce_specs:
-                token_row = recovery_manager.reconstruct_token_row(spec, run_id, source_row=pipeline_row, payload_store=payload_store)
-                results.extend(processor.resume_incomplete_token(spec, token_row, ctx, resume_checkpoint_id=resume_checkpoint_id))
-        else:
-            # No incomplete fork/expand/coalesce tokens for this row (never started,
-            # fully linear, or interrupted linear token): whole-row restart from source
-            # is correct. process_existing_row mints a fresh token and re-traverses.
-            results = processor.process_existing_row(
-                row_id=row_id,
-                row_data=pipeline_row,
-                transforms=config.transforms,
-                ctx=ctx,
-                source_node_id=source_node_id,
-                source_on_success=source_on_success,
-            )
-
-        # Handle all results from this row
-        accumulate_row_outcomes(results, counters, pending_tokens)
-
-        # ─────────────────────────────────────────────────────────────────
-        # Check for timed-out coalesces after processing each row
-        # Must check coalesce timeouts after each row to flush stale barriers
-        # ─────────────────────────────────────────────────────────────────
-        if coalesce_executor is not None:
-            handle_coalesce_timeouts(
-                coalesce_executor=coalesce_executor,
-                coalesce_node_map=coalesce_node_map,
-                processor=processor,
-                ctx=ctx,
-                counters=counters,
-                pending_tokens=pending_tokens,
-            )
-
-        if row_union_executor is not None:
-            handle_row_union_timeouts(
-                row_union_executor=row_union_executor,
-                processor=processor,
-                ctx=ctx,
-                counters=counters,
-            )
-
-        # ─────────────────────────────────────────────────────────────
-        # COORDINATION LATCH CHECK (ADR-030 §A.3 / §C.2, slice 4)
-        # Poll the heartbeat thread's latch before the shutdown check so
-        # a deposed resume-takeover-leader raises RunWorkerEvictedError
-        # proactively at each row boundary, without waiting for the next
-        # fenced write to refuse.  An optimization on top of the
-        # epoch/membership fences — both independently refuse the same
-        # writes — but this surfaces the condition on the drain thread.
-        # ─────────────────────────────────────────────────────────────
-        if check_coordination_latch is not None:
-            check_coordination_latch()
-
-        # ─────────────────────────────────────────────────────────────
-        # GRACEFUL SHUTDOWN CHECK
-        # Check between row iterations — current row is fully
-        # processed, outcomes recorded, safe to stop here.
-        # No quarantine path in resume (rows already validated).
-        # ─────────────────────────────────────────────────────────────
-        if shutdown_event is not None and shutdown_event.is_set():
-            interrupted_by_shutdown = True
-            break
 
     if not interrupted_by_shutdown:
         # CRITICAL: Flush remaining barriers only at true end-of-source.
@@ -456,6 +270,30 @@ def run_resume_processing_loop(
             )
 
     return interrupted_by_shutdown
+
+
+def refuse_unaccounted_resume(factory: RecorderFactory, coordination_token: CoordinationToken) -> None:
+    """Refuse a resume with an undecided token no scheduler work covers (the one resume coverage check).
+
+    ``verify_resume_coverage`` records the refusal as a value-free
+    ``resume_refused`` coordination event under this leader's seat before this
+    raises; the resume failure ceremony then stamps the run FAILED. Nothing is
+    re-driven, so the run stays resumable-but-refusing (lane ruling M2).
+
+    Raises:
+        AuditIntegrityError: A token is neither decided nor covered by
+            scheduler work.
+    """
+    refusal = factory.scheduler.leases.verify_resume_coverage(coordination_token=coordination_token)
+    if refusal is None:
+        return
+    raise AuditIntegrityError(
+        f"Resume of run {coordination_token.run_id!r} refused: {refusal.token_count} token(s) have no completed "
+        "outcome, no durable scheduler work item and no open producing item; resume re-drives only scheduler work "
+        "and never re-derives a "
+        f"row, so it cannot account for them. First token id(s): {', '.join(refusal.first_token_ids)}. "
+        "Recorded as a resume_refused coordination event; nothing was re-driven."
+    )
 
 
 def _resume_failure_result_from_baseline(
@@ -515,44 +353,35 @@ class _ResumeAuditSnapshot:
     """READ-ONLY resume reconstruction results, assembled BEFORE the seat CAS.
 
     ``reconstruct_resume_state`` used to interleave read-only reconstruction
-    (manifest drift, source-lifecycle completeness, per-source schema/contract
+    (manifest drift, source-lifecycle completeness, per-source name/lifecycle
     maps) with durable mutation (the leadership CAS and incomplete-batch
     rewrite) in one method, so a reader could not tell read from write at the
     boundary (elspeth-e4f1eb6038). This snapshot is the output of the read-only
     stage: every field is derived from read-only audit/recovery queries and
     NOTHING here has mutated durable state. The caller composes the durable
-    stages (``_acquire_resume_leadership``, the post-CAS work-set computation,
-    unprocessed-row restore, ``_repair_resume_batches``) on top of it, in order.
+    stages (``_acquire_resume_leadership``, ``_repair_resume_batches``, the
+    undecided-FAILED requeue) on top of it, in order.
 
-    The resume WORK SET (row-replay IDs + incomplete-token continuations) is
-    deliberately NOT a field here. Every field this snapshot DOES carry is
-    topology-stable — fixed at run start and never mutated by row-level
-    processing (the runtime-VAL manifest, per-source schema/contract/lifecycle
-    maps) — so reading it before the seat CAS is sound. The work set is the
-    opposite: it is derived from ``token_outcomes`` / ``tokens`` /
-    ``node_states`` / the scheduler journal, all of which a competing resume
-    leader mutates. A pre-CAS work-set read is a check whose act (row replay)
-    is only serialized by the leadership CAS, so it must be recomputed AFTER
-    the seat is won, under leadership exclusivity — see
-    ``reconstruct_resume_state``.
+    Every field this snapshot carries is topology-stable — fixed at run start
+    and never mutated by row-level processing (the runtime-VAL manifest, the
+    per-source name/lifecycle maps) — so reading it before the seat CAS is
+    sound. The resume work itself (the run's non-terminal scheduler items) is
+    never read here: a competing resume leader mutates it, so it is read by the
+    processor under leadership exclusivity.
     """
 
     factory: RecorderFactory
     recovery: RecoveryManager
     run_id: str
     worker_id: str
-    schema_contracts_by_source: Mapping[NodeID, SchemaContract]
     source_names_by_source: Mapping[NodeID, str]
     source_lifecycle_by_source: Mapping[NodeID, str]
-    source_schema_classes: Mapping[NodeID, type[Any]]
 
     def __post_init__(self) -> None:
         freeze_fields(
             self,
-            "schema_contracts_by_source",
             "source_names_by_source",
             "source_lifecycle_by_source",
-            "source_schema_classes",
         )
 
 
@@ -561,8 +390,8 @@ class ResumeCoordinator:
 
     Composes the module-level resume helpers (``setup_resume_context`` and
     ``run_resume_processing_loop``) into the full resume flow: reconstruct
-    resume state from the audit trail, process the unprocessed rows, and
-    finalize the run with audit-derived terminal status. The Orchestrator
+    resume state from the audit trail, re-drive the run's durable scheduler
+    work, and finalize the run with audit-derived terminal status. The Orchestrator
     delegates its public ``resume()`` here.
     """
 
@@ -684,23 +513,6 @@ class ResumeCoordinator:
             if on_resume_point_refreshed is not None:
                 on_resume_point_refreshed(resume_point)
 
-            # Stage 2.5 — compute the work set under acquired leadership.
-            # Row outcomes and incomplete tokens can change between a pre-CAS
-            # read and acquisition; replaying that stale set duplicates completed
-            # rows and misses new incomplete tokens. Topology-stable reads stay
-            # in _load_resume_audit_snapshot before the CAS.
-            workset = snapshot.recovery.get_resume_workset(snapshot.run_id)
-
-            # A CAS loser must be refused before expensive payload reads and
-            # schema decoding (elspeth-e3d1310b93). The winner owns cleanup for
-            # any restoration failure from this point (elspeth-245b21351b).
-            unprocessed_rows = snapshot.recovery.get_unprocessed_row_data_by_source(
-                snapshot.run_id,
-                payload_store,
-                source_schema_classes=snapshot.source_schema_classes,
-                row_ids=workset.row_ids,
-            )
-
             # Stage 3 — only the seat winner may rewrite incomplete batches.
             batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot, coordination_token=coordination_token)
             # Stage 3b — a claim that died on an exception mid-row left its item
@@ -712,10 +524,6 @@ class ResumeCoordinator:
             return ResumeState(
                 factory=snapshot.factory,
                 run_id=snapshot.run_id,
-                unprocessed_rows=unprocessed_rows,
-                incomplete_by_row=workset.incomplete_by_row,
-                recovery_manager=snapshot.recovery,
-                schema_contracts_by_source=snapshot.schema_contracts_by_source,
                 source_names_by_source=snapshot.source_names_by_source,
                 source_lifecycle_by_source=snapshot.source_lifecycle_by_source,
                 has_restored_barrier_work=has_restored_barrier_work,
@@ -746,10 +554,9 @@ class ResumeCoordinator:
 
         Create a fresh factory, verify resumability (runtime-VAL manifest drift
         + source-lifecycle completeness), and reconstruct the per-source
-        schema/contract maps. Performs NO durable mutation — the seat CAS
-        (``_acquire_resume_leadership``), the post-CAS work-set computation,
-        unprocessed-row restore, and batch repair (``_repair_resume_batches``)
-        all run in the caller AFTER this returns. Incomplete-source refusal is
+        name/lifecycle maps. Performs NO durable mutation — the seat CAS
+        (``_acquire_resume_leadership``) and batch repair
+        (``_repair_resume_batches``) run in the caller AFTER this returns. Incomplete-source refusal is
         an operator-facing "start fresh" outcome (a leaderless run is then
         finalized with ``elspeth abandon``, engine/orchestrator/abandon.py);
         it must not strand the run as RUNNING or rewrite retry batches merely
@@ -770,7 +577,7 @@ class ResumeCoordinator:
             )
         recovery = RecoveryManager(self._db, self._checkpoint_manager)
 
-        # Resume replays persisted PipelineRow payloads through NullSource rather
+        # Resume re-drives persisted scheduler payloads through NullSource rather
         # than re-opening the original source plugin, so source-boundary evidence
         # is inherited from the original run. That is only sound if the current
         # declaration-contract and Tier-1 registries still exactly match the
@@ -803,21 +610,13 @@ class ResumeCoordinator:
         if lifecycle_gate.incomplete_sources:
             raise IncompleteSourceResumeError(run_id, lifecycle_gate.incomplete_sources)
 
-        # NOTE: the resume WORK SET (row-replay IDs + incomplete-token
-        # continuations) is NOT computed here. It reads row-level state a
-        # competing resume leader mutates, so it must be read AFTER the seat CAS
-        # — see reconstruct_resume_state Stage 2.5. Only topology-stable
-        # reconstruction (schema/contract/lifecycle maps below) stays pre-CAS.
+        # Only topology-stable reconstruction (the name/lifecycle maps below)
+        # stays pre-CAS; the run's scheduler work is read under leadership.
         source_records = factory.run_lifecycle.get_run_source_resume_records(run_id)
-        source_schema_classes: dict[NodeID, type[Any]] = {}
-        schema_contracts_by_source: dict[NodeID, SchemaContract] = {}
         source_names_by_source: dict[NodeID, str] = {}
         source_lifecycle_by_source: dict[NodeID, str] = {}
         for raw_source_node_id, source_record in source_records.items():
             source_node_id = NodeID(str(raw_source_node_id))
-            schema_dict = json.loads(source_record.source_schema_json)
-            source_schema_classes[source_node_id] = reconstruct_schema_from_json(schema_dict)
-            schema_contracts_by_source[source_node_id] = source_record.schema_contract
             source_names_by_source[source_node_id] = str(source_record.source_name)
             source_lifecycle_by_source[source_node_id] = str(source_record.lifecycle_state)
 
@@ -826,10 +625,8 @@ class ResumeCoordinator:
             recovery=recovery,
             run_id=run_id,
             worker_id=worker_id,
-            schema_contracts_by_source=schema_contracts_by_source,
             source_names_by_source=source_names_by_source,
             source_lifecycle_by_source=source_lifecycle_by_source,
-            source_schema_classes=source_schema_classes,
         )
 
     def _acquire_resume_leadership(self, snapshot: _ResumeAuditSnapshot) -> CoordinationToken:
@@ -864,8 +661,8 @@ class ResumeCoordinator:
         flush-interrupting crash) — and reports whether the scheduler journal
         carries BLOCKED barrier rows. (F1: barrier restore itself runs in
         PROCESSOR CONSTRUCTION; a run whose remaining work all sits at barriers
-        has zero unprocessed rows but must still run the processing path so the
-        restored buffers flush, so the resume quiescence gate consults this flag.)
+        must still run the processing path so the restored buffers flush, so the
+        resume quiescence gate consults this flag.)
         """
         batch_id_remap = handle_incomplete_batches(snapshot.factory.execution, coordination_token=coordination_token)
         has_restored_barrier_work = snapshot.recovery.count_blocked_barrier_items(snapshot.run_id) > 0
@@ -1124,10 +921,6 @@ class ResumeCoordinator:
 
             check_combined_coordination_latch()
             # The token reaches each fenced collaborator by value (ADR-048 §3).
-            schema_contracts_by_source = state.schema_contracts_by_source
-            unprocessed_rows = state.unprocessed_rows
-            incomplete_by_row = state.incomplete_by_row
-            recovery_manager = state.recovery_manager
             resume_checkpoint_id = resume_point.checkpoint.checkpoint_id
             shutdown_ctx = nullcontext(shutdown_event) if shutdown_event is not None else shutdown_handler_context()
 
@@ -1143,31 +936,26 @@ class ResumeCoordinator:
             if incomplete_sources:
                 raise IncompleteSourceResumeError(run_id, incomplete_sources)
 
-            if unprocessed_rows or state.has_restored_barrier_work:
+            if state.has_restored_barrier_work:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
 
-            # F1 QUIESCENCE GATE (co-repointed with the buffered-token
-            # exclusion, Task 3.2): journal BLOCKED barrier rows are excluded
-            # from ``unprocessed_rows`` because they are RESTORED at processor
-            # construction — so a fully-buffered crashed run (all remaining
-            # work sitting at barriers) legitimately has zero unprocessed
-            # rows. PENDING_SINK rows are also absent when every leaf already
-            # has a terminal outcome, but the processor must still reclaim
-            # them and reconcile the durable sink effect. Early-completing in
-            # either case would finalize the run and delete checkpoints
-            # WITHOUT constructing the recovery processor. The no-work arm
-            # therefore requires restored barrier work, the complete scheduler
-            # journal, and any leader-pending zero-member collector groups to
-            # be quiescent. Those groups have no child journal rows to inspect.
-            # Only consult the journal when the other two work sources are
-            # empty. Once rows or restored barriers are present the processing
-            # path is already mandatory, so an additional database query cannot
-            # change the branch decision.
-            has_active_scheduler_work = (
-                not unprocessed_rows and not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
-            )
+            # F1 QUIESCENCE GATE: the resume's work is the run's durable
+            # scheduler work — journal BLOCKED barrier rows (RESTORED into
+            # executor buffers at processor construction), READY/LEASED items,
+            # and PENDING_SINK items (which the processor must reclaim to
+            # reconcile the durable sink effect even when every leaf already
+            # has a terminal outcome). Early-completing while any of it exists
+            # would finalize the run and delete checkpoints WITHOUT
+            # constructing the recovery processor. The no-work arm therefore
+            # requires restored barrier work, the complete scheduler journal,
+            # and any leader-pending zero-member collector groups to be
+            # quiescent. Those groups have no child journal rows to inspect.
+            # Only consult the journal when restored barriers are absent: once
+            # they are present the processing path is already mandatory, so an
+            # additional database query cannot change the branch decision.
+            has_active_scheduler_work = not state.has_restored_barrier_work and factory.scheduler.count_active_work(run_id=run_id) > 0
             pending_empty_collector_groups: tuple[tuple[str, str], ...] = ()
-            if not unprocessed_rows and not state.has_restored_barrier_work and not has_active_scheduler_work:
+            if not state.has_restored_barrier_work and not has_active_scheduler_work:
                 require_all_opener_node_ids = tuple(
                     str(node_id)
                     for node_id, binding in graph.get_group_bindings().by_opener_node().items()
@@ -1179,16 +967,14 @@ class ResumeCoordinator:
                 )
             if has_active_scheduler_work or pending_empty_collector_groups:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
-            if (
-                not unprocessed_rows
-                and not state.has_restored_barrier_work
-                and not has_active_scheduler_work
-                and not pending_empty_collector_groups
-            ):
+            if not state.has_restored_barrier_work and not has_active_scheduler_work and not pending_empty_collector_groups:
                 check_combined_coordination_latch()
+                # No work and no restored barrier holds: nothing remains for a
+                # journal restore to mint, so the coverage check is complete here.
+                refuse_unaccounted_resume(factory, coordination_token)
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
 
-                # All rows were processed - complete the run.
+                # No scheduler work remains - complete the run.
                 #
                 # Phase 2.2 (elspeth-0de989c56d): the resume's local counters
                 # are 0 here because nothing was reprocessed, but the audit DB
@@ -1222,14 +1008,9 @@ class ResumeCoordinator:
                     run_id=run_id,
                     config=config,
                     graph=graph,
-                    unprocessed_rows=unprocessed_rows,
                     barrier_restore=barrier_restore,
                     settings=settings,
                     payload_store=payload_store,
-                    incomplete_by_row=incomplete_by_row,
-                    recovery_manager=recovery_manager,
-                    resume_checkpoint_id=resume_checkpoint_id,
-                    schema_contracts_by_source=schema_contracts_by_source,
                     shutdown_event=active_event,
                     coordination_token=coordination_token,
                     check_coordination_latch=check_combined_coordination_latch,
@@ -1243,13 +1024,13 @@ class ResumeCoordinator:
             # meaning RunFinished was emitted after telemetry flush (never exported).
             #
             # F2 (resume-fork-reemit) — UNIFY both resume branches on the audit
-            # trail.  This with-unprocessed-rows branch previously derived its
+            # trail.  This processing branch previously derived its
             # terminal status + counters from the resume loop's *local* counters
             # (only what THIS resume call reprocessed), so a resumed run's
             # RunResult disagreed field-for-field with an uninterrupted run
             # (e.g. a resumed 1-row 2-branch fork reported rows_succeeded=1,
             # rows_forked=0 instead of the cumulative 2, 1) — while the
-            # no-unprocessed-rows branch already reconstructed cumulative
+            # no-work branch already reconstructed cumulative
             # counters from token_outcomes.  Both branches now finalize from the
             # SAME audit-derived cumulative (status, counters).
             #
@@ -1358,20 +1139,15 @@ class ResumeCoordinator:
         run_id: str,
         config: PipelineConfig,
         graph: ExecutionGraph,
-        unprocessed_rows: Sequence[ResumedRow],
         barrier_restore: BarrierJournalRestoreContext | None,
         settings: ElspethSettings | None = None,
         *,
         payload_store: PayloadStore,
-        incomplete_by_row: Mapping[str, Sequence[IncompleteTokenSpec]],
-        recovery_manager: RecoveryManager,
-        resume_checkpoint_id: str,
-        schema_contracts_by_source: Mapping[NodeID, SchemaContract],
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
-        """Process unprocessed rows during resume.
+        """Re-drive a resumed run's durable scheduler work and restored barriers.
 
         ``coordination_token`` is the seat the resume takeover CAS returned;
         it reaches every checkpoint write as a parameter, by value
@@ -1386,9 +1162,11 @@ class ResumeCoordinator:
         #
         # Source on_start():       Skipped (include_source_on_start=False)
         # Graph registration:     Loads from DB (setup_resume_context)
-        # Quarantine routing:     Not applicable (rows already validated)
+        # Row intake:             None — no source row is re-derived; every
+        #                         ingested row (valid or quarantined) is
+        #                         already durable scheduler work
         # Field resolution:       Skipped (loaded from DB in original run)
-        # Schema contract:        Skipped (passed via parameter)
+        # Schema contract:        Skipped (each work item's payload carries its own)
         # operation_id lifecycle: Not applicable (no source track_operation)
         # Progress emission:      None (known gap — T24 follow-up)
         # Checkpointing:          Same post-sink + shutdown semantics as run()
@@ -1414,18 +1192,13 @@ class ResumeCoordinator:
                 coordination_token=coordination_token,
             )
 
-            # ADR-025 §3: schema contracts are plural-by-source on resume.
-            # ``ctx.contract`` is set per-row inside the resume loop via the
-            # per-source lookup; the previous singular write here was a dead
-            # assignment that the loop's per-row reassignment overwrote on
-            # the first row anyway. ``run_transform_runtime_preflights``
-            # does not read ``ctx.contract`` (it only sets ``ctx.node_id``
-            # per-transform). Setting ``ctx.contract`` to None here is not
-            # required — the field carries the prior run's value through
-            # nullcontext if no rows are reprocessed, which is irrelevant
-            # because the early-exit path skips this method entirely.
             preflight_retry_manager = RetryManager(RuntimeRetryConfig.from_settings(settings.retry)) if settings is not None else None
             try:
+                # The processor is built and the barrier journal restored (which
+                # mints the work of committed coalesce/aggregation residuals):
+                # every token must now be decided or covered before anything is
+                # re-driven or written to a sink.
+                refuse_unaccounted_resume(factory, coordination_token)
                 run_transform_runtime_preflights(
                     factory,
                     run_id,
@@ -1448,31 +1221,11 @@ class ResumeCoordinator:
                 coalesce_executor=run_ctx.coalesce_executor,
                 coalesce_node_map=run_ctx.coalesce_node_map,
             )
-            source_on_success_by_source: dict[NodeID, str] = {}
-            for source_name, source_id in artifacts.source_id_map.items():
-                source_on_success = config.sources[source_name].on_success
-                if source_on_success is None:
-                    raise OrchestrationInvariantError(
-                        f"Cannot resume rows from source {source_name!r}: source on_success routing is missing."
-                    )
-                source_on_success_by_source[source_id] = source_on_success
 
             cleanup_pending_exc: BaseException | None = None
             try:
                 # 3. Process loop (resume path)
-                interrupted = run_resume_processing_loop(
-                    loop_ctx,
-                    unprocessed_rows,
-                    incomplete_by_row=incomplete_by_row,
-                    recovery_manager=recovery_manager,
-                    payload_store=payload_store,
-                    run_id=run_id,
-                    resume_checkpoint_id=resume_checkpoint_id,
-                    schema_contracts_by_source=schema_contracts_by_source,
-                    source_on_success_by_source=source_on_success_by_source,
-                    shutdown_event=shutdown_event,
-                    check_coordination_latch=check_coordination_latch,
-                )
+                interrupted = run_resume_processing_loop(loop_ctx, shutdown_event=shutdown_event)
 
                 # 4. Flush + write sinks with checkpoint advancement
                 self._sink_flush.flush_and_write_sinks(

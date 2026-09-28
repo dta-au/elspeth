@@ -56,7 +56,7 @@ from uuid import uuid4
 
 import pytest
 
-from elspeth.contracts import Determinism, PipelineRow, RunStatus, SourceRow, TokenInfo
+from elspeth.contracts import Determinism, PipelineRow, RowResult, RunStatus, SourceRow, TokenInfo
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, OutputMode
 from elspeth.contracts.identity import LineageFrame
@@ -92,7 +92,7 @@ from elspeth.engine.processor import RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
-from elspeth.testing import make_pipeline_row, make_source_row, make_source_row_quarantined
+from elspeth.testing import make_pipeline_row, make_source_quarantine_result, make_source_row, make_source_row_quarantined
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
 from tests.fixtures.landscape import make_landscape_db, make_recorder_with_run
@@ -529,11 +529,16 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
             ceremony=MagicMock(spec=RunCeremony),
         )
         driver._quarantine_router = MagicMock(spec=QuarantineRouter)
+
         # The clock only jumps once the loop moves past the valid row —
         # i.e. once a quarantined row is on deck — mirroring the original
         # source's clock-jump timing. The jump is far larger than the
         # timeout budget so the very next sweep sees the deadline expired.
-        driver._quarantine_router.route.side_effect = lambda *a, **kw: clock.advance(_CLOCK_JUMP_SECONDS)
+        def _route_quarantined(*_args: Any, **_kwargs: Any) -> RowResult:
+            clock.advance(_CLOCK_JUMP_SECONDS)
+            return make_source_quarantine_result(sink_name="default")
+
+        driver._quarantine_router.route.side_effect = _route_quarantined
         lifecycle = MagicMock(spec=SourceLifecycleRecorder)
         lifecycle.record_field_resolution.return_value = ({}, None)
         driver._lifecycle_recorder = lifecycle

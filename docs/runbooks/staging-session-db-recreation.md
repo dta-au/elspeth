@@ -2,10 +2,10 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and legacy issue tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 71 and Landscape epoch 47)
+## Current Cutover: 0.8.1 replica recovery, identity admission, prompt provenance and call mode audit (session epoch 71 and Landscape epoch 48)
 
 0.8.1 advances `SESSION_SCHEMA_EPOCH` from 53 to 71 and Landscape
-`SQLITE_SCHEMA_EPOCH` from 38 to 47. Session epoch 54 adds durable Composer
+`SQLITE_SCHEMA_EPOCH` from 38 to 48. Session epoch 54 adds durable Composer
 progress snapshots and exact request lifecycle leases. Landscape epoch 39
 adds immutable web run-start permit binding and recoverable pre-effect
 admission state. Session epoch 55 adds identity ownership foreign keys,
@@ -55,6 +55,10 @@ Landscape epoch 47 indexes verification decisions in run, time, and call order
 and indexes node states by run so corrupted verdict ownership can be checked
 without scanning the verification table. Populated epoch-46 stores require
 recreation.
+Landscape epoch 48 hands each source-quarantined row to its sink through a
+durable PENDING_SINK work item written with the row, and resume re-drives only
+scheduler work (it never re-derives a source row). Populated epoch-47 stores
+require recreation.
 Session epoch 63 also adds `interpretation_events.surface_origin`: review cards raised by
 the state-revert, YAML-import and E2E-seed routes now record that origin with
 empty LLM provenance, where they previously wrote the route name into the
@@ -80,7 +84,7 @@ Session epoch 68 adds `compose_checkpoint` and `ordinary_proposal_checkpoint`
 to the closed reason vocabulary of persisted `proposal.rebased` events. They
 keep pending proposals bound to the composition head across checkpoints.
 Earlier readers reject these reasons, so recreate epoch-67 session stores too;
-the Landscape epoch remains 47.
+session epoch 68 does not change the Landscape schema.
 Session epoch 69 adds immutable `message_ingress_receipts`: each accepted
 freeform client request UUID binds to one user message and the original nullable
 requested state. Recreate epoch-68 session stores before starting this schema;
@@ -89,7 +93,7 @@ Session epoch 70 updates the persisted tutorial Build stage and its closed
 CHECK. Session epoch 71 removes the retired Composer mode selector and mode-specific
 storage, and adds mode-neutral fork/revert receipts with append-only attempt
 and settlement evidence. Recreate predecessor session stores before starting
-this version; Landscape remains at epoch 47.
+this version; these session epochs do not change the Landscape schema.
 
 These intermediate definitions
 share one prepared 0.8.1 cutover; installing the intermediate ACA pair is not
@@ -177,8 +181,8 @@ Epoch 36 binds every coalesce effect to its non-null lineage group.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 62. Landscape epoch 47
-is the current release boundary, so a Landscape database left at epoch 46 or
+session epoch is a recreate boundary, including epoch 62. Landscape epoch 48
+is the current release boundary, so a Landscape database left at epoch 47 or
 below is stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
@@ -201,7 +205,7 @@ and epochs; forward and backward compatibility decisions; and an explicit
 the freshly recreated current databases. Rollback across this boundary is
 unsupported: keep the service drained, repair the epoch-71 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-71/Landscape-epoch-47 record when binding candidate and rollback
+session-epoch-71/Landscape-epoch-48 record when binding candidate and rollback
 decisions.
 
 For a later candidate that has used identity administration, the window also
@@ -810,7 +814,7 @@ resolve it with the Phase 5b procedure above before running these probes:
 
 ```bash
 sqlite3 "$DB_PATH" 'PRAGMA user_version;'         # expect 71 (== SESSION_SCHEMA_EPOCH)
-sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 47 (== SQLITE_SCHEMA_EPOCH)
+sqlite3 "$LANDSCAPE_PATH" 'PRAGMA user_version;'  # expect 48 (== SQLITE_SCHEMA_EPOCH)
 ```
 
 Any predecessor session or Landscape epoch is not repairable in place: keep the

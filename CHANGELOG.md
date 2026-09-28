@@ -52,7 +52,7 @@ Audit and Graduation steps.
 Session epoch 71 removes mode-specific operation state and adds mode-neutral
 durable receipts for session fork and state revert. Earlier Sessions stores
 must be recreated; there is no compatibility reader or in-place migration.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 47 for immutable web
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 48 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective
@@ -81,16 +81,23 @@ Epoch 47 indexes verification decisions by run, time, and call ID for bounded
 exports and indexes node states by run to detect misplaced verdicts without a
 full verification-table scan. Populated epoch-46 Landscape stores must be
 recreated.
+Epoch 48 hands a source-quarantined row to its sink through a durable
+PENDING_SINK work item written in the same transaction that records it, and
+resume re-drives only scheduler work: it never re-derives a source row, and it
+refuses (recording a value-free `resume_refused` coordination event) a run with
+an undecided token that no scheduler work covers. A store written before epoch
+48 can hold a quarantined token with no work item, which resume would now
+refuse as corruption, so it is refused at startup; recreate it.
 These changes share one paired cutover; the intermediate ACA epochs are not a
 separate deployment requirement.
 
 ELSPETH does not migrate either predecessor database in place before 1.0.
 Archive or export required evidence, stop the old service, recreate stale
 session and Landscape stores, then install 0.8.1. Session databases below
-epoch 71 (including epoch 70) and Landscape databases below epoch 47 must be
+epoch 71 (including epoch 70) and Landscape databases below epoch 48 must be
 recreated together.
 Startup accepts an empty database or an existing database matching the exact
-current schema epoch (session 71, Landscape 47); these are not minimum versions.
+current schema epoch (session 71, Landscape 48); these are not minimum versions.
 Preserve `data/auth.db` and follow the account re-admission guidance in the
 [session DB reset runbook](docs/runbooks/staging-session-db-recreation.md).
 Do not roll older code back over the recreated databases; keep the service
@@ -623,6 +630,25 @@ drained and repair this release forward.
   resume of a leader that died mid-retry). A run can no longer be finalised
   successful while a row whose claim died mid-row has no outcome: it now ends
   `FAILED` instead of `COMPLETED`.
+- **A quarantined source row survives a crash, and resume never re-validates
+  it.** A row that fails source validation and is routed to a quarantine sink
+  is now recorded, with its validation error, its failed source state, its
+  routing event and a durable work item for the quarantine sink, in one
+  transaction. Before, it existed only in memory until the sink write, so a
+  crash before that write lost it. Resuming a fixed-schema run then stopped
+  with a schema validation error and left every valid row without an outcome.
+  Resuming an observed-schema run re-read the row, accepted it and published
+  it to the success sink as a successful row, and the run finished
+  `completed` with exit 0. Resume now only re-drives recorded work items and
+  never reads a source row again: after the same crash the quarantined row
+  reaches its quarantine sink, the valid rows reach theirs, nothing is
+  published twice, and the run ends `completed_with_failures`. Resume refuses
+  a run in which a row has neither an outcome nor a work item (its own, or the
+  still-open work that forked, expanded or collected it) and records the
+  refusal in the audit trail as a `resume_refused` event naming the token ids
+  (never row values). A run can no longer be stamped successful while any row
+  lacks a recorded outcome. `elspeth resume`'s preview reports "Scheduler work
+  items (to re-drive)" instead of "Unprocessed rows".
 - **`elspeth resume` finishes a row whose work died on an unexpected error.**
   When a transform raises something that is neither a row error nor
   retryable (a plugin bug or an ELSPETH failure), the row's work item is left
@@ -677,8 +703,9 @@ drained and repair this release forward.
   write left the run unresumable. One reader, the inverse of the canonical
   encoder, now reads stored canonical text back to the double that was hashed:
   the sink boundary, the durable sink-effect plan (execution and
-  finalization), the replacing-sink predecessor snapshot, resume's row
-  restore, row and call payload reads, and source replay all use it.
+  finalization), the replacing-sink predecessor snapshot, row and call
+  payload reads, and source replay all use it (resume no longer reads a
+  stored source row at all; see Epoch 48 above).
 - **`examples/batch_error_routing`** shows a failed aggregation batch end to
   end. One order's amount is a string, so its whole batch of three fails:
   `settings.yaml` routes all three rows, with their original values, to the

@@ -59,7 +59,7 @@ def _route_to_sink(
     outcome: TerminalOutcome | None,
     path: TerminalPath,
     error_hash: str | None = None,
-    scheduler_pending_sink: bool = False,
+    scheduler_pending_sink: bool,
     join_group_id: str | None = None,
 ) -> None:
     """Validate sink exists in pending_tokens and append the token.
@@ -76,14 +76,24 @@ def _route_to_sink(
         path: Terminal provenance path to persist after sink durability
         error_hash: 16-char sha256 prefix capturing the originating error;
             required by PendingOutcome for failure/error paths.
-        scheduler_pending_sink: Whether this exact token has a durable
-            PENDING_SINK scheduler handoff to terminalize after sink durability.
+        scheduler_pending_sink: The result's handoff flag. Every sink-bound
+            token must already have a durable PENDING_SINK scheduler handoff
+            (the drain, barrier completion and the fenced quarantine ingest
+            each write one before the result reaches here), because the sink
+            flush terminalizes every written batch's scheduler rows; a
+            sink-bound result without one would be a token with no durable
+            record of its pending write, so it is refused.
         join_group_id: Merge-event identity, required by PendingOutcome for
             COALESCED and forbidden otherwise.
     """
     if sink_name not in pending_tokens:
         raise OrchestrationInvariantError(
             f"Sink '{sink_name}' not in configured sinks. Available: {sorted(pending_tokens.keys())}. Token: {token}"
+        )
+    if not scheduler_pending_sink:
+        raise OrchestrationInvariantError(
+            f"Sink-bound token {token.token_id!r} ({path.value}) has no durable PENDING_SINK scheduler handoff; "
+            "every token queued for a sink write must be parked durably first."
         )
     pending_tokens[sink_name].append(
         (
@@ -92,7 +102,6 @@ def _route_to_sink(
                 outcome=outcome,
                 path=path,
                 error_hash=error_hash,
-                scheduler_pending_sink=scheduler_pending_sink,
                 join_group_id=join_group_id,
             ),
         )
@@ -270,7 +279,7 @@ def accumulate_row_outcomes(
     the processor) rather than a default_sink_name parameter.
 
     Args:
-        results: Iterable of RowProcessingResult from processor.process_row/process_token
+        results: Iterable of RowProcessingResult from the processor (process_row, the scheduler drain)
         counters: Mutable ExecutionCounters to update
         pending_tokens: Dict of sink_name -> list of (token, pending_outcome) pairs
     """
@@ -305,6 +314,14 @@ def accumulate_row_outcomes(
             )
         elif pair == (TerminalOutcome.SUCCESS, TerminalPath.COALESCED) and result.join_group_id is None:
             raise OrchestrationInvariantError(f"(SUCCESS, COALESCED) result missing join_group_id. Token: {result.token}")
+        # (FAILURE, QUARANTINED_AT_SOURCE) is a shared pair: the table entry is
+        # the sinkless discard (outcome already recorded, never routed). A
+        # result carrying a sink is a source-quarantined row that the fenced
+        # quarantine ingest parked durably; it routes to its quarantine sink
+        # with the error hash recorded at ingest — never recomputed.
+        source_quarantine_to_sink = pair == (TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE) and result.sink_name is not None
+        if source_quarantine_to_sink:
+            error_hash = result.authoritative_error_hash
 
         # Counter movement comes from the shared table (elspeth-feeb4482fc);
         # the audit derive and the sink-diversion reconciler consume the SAME
@@ -322,7 +339,7 @@ def accumulate_row_outcomes(
             counters.rows_coalesce_failed += 1
         if effect.counts_routed_destination:
             counters.routed_destinations[_require_sink_name(result)] += 1
-        if effect.routes_to_sink:
+        if effect.routes_to_sink or source_quarantine_to_sink:
             _route_to_sink(
                 _require_sink_name(result),
                 pending_tokens,

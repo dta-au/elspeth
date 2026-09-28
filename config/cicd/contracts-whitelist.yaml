@@ -43,10 +43,6 @@ allowed_external_types:
   - "engine/orchestrator/types:AggregationFlushResult"
   - "engine/orchestrator/types:ExecutionCounters"
   # BufferEntry moved to contracts/engine.py — no longer an external type exception
-  # Resume/recovery identity spec - built exclusively from checkpoint DB columns by
-  # core RecoveryManager, consumed only by the engine resume path; subsystem-internal
-  # plumbing kept with its producer, not a universal data contract like TokenInfo.
-  - "core/checkpoint/recovery:IncompleteTokenSpec"
   # Secret loader types - used by web secret stores (user_store, server_store)
   - "core/security/secret_loader:SecretRef"
   # Composition state types - shared between web composer and composer MCP server

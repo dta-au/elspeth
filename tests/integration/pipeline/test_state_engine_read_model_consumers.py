@@ -19,7 +19,6 @@ from typing import Any, cast
 
 import pytest
 
-import elspeth.core.checkpoint.recovery as recovery_module
 import elspeth.engine.orchestrator.resume as resume_module
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, BarrierIntakePassOutcome
@@ -40,7 +39,6 @@ class _ProcessorSchedulerSpy:
         self.unquiesced = 0
         self.active = 0
         self.peer_owners: tuple[str, ...] = ()
-        self.row_ids: frozenset[str] = frozenset()
         self.blocked_rows: list[object] = []
 
     def count_unresolved_work(self, *, run_id: str) -> int:
@@ -63,10 +61,6 @@ class _ProcessorSchedulerSpy:
             )
         )
         return self.peer_owners
-
-    def active_row_ids(self, *, run_id: str) -> frozenset[str]:
-        self.calls.append(("active_row_ids", {"run_id": run_id}))
-        return self.row_ids
 
     def list_blocked_barrier_items(self, *, run_id: str) -> list[object]:
         self.calls.append(("list_blocked_barrier_items", {"run_id": run_id}))
@@ -129,14 +123,6 @@ def test_rm06_processor_preserves_peer_owner_order_and_selector_arguments() -> N
             {"run_id": RUN_ID, "caller_owner": "leader-owner"},
         )
     ]
-
-
-def test_rm09_processor_returns_exact_active_source_row_id_set() -> None:
-    spy = _ProcessorSchedulerSpy()
-    spy.row_ids = frozenset(("row-z", "row-a"))
-
-    assert _processor(spy).active_scheduled_row_ids() == frozenset(("row-z", "row-a"))
-    assert spy.calls == [("active_row_ids", {"run_id": RUN_ID})]
 
 
 @pytest.mark.parametrize(("rows", "expected"), [([], False), ([object()], True)])
@@ -218,25 +204,6 @@ def test_rm08_maintenance_evicts_exact_dead_worker_listing_in_order() -> None:
     assert evicted_worker_ids == ["dead-z", "dead-a"]
     assert trace[-1] == ("recover", token)
     assert drain._scheduler_drains_since_maintenance == 0
-
-
-def test_rm10_recovery_excludes_exact_blocked_barrier_token_id_set(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str]] = []
-
-    class _BarrierRepository:
-        def __init__(self, engine: object, *, events: object) -> None:
-            calls.append(("init", str(engine)))
-
-        def blocked_barrier_token_ids(self, *, run_id: str) -> frozenset[str]:
-            calls.append(("blocked_barrier_token_ids", run_id))
-            return frozenset(("token-z", "token-a"))
-
-    monkeypatch.setattr(recovery_module, "BarrierJournalRepository", _BarrierRepository)
-    manager: Any = object.__new__(recovery_module.RecoveryManager)
-    manager._db = SimpleNamespace(engine="engine-sentinel")
-
-    assert manager._get_buffered_journal_token_ids(RUN_ID) == {"token-z", "token-a"}
-    assert calls == [("init", "engine-sentinel"), ("blocked_barrier_token_ids", RUN_ID)]
 
 
 @pytest.mark.parametrize(("blocked_count", "expected"), [(0, False), (5, True)])
@@ -376,20 +343,6 @@ def _function_node(contract: _ArchitectureContract) -> ast.FunctionDef:
                 ),
             ),
             id="RM-12-restore-hard-seam",
-        ),
-        pytest.param(
-            _ArchitectureContract(
-                "RM-14",
-                "src/elspeth/engine/orchestrator/resume.py",
-                "ResumeCoordinator",
-                "reconstruct_resume_state",
-                (
-                    "workset = snapshot.recovery.get_resume_workset(snapshot.run_id)",
-                    "row_ids=workset.row_ids",
-                    "incomplete_by_row=workset.incomplete_by_row",
-                ),
-            ),
-            id="RM-14-resume-workset-hard-seam",
         ),
         pytest.param(
             _ArchitectureContract(

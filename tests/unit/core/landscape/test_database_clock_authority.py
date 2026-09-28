@@ -174,7 +174,15 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # E3 (lane ruling 2026-09-26, option A2): 66e5132f… → the value below, +1 identity:
 # SchedulerLeaseRepository.requeue_undecided_failed_work, resume's leader verb that
 # returns an outcomeless FAILED item to READY. Re-derived from the live inventory.
-_CLOCK_BOUNDARY_DIGEST = "62e34418a6e81e085fa796a49abaa21444516d4537723a8fae10c7b2f9c1afc7"
+# QR (lane 5887, the fenced source-quarantine ingest): 62e34418… → the value below, one
+# identity leaves and two arrive: DataFlowRepository.create_quarantine_row_with_token
+# (deleted) leaves; SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink (the
+# ONE fenced_leader_transaction recording a rejected row's whole audit record) and
+# NodeStateRepository.record_failed_source_quarantine_state_on (its step-0 FAILED state,
+# fence-extended on the caller's connection) arrive. Re-derived by RUNNING the gate.
+# QR H2 (resume coverage check): c864f58d… → the value below, +1 identity:
+# SchedulerLeaseRepository.verify_resume_coverage. Re-derived by RUNNING the gate.
+_CLOCK_BOUNDARY_DIGEST = "aecd851337f99f935215c8d914b386ab2e8cb782b9163571f0026984eb5c8e11"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -258,7 +266,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.finalize_coalesce_effect"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.fork_token"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.insert_row_with_token_on"),
-        ("src/elspeth/core/landscape/data_flow_repository.py", "DataFlowRepository.create_quarantine_row_with_token"),
         ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_candidate"),
         ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_verified_candidate"),
         ("src/elspeth/core/landscape/execution/batches.py", "BatchRepository.complete_batch"),
@@ -272,6 +279,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.begin_node_states_many"),
         ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_completed_node_state"),
         ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_completed_node_state_on"),
+        ("src/elspeth/core/landscape/execution/node_states.py", "NodeStateRepository.record_failed_source_quarantine_state_on"),
         ("src/elspeth/core/landscape/execution/operations.py", "OperationRepository.begin_operation"),
         ("src/elspeth/core/landscape/execution/operations.py", "OperationRepository.complete_operation"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._finalize_on"),
@@ -362,7 +370,11 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         # outcome to READY (lane ruling 2026-09-26, option A2): it clears the
         # lease columns under the epoch fence and stamps Landscape decision time.
         ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.requeue_undecided_failed_work"),
+        # Resume's coverage check (QR H2): stamps its value-free resume_refused
+        # coordination event with Landscape decision time under the epoch fence.
+        ("src/elspeth/core/landscape/scheduler/leases.py", "SchedulerLeaseRepository.verify_resume_coverage"),
         ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.ingest_row_with_initial_claim"),
+        ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.ingest_quarantine_row_with_pending_sink"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_pending_sink"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_ready"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.heartbeat_lease"),

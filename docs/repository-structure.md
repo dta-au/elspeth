@@ -8,8 +8,8 @@ guess.
 
 Scope: the top level and one level down where it aids placement. The internal
 layout of `src/elspeth/` and `tests/` is intentionally *not* repeated here — see
-the [Repository Architecture](../README.md#repository-architecture) section of
-the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
+the [architecture code boundaries](../ARCHITECTURE.md#code-boundaries) for the
+source tree.
 
 ## Purpose categories
 

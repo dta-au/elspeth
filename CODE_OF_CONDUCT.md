@@ -34,6 +34,5 @@ disclosure would create risk.
 
 ## Attribution
 
-This code of conduct is intentionally short and project-specific. It is
-compatible in spirit with common open-source community standards while keeping
-the release-facing public-sector context explicit.
+This code of conduct is intentionally short and project-specific. It applies
+to participation in the repository and its project channels.

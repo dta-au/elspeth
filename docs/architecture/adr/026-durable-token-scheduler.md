@@ -124,8 +124,8 @@ READY → LEASED → (BLOCKED | PENDING_SINK) → TERMINAL | FAILED
   (NEW on this branch; replaces `row_index` as the resume sort key).
   The orchestrator assigns it monotonically while iterating sources in
   YAML declaration order. Token construction is type-enforced:
-  `TokenManager.create_initial_token()` and
-  `TokenManager.create_quarantine_token()` require
+  `TokenManager.create_initial_token()` and the fenced source-quarantine
+  ingest `engine.tokens.ingest_source_quarantine()` require
   `source_row_index` and `ingest_sequence` as keyword-only `int`
   parameters, so missing identity is a caller type error rather than a
   runtime defaulting path.
@@ -357,8 +357,8 @@ it.
   count increases — the preconditions are completeness
   gates, not redesigns.
 - **The scheduler is also a debugging surface.**
-  `summarize_active_work`, `count_active_work`, and
-  `active_row_ids` give the operator (and the MCP failure-
+  `summarize_active_work` and `count_active_work` give the
+  operator (and the MCP failure-
   context tool) a precise picture of "what is the run
   currently doing?" that the inline-with-source model
   couldn't.

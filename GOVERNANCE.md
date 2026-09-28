@@ -2,9 +2,9 @@
 
 ## Project Status
 
-ELSPETH is an open-source, MIT-licensed, high-assurance pipeline platform on the
+ELSPETH is an open-source, MIT-licensed pipeline platform on the
 0.8.1 release line. The repository is maintained as a public
-open-source project for evaluation and pilot-adoption planning. It does not
+project for evaluation and pilot-adoption planning. It does not
 claim a completed whole-platform independent assurance assessment.
 
 ## Decision Authority
@@ -81,9 +81,8 @@ last-push approval protection, required conversation resolution, CODEOWNERS or
 an equivalent ownership map for security-sensitive paths, and review
 requirements for release tags or branches where the platform supports them.
 
-Delivery governance and project-control reporting beyond the above are set by
-the maintainer's organisation, not decided by this project; the control-report
-set is described in `docs/project-control/README.md`.
+Delivery governance beyond the above is set by the adopting organisation;
+this file defines only the repository's own decision and release posture.
 
 ## Security Governance
 

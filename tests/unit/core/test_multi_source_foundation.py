@@ -2475,7 +2475,6 @@ def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
     assert failed.lease_owner is None
     assert failed.lease_expires_at is None
     assert repo.count_active_work(run_id="run-1") == 0
-    assert repo.active_row_ids(run_id="run-1") == frozenset()
     assert repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30) is None
 
 
@@ -2521,7 +2520,6 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     assert blocked.barrier_key == "barrier:row-1"
     restarted_repo = TokenSchedulerRepository(engine)
     assert restarted_repo.count_active_work(run_id="run-1") == 1
-    assert restarted_repo.active_row_ids(run_id="run-1") == frozenset({"row-1"})
     assert restarted_repo.claim_ready(member_token=_scheduler_member(engine, "worker-c"), lease_owner="worker-c", lease_seconds=30) is None
 
     completed = repo.mark_blocked_barrier_terminal(
@@ -2531,7 +2529,6 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     )
     assert completed == 1
     assert restarted_repo.count_active_work(run_id="run-1") == 0
-    assert restarted_repo.active_row_ids(run_id="run-1") == frozenset()
 
     second = repo.enqueue_ready(
         member_token=_scheduler_leader(engine).membership,

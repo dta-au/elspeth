@@ -42,8 +42,6 @@ files:
     Mapping[str, Any]: 15
   src/elspeth/contracts/chat_parts.py:
     dict[str, Any]: 7
-  src/elspeth/contracts/checkpoint.py:
-    Mapping[str, Any]: 1
   src/elspeth/contracts/coalesce_metadata.py:
     dict[str, Any]: 3
   src/elspeth/contracts/composer_audit.py:
@@ -121,8 +119,6 @@ files:
     dict[str, Any]: 18
   src/elspeth/core/canonical.py:
     dict[str, Any]: 1
-  src/elspeth/core/checkpoint/recovery.py:
-    dict[str, object]: 1
   src/elspeth/core/checkpoint/serialization.py:
     dict[str, object]: 2
   src/elspeth/core/config.py:
@@ -154,7 +150,7 @@ files:
     Mapping[str, object]: 6
     dict[str, object]: 2
   src/elspeth/core/landscape/data_flow_repository.py:
-    Mapping[str, object]: 13
+    Mapping[str, object]: 12
     dict[str, object]: 1
   src/elspeth/core/landscape/database.py:
     dict[str, Any]: 1
@@ -167,7 +163,7 @@ files:
   src/elspeth/core/landscape/execution/calls.py:
     dict[str, object]: 4
   src/elspeth/core/landscape/execution/node_states.py:
-    Mapping[str, object]: 14
+    Mapping[str, object]: 15
     dict[str, object]: 4
   src/elspeth/core/landscape/execution/operations.py:
     Mapping[str, object]: 2
@@ -214,15 +210,15 @@ files:
     Mapping[str, object]: 1
     dict[str, Any]: 4
   src/elspeth/core/landscape/scheduler/barrier.py:
-    Mapping[str, object]: 6
-    dict[str, object]: 5
+    Mapping[str, object]: 5
+    dict[str, object]: 3
   src/elspeth/core/landscape/scheduler/dispositions.py:
     dict[str, object]: 1
   src/elspeth/core/landscape/scheduler/events.py:
     Mapping[str, object]: 2
   src/elspeth/core/landscape/scheduler/work_items.py:
-    Mapping[str, object]: 1
-    dict[str, object]: 7
+    Mapping[str, object]: 2
+    dict[str, object]: 9
   src/elspeth/core/landscape/scheduler_repository.py:
     Mapping[str, object]: 2
     dict[str, object]: 1
@@ -302,7 +298,7 @@ files:
   src/elspeth/engine/processor.py:
     Mapping[str, object]: 1
     dict[str, Any]: 1
-    dict[str, object]: 3
+    dict[str, object]: 2
   src/elspeth/engine/spans.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 5
@@ -1033,10 +1029,10 @@ files:
     Mapping[str, Any]: 13
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 739
+  Mapping[str, Any]: 738
   Mapping[str, object]: 297
   MutableMapping[str, Any]: 8
   boundary: 58
   dict[str, Any]: 1061
-  dict[str, object]: 377
-  soft: 2482
+  dict[str, object]: 375
+  soft: 2479

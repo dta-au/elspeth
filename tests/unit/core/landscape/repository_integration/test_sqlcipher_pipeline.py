@@ -22,7 +22,8 @@ class TestPipelineWithSQLCipherLandscape:
         from sqlalchemy import select
         from tests.fixtures.landscape import make_factory
 
-        from elspeth.contracts import NodeType, RunStatus
+        from elspeth.contracts import NodeType, RunStatus, TerminalOutcome, TerminalPath
+        from elspeth.contracts.audit import TokenRef
         from elspeth.contracts.schema import SchemaConfig
         from elspeth.core.landscape.database import LandscapeDB
         from elspeth.core.landscape.schema import nodes_table, rows_table, runs_table
@@ -52,13 +53,22 @@ class TestPipelineWithSQLCipherLandscape:
             )
 
             # Create a row
-            row, _ = factory.data_flow.create_row_with_token(
+            row, token = factory.data_flow.create_row_with_token(
                 coordination_token=leader_coordination_token(factory, run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data={"customer_id": "C001", "amount": 42.0},
                 source_row_index=0,
                 ingest_sequence=0,
+            )
+            # The row reaches its outcome: a run is never stamped successful
+            # while a token lacks one (QR-4).
+            factory.data_flow.record_token_outcome_leader(
+                TokenRef(token_id=token.token_id, run_id=run_id),
+                TerminalOutcome.SUCCESS,
+                TerminalPath.DEFAULT_FLOW,
+                coordination_token=leader_coordination_token(factory, run_id),
+                sink_name="default",
             )
 
             # Complete the run

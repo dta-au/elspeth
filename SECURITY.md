@@ -73,7 +73,7 @@ Out of scope:
 
 - third-party provider infrastructure such as Azure OpenAI, OpenRouter,
   Microsoft Entra, ChromaDB, Dataverse, and GitHub;
-- denial-of-service testing against any live government or staging system
+- denial-of-service testing against any live or shared system
   without explicit written authorisation;
 - social engineering or physical access attempts.
 

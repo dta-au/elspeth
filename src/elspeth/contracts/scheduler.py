@@ -282,3 +282,39 @@ class SchedulerEvent:
         _validate_scheduler_enum(self.to_status, TokenWorkStatus, "to_status")
         require_int(self.from_attempt, "from_attempt", optional=True, min_value=0)
         require_int(self.to_attempt, "to_attempt", min_value=0)
+
+
+# How many token ids a resume refusal names in its recorded event and message:
+# enough to start an investigation, bounded independent of the run's size.
+RESUME_REFUSAL_TOKEN_ID_LIMIT = 10
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeCoverageRefusal:
+    """The resume coverage check's refusal: undecided tokens no scheduler work covers.
+
+    Resume re-drives only durable scheduler work and never re-derives a row,
+    so every token of a resumable run is decided (a completed outcome) or
+    covered by a READY / LEASED / BLOCKED / PENDING_SINK item. This names the
+    tokens that are neither. Carries ELSPETH token identifiers and a count
+    only — never row values. ``first_token_ids`` is the sorted head of the
+    offending set, bounded by ``RESUME_REFUSAL_TOKEN_ID_LIMIT``.
+    """
+
+    token_count: int
+    first_token_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        require_int(self.token_count, "token_count", min_value=1)
+        if type(self.first_token_ids) is not tuple:
+            raise TypeError(f"first_token_ids must be a tuple, got {type(self.first_token_ids).__name__}")
+        for token_id in self.first_token_ids:
+            if type(token_id) is not str or not token_id:
+                raise ValueError(f"first_token_ids entries must be non-empty strings, got {token_id!r}")
+        if len(self.first_token_ids) != min(self.token_count, RESUME_REFUSAL_TOKEN_ID_LIMIT):
+            raise ValueError(
+                f"first_token_ids must name min(token_count, {RESUME_REFUSAL_TOKEN_ID_LIMIT}) tokens; "
+                f"got {len(self.first_token_ids)} for token_count={self.token_count}"
+            )
+        if list(self.first_token_ids) != sorted(set(self.first_token_ids)):
+            raise ValueError("first_token_ids must be sorted and distinct")

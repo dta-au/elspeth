@@ -34,6 +34,7 @@ quiescence predicate are pinned by the valid-token tests at the bottom.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -306,6 +307,20 @@ def _fence_refusals(db: LandscapeDB, verb: str) -> list[dict[str, object]]:
             .all()
         )
     return [dict(row) for row in rows if json.loads(str(row["context_json"])).get("verb") == verb]
+
+
+def _resume_refusals(db: LandscapeDB) -> list[dict[str, object]]:
+    with db.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(run_coordination_events_table)
+                .where(run_coordination_events_table.c.run_id == RUN_ID)
+                .where(run_coordination_events_table.c.event_type == "resume_refused")
+            )
+            .mappings()
+            .all()
+        )
+    return [dict(row) for row in rows]
 
 
 def _seat_image(db: LandscapeDB) -> tuple[object, ...]:
@@ -1031,6 +1046,22 @@ class TestStaleTokenFenceRefusals:
         assert row["status"] == TokenWorkStatus.FAILED.value, "a deposed leader cannot requeue work under the new one"
         assert row["work_item_id"] == work_item_id
         assert len(_fence_refusals(db, "requeue_undecided_failed_work")) == 1
+
+    def test_verify_resume_coverage_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        repo = TokenSchedulerRepository(db.engine)
+        # A token with no outcome, no work item and no open producer: without
+        # the fence the check WOULD record a resume_refused event for it.
+        token_id, _row_id = _seed_row_and_token(db, sequence=0)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError):
+            repo.leases.verify_resume_coverage(coordination_token=token)
+        assert _resume_refusals(db) == [], "a deposed leader cannot record a resume refusal under the new one"
+        assert len(_fence_refusals(db, "verify_resume_coverage")) == 1
+        # Control: the current leader's check does see the uncovered token.
+        refusal = repo.leases.verify_resume_coverage(coordination_token=replace(token, leader_epoch=token.leader_epoch + 1))
+        assert refusal is not None
+        assert refusal.first_token_ids == (token_id,)
+        assert len(_resume_refusals(db)) == 1
 
     def test_terminalize_pending_sinks_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
         repo = TokenSchedulerRepository(db.engine)

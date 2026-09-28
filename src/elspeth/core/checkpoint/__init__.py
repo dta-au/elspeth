@@ -7,7 +7,6 @@ Provides:
 - ResumeCheck: Result of checking if a run can be resumed
 - ResumePoint: Information needed to resume a run
 - NonResumableRunError: Clean operator-facing resume refusal
-- IncompleteTokenSpec: Token continuation metadata needed by resume
 - checkpoint_dumps/checkpoint_loads: Type-preserving JSON serialization for aggregation state
 """
 
@@ -18,7 +17,6 @@ from elspeth.core.checkpoint.recovery import (
     GroupBindingView,
     GroupSatisfiabilityResumeGate,
     GroupUnsatisfiableResumeError,
-    IncompleteTokenSpec,
     NonResumableRunError,
     RecoveryManager,
     UnsatisfiableGroupMember,
@@ -35,7 +33,6 @@ __all__ = [
     "GroupBindingView",
     "GroupSatisfiabilityResumeGate",
     "GroupUnsatisfiableResumeError",
-    "IncompleteTokenSpec",
     "NonResumableRunError",
     "RecoveryManager",
     "ResumeCheck",
