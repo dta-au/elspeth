@@ -566,6 +566,60 @@ class TestAllowedRanges:
         allowed = (ipaddress.ip_network("::1/128"),)
         _validate_ip_address("::1", allowed_ranges=allowed)  # OK
 
+    def test_ipv6_unspecified_blocked_without_allowed_ranges(self) -> None:
+        """``::`` is blocked by default, like its IPv4 twin 0.0.0.0.
+
+        Connecting to the unspecified address reaches listeners on the local
+        host, so a hostname resolving to ``::`` must not pass as public.
+        """
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            _validate_ip_address("::")
+
+    def test_ipv6_unspecified_not_admitted_by_loopback_allowlist(self) -> None:
+        """Allowing ``::1/128`` does not also admit ``::``."""
+        allowed = (ipaddress.ip_network("::1/128"),)
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            _validate_ip_address("::", allowed_ranges=allowed)
+
+
+class TestSpecialPurposeRanges:
+    """Special-purpose and IPv4-embedding ranges are not public destinations."""
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "198.18.0.1",  # benchmarking (RFC 2544)
+            "192.0.0.192",  # IETF protocol assignments (RFC 6890)
+            "240.0.0.1",  # reserved (RFC 1112)
+            "::7f00:1",  # IPv4-compatible IPv6 embedding 127.0.0.1 (RFC 4291, deprecated)
+            "64:ff9b::7f00:1",  # NAT64 well-known prefix embedding 127.0.0.1 (RFC 6052)
+            "64:ff9b:1::1",  # NAT64 local-use prefix (RFC 8215)
+            "2002:7f00:1::1",  # 6to4 embedding 127.0.0.1 (RFC 3056)
+        ],
+    )
+    def test_blocked_by_default(self, ip: str) -> None:
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            _validate_ip_address(ip)
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "168.63.129.16",  # Azure WireServer / platform endpoint
+            "::a9fe:a9fe",  # IPv4-compatible form of 169.254.169.254
+            "64:ff9b::a9fe:a9fe",  # NAT64 form of 169.254.169.254
+            "2002:a9fe:a9fe::1",  # 6to4 form of 169.254.169.254
+        ],
+    )
+    def test_platform_and_embedded_metadata_always_blocked(self, ip: str) -> None:
+        """No operator allowlist admits these, matching the IPv4-mapped metadata rule."""
+        allow_everything = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+        with pytest.raises(SSRFBlockedError, match="Always-blocked"):
+            _validate_ip_address(ip, allowed_ranges=allow_everything)
+
+    @pytest.mark.parametrize("ip", ["8.8.8.8", "2606:4700:4700::1111", "168.63.129.17"])
+    def test_public_neighbours_still_allowed(self, ip: str) -> None:
+        _validate_ip_address(ip)  # Should not raise
+
 
 # ===========================================================================
 # allowed_ranges through validate_url_for_ssrf
@@ -581,6 +635,12 @@ class TestAllowedRangesFullPath:
         allowed = (ipaddress.ip_network("127.0.0.0/8"),)
         result = validate_url_for_ssrf("http://localhost/page", allowed_ranges=allowed)
         assert result.resolved_ip == "127.0.0.1"
+
+    def test_hostname_resolving_to_ipv6_unspecified_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hostname whose only address is ``::`` is refused before any connection."""
+        monkeypatch.setattr("elspeth.core.security.web._resolve_hostname", lambda h: ["::"])
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            validate_url_for_ssrf("http://attacker.example/")
 
     def test_cloud_metadata_blocked_via_full_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """169.254.169.254 blocked via full path even with allow_private."""
