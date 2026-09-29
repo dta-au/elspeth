@@ -2080,21 +2080,17 @@ def planner_model_catalog() -> _ModelCatalog:
 
 
 _MODEL_CATALOG_GUIDANCE: Final[str] = (
-    "This model catalog is rendered at prompt build from the same catalog the "
-    "list_models tool serves and is current for this deployment. A slug in "
-    "models_by_provider is served: bind it directly, with no discovery call. "
-    "provider_model_counts and total_models are every provider the catalog "
-    "knows, so a provider absent from models_by_provider is still a real "
-    "provider — its identifiers were not carried. authorable_providers is the "
-    "closed set an llm node's provider option may name; identifiers are "
-    "carried only for those, because a slug from any other provider cannot be "
-    "authored here. A provider named in authorable_providers with no "
-    "provider_model_counts entry has no catalogued identifiers on this "
-    "deployment — those endpoints are operator-configured. Each models_omitted "
-    "entry names a provider whose identifiers exceeded the byte budget and "
-    "carries its model_count and a details_via marker; follow the marker "
-    "before binding a slug for that provider. Never invent a slug and never "
-    "recall one from training: an unserved slug is rejected at preflight."
+    "Current at prompt build, this is the catalog list_models serves. Bind a "
+    "served models_by_provider slug directly, with no discovery call. "
+    "provider_model_counts and total_models include every known provider; "
+    "absence from models_by_provider means identifiers were not carried. "
+    "authorable_providers is the closed llm provider-option set; only its "
+    "identifiers are carried or authorable. An authorable provider absent from "
+    "provider_model_counts has no catalogued identifiers: its endpoints are "
+    "operator-configured. Each models_omitted entry names an over-budget "
+    "provider with model_count and details_via; follow that marker before "
+    "binding its slug. Never invent a slug or recall one from training: "
+    "preflight rejects an unserved slug."
 )
 
 _EXPRESSION_GRAMMAR_GUIDANCE: Final[str] = (
