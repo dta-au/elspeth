@@ -461,7 +461,8 @@ def _build_multi_query_output_schema(
         field
         for query_name in query_names
         for field in _llm_generated_output_fields(
-            f"{query_name}_{response_field}", () if extracted_fields is None else extracted_fields.get(query_name, ())
+            f"{query_name}_{response_field}",
+            extracted_fields[query_name] if extracted_fields is not None and query_name in extracted_fields else (),
         )
     )
     augmented_config = SchemaConfig(

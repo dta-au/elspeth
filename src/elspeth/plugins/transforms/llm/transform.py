@@ -1213,7 +1213,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e77cde4e084eab3f"
+    source_file_hash: str | None = "sha256:1c09ac95a0ef3b1e"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1593,7 +1593,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             generated_fields = tuple(
                 field
                 for spec in query_specs
-                for field in _llm_generated_output_fields(f"{spec.name}_{self._response_field}", extracted.get(spec.name, ()))
+                for field in _llm_generated_output_fields(
+                    f"{spec.name}_{self._response_field}", extracted[spec.name] if spec.name in extracted else ()
+                )
             )
             self._output_schema_config = _build_llm_output_schema_config(
                 schema_config, prefixed_guaranteed, generated_fields=generated_fields
