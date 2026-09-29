@@ -123,6 +123,24 @@
         "tier": "common"
       },
       {
+        "description": "Validated static public-page request headers.",
+        "kind": "json-object",
+        "label": "Headers",
+        "name": "headers",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Map validated request header names to input row fields.",
+        "kind": "json-object",
+        "label": "Header Fields",
+        "name": "header_fields",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "default": "markdown",
         "description": "Content extraction format to emit: markdown, plain text, or raw HTML/JSON text.",
         "enum": [

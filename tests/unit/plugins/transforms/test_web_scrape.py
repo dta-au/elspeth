@@ -6,6 +6,7 @@ get_ssrf_safe() actually sends.
 """
 
 import hashlib
+import os
 import socket
 from datetime import UTC, datetime
 from typing import Any
@@ -17,7 +18,7 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType, check_compatibility
 from elspeth.contracts.audit import Call
-from elspeth.contracts.call_data import MultipartPart, multipart_min_body_size
+from elspeth.contracts.call_data import HTTPCallRequest, MultipartPart, multipart_min_body_size
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
@@ -1792,6 +1793,126 @@ def test_query_options_reject_sensitive_names_and_duplicate_bindings() -> None:
     options["query"] = {"SearchText": "static"}
     with pytest.raises(PluginConfigError, match="SearchText"):
         WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Host",
+        "content-length",
+        "Transfer-Encoding",
+        "Connection",
+        "Cookie",
+        "Authorization",
+        "Proxy-Authorization",
+        "TE",
+        "Upgrade",
+        "Content-Type",
+        "X-Abuse-Contact",
+        "X-Custom",
+    ],
+)
+def test_request_header_policy_rejects_unsafe_names_at_config_time(name: str) -> None:
+    options = _make_basic_transform_options()
+    options["headers"] = {name: "value"}
+    with pytest.raises(PluginConfigError, match="header"):
+        WebScrapeTransform(options)
+
+
+def test_request_header_policy_rejects_case_insensitive_duplicates() -> None:
+    options = _make_basic_transform_options()
+    options["headers"] = {"Accept": "text/html"}
+    options["header_fields"] = {"aCcEpT": "accept_value"}
+    with pytest.raises(PluginConfigError, match="header"):
+        WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize("value", ["", "value\r\nX-Injected: yes", "café", "a" * 1025, ["text/html"]])
+def test_request_header_field_invalid_value_is_row_error_before_dns(mock_ctx: PluginContext, value: object) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/search"
+    options["header_fields"] = {"Accept": "accept_value"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS should not be reached")):
+        result = transform.process(make_pipeline_row({"accept_value": value}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "validation_failed"
+    assert "value" not in str(result.reason)
+
+
+@respx.mock
+def test_request_headers_static_and_row_fields_reach_get_without_credentials(mock_ctx: PluginContext) -> None:
+    route = respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/search"
+    options["headers"] = {"Accept": "text/html"}
+    options["header_fields"] = {"Accept-Language": "language"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"language": "en-AU"}), mock_ctx)
+
+    assert result.status == "success"
+    assert transform.declared_input_fields == frozenset({"language"})
+    assert route.calls[0].request.headers["accept"] == "text/html"
+    assert route.calls[0].request.headers["accept-language"] == "en-AU"
+
+
+@respx.mock
+def test_request_header_audit_binds_wire_value_without_recording_plaintext(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://example.com/search", header_fields={"Accept-Language": "language"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    archived_requests: list[dict[str, object]] = []
+    original_record_call = mock_ctx.landscape.record_call
+
+    def capture_record_call(**kwargs: object) -> Call:
+        request_data = kwargs["request_data"]
+        assert isinstance(request_data, HTTPCallRequest)
+        archived_requests.append(request_data.to_dict())
+        return original_record_call(**kwargs)
+
+    mock_ctx.landscape.record_call = capture_record_call
+    env = dict(os.environ)
+    env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+    env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+    with patch.dict(os.environ, env, clear=True), patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        first = transform.process(make_pipeline_row({"language": "en-AU"}), mock_ctx)
+        second = transform.process(make_pipeline_row({"language": "en-NZ"}), mock_ctx)
+
+    assert first.status == second.status == "success"
+    assert len(archived_requests) == 2
+    assert archived_requests[0]["headers"]["Accept-Language"].startswith("<fingerprint:")
+    assert archived_requests[0]["headers"]["Accept-Language"] != archived_requests[1]["headers"]["Accept-Language"]
+    assert "en-AU" not in str(archived_requests)
+    assert "en-NZ" not in str(archived_requests)
+
+
+@respx.mock
+def test_request_headers_reach_post_form(mock_ctx: PluginContext) -> None:
+    route = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://example.com/search", method="POST", request_form_field="form", headers={"Accept": "text/html"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"form": [{"name": "q", "value": "Acme"}]}), mock_ctx)
+
+    assert result.status == "success"
+    assert route.calls[0].request.headers["accept"] == "text/html"
+    assert route.calls[0].request.headers["content-type"] == "application/x-www-form-urlencoded; charset=utf-8"
 
 
 def test_fixed_url_invariant_probe_is_offline_and_restores_configured_url(mock_ctx: PluginContext) -> None:

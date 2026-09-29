@@ -12,6 +12,7 @@ The fingerprinting logic ensures:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from collections.abc import Mapping
@@ -120,7 +121,7 @@ def is_sensitive_header(header_name: str) -> bool:
     return lower_name.startswith("x") and lower_name[1:] in SENSITIVE_HEADER_WORDS
 
 
-def fingerprint_headers(headers: dict[str, str]) -> dict[str, str]:
+def fingerprint_headers(headers: dict[str, str], *, force_fingerprint_names: frozenset[str] = frozenset()) -> dict[str, str]:
     """Fingerprint sensitive request headers for audit recording.
 
     Sensitive headers (auth, api keys, tokens) are replaced with HMAC
@@ -156,7 +157,16 @@ def fingerprint_headers(headers: dict[str, str]) -> dict[str, str]:
     result: dict[str, str] = {}
 
     for k, v in headers.items():
-        if is_sensitive_header(k):
+        if k.casefold() in force_fingerprint_names:
+            if have_key:
+                result[k] = f"<fingerprint:{secret_fingerprint(v)}>"
+            elif allow_raw:
+                # Development mode has no HMAC key. Keep request identity
+                # comparable in replay/verify without exposing the raw value.
+                result[k] = f"<sha256:{hashlib.sha256(v.encode('ascii')).hexdigest()}>"
+            else:
+                raise FrameworkBugError("Configured request headers require ELSPETH_FINGERPRINT_KEY")
+        elif is_sensitive_header(k):
             if allow_raw:
                 # Dev mode: remove header (don't store secrets, don't require key)
                 pass

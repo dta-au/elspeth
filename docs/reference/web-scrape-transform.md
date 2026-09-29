@@ -68,6 +68,26 @@ must be a string; missing, invalid, or oversized URLs fail before DNS. Query
 parameter names associated with credentials are rejected. Query values and the
 resulting URL are audit evidence, so search terms should not contain secrets.
 
+For public pages that require request headers, use `headers` for fixed values
+and `header_fields` to read values from each row:
+
+```yaml
+headers: {Accept: text/html}
+header_fields: {Accept-Language: preferred_language}
+```
+
+The supported names are `Accept`, `Accept-Language`, `User-Agent`, and
+`X-Requested-With` (case-insensitive). Names that control transport, body
+framing, authentication, cookies, or ELSPETH's scraping identity are rejected
+at configuration time. Header values must be nonempty ASCII without control
+characters, at most 1,024 bytes each and 4,096 bytes together. Missing or
+invalid row values fail before DNS. Configured header values are sent unchanged;
+the request audit and telemetry contain only a fingerprint of each value. A
+fingerprint key is required in production. Development mode uses a SHA-256
+digest so replay and verify still distinguish different values. Do not put
+credentials in these headers; authenticated requests will use dedicated
+secret-reference options.
+
 GET is the default. To request data with POST, add a JSON object to each input
 row and name its field explicitly:
 

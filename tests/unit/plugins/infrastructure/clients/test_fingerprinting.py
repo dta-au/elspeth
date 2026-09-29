@@ -172,6 +172,32 @@ class TestFingerprintHeaders:
         result = fingerprint_headers({})
         assert result == {}
 
+    def test_configured_row_header_requires_key_outside_dev_mode(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k not in ("ELSPETH_FINGERPRINT_KEY", "ELSPETH_ALLOW_RAW_SECRETS")}
+        with patch.dict(os.environ, env, clear=True), pytest.raises(FrameworkBugError, match="ELSPETH_FINGERPRINT_KEY"):
+            fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+
+    def test_configured_row_header_hmac_binds_value_without_exposure(self) -> None:
+        env = dict(os.environ)
+        env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+        env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+        with patch.dict(os.environ, env, clear=True):
+            first = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+            second = fingerprint_headers({"Accept-Language": "en-NZ"}, force_fingerprint_names=frozenset({"accept-language"}))
+        assert first["Accept-Language"].startswith("<fingerprint:")
+        assert first != second
+        assert "en-AU" not in str(first)
+
+    def test_configured_row_header_dev_fingerprint_still_binds_value(self) -> None:
+        env = {k: v for k, v in os.environ.items() if k != "ELSPETH_FINGERPRINT_KEY"}
+        env["ELSPETH_ALLOW_RAW_SECRETS"] = "true"
+        with patch.dict(os.environ, env, clear=True):
+            first = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+            second = fingerprint_headers({"Accept-Language": "en-NZ"}, force_fingerprint_names=frozenset({"accept-language"}))
+        assert first["Accept-Language"].startswith("<sha256:")
+        assert first != second
+        assert "en-AU" not in str(first)
+
 
 class TestFilterResponseHeaders:
     """Branch coverage for filter_response_headers()."""

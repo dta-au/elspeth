@@ -220,8 +220,8 @@ class AuditedHTTPClient(AuditedClientBase):
     def _is_sensitive_header(self, header_name: str) -> bool:
         return _is_sensitive_header_fn(header_name)
 
-    def _filter_request_headers(self, headers: dict[str, str]) -> dict[str, str]:
-        return _fingerprint_headers(headers)
+    def _filter_request_headers(self, headers: dict[str, str], *, force_fingerprint_names: frozenset[str] = frozenset()) -> dict[str, str]:
+        return _fingerprint_headers(headers, force_fingerprint_names=force_fingerprint_names)
 
     def _filter_response_headers(self, headers: dict[str, str]) -> dict[str, str]:
         return _filter_response_headers(headers)
@@ -1206,6 +1206,7 @@ class AuditedHTTPClient(AuditedClientBase):
         request: SSRFSafeRequest,
         *,
         headers: dict[str, str] | None = None,
+        fingerprinted_header_names: frozenset[str] = frozenset(),
         json: Mapping[str, Any] | None = None,
         form: tuple[tuple[str, str], ...] | None = None,
         multipart_body: bytes | None = None,
@@ -1305,7 +1306,7 @@ class AuditedHTTPClient(AuditedClientBase):
         request_dto = HTTPCallRequest(
             method=method_upper,
             url=_fingerprint_url(request.original_url),
-            headers=self._filter_request_headers(merged_headers),
+            headers=self._filter_request_headers(merged_headers, force_fingerprint_names=fingerprinted_header_names),
             json=json,
             form=form,
             multipart=multipart_metadata,
@@ -1381,6 +1382,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     original_url=logical_request_url,
                     allowed_ranges=allowed_ranges,
                     allowed_origins=allowed_origins,
+                    fingerprinted_header_names=fingerprinted_header_names,
                     replay_hops=replay_hops,
                 )
 
@@ -1506,6 +1508,7 @@ class AuditedHTTPClient(AuditedClientBase):
         request: SSRFSafeRequest,
         *,
         headers: dict[str, str] | None = None,
+        fingerprinted_header_names: frozenset[str] = frozenset(),
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
@@ -1521,6 +1524,7 @@ class AuditedHTTPClient(AuditedClientBase):
             "GET",
             request,
             headers=headers,
+            fingerprinted_header_names=fingerprinted_header_names,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             allowed_ranges=allowed_ranges,
@@ -1538,6 +1542,7 @@ class AuditedHTTPClient(AuditedClientBase):
         *,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
         allowed_origins: Sequence[HTTPOrigin] = (),
+        fingerprinted_header_names: frozenset[str] = frozenset(),
         replay_hops: list[HTTPRedirectReplayHop] | None = None,
     ) -> tuple[httpx.Response, int, str]:
         """Follow HTTP redirects with SSRF validation at each hop.
@@ -1605,7 +1610,7 @@ class AuditedHTTPClient(AuditedClientBase):
             blocked_hop_request_dto = HTTPCallRequest(
                 method="GET",
                 url=_fingerprint_url(redirect_url),
-                headers=self._filter_request_headers(hop_headers),
+                headers=self._filter_request_headers(hop_headers, force_fingerprint_names=fingerprinted_header_names),
                 hop_number=hop_number,
                 redirect_from=_fingerprint_url(redirect_from),
             )
@@ -1667,7 +1672,7 @@ class AuditedHTTPClient(AuditedClientBase):
             hop_request_dto = HTTPCallRequest(
                 method="GET",
                 url=_fingerprint_url(redirect_url),
-                headers=self._filter_request_headers(hop_headers),
+                headers=self._filter_request_headers(hop_headers, force_fingerprint_names=fingerprinted_header_names),
                 resolved_ip=redirect_request.resolved_ip,
                 hop_number=hop_number,
                 redirect_from=_fingerprint_url(redirect_from),

@@ -86,6 +86,7 @@ from elspeth.plugins.transforms.web_scrape_errors import (
 )
 from elspeth.plugins.transforms.web_scrape_extraction import CSSRecordsConfig, extract_content, extract_css_records
 from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+from elspeth.plugins.transforms.web_scrape_request_headers import build_request_headers
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -289,6 +290,8 @@ class WebScrapeConfig(TransformDataConfig):
     )
     query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.")
     query_fields: dict[str, str] = Field(default_factory=dict, description="Map URL query parameter names to input row field names.")
+    headers: dict[str, str] = Field(default_factory=dict, description="Validated static public-page request headers.")
+    header_fields: dict[str, str] = Field(default_factory=dict, description="Map validated request header names to input row fields.")
     format: Literal["markdown", "text", "raw"] = Field(
         default="markdown",
         description="Content extraction format to emit: markdown, plain text, or raw HTML/JSON text.",
@@ -334,6 +337,7 @@ class WebScrapeConfig(TransformDataConfig):
         if self.request_multipart_field is not None:
             fields.add(self.request_multipart_field)
         fields.update(self.query_fields.values())
+        fields.update(self.header_fields.values())
         return super().declared_input_fields | frozenset(fields)
 
     @model_validator(mode="after")
@@ -347,6 +351,15 @@ class WebScrapeConfig(TransformDataConfig):
         for field_name in self.query_fields.values():
             if not field_name:
                 raise ValueError("query_fields row field names must not be empty")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_header_options(self) -> "WebScrapeConfig":
+        if any(not field_name for field_name in self.header_fields.values()):
+            raise ValueError("header_fields row field names must not be empty")
+        # A sentinel row validates names, static values, duplicates and the
+        # complete header block without accepting row values at config time.
+        build_request_headers(self.headers, self.header_fields, dict.fromkeys(self.header_fields.values(), "probe"))
         return self
 
     @model_validator(mode="after")
@@ -439,6 +452,8 @@ class WebScrapeConfig(TransformDataConfig):
             option_key_to_value["request_multipart_field"] = self.request_multipart_field
         for name, field_name in self.query_fields.items():
             option_key_to_value[f"query_fields.{name}"] = field_name
+        for name, field_name in self.header_fields.items():
+            option_key_to_value[f"header_fields.{name}"] = field_name
 
         list_name_to_entries: dict[str, tuple[str, ...] | None] = {
             "guaranteed_fields": self.schema_config.guaranteed_fields,
@@ -688,7 +703,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4ca8c91cc0e45b77"
+    source_file_hash: str | None = "sha256:d4a6011b24f5d3de"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -698,6 +713,7 @@ class WebScrapeTransform(BaseTransform):
     usage_when_to_use = (
         "Use when a node has a fixed public HTTP(S) URL or each row carries one, and you need an audited fetch, "
         "Markdown or plain text extraction, and a change fingerprint. Map row fields into URL query parameters "
+        "or validated request headers "
         "for searches against a fixed site. A read-only POST can send a "
         "row's JSON object or ordered form fields to a public data endpoint. Returned remote content is "
         "untrusted before LLM consumption, so apply the appropriate prompt-injection control first."
@@ -754,6 +770,8 @@ class WebScrapeTransform(BaseTransform):
         self._request_multipart_field = cfg.request_multipart_field
         self._query = cfg.query
         self._query_fields = cfg.query_fields
+        self._headers = cfg.headers
+        self._header_fields = cfg.header_fields
         self._records = cfg.records
 
         # Declare output fields for centralized collision detection in TransformExecutor.
@@ -777,6 +795,7 @@ class WebScrapeTransform(BaseTransform):
         if cfg.request_multipart_field is not None:
             input_options["request_multipart_field"] = cfg.request_multipart_field
         input_options.update({f"query_fields.{name}": field_name for name, field_name in cfg.query_fields.items()})
+        input_options.update({f"header_fields.{name}": field_name for name, field_name in cfg.header_fields.items()})
         self._reject_input_options_naming_created_fields(input_options)
 
         # Format and fingerprint mode
@@ -851,11 +870,12 @@ class WebScrapeTransform(BaseTransform):
             return PluginAssistance(
                 plugin_name="web_scrape",
                 issue_code=None,
-                summary="Fetch a fixed or row-provided URL with SSRF protection, audit recording, and content-fingerprinting. GET can map row fields into query parameters; POST sends JSON, URL-encoded form, or bounded multipart fields from a row. Output formats: raw, text, markdown.",
+                summary="Fetch a fixed or row-provided URL with SSRF protection, audit recording, and content-fingerprinting. GET can map row fields into query parameters and safe headers; POST sends JSON, URL-encoded form, or bounded multipart fields from a row. Output formats: raw, text, markdown.",
                 composer_hints=(
                     "web_scrape is a transform, not a source: set exactly one of url (fixed node address) or url_field (row URL); it writes content_field.",
                     "For read-only POST data retrieval, set method: POST and exactly one of request_json_field, request_form_field, or request_multipart_field. Multipart entries are ordered text values or payload-store blob references; use format: raw for application/json responses.",
                     "For a public search endpoint, set url to the fixed HTTP(S) address and query_fields to a mapping from query parameter names to input row fields; query holds static parameters. Do not put credentials in URLs or row query values.",
+                    "Use headers for fixed Accept, Accept-Language, User-Agent, or X-Requested-With values and header_fields to bind those generic names to row fields. Authentication and Cookie headers are forbidden; configured values are fingerprinted in audit evidence.",
                     "POST bodies are retained in HTTP audit evidence; do not put credentials in them. POST redirects are rejected and POST failures are not automatically retried.",
                     "If you saw Unknown source plugin: web_scrape, use a URL row source first, then add web_scrape as a transform.",
                     "URLs MUST include explicit scheme (http:// or https://). Bare hostnames are rejected by the SSRF guard at fetch time.",
@@ -942,6 +962,8 @@ class WebScrapeTransform(BaseTransform):
             )
         for field_name in self._query_fields.values():
             probe = self._augment_invariant_probe_row(probe, field_name=field_name, value="probe")
+        for field_name in self._header_fields.values():
+            probe = self._augment_invariant_probe_row(probe, field_name=field_name, value="probe")
         return [probe]
 
     def execute_forward_invariant_probe(
@@ -966,8 +988,9 @@ class WebScrapeTransform(BaseTransform):
             request_form: tuple[tuple[str, str], ...] | None = None,
             request_multipart: tuple[bytes, MultipartMetadata] | None = None,
             request_params: dict[str, str | int | float] | None = None,
+            request_headers: dict[str, str] | None = None,
         ) -> tuple[httpx.Response, str, _InvariantCall]:
-            del probe_ctx, request_json, request_form, request_multipart
+            del probe_ctx, request_json, request_form, request_multipart, request_headers
             logical_url = str(httpx.Request(self._method, safe_request.original_url, params=request_params).url)
             return (
                 httpx.Response(
@@ -1036,6 +1059,11 @@ class WebScrapeTransform(BaseTransform):
         request_form: tuple[tuple[str, str], ...] | None = None
         request_multipart: tuple[bytes, MultipartMetadata] | None = None
         request_params: dict[str, str | int | float] = dict(self._query)
+        try:
+            request_headers = build_request_headers(self._headers, self._header_fields, row)
+        except ValueError:
+            return TransformResult.error({"reason": "validation_failed", "error": "request headers are invalid"})
+        audited_header_names = frozenset(name.casefold() for name in request_headers)
         if self._query_fields:
             values = row.to_dict()
             for name, field_name in self._query_fields.items():
@@ -1201,9 +1229,11 @@ class WebScrapeTransform(BaseTransform):
                             "X-Abuse-Contact": self._abuse_contact,
                             "X-Scraping-Reason": self._scraping_reason,
                             "Host": archived_safe.host_header,
+                            **request_headers,
                             **({"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"} if request_form is not None else {}),
                             **({"Content-Type": request_multipart[1].content_type} if request_multipart is not None else {}),
-                        }
+                        },
+                        force_fingerprint_names=audited_header_names,
                     ),
                     params=fingerprint_params(request_params) if request_params else None,
                     json=request_json,
@@ -1231,7 +1261,17 @@ class WebScrapeTransform(BaseTransform):
 
         # Fetch URL using pinned IP (prevents DNS rebinding between validation and fetch)
         try:
-            if request_multipart is not None:
+            if request_headers:
+                response, final_hostname_url, call = self._fetch_url(
+                    safe_request,
+                    ctx,
+                    request_json,
+                    request_form=request_form,
+                    request_multipart=request_multipart,
+                    request_params=request_params or None,
+                    request_headers=request_headers,
+                )
+            elif request_multipart is not None:
                 if request_params:
                     response, final_hostname_url, call = self._fetch_url(
                         safe_request, ctx, request_multipart=request_multipart, request_params=request_params
@@ -1250,11 +1290,10 @@ class WebScrapeTransform(BaseTransform):
                     response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_json, request_params=request_params)
                 else:
                     response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_json)
+            elif request_params:
+                response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_params=request_params)
             else:
-                if request_params:
-                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_params=request_params)
-                else:
-                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
+                response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
             final_resolved_ip = _final_response_ip(response)
         except BodyTooLargeError as e:
             # Rebuild the message from structured fields — str(e) carries the
@@ -1413,6 +1452,7 @@ class WebScrapeTransform(BaseTransform):
         request_form: tuple[tuple[str, str], ...] | None = None,
         request_multipart: tuple[bytes, MultipartMetadata] | None = None,
         request_params: dict[str, str | int | float] | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """Fetch URL using SSRF-safe IP pinning with audit recording.
 
@@ -1458,6 +1498,7 @@ class WebScrapeTransform(BaseTransform):
         headers = {
             "X-Abuse-Contact": self._abuse_contact,
             "X-Scraping-Reason": self._scraping_reason,
+            **(request_headers or {}),
         }
 
         try:
@@ -1466,6 +1507,7 @@ class WebScrapeTransform(BaseTransform):
                     "POST",
                     safe_request,
                     headers=headers,
+                    fingerprinted_header_names=frozenset(name.casefold() for name in (request_headers or {})),
                     json=request_json,
                     form=request_form,
                     multipart_body=request_multipart[0] if request_multipart is not None else None,
@@ -1481,6 +1523,7 @@ class WebScrapeTransform(BaseTransform):
                         "GET",
                         safe_request,
                         headers=headers,
+                        fingerprinted_header_names=frozenset(name.casefold() for name in (request_headers or {})),
                         params=request_params,
                         follow_redirects=True,
                         allowed_ranges=self._allowed_ranges,
@@ -1490,6 +1533,7 @@ class WebScrapeTransform(BaseTransform):
                     response, final_hostname_url, call = client.get_ssrf_safe(
                         safe_request,
                         headers=headers,
+                        fingerprinted_header_names=frozenset(name.casefold() for name in (request_headers or {})),
                         follow_redirects=True,
                         allowed_ranges=self._allowed_ranges,
                         allowed_origins=self._allowed_origins,
