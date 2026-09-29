@@ -514,6 +514,7 @@ class AuditedHTTPClient(AuditedClientBase):
         follow_redirects: bool,
         max_redirects: int,
         allowed_origins: Sequence[HTTPOrigin],
+        bound_header_origin: HTTPOrigin | None,
     ) -> tuple[httpx.Response, str, Call]:
         session = self._call_mode_session
         if session is None or session.mode is not RunMode.REPLAY:
@@ -615,6 +616,8 @@ class AuditedHTTPClient(AuditedClientBase):
             if type(archived_hop_url) is not str:
                 raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
             validate_allowed_http_origin(archived_hop_url, allowed_origins)
+            if bound_header_origin is not None:
+                validate_allowed_http_origin(archived_hop_url, (bound_header_origin,))
             last_hop_url = archived_hop_url
             last_hop_transport_url = hop_url
             self._restore_replay_response(
@@ -1287,6 +1290,9 @@ class AuditedHTTPClient(AuditedClientBase):
             **(headers or {}),
             "Host": request.host_header,
         }
+        bound_header_origin: HTTPOrigin | None = None
+        if fingerprinted_header_names:
+            bound_header_origin = (request.scheme, request.bare_hostname.lower(), request.port)
         if form is not None:
             merged_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
         if multipart_metadata is not None:
@@ -1326,6 +1332,7 @@ class AuditedHTTPClient(AuditedClientBase):
                 follow_redirects=follow_redirects,
                 max_redirects=max_redirects,
                 allowed_origins=allowed_origins,
+                bound_header_origin=bound_header_origin,
             )
 
         if self._semantic_managed_identity_verify:
@@ -1382,6 +1389,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     original_url=logical_request_url,
                     allowed_ranges=allowed_ranges,
                     allowed_origins=allowed_origins,
+                    bound_header_origin=bound_header_origin,
                     fingerprinted_header_names=fingerprinted_header_names,
                     replay_hops=replay_hops,
                 )
@@ -1543,6 +1551,7 @@ class AuditedHTTPClient(AuditedClientBase):
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
         allowed_origins: Sequence[HTTPOrigin] = (),
         fingerprinted_header_names: frozenset[str] = frozenset(),
+        bound_header_origin: HTTPOrigin | None = None,
         replay_hops: list[HTTPRedirectReplayHop] | None = None,
     ) -> tuple[httpx.Response, int, str]:
         """Follow HTTP redirects with SSRF validation at each hop.
@@ -1600,7 +1609,12 @@ class AuditedHTTPClient(AuditedClientBase):
             hop_number = redirects_followed + 1
             hop_start = time.perf_counter()
 
-            hop_headers = {k: v for k, v in original_headers.items() if k.lower() != "host"}
+            # Before admission, a blocked hop's evidence must not claim that
+            # origin-bound values were sent. Restore them only after the
+            # redirect has passed the exact-origin check below.
+            hop_headers = {
+                k: v for k, v in original_headers.items() if k.lower() != "host" and k.casefold() not in fingerprinted_header_names
+            }
             redirect_url_obj = httpx.URL(redirect_url)
             redirect_host = redirect_url_obj.host or "unknown"
             default_port = 443 if redirect_url_obj.scheme == "https" else 80
@@ -1618,6 +1632,8 @@ class AuditedHTTPClient(AuditedClientBase):
             # CRITICAL: Validate the redirect target for SSRF
             try:
                 validate_allowed_http_origin(redirect_url, allowed_origins)
+                if bound_header_origin is not None:
+                    validate_allowed_http_origin(redirect_url, (bound_header_origin,))
                 redirect_request = validate_url_for_ssrf(redirect_url, allowed_ranges=allowed_ranges)
             except contract_errors.TIER_1_ERRORS:
                 raise
@@ -1655,6 +1671,7 @@ class AuditedHTTPClient(AuditedClientBase):
             hostname_url = httpx.URL(redirect_url)
 
             # Build headers for this hop (Host header for virtual hosting)
+            hop_headers.update({k: v for k, v in original_headers.items() if k.casefold() in fingerprinted_header_names})
             hop_headers["Host"] = redirect_request.host_header
 
             # TLS SNI for this hop

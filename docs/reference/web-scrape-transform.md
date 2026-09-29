@@ -88,6 +88,11 @@ digest so replay and verify still distinguish different values. Do not put
 credentials in these headers; authenticated requests will use dedicated
 secret-reference options.
 
+When any configured header is present, GET redirects must stay on the
+initial request's exact scheme, hostname, and effective port. A cross-origin
+redirect is recorded as a blocked hop and is never fetched, even when
+`http.allowed_origins` otherwise permits its destination.
+
 GET is the default. To request data with POST, add a JSON object to each input
 row and name its field explicitly:
 

@@ -25,7 +25,7 @@ from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipTo
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import TokenWorkItem
-from elspeth.core.security.web import SSRFSafeRequest
+from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from tests.fixtures.mock_audit import mock_audit_authority
 
@@ -490,6 +490,58 @@ def test_ssrf_http_replay_records_redirect_hop_before_parent_without_network(moc
                 "source_call_id": item["source_call_id"],
                 "identity": "archived_fingerprint",
             }
+
+
+def test_ssrf_http_replay_refuses_archived_cross_origin_bound_header(mock_execution, mock_telemetry_emit, monkeypatch):
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
+    monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+    hop_response = {"transport": {"request_url": "https://93.184.216.34/end"}}
+    top_response = {
+        "redirect_count": 1,
+        "transport": {
+            "redirect_hops": [
+                {
+                    "request": {"method": "GET", "url": "https://other.example/end"},
+                    "response": hop_response,
+                }
+            ]
+        },
+    }
+
+    class _ReplaySession:
+        mode = RunMode.REPLAY
+
+        def replay_call(self, *, call_type: CallType, **_kwargs: Any) -> ReplayCallEvidence:
+            if call_type is CallType.HTTP:
+                return ReplayCallEvidence("top-source-call", CallStatus.SUCCESS, top_response, None, 1.0)
+            return ReplayCallEvidence("hop-source-call", CallStatus.SUCCESS, hop_response, None, 1.0)
+
+    safe_request = SSRFSafeRequest(
+        original_url="https://source.example/start",
+        resolved_ip="93.184.216.34",
+        host_header="source.example",
+        port=443,
+        path="/start",
+        scheme="https",
+        bare_hostname="source.example",
+    )
+    with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", side_effect=AssertionError("network client constructed")):
+        client = AuditedHTTPClient(
+            **mock_audit_authority(),
+            execution=mock_execution,
+            state_id="test-state-001",
+            run_id="replay-run",
+            telemetry_emit=mock_telemetry_emit,
+            call_mode_session=_ReplaySession(),
+        )
+        with pytest.raises(SSRFBlockedError, match="origin"):
+            client.request_ssrf_safe(
+                "GET",
+                safe_request,
+                headers={"X-Requested-With": "public-search"},
+                fingerprinted_header_names=frozenset({"x-requested-with"}),
+                follow_redirects=True,
+            )
 
 
 @respx.mock

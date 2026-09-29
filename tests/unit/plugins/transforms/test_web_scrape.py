@@ -2005,6 +2005,79 @@ def test_request_headers_reach_post_form(mock_ctx: PluginContext) -> None:
     assert route.calls[0].request.headers["content-type"] == "application/x-www-form-urlencoded; charset=utf-8"
 
 
+@pytest.mark.parametrize(
+    "redirect_url",
+    ["https://other.example/final", "http://source.example/final", "https://source.example:8443/final"],
+)
+@respx.mock
+def test_row_header_rejects_cross_origin_redirect_before_dns_or_dispatch(mock_ctx: PluginContext, redirect_url: str) -> None:
+    first = respx.get(f"https://{_TEST_IP}:443/start").mock(return_value=httpx.Response(302, headers={"Location": redirect_url}))
+    other = respx.get(f"https://{_TEST_IP}:443/final").mock(return_value=httpx.Response(200, text="other origin"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://source.example/start", header_fields={"X-Requested-With": "request_kind"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    calls: list[tuple[CallType, HTTPCallRequest]] = []
+    original_record_call = mock_ctx.landscape.record_call
+
+    def record_call(**kwargs: object) -> Call:
+        call_type = kwargs["call_type"]
+        request_data = kwargs["request_data"]
+        assert isinstance(call_type, CallType)
+        assert isinstance(request_data, HTTPCallRequest)
+        calls.append((call_type, request_data))
+        return original_record_call(**kwargs)
+
+    mock_ctx.landscape.record_call = record_call
+    resolved_hosts: list[str] = []
+
+    def resolve_initial_only(host: str, *_args: object, **_kwargs: object) -> list[tuple[Any, ...]]:
+        resolved_hosts.append(host)
+        assert host == "source.example"
+        return _mock_getaddrinfo()(host, 443)
+
+    env = dict(os.environ)
+    env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+    env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+    with patch.dict(os.environ, env, clear=True), patch("socket.getaddrinfo", resolve_initial_only):
+        result = transform.process(make_pipeline_row({"request_kind": "canary-sensitive-value"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["error_type"] == "SSRFBlockedError"
+    assert first.call_count == 1
+    assert other.call_count == 0
+    assert resolved_hosts == ["source.example"]
+    redirect_requests = [request for call_type, request in calls if call_type is CallType.HTTP_REDIRECT]
+    assert len(redirect_requests) == 1
+    assert "X-Requested-With" not in redirect_requests[0].headers
+    assert "canary-sensitive-value" not in str(redirect_requests[0].to_dict())
+
+
+@respx.mock
+def test_row_header_remains_on_same_origin_redirect(mock_ctx: PluginContext) -> None:
+    first = respx.get(f"https://{_TEST_IP}:443/start").mock(
+        return_value=httpx.Response(302, headers={"Location": "https://source.example/final"})
+    )
+    second = respx.get(f"https://{_TEST_IP}:443/final").mock(return_value=httpx.Response(200, text="same origin"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://source.example/start", header_fields={"X-Requested-With": "request_kind"})
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    env = dict(os.environ)
+    env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
+    env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+    with patch.dict(os.environ, env, clear=True), patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"request_kind": "public-search"}), mock_ctx)
+
+    assert result.status == "success"
+    assert first.call_count == second.call_count == 1
+    assert first.calls[0].request.headers["x-requested-with"] == "public-search"
+    assert second.calls[0].request.headers["x-requested-with"] == "public-search"
+
+
 def test_fixed_url_invariant_probe_is_offline_and_restores_configured_url(mock_ctx: PluginContext) -> None:
     options = _make_basic_transform_options()
     options.pop("url_field")
