@@ -789,7 +789,7 @@ def test_receipt_vocabulary_is_closed_and_named() -> None:
     for kind in CHECK_KINDS:
         assert f"`{kind}`" in receipt, kind
     assert "only after the live procedure completes" in receipt
-    assert "not prerequisites to closing `elspeth-5ec3befc1a`" in receipt
+    assert "Task `elspeth-5ec3befc1a` already closed through desktop acceptance" in receipt
     assert "Never create a receipt from desktop analysis" in receipt
     assert "legacy v2 P4b" in text
     assert "does not measure the new runtime capabilities" in " ".join(text.split())
