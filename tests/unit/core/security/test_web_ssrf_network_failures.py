@@ -582,6 +582,45 @@ class TestAllowedRanges:
             _validate_ip_address("::", allowed_ranges=allowed)
 
 
+class TestSpecialPurposeRanges:
+    """Special-purpose and IPv4-embedding ranges are not public destinations."""
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "198.18.0.1",  # benchmarking (RFC 2544)
+            "192.0.0.192",  # IETF protocol assignments (RFC 6890)
+            "240.0.0.1",  # reserved (RFC 1112)
+            "::7f00:1",  # IPv4-compatible IPv6 embedding 127.0.0.1 (RFC 4291, deprecated)
+            "64:ff9b::7f00:1",  # NAT64 well-known prefix embedding 127.0.0.1 (RFC 6052)
+            "64:ff9b:1::1",  # NAT64 local-use prefix (RFC 8215)
+            "2002:7f00:1::1",  # 6to4 embedding 127.0.0.1 (RFC 3056)
+        ],
+    )
+    def test_blocked_by_default(self, ip: str) -> None:
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            _validate_ip_address(ip)
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "168.63.129.16",  # Azure WireServer / platform endpoint
+            "::a9fe:a9fe",  # IPv4-compatible form of 169.254.169.254
+            "64:ff9b::a9fe:a9fe",  # NAT64 form of 169.254.169.254
+            "2002:a9fe:a9fe::1",  # 6to4 form of 169.254.169.254
+        ],
+    )
+    def test_platform_and_embedded_metadata_always_blocked(self, ip: str) -> None:
+        """No operator allowlist admits these, matching the IPv4-mapped metadata rule."""
+        allow_everything = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+        with pytest.raises(SSRFBlockedError, match="Always-blocked"):
+            _validate_ip_address(ip, allowed_ranges=allow_everything)
+
+    @pytest.mark.parametrize("ip", ["8.8.8.8", "2606:4700:4700::1111", "168.63.129.17"])
+    def test_public_neighbours_still_allowed(self, ip: str) -> None:
+        _validate_ip_address(ip)  # Should not raise
+
+
 # ===========================================================================
 # allowed_ranges through validate_url_for_ssrf
 # ===========================================================================
