@@ -379,31 +379,66 @@ class MultipartMetadata:
     body_size: int
 
     def __post_init__(self) -> None:
-        if not self.parts or any(type(part) is not MultipartPart for part in self.parts):
-            raise ValueError("multipart metadata needs typed parts")
+        if not 1 <= len(self.parts) <= 256 or any(type(part) is not MultipartPart for part in self.parts):
+            raise ValueError("multipart metadata needs 1 to 256 typed parts")
         if type(self.boundary) is not str or re.fullmatch(r"elspeth-[0-9a-f]{32}", self.boundary) is None:
             raise ValueError("multipart metadata has invalid boundary")
         if type(self.body_sha256) is not str or _SHA256_HEX.fullmatch(self.body_sha256) is None:
             raise ValueError("multipart metadata has invalid body hash")
         require_int(self.body_size, "body_size", min_value=1)
+        if sum(len(part.value) for part in self.parts if part.value is not None) > self.body_size:
+            raise ValueError("multipart text exceeds body size")
 
     @property
     def content_type(self) -> str:
         return f"multipart/form-data; boundary={self.boundary}"
 
 
-def encode_multipart_form(
-    parts: tuple[MultipartPart, ...], blobs: Mapping[str, bytes], *, max_body_bytes: int
-) -> tuple[bytes, MultipartMetadata]:
-    """Encode ordered parts with a reproducible boundary and a hard byte cap."""
+def _multipart_boundary(parts: tuple[MultipartPart, ...]) -> str:
+    manifest = json.dumps([part.to_dict() for part in parts], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "elspeth-" + hashlib.sha256(manifest).hexdigest()[:32]
+
+
+def _multipart_prefix(part: MultipartPart, boundary: str) -> bytes:
+    name = part.name.replace("\\", "\\\\").replace('"', '\\"')
+    disposition = f'Content-Disposition: form-data; name="{name}"'
+    if part.blob_ref is not None:
+        if part.filename is None:
+            raise ValueError("multipart blob part is incomplete")
+        filename = part.filename.replace("\\", "\\\\").replace('"', '\\"')
+        disposition += f'; filename="{filename}"'
+    headers = f"--{boundary}\r\n{disposition}\r\n"
+    if part.content_type is not None:
+        headers += f"Content-Type: {part.content_type}\r\n"
+    return (headers + "\r\n").encode("ascii")
+
+
+def multipart_min_body_size(parts: tuple[MultipartPart, ...], *, max_body_bytes: int) -> int:
+    """Exact framing and text size, before any file part is read."""
     if not 1 <= len(parts) <= 256 or any(type(part) is not MultipartPart for part in parts):
         raise ValueError("multipart form needs 1 to 256 typed parts")
     if max_body_bytes <= 0:
         raise ValueError("max_body_bytes must be positive")
-    if any(part.value is not None and len(part.value.encode("utf-8")) > max_body_bytes for part in parts):
-        raise ValueError("multipart text part exceeds max_body_bytes")
-    manifest = json.dumps([part.to_dict() for part in parts], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    boundary = "elspeth-" + hashlib.sha256(manifest).hexdigest()[:32]
+    text_chars = sum(len(part.value) for part in parts if part.value is not None)
+    if text_chars > max_body_bytes:
+        raise ValueError("multipart text exceeds max_body_bytes")
+    boundary = _multipart_boundary(parts)
+    size = len(f"--{boundary}--\r\n".encode("ascii"))
+    for part in parts:
+        size += len(_multipart_prefix(part, boundary)) + 2
+        if part.value is not None:
+            size += len(part.value.encode("utf-8"))
+        if size > max_body_bytes:
+            raise ValueError("multipart body exceeds max_body_bytes")
+    return size
+
+
+def encode_multipart_form(
+    parts: tuple[MultipartPart, ...], blobs: Mapping[str, bytes], *, max_body_bytes: int
+) -> tuple[bytes, MultipartMetadata]:
+    """Encode ordered parts with a reproducible boundary and a hard byte cap."""
+    multipart_min_body_size(parts, max_body_bytes=max_body_bytes)
+    boundary = _multipart_boundary(parts)
     boundary_bytes = boundary.encode("ascii")
     body = bytearray()
 
@@ -413,8 +448,6 @@ def encode_multipart_form(
         body.extend(chunk)
 
     for part in parts:
-        name = part.name.replace("\\", "\\\\").replace('"', '\\"')
-        disposition = f'Content-Disposition: form-data; name="{name}"'
         if part.value is not None:
             content = part.value.encode("utf-8")
         else:
@@ -423,15 +456,9 @@ def encode_multipart_form(
             content = blobs[part.blob_ref]
             if type(content) is not bytes or hashlib.sha256(content).hexdigest() != part.blob_ref:
                 raise IntegrityError("Multipart blob bytes do not match the declared reference")
-            filename = part.filename.replace("\\", "\\\\").replace('"', '\\"')
-            disposition += f'; filename="{filename}"'
         if b"--" + boundary_bytes in content:
             raise ValueError("multipart content contains the generated boundary")
-        append(b"--" + boundary_bytes + b"\r\n")
-        append(disposition.encode("ascii") + b"\r\n")
-        if part.content_type is not None:
-            append(f"Content-Type: {part.content_type}\r\n".encode("ascii"))
-        append(b"\r\n")
+        append(_multipart_prefix(part, boundary))
         append(content)
         append(b"\r\n")
     append(b"--" + boundary_bytes + b"--\r\n")
@@ -439,6 +466,38 @@ def encode_multipart_form(
     return encoded, MultipartMetadata(
         parts=parts, boundary=boundary, body_sha256=hashlib.sha256(encoded).hexdigest(), body_size=len(encoded)
     )
+
+
+def validate_multipart_form(body: bytes, metadata: MultipartMetadata) -> None:
+    """Prove the audited manifest describes every byte sent by the HTTP client."""
+    if type(body) is not bytes or len(body) != metadata.body_size or hashlib.sha256(body).hexdigest() != metadata.body_sha256:
+        raise ValueError("multipart body size or hash does not match metadata")
+    if metadata.boundary != _multipart_boundary(metadata.parts):
+        raise ValueError("multipart boundary does not match manifest")
+    cursor = 0
+    marker = b"\r\n--" + metadata.boundary.encode("ascii")
+    for part in metadata.parts:
+        prefix = _multipart_prefix(part, metadata.boundary)
+        if not body.startswith(prefix, cursor):
+            raise ValueError("multipart body headers do not match manifest")
+        cursor += len(prefix)
+        if part.value is not None:
+            content = part.value.encode("utf-8")
+            if not body.startswith(content, cursor):
+                raise ValueError("multipart text value does not match manifest")
+            cursor += len(content)
+        else:
+            if part.blob_ref is None:
+                raise ValueError("multipart blob part is incomplete")
+            end = body.find(marker, cursor)
+            if end < 0 or hashlib.sha256(body[cursor:end]).hexdigest() != part.blob_ref:
+                raise ValueError("multipart file bytes do not match manifest")
+            cursor = end
+        if not body.startswith(b"\r\n", cursor):
+            raise ValueError("multipart part is missing its terminator")
+        cursor += 2
+    if body[cursor:] != f"--{metadata.boundary}--\r\n".encode("ascii"):
+        raise ValueError("multipart closing boundary does not match manifest")
 
 
 @dataclass(frozen=True, slots=True)

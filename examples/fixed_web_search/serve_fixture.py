@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -12,6 +14,7 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 class SearchHandler(BaseHTTPRequestHandler):
     access_log: Path
+    wire_log: Path
 
     @staticmethod
     def _matches(query: str) -> list[str]:
@@ -61,7 +64,8 @@ class SearchHandler(BaseHTTPRequestHandler):
         self._send_html(body)
 
     def do_POST(self) -> None:
-        path = urlsplit(self.path).path
+        parsed_url = urlsplit(self.path)
+        path = parsed_url.path
         if path not in {"/form-search", "/multipart-search"}:
             self.send_error(404)
             return
@@ -106,6 +110,13 @@ class SearchHandler(BaseHTTPRequestHandler):
             self.send_error(400)
             return
         query = fields[0][1]
+        if path == "/multipart-search":
+            fixture_ids = parse_qs(parsed_url.query).get("fixture_id", [])
+            if len(fixture_ids) != 1 or not fixture_ids[0].isdigit():
+                self.send_error(400)
+                return
+            with self.wire_log.open("a", encoding="ascii") as log:
+                log.write(json.dumps({"fixture_id": fixture_ids[0], "sha256": hashlib.sha256(wire_body).hexdigest()}) + "\n")
         self._record_query(query)
         self._send_html(self._directory_html(query))
 
@@ -115,6 +126,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--access-log", type=Path, required=True)
+    parser.add_argument("--wire-log", type=Path, required=True)
     args = parser.parse_args()
     SearchHandler.access_log = args.access_log
+    SearchHandler.wire_log = args.wire_log
     HTTPServer(("127.0.0.1", 8213), SearchHandler).serve_forever()

@@ -23,7 +23,7 @@ OUTPUT="$EXAMPLE/output$suffix"
 SETTINGS="$EXAMPLE/settings_fixture$suffix.yaml"
 mkdir -p "$OUTPUT" "$RUNS"
 
-for artifact in "$RUNS/audit.db" "$RUNS/access.log" "$RUNS/server.log" "$RUNS/pipeline.out" "$RUNS/pipeline.err" "$OUTPUT/results.jsonl" "$OUTPUT/failures.jsonl"; do
+for artifact in "$RUNS/audit.db" "$RUNS/access.log" "$RUNS/wire.log" "$RUNS/server.log" "$RUNS/pipeline.out" "$RUNS/pipeline.err" "$OUTPUT/results.jsonl" "$OUTPUT/failures.jsonl"; do
     if [ -e "$artifact" ]; then
         echo "Refusing to overwrite existing $artifact" >&2
         exit 2
@@ -45,6 +45,7 @@ with (runs / "input.jsonl").open("w", encoding="utf-8") as output:
     for index, query in enumerate(rows, start=1):
         output.write(json.dumps({
             "id": index,
+            "fixture_id": str(index),
             "search_text": query,
             "search_parts": [
                 {"name": "q", "value": query},
@@ -52,6 +53,7 @@ with (runs / "input.jsonl").open("w", encoding="utf-8") as output:
                 {"name": "scope", "value": "public"},
             ],
         }, ensure_ascii=False) + "\n")
+    output.write(json.dumps({"id": 4, "fixture_id": "4", "search_text": "Malformed Row", "search_parts": "invalid"}) + "\n")
 PY
 fi
 
@@ -66,7 +68,7 @@ stop_server() {
 trap stop_server EXIT
 
 start_server() {
-    "$PYTHON_BIN" "$EXAMPLE/serve_fixture.py" --access-log "$RUNS/access.log" \
+    "$PYTHON_BIN" "$EXAMPLE/serve_fixture.py" --access-log "$RUNS/access.log" --wire-log "$RUNS/wire.log" \
         >> "$RUNS/server.log" 2>&1 &
     server_pid=$!
     for _ in $(seq 1 30); do
@@ -90,7 +92,7 @@ run_elspeth run --settings "$SETTINGS" --execute \
 pipeline_exit=$?
 set -e
 printf 'pipeline_exit=%s\n' "$pipeline_exit"
-if [ "$pipeline_exit" -ne 0 ]; then
+if [ "$pipeline_exit" -ne 0 ] && { [ "$variant" != multipart ] || [ "$pipeline_exit" -ne 1 ]; }; then
     cat "$RUNS/pipeline.err" >&2
     exit "$pipeline_exit"
 fi
@@ -112,7 +114,12 @@ assert all(row["fetch_status"] == 200 for row in rows)
 assert sorted(len(row["candidates"]) for row in rows) == [0, 1, 2]
 candidate_fields = {"name"} if variant in {"directory", "form", "multipart"} else {"name", "detail_path", "registration"}
 assert all(set(candidate) == candidate_fields for row in rows for candidate in row["candidates"])
-assert not (output / "failures.jsonl").exists()
+if variant == "multipart":
+    failures = [json.loads(line) for line in (output / "failures.jsonl").read_text().splitlines()]
+    assert len(failures) == 1, failures
+    assert failures[0]["id"] == 4, failures
+else:
+    assert not (output / "failures.jsonl").exists()
 print(f"verified_rows={len(rows)} verified_requests={len(requests)}")
 PY
 
@@ -123,8 +130,9 @@ import sys
 
 runs = pathlib.Path(sys.argv[1])
 settings_path = pathlib.Path(sys.argv[2])
+expected_status = "completed_with_failures" if runs.name.endswith("multipart") else "completed"
 source_run_id = sqlite3.connect(runs / "audit.db").execute(
-    "SELECT run_id FROM runs WHERE status = 'completed' ORDER BY started_at DESC LIMIT 1"
+    "SELECT run_id FROM runs WHERE status = ? ORDER BY started_at DESC LIMIT 1", (expected_status,)
 ).fetchone()[0]
 settings = settings_path.read_text()
 for mode in ("replay", "verify"):
@@ -140,7 +148,7 @@ run_elspeth run --settings "$RUNS/settings_replay.yaml" --execute \
 replay_exit=$?
 set -e
 printf 'replay_exit=%s\n' "$replay_exit"
-if [ "$replay_exit" -ne 0 ]; then
+if [ "$replay_exit" -ne 0 ] && { [ "$variant" != multipart ] || [ "$replay_exit" -ne 1 ]; }; then
     cat "$RUNS/replay.err" >&2
     exit "$replay_exit"
 fi
@@ -152,7 +160,7 @@ run_elspeth run --settings "$RUNS/settings_verify.yaml" --execute \
 verify_exit=$?
 set -e
 printf 'verify_exit=%s\n' "$verify_exit"
-if [ "$verify_exit" -ne 0 ]; then
+if [ "$verify_exit" -ne 0 ] && { [ "$variant" != multipart ] || [ "$verify_exit" -ne 1 ]; }; then
     cat "$RUNS/verify.err" >&2
     exit "$verify_exit"
 fi
@@ -164,6 +172,7 @@ import pathlib
 import sqlite3
 import sys
 import urllib.parse
+from collections import Counter
 
 runs = pathlib.Path(sys.argv[1])
 variant = sys.argv[2]
@@ -184,13 +193,31 @@ if variant == "form":
         encoded = urllib.parse.urlencode([tuple(pair) for pair in form]).encode("ascii")
         assert request["body_sha256"] == hashlib.sha256(encoded).hexdigest()
 if variant == "multipart":
+    statuses = [row[0] for row in conn.execute("SELECT status FROM runs")]
+    assert statuses == ["completed_with_failures"] * 3, statuses
+    failed_states = conn.execute("SELECT COUNT(*) FROM node_states WHERE status = 'failed'").fetchone()[0]
+    assert failed_states == 3, failed_states
     refs = [row[0] for row in conn.execute("SELECT request_ref FROM calls WHERE call_type = 'http'")]
     assert len(refs) == 9, refs
+    audited_pairs = []
     for ref in refs:
         request = json.loads((runs / "payloads" / ref[:2] / ref).read_text())
         assert request["body_encoding"] == "multipart-v1", request
         assert [part["name"] for part in request["multipart"]] == ["q", "attachment", "scope"]
         assert request["body_size"] <= 8192
-        assert len(request["body_sha256"]) == 64
+        audited_pairs.append((str(request["params"]["fixture_id"]), request["body_sha256"]))
+    wire_entries = [json.loads(line) for line in (runs / "wire.log").read_text().splitlines()]
+    assert len(wire_entries) == 6, wire_entries
+    wire_pairs = [(entry["fixture_id"], entry["sha256"]) for entry in wire_entries]
+    assert set(audited_pairs) == set(wire_pairs)
+    assert set(Counter(audited_pairs).values()) == {3}
+    assert set(Counter(wire_pairs).values()) == {2}
+    audited_by_id = dict(audited_pairs)
+    wire_by_id = dict(wire_pairs)
+    assert audited_by_id == wire_by_id
+    first_id, second_id = sorted(wire_by_id)[:2]
+    swapped = dict(wire_by_id)
+    swapped[first_id], swapped[second_id] = swapped[second_id], swapped[first_id]
+    assert swapped != audited_by_id
 print(f"verified_replay_without_network=3 verified_live_calls={verdicts[1]}")
 PY

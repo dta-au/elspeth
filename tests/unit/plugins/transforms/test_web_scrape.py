@@ -5,6 +5,7 @@ known resolved IP, then mock respx to match the IP-based URL that
 get_ssrf_safe() actually sends.
 """
 
+import hashlib
 import socket
 from datetime import UTC, datetime
 from typing import Any
@@ -16,6 +17,7 @@ import respx
 
 from elspeth.contracts import CallStatus, CallType, check_compatibility
 from elspeth.contracts.audit import Call
+from elspeth.contracts.call_data import MultipartPart, multipart_min_body_size
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
@@ -323,6 +325,36 @@ def test_web_scrape_multipart_oversized_blob_refused_before_dns(mock_ctx: Plugin
         )
 
     resolve.assert_not_called()
+    assert result.status == "error"
+    assert result.reason is not None and "max_request_body_bytes" in str(result.reason)
+
+
+def test_web_scrape_multipart_uses_one_aggregate_file_budget_before_dns(mock_ctx: PluginContext, tmp_path) -> None:
+    first = b"a" * 64
+    second = b"b" * 64
+    first_ref = hashlib.sha256(first).hexdigest()
+    second_ref = hashlib.sha256(second).hexdigest()
+    parts = (
+        MultipartPart(name="first", blob_ref=first_ref, filename="a.bin", content_type="application/octet-stream"),
+        MultipartPart(name="second", blob_ref=second_ref, filename="b.bin", content_type="application/octet-stream"),
+    )
+    limit = multipart_min_body_size(parts, max_body_bytes=4096) + 100
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update({"url": "https://example.com/upload", "method": "POST", "request_multipart_field": "parts"})
+    options["http"]["max_request_body_bytes"] = limit
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    store = FilesystemPayloadStore(base_path=tmp_path)
+    assert store.store(first) == first_ref
+    assert store.store(second) == second_ref
+    transform._payload_store = store
+
+    with patch.object(store, "retrieve_bounded", wraps=store.retrieve_bounded) as read, patch("socket.getaddrinfo") as resolve:
+        result = transform.process(make_pipeline_row({"parts": [part.to_dict() for part in parts]}), mock_ctx)
+
+    resolve.assert_not_called()
+    assert [call.kwargs["max_bytes"] for call in read.call_args_list] == [100, 36]
     assert result.status == "error"
     assert result.reason is not None and "max_request_body_bytes" in str(result.reason)
 

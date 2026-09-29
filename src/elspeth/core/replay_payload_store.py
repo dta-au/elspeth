@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.audit import NodeStateCompleted, NodeStateFailed
+from elspeth.contracts.call_data import MultipartPart
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
@@ -44,9 +45,7 @@ def _audited_ref(value: object, *, location: str) -> str:
     return value
 
 
-def _row_refs(
-    row: object, *, fields: frozenset[str], image_fields: frozenset[str], multipart_fields: frozenset[str], location: str
-) -> Iterable[str]:
+def _row_refs(row: object, *, fields: frozenset[str], image_fields: frozenset[str], location: str) -> Iterable[str]:
     if type(row) not in (dict, MappingProxyType):
         raise AuditIntegrityError(f"{location}: audited row is not an object")
     row = cast("dict[str, object] | MappingProxyType[str, object]", row)
@@ -62,29 +61,51 @@ def _row_refs(
                 yield _audited_ref(ref, location=f"{location}.{field_name}[{index}]")
         else:
             yield _audited_ref(value, location=f"{location}.{field_name}")
-    for field_name in multipart_fields:
+
+
+def _multipart_row_refs(row: object, *, fields: frozenset[str], location: str) -> tuple[str, ...]:
+    """Admit file refs only from valid manifests; invalid rows remain row errors."""
+    if type(row) not in (dict, MappingProxyType):
+        raise AuditIntegrityError(f"{location}: audited row is not an object")
+    row = cast("dict[str, object] | MappingProxyType[str, object]", row)
+    refs: list[str] = []
+    for field_name in fields:
         if field_name not in row:
             continue
         parts = row[field_name]
         if type(parts) not in (list, tuple):
-            raise AuditIntegrityError(f"{location}.{field_name}: invalid multipart manifest")
+            continue
         parts = cast("list[object] | tuple[object, ...]", parts)
         if not 1 <= len(parts) <= 256:
-            raise AuditIntegrityError(f"{location}.{field_name}: invalid multipart manifest")
-        for index, part in enumerate(parts):
+            continue
+        field_refs: list[str] = []
+        for part in parts:
             if type(part) not in (dict, MappingProxyType):
-                raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid multipart part")
+                field_refs.clear()
+                break
             part = cast("dict[str, object] | MappingProxyType[str, object]", part)
             keys = set(part)
-            if keys == {"name", "value"}:
-                if type(part["name"]) is not str or not part["name"] or type(part["value"]) is not str:
-                    raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid text part")
-            elif keys == {"name", "blob_ref", "filename", "content_type"}:
-                if any(type(part[key]) is not str or not part[key] for key in ("name", "filename", "content_type")):
-                    raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid file part")
-                yield _audited_ref(part["blob_ref"], location=f"{location}.{field_name}[{index}].blob_ref")
-            else:
-                raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid multipart part")
+            try:
+                if keys == {"name", "value"}:
+                    MultipartPart(name=cast("str", part["name"]), value=cast("str", part["value"]))
+                elif keys == {"name", "blob_ref", "filename", "content_type"}:
+                    parsed = MultipartPart(
+                        name=cast("str", part["name"]),
+                        blob_ref=cast("str", part["blob_ref"]),
+                        filename=cast("str", part["filename"]),
+                        content_type=cast("str", part["content_type"]),
+                    )
+                    if parsed.blob_ref is not None:
+                        field_refs.append(parsed.blob_ref)
+                else:
+                    field_refs.clear()
+                    break
+            except (TypeError, ValueError):
+                field_refs.clear()
+                break
+        else:
+            refs.extend(field_refs)
+    return tuple(refs)
 
 
 def collect_source_payload_refs(
@@ -109,6 +130,7 @@ def collect_source_payload_refs(
     if any(type(field_name) is not str or not field_name for field_name in fields | image_fields | multipart_fields):
         raise ValueError("payload ref fields must contain admitted field names")
     input_refs: set[str] = set()
+    multipart_refs: set[str] = set()
     output_refs: set[str] = set()
     pdf_node_ids = {node.node_id for node in factory.data_flow.get_nodes(source_run_id) if node.plugin_name == "pdf_rasterize"}
     pdf_states: dict[str, NodeStateCompleted | NodeStateFailed] = {}
@@ -121,11 +143,8 @@ def collect_source_payload_refs(
             data = factory.query.get_row_data(row.row_id)
             if data.state is not RowDataState.AVAILABLE or data.data is None:
                 raise AuditIntegrityError(f"Source run {source_run_id}: row {row.row_id} payload unavailable")
-            input_refs.update(
-                _row_refs(
-                    data.data, fields=fields, image_fields=image_fields, multipart_fields=multipart_fields, location=f"row {row.row_id}"
-                )
-            )
+            input_refs.update(_row_refs(data.data, fields=fields, image_fields=image_fields, location=f"row {row.row_id}"))
+            multipart_refs.update(_multipart_row_refs(data.data, fields=multipart_fields, location=f"row {row.row_id}"))
 
     for token in factory.query.get_all_tokens_for_run(source_run_id):
         if token.token_data_ref is None:
@@ -138,15 +157,8 @@ def collect_source_payload_refs(
         if type(decoded) is not dict or set(decoded) != {"data", "contract"} or type(decoded["contract"]) is not dict:
             raise AuditIntegrityError(f"Source run {source_run_id}: token {token.token_id} has no data/contract envelope")
         SchemaContract.from_checkpoint(decoded["contract"])
-        input_refs.update(
-            _row_refs(
-                decoded["data"],
-                fields=fields,
-                image_fields=image_fields,
-                multipart_fields=multipart_fields,
-                location=f"token {token.token_id}",
-            )
-        )
+        input_refs.update(_row_refs(decoded["data"], fields=fields, image_fields=image_fields, location=f"token {token.token_id}"))
+        multipart_refs.update(_multipart_row_refs(decoded["data"], fields=multipart_fields, location=f"token {token.token_id}"))
 
     for state in factory.query.get_all_node_states_for_run(source_run_id):
         if state.node_id in pdf_node_ids:
@@ -222,7 +234,7 @@ def collect_source_payload_refs(
         content = source_store.retrieve(ref)
         if hashlib.sha256(content).hexdigest() != ref:
             raise AuditIntegrityError(f"Source run {source_run_id}: blob {ref} failed integrity check")
-    return SourcePayloadRefs(input_refs=frozenset(input_refs), output_refs=frozenset(output_refs))
+    return SourcePayloadRefs(input_refs=frozenset(input_refs | multipart_refs), output_refs=frozenset(output_refs))
 
 
 class SourceBoundPayloadStore:

@@ -9,6 +9,7 @@ sources:
         mode: fixed
         fields:
           - 'id: int'
+          - 'fixture_id: str'
           - 'search_text: str'
           - 'search_parts: any'
       on_validation_failure: discard
@@ -22,6 +23,8 @@ transforms:
       url: http://127.0.0.1:8213/multipart-search
       method: POST
       request_multipart_field: search_parts
+      query_fields:
+        fixture_id: fixture_id
       content_field: result_html
       fingerprint_field: result_fingerprint
       format: raw

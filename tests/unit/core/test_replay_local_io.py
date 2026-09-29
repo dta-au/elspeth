@@ -350,11 +350,27 @@ def test_payload_collector_admits_only_configured_multipart_file_refs() -> None:
 
     collected = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"})
     assert collected.input_refs == {ref}
-    assert unrelated not in store.reads
+    assert store.reads == []
 
-    row["parts"][1]["blob_ref"] = unrelated
-    with pytest.raises(KeyError):
-        collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"})
+    row["parts"] = "malformed"
+    malformed = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"})
+    assert malformed.input_refs == set()
+
+    row["parts"] = [
+        {"name": "attachment", "blob_ref": ref, "filename": "query.txt", "content_type": "text/plain"},
+        {"name": "broken"},
+    ]
+    partially_malformed = collect_source_payload_refs(
+        factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"}
+    )
+    assert partially_malformed.input_refs == set()
+
+    row["parts"] = [{"name": "file", "blob_ref": unrelated, "filename": "x.txt", "content_type": "text/plain"}]
+    missing_blob = collect_source_payload_refs(
+        factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"}
+    )
+    assert missing_blob.input_refs == {unrelated}
+    assert unrelated not in store.reads
 
 
 def test_payload_collector_accepts_failed_pdf_state_with_refusal_receipt() -> None:

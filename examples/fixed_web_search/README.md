@@ -11,7 +11,7 @@ hostname, and port. It is independent of `allowed_hosts`, which still validates
 the resolved IP address. Set the origins to the site you are approved to query;
 the ABN address is only an example.
 
-Run the four three-row local fixtures with
+Run the local fixtures with
 `./examples/fixed_web_search/run_fixture.sh directory` and
 `./examples/fixed_web_search/run_fixture.sh registry`, then
 `./examples/fixed_web_search/run_fixture.sh form` and
@@ -19,10 +19,11 @@ Run the four three-row local fixtures with
 HTML list items; the second uses `term` and HTML articles with detail links
 and registration text. The form variant sends ordered URL-encoded POST fields,
 including a repeated `scope` field and a Unicode search value. The multipart
-variant submits ordered text and a content-addressed file part. All four
-assert three HTTP requests and three output rows, including one result,
-multiple possible results, and no results. Each replays
-its three calls offline and verifies them against the restarted fixture. The
+variant submits ordered text and a content-addressed file part. It also has a
+fourth malformed input row that is routed to the error sink, both live and in
+replay and verify. Each variant asserts three HTTP requests and three output
+rows, including one result, multiple possible results, and no results. Each
+replays its three calls offline and verifies them against the restarted fixture. The
 page response, bounded `candidates` list, and audit refs are retained. The
 pipeline does not claim that any match validates an entity. The runner refuses
 to overwrite earlier output or audit files.

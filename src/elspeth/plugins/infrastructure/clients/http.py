@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import hashlib
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -33,6 +32,7 @@ from elspeth.contracts.call_data import (
     MultipartMetadata,
     RawCallPayload,
     encode_urlencoded_form,
+    validate_multipart_form,
 )
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
@@ -1263,10 +1263,9 @@ class AuditedHTTPClient(AuditedClientBase):
         if multipart_metadata is not None:
             if method_upper != "POST" or json is not None or form is not None or follow_redirects:
                 raise ValueError("multipart requires POST without another body or redirects")
-            if type(multipart_body) is not bytes or len(multipart_body) != multipart_metadata.body_size:
-                raise ValueError("multipart body size does not match metadata")
-            if hashlib.sha256(multipart_body).hexdigest() != multipart_metadata.body_sha256:
-                raise ValueError("multipart body hash does not match metadata")
+            if type(multipart_body) is not bytes:
+                raise ValueError("multipart body must be bytes")
+            validate_multipart_form(multipart_body, multipart_metadata)
             if any(key.casefold() == "content-type" for key in (headers or {})):
                 raise ValueError("multipart content type is controlled by AuditedHTTPClient")
         validate_allowed_http_origin(request.original_url, allowed_origins)

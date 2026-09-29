@@ -32,6 +32,7 @@ from elspeth.contracts.call_data import (
     MultipartPart,
     encode_multipart_form,
     encode_urlencoded_form,
+    multipart_min_body_size,
 )
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
@@ -687,7 +688,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8356f3abd6ce56db"
+    source_file_hash: str | None = "sha256:4ca8c91cc0e45b77"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1108,22 +1109,42 @@ class WebScrapeTransform(BaseTransform):
                 return TransformResult.error(
                     {"reason": "validation_failed", "error": f"POST multipart field '{self._request_multipart_field}' is invalid"}
                 )
+            try:
+                remaining_file_bytes = self._max_request_body_bytes - multipart_min_body_size(
+                    parts, max_body_bytes=self._max_request_body_bytes
+                )
+            except ValueError:
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "error": f"POST multipart exceeds max_request_body_bytes {self._max_request_body_bytes}",
+                    }
+                )
             blobs: dict[str, bytes] = {}
             for part in parts:
-                if part.blob_ref is None or part.blob_ref in blobs:
+                if part.blob_ref is None:
                     continue
-                try:
-                    blob_content = self._payload_store.retrieve_bounded(part.blob_ref, max_bytes=self._max_request_body_bytes)
-                except PayloadNotFoundError:
-                    return TransformResult.error({"reason": "blob_not_found", "blob_ref": part.blob_ref})
-                if blob_content is None:
+                if part.blob_ref not in blobs:
+                    try:
+                        blob_content = self._payload_store.retrieve_bounded(part.blob_ref, max_bytes=remaining_file_bytes)
+                    except PayloadNotFoundError:
+                        return TransformResult.error({"reason": "blob_not_found", "blob_ref": part.blob_ref})
+                    if blob_content is None:
+                        return TransformResult.error(
+                            {
+                                "reason": "validation_failed",
+                                "error": f"POST multipart exceeds max_request_body_bytes {self._max_request_body_bytes}",
+                            }
+                        )
+                    blobs[part.blob_ref] = blob_content
+                if len(blobs[part.blob_ref]) > remaining_file_bytes:
                     return TransformResult.error(
                         {
                             "reason": "validation_failed",
                             "error": f"POST multipart exceeds max_request_body_bytes {self._max_request_body_bytes}",
                         }
                     )
-                blobs[part.blob_ref] = blob_content
+                remaining_file_bytes -= len(blobs[part.blob_ref])
             try:
                 request_multipart = encode_multipart_form(parts, blobs, max_body_bytes=self._max_request_body_bytes)
             except ValueError:
