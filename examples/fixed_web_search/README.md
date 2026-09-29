@@ -6,11 +6,14 @@ local government-style directory with the query key `q`; `settings_abn_page.yaml
 uses ABN Lookup's public results address with the query key `SearchText`. The
 plugin code is identical for both.
 
-Run the three-row local fixture with `./examples/fixed_web_search/run_fixture.sh`.
-It asserts three HTTP requests and three output rows, including one result,
-multiple possible results, and no results. It then replays all three calls
-offline and verifies all three against the restarted fixture. The page
-response, bounded `candidates` list, and audit refs are retained. The
+Run the two three-row local fixtures with
+`./examples/fixed_web_search/run_fixture.sh directory` and
+`./examples/fixed_web_search/run_fixture.sh registry`. The first uses `q` and
+HTML list items; the second uses `term` and HTML articles with detail links
+and registration text. Both assert three HTTP requests and three output rows,
+including one result, multiple possible results, and no results. Each replays
+its three calls offline and verifies them against the restarted fixture. The
+page response, bounded `candidates` list, and audit refs are retained. The
 pipeline does not claim that any match validates an entity. The runner refuses
 to overwrite earlier output or audit files.
 

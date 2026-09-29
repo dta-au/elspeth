@@ -15,16 +15,25 @@ class SearchHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
             body = b"ok"
-        elif parsed.path == "/directory":
-            query = parse_qs(parsed.query).get("q", [""])[0]
+        elif parsed.path in {"/directory", "/registry"}:
+            query_key = "q" if parsed.path == "/directory" else "term"
+            query = parse_qs(parsed.query).get(query_key, [""])[0]
             if query == "Commonwealth Bank":
                 matches = ["Commonwealth Bank branch A", "Commonwealth Bank branch B"]
             elif query == "Australian Taxation Office":
                 matches = ["Australian Taxation Office"]
             else:
                 matches = []
-            entries = "".join(f"<li>{html.escape(match)}</li>" for match in matches)
-            body = f"<main><h1>Results for {html.escape(query)}</h1><ul>{entries}</ul></main>".encode()
+            if parsed.path == "/directory":
+                entries = "".join(f"<li>{html.escape(match)}</li>" for match in matches)
+                body = f"<main><h1>Results for {html.escape(query)}</h1><ul>{entries}</ul></main>".encode()
+            else:
+                entries = "".join(
+                    f'<article><h2><a href="/registry/{index}">{html.escape(match)}</a></h2>'
+                    '<p class="registration">Registered</p></article>'
+                    for index, match in enumerate(matches, start=1)
+                )
+                body = f'<section class="results"><header>{html.escape(query)}</header>{entries}</section>'.encode()
             with self.access_log.open("a", encoding="utf-8") as log:
                 log.write(query + "\n")
         else:
