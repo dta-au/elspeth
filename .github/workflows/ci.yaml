@@ -378,7 +378,7 @@ jobs:
       image: python:${{ matrix.python-version }}-bookworm
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
-      PYTEST_WORKERS: ${{ github.event_name == 'pull_request' && matrix.hosted_workers || '12' }}
+      PYTEST_WORKERS: ${{ matrix.workers }}
     # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
@@ -391,10 +391,10 @@ jobs:
         include:
           - python-version: "3.12"
             coverage: false
-            hosted_workers: "4"
+            workers: "4"
           - python-version: "3.13"
             coverage: true
-            hosted_workers: "2"
+            workers: "2"
 
     steps:
       - name: Checkout code
@@ -480,8 +480,8 @@ jobs:
           # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
           # PR #212's hosted 3.12 and 3.13 jobs were SIGKILLed with the default
           # 12 workers; the 3.13 coverage job was also SIGKILLed at 4 workers.
-          # Bound hosted concurrency per matrix lane. Trusted push jobs retain
-          # the 12-worker capacity of their runner.
+          # The trusted push 3.13 job also failed with 12 workers, including
+          # coverage database errors. Bound concurrency for both event types.
           uv run pytest tests/ \
             --cov=src/elspeth \
             --cov-report=xml \
@@ -518,7 +518,7 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           # No `-m`: same reason as the coverage step above. Use the same
-          # hosted-runner worker cap as the coverage lane.
+          # per-lane worker cap as the coverage lane.
           uv run pytest tests/ \
             -n "$PYTEST_WORKERS" \
             -v
