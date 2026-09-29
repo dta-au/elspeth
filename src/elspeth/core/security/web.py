@@ -96,12 +96,21 @@ BLOCKED_IP_RANGES = [
     ipaddress.ip_network("192.168.0.0/16"),  # Private Class C (RFC 1918)
     ipaddress.ip_network("169.254.0.0/16"),  # Link-local (AWS/Azure/GCP metadata endpoints)
     ipaddress.ip_network("100.64.0.0/10"),  # CGNAT (RFC 6598) - shared ISP space, often internal
+    ipaddress.ip_network("192.0.0.0/24"),  # IETF protocol assignments (RFC 6890) - not public hosts
+    ipaddress.ip_network("198.18.0.0/15"),  # Benchmarking (RFC 2544) - often internal test networks
+    ipaddress.ip_network("240.0.0.0/4"),  # Reserved (RFC 1112) - never a public host
     # IPv6 ranges
     ipaddress.ip_network("::1/128"),  # IPv6 loopback
     ipaddress.ip_network("::/128"),  # IPv6 unspecified - like 0.0.0.0, connects to local listeners
     ipaddress.ip_network("fc00::/7"),  # IPv6 unique local (RFC 4193) - private
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (RFC 4291) - can reach metadata
     ipaddress.ip_network("::ffff:0:0/96"),  # IPv4-mapped IPv6 - CRITICAL: bypass vector!
+    # IPv6 prefixes that embed an IPv4 address. Where the network translates
+    # them, they reach whatever IPv4 host they embed, private ranges included.
+    ipaddress.ip_network("::/96"),  # IPv4-compatible IPv6 (RFC 4291, deprecated)
+    ipaddress.ip_network("64:ff9b::/96"),  # NAT64 well-known prefix (RFC 6052)
+    ipaddress.ip_network("64:ff9b:1::/48"),  # NAT64 local-use prefix (RFC 8215)
+    ipaddress.ip_network("2002::/16"),  # 6to4 (RFC 3056)
 ]
 
 # Unconditionally blocked — no allowlist can bypass these.
@@ -115,11 +124,16 @@ BLOCKED_IP_RANGES = [
 # block the IPv4-mapped form of the metadata endpoint. Without this entry, a broad
 # IPv6 allowed_range covering ::ffff:0:0/96 would bypass the standard blocklist
 # before the IPv4 169.254.0.0/16 check could catch it (IPv6 addresses are checked
-# against IPv6 networks, not IPv4 networks).
+# against IPv6 networks, not IPv4 networks). The IPv4-compatible, NAT64 and 6to4
+# forms of 169.254.0.0/16 are here for the same reason.
 ALWAYS_BLOCKED_RANGES = (
     ipaddress.ip_network("169.254.0.0/16"),  # IPv4 link-local (AWS/Azure/GCP metadata)
     ipaddress.ip_network("::ffff:169.254.0.0/112"),  # IPv4-mapped metadata endpoint
+    ipaddress.ip_network("::169.254.0.0/112"),  # IPv4-compatible metadata endpoint
+    ipaddress.ip_network("64:ff9b::169.254.0.0/112"),  # NAT64 metadata endpoint
+    ipaddress.ip_network("2002:a9fe::/32"),  # 6to4 metadata endpoint
     ipaddress.ip_network("fd00:ec2::254/128"),  # AWS EC2 IPv6 metadata endpoint
+    ipaddress.ip_network("168.63.129.16/32"),  # Azure WireServer / platform endpoint
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (same attack surface)
     ipaddress.ip_network("255.255.255.255/32"),  # IPv4 broadcast
     ipaddress.ip_network("224.0.0.0/4"),  # IPv4 multicast
