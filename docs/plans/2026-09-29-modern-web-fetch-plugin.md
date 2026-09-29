@@ -1,6 +1,6 @@
 # Modern web fetch capability plan
 
-**Status:** Implementation plan; no runtime behavior changes in this document.
+**Status:** In progress. The POST-first HTTP slice is locally merged on `release/0.8.1` through `e4db1dbfc` (29 September 2026): fixed or row URLs, row-mapped query values, ordered URL-encoded POST forms, bounded CSS candidate extraction, two distinct local search-page layouts, and live/replay/verify fixture runs. A hermetic 10,000-row completed batch also passed. Multipart, origin authentication and policy, pagination, browser forms and their egress gate, crawl, mid-source restart, and a live public-page canary remain open. The web services have not been restarted with this code because host authentication is required.
 **Target:** ELSPETH `release/0.8.1` baseline at `4b83b568` (29 September 2026).
 **Goal:** Fetch and extract modern web data, submit HTTP forms, and fill browser forms while preserving ELSPETH's audit, replay, verification, network, and Composer contracts. A required end-to-end example is searching the Australian Government's ABN Lookup page with a node-owned address and row-owned search values. The capability must work for other government search pages without ABN-specific runtime code.
 
