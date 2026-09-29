@@ -31,9 +31,10 @@ from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import ResumePoint, RunMode, RunStatus
+from elspeth.contracts import ResumePoint, RunMode, RunStatus, SourceRow
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.coordination import (
@@ -57,6 +58,7 @@ from elspeth.core.checkpoint.recovery import (
     GroupUnsatisfiableResumeError,
     NonResumableRunError,
     check_group_satisfiability_resumable,
+    check_http_effects_resumable,
     check_run_status_resumable,
     check_source_lifecycle_resumable,
     group_binding_view_from_graph,
@@ -71,10 +73,11 @@ from elspeth.core.landscape.factory import RecorderFactory
 # immutable-success backstops retained beneath (the acquire_run_leadership
 # takeover CAS and the run_lifecycle conditional UPDATEs).
 from elspeth.core.landscape.run_lifecycle_repository import _IMMUTABLE_SUCCESS_RUN_STATUSES
-from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
+from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES, rows_table
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
 from elspeth.engine.executors.replay_sink_effect import verify_virtual_sink_members
+from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
 from elspeth.engine.orchestrator.authority_guard import CallerAuthorityGuard
 from elspeth.engine.orchestrator.bootstrap import prepare_for_run
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
@@ -87,6 +90,7 @@ from elspeth.engine.orchestrator.outcomes import (
     handle_coalesce_timeouts,
     handle_row_union_timeouts,
 )
+from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import (
     GraphArtifacts,
     LoopContext,
@@ -100,6 +104,7 @@ from elspeth.engine.orchestrator.run_status import (
 )
 from elspeth.engine.orchestrator.runtime_preflight import run_transform_runtime_preflights
 from elspeth.engine.orchestrator.shutdown import shutdown_handler_context
+from elspeth.engine.orchestrator.source_snapshot import load_committed_source_snapshot
 from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
 )
@@ -175,10 +180,52 @@ def setup_resume_context(
     )
 
 
+def pending_source_snapshot_rows(
+    factory: RecorderFactory,
+    payload_store: PayloadStore,
+    db: LandscapeDB,
+    run_id: str,
+    config: PipelineConfig,
+    graph: ExecutionGraph,
+) -> tuple[tuple[tuple[str, NodeID, int, SourceRow], ...], int]:
+    """Verify the ingested prefix against sealed source emissions and return its suffix."""
+    source_id_map = build_source_id_map(graph)
+    pending: list[tuple[str, NodeID, int, SourceRow]] = []
+    with db.engine.connect() as conn:
+        next_ingest_sequence = conn.execute(
+            select(func.max(rows_table.c.ingest_sequence)).where(rows_table.c.run_id == run_id)
+        ).scalar_one()
+        for source_name, active_source in config.sources.items():
+            if active_source.config.get("snapshot_for_resume") is not True:
+                continue
+            source_id = source_id_map[source_name]
+            snapshot = load_committed_source_snapshot(
+                factory,
+                payload_store,
+                run_id=run_id,
+                source_id=source_id,
+                source_name=source_name,
+            )
+            ingested = conn.execute(
+                select(rows_table.c.row_index, rows_table.c.source_row_index)
+                .where(rows_table.c.run_id == run_id, rows_table.c.source_node_id == source_id)
+                .order_by(rows_table.c.row_index)
+            ).all()
+            if len(ingested) > len(snapshot) or any(
+                row_index != ordinal or source_row_index != snapshot[ordinal].source_row_index
+                for ordinal, (row_index, source_row_index) in enumerate(ingested)
+            ):
+                raise AuditIntegrityError(f"Source {source_name!r} ingested rows differ from its sealed snapshot prefix")
+            pending.extend((source_name, source_id, ordinal, row) for ordinal, row in enumerate(snapshot[len(ingested) :], len(ingested)))
+    return tuple(pending), 0 if next_ingest_sequence is None else next_ingest_sequence + 1
+
+
 def run_resume_processing_loop(
     loop_ctx: LoopContext,
     *,
     shutdown_event: threading.Event | None = None,
+    source_snapshot_rows_processed: bool = False,
+    flush_end_of_input: bool = True,
 ) -> bool:
     """Re-drive a resumed run's durable scheduler work, then flush barriers at end of input.
 
@@ -242,11 +289,18 @@ def run_resume_processing_loop(
         )
 
     if not interrupted_by_shutdown and processor.has_scheduled_work():
+        # Freshly ingested snapshot rows already contributed their terminal
+        # results to pending_tokens. The durable PENDING_SINK rehydration sees
+        # those same tokens; retain only results not accumulated this pass.
+        already_pending = (
+            {token.token_id for bucket in pending_tokens.values() for token, _ in bucket} if source_snapshot_rows_processed else set()
+        )
         results = processor.drain_scheduled_work(ctx)
-        counters.rows_processed += len({result.token.row_id for result in results})
-        accumulate_row_outcomes(results, counters, pending_tokens)
+        newly_recovered = tuple(result for result in results if result.token.token_id not in already_pending)
+        counters.rows_processed += len({result.token.row_id for result in newly_recovered})
+        accumulate_row_outcomes(newly_recovered, counters, pending_tokens)
 
-    if not interrupted_by_shutdown:
+    if not interrupted_by_shutdown and flush_end_of_input:
         # CRITICAL: Flush remaining barriers only at true end-of-source.
         # ADR-030 §D steps 2-3 (slice 3): journal-quiescence gate, then the
         # intake -> trigger evaluation -> flush loop until no BLOCKED barrier
@@ -852,6 +906,11 @@ class ResumeCoordinator:
             assert implementation_check.cause is not None
             raise NonResumableRunError(guarded_run_id, implementation_check.reason, cause=implementation_check.cause)
 
+        effect_check = check_http_effects_resumable(graph)
+        if not effect_check.can_resume:
+            assert effect_check.reason is not None and effect_check.cause is not None
+            raise NonResumableRunError(guarded_run_id, effect_check.reason, cause=effect_check.cause)
+
         # ---- resume() entry guard, part 3: group satisfiability (spec §8) ----
         # SAME shared implementation as the advisory can_resume() — the
         # check_source_lifecycle_resumable two-surface precedent
@@ -936,6 +995,15 @@ class ResumeCoordinator:
             if incomplete_sources:
                 raise IncompleteSourceResumeError(run_id, incomplete_sources)
 
+            snapshot_rows, next_ingest_sequence = pending_source_snapshot_rows(
+                factory,
+                payload_store,
+                self._db,
+                run_id,
+                config,
+                graph,
+            )
+
             if state.has_restored_barrier_work:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
 
@@ -965,9 +1033,14 @@ class ResumeCoordinator:
                     run_id=run_id,
                     opener_node_ids=require_all_opener_node_ids,
                 )
-            if has_active_scheduler_work or pending_empty_collector_groups:
+            if has_active_scheduler_work or pending_empty_collector_groups or snapshot_rows:
                 resume_failure_counter_baseline = _derive_resume_failure_counter_baseline(factory, run_id)
-            if not state.has_restored_barrier_work and not has_active_scheduler_work and not pending_empty_collector_groups:
+            if (
+                not state.has_restored_barrier_work
+                and not has_active_scheduler_work
+                and not pending_empty_collector_groups
+                and not snapshot_rows
+            ):
                 check_combined_coordination_latch()
                 # No work and no restored barrier holds: nothing remains for a
                 # journal restore to mint, so the coverage check is complete here.
@@ -1014,6 +1087,8 @@ class ResumeCoordinator:
                     shutdown_event=active_event,
                     coordination_token=coordination_token,
                     check_coordination_latch=check_combined_coordination_latch,
+                    source_snapshot_rows=snapshot_rows,
+                    next_ingest_sequence=next_ingest_sequence,
                 )
 
             check_combined_coordination_latch()
@@ -1146,6 +1221,8 @@ class ResumeCoordinator:
         shutdown_event: threading.Event | None = None,
         coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
+        source_snapshot_rows: tuple[tuple[str, NodeID, int, SourceRow], ...] = (),
+        next_ingest_sequence: int = 0,
     ) -> RunResult:
         """Re-drive a resumed run's durable scheduler work and restored barriers.
 
@@ -1225,7 +1302,92 @@ class ResumeCoordinator:
             cleanup_pending_exc: BaseException | None = None
             try:
                 # 3. Process loop (resume path)
-                interrupted = run_resume_processing_loop(loop_ctx, shutdown_event=shutdown_event)
+                if source_snapshot_rows:
+                    # Existing scheduler/barrier work, including expired
+                    # downtime deadlines, settles before any new source row
+                    # may supply a missing member. EOF waits for the suffix.
+                    run_resume_processing_loop(
+                        loop_ctx,
+                        shutdown_event=shutdown_event,
+                        flush_end_of_input=False,
+                    )
+                quarantine_router = QuarantineRouter(ceremony=self._ceremony)
+                for source_name, source_id, row_index, source_row in source_snapshot_rows:
+                    if shutdown_event is not None and shutdown_event.is_set():
+                        break
+                    if check_coordination_latch is not None:
+                        check_coordination_latch()
+                    active_source = config.sources[source_name]
+                    run_ctx.ctx.node_id = source_id
+                    run_ctx.ctx.operation_id = None
+                    if source_row.source_row_index is None:
+                        raise AuditIntegrityError("Admitted source snapshot row has no source identity")
+                    if source_row.is_quarantined:
+                        result = quarantine_router.route(
+                            run_id,
+                            source_id,
+                            source_row,
+                            row_index,
+                            source_row.source_row_index,
+                            next_ingest_sequence,
+                            artifacts.edge_map,
+                            loop_ctx,
+                            active_source=active_source,
+                        )
+                        results = [result]
+                    else:
+                        timeout_result = check_aggregation_timeouts(
+                            config=config,
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            pending_tokens=loop_ctx.pending_tokens,
+                            agg_transform_lookup=dict(run_ctx.agg_transform_lookup),
+                        )
+                        loop_ctx.counters.accumulate_flush_result(timeout_result)
+                        results = run_ctx.processor.process_row(
+                            row_index=row_index,
+                            source_row=source_row,
+                            transforms=config.transforms,
+                            ctx=run_ctx.ctx,
+                            source_node_id=source_id,
+                            source_plugin=active_source,
+                            source_on_success=active_source.on_success,
+                            source_row_index=source_row.source_row_index,
+                            ingest_sequence=next_ingest_sequence,
+                        )
+                    next_ingest_sequence += 1
+                    loop_ctx.counters.rows_processed += 1
+                    accumulate_row_outcomes(results, loop_ctx.counters, loop_ctx.pending_tokens)
+                    if source_row.is_quarantined:
+                        timeout_result = check_aggregation_timeouts(
+                            config=config,
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            pending_tokens=loop_ctx.pending_tokens,
+                            agg_transform_lookup=dict(run_ctx.agg_transform_lookup),
+                        )
+                        loop_ctx.counters.accumulate_flush_result(timeout_result)
+                    if run_ctx.coalesce_executor is not None:
+                        handle_coalesce_timeouts(
+                            coalesce_executor=run_ctx.coalesce_executor,
+                            coalesce_node_map=dict(run_ctx.coalesce_node_map),
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            counters=loop_ctx.counters,
+                            pending_tokens=loop_ctx.pending_tokens,
+                        )
+                    if run_ctx.processor.row_union_executor is not None:
+                        handle_row_union_timeouts(
+                            row_union_executor=run_ctx.processor.row_union_executor,
+                            processor=run_ctx.processor,
+                            ctx=run_ctx.ctx,
+                            counters=loop_ctx.counters,
+                        )
+                interrupted = run_resume_processing_loop(
+                    loop_ctx,
+                    shutdown_event=shutdown_event,
+                    source_snapshot_rows_processed=bool(source_snapshot_rows),
+                )
 
                 # 4. Flush + write sinks with checkpoint advancement
                 self._sink_flush.flush_and_write_sinks(

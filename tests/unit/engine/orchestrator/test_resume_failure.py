@@ -733,7 +733,8 @@ class TestResumeFinalizesAsFailed:
         assert call_order[0] == "sweep", call_order
         assert "drain" in call_order
 
-    def test_resume_loop_sweeps_restored_coalesce_timeouts_before_scheduler_drain(self) -> None:
+    @pytest.mark.parametrize("flush_end_of_input", [True, False])
+    def test_resume_loop_sweeps_restored_coalesce_timeouts_before_scheduler_drain(self, flush_end_of_input: bool) -> None:
         # elspeth-321f335ff2 (coalesce sibling of elspeth-0bffbd1af1):
         # restored coalesce groups carry backdated arrival anchors, so a group
         # whose timeout expired during downtime is already stale when replay
@@ -778,7 +779,7 @@ class TestResumeFinalizesAsFailed:
             coalesce_node_map={CoalesceName("merge"): NodeID("coalesce-node")},
         )
 
-        run_resume_processing_loop(loop_ctx)
+        run_resume_processing_loop(loop_ctx, flush_end_of_input=flush_end_of_input)
 
         assert call_order, "neither the sweep nor the drain ran"
         assert call_order[0] == "sweep", call_order
@@ -1027,9 +1028,11 @@ class TestResumeFinalizesAsFailed:
 
         orders_source = _specced_source()
         orders_source.name = "csv"
+        orders_source.config = {}
         orders_source._on_validation_failure = "discard"
         refunds_source = _specced_source()
         refunds_source.name = "csv"
+        refunds_source.config = {}
         refunds_source._on_validation_failure = "discard"
         sink = _specced_sink()
         sink.name = "json"
@@ -1650,9 +1653,11 @@ class TestResumeFinalizesAsFailed:
             # real contract: an empty registry (no bound groups).
             graph_stub = MagicMock(spec=ExecutionGraph)
             graph_stub.get_group_bindings.return_value = GroupBindingRegistry(bindings=())
+            config_stub = MagicMock(spec=PipelineConfig)
+            config_stub.sources = {}
             result = orch.resume(
                 resume_point,
-                MagicMock(spec=object),
+                config_stub,
                 graph_stub,
                 payload_store=MockPayloadStore(),
             )

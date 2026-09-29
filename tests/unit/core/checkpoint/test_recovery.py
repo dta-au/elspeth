@@ -441,6 +441,20 @@ def test_can_resume_true_for_failed_run_with_valid_checkpoint(
     assert check.reason is None
 
 
+def test_can_resume_refuses_web_search_post_without_effect_reservation(
+    db: LandscapeDB, checkpoint_manager: CheckpointManager, recovery_manager: RecoveryManager
+) -> None:
+    graph = ExecutionGraph()
+    graph.add_node("checkpoint-node", node_type=NodeType.TRANSFORM, plugin_name="web_scrape", config={"method": "POST"})
+    run_id = "run-post-search-uncertain-effect"
+    _create_failed_run_with_checkpoint(db, checkpoint_manager, run_id, graph=graph)
+
+    check = recovery_manager.can_resume(run_id, graph)
+    assert not check.can_resume
+    assert check.cause is ResumeRefusalCause.UNCERTAIN_REMOTE_EFFECT
+    assert check.reason is not None and "POST" in check.reason
+
+
 @pytest.mark.parametrize("lifecycle_state", ["ready", "loading", "interrupted"])
 def test_can_resume_rejects_incomplete_source_lifecycle(
     db: LandscapeDB,

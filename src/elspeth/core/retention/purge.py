@@ -5,6 +5,8 @@ and retention period. Deletes blobs while preserving hashes in Landscape
 for audit integrity.
 """
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
@@ -18,7 +20,8 @@ from sqlalchemy.exc import SQLAlchemyError
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
-from elspeth.contracts.payload_store import PayloadStore
+from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
+from elspeth.core.canonical import stable_hash
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.model_loaders import validate_run_lifecycle_row
 from elspeth.core.landscape.reproducibility import update_grade_after_purge
@@ -90,6 +93,49 @@ class PurgeManager:
         """
         self._db = db
         self._payload_store = payload_store
+
+    def _source_snapshot_children(self, refs: set[str]) -> dict[str, str]:
+        """Map source-load operation metadata refs to their spool payload refs."""
+        if not refs:
+            return {}
+        metadata_hashes: dict[str, str | None] = {}
+        ordered_refs = sorted(refs)
+        with self._db.connection() as conn:
+            for start in range(0, len(ordered_refs), self._PURGE_CHUNK_SIZE):
+                for metadata_ref, output_hash in conn.execute(
+                    select(operations_table.c.output_data_ref, operations_table.c.output_data_hash)
+                    .where(operations_table.c.operation_type == "source_load")
+                    .where(operations_table.c.output_data_ref.in_(ordered_refs[start : start + self._PURGE_CHUNK_SIZE]))
+                ):
+                    if metadata_ref in metadata_hashes and metadata_hashes[metadata_ref] != output_hash:
+                        raise contract_errors.AuditIntegrityError("Source snapshot metadata has conflicting operation hashes")
+                    metadata_hashes[metadata_ref] = output_hash
+        children: dict[str, str] = {}
+        for metadata_ref, output_hash in metadata_hashes.items():
+            try:
+                content = self._payload_store.retrieve_bounded(metadata_ref, max_bytes=1024)
+            except PayloadNotFoundError:
+                continue  # A previous partial purge already removed the metadata.
+            if content is None:
+                continue  # Other source-load outputs are not snapshot metadata.
+            try:
+                metadata = json.loads(content)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if type(metadata) is not dict or "source_snapshot_ref" not in metadata:
+                continue
+            if stable_hash(metadata) != output_hash:
+                raise contract_errors.AuditIntegrityError("Source snapshot metadata differs from its operation hash during purge")
+            child = metadata["source_snapshot_ref"]
+            if (
+                set(metadata) != {"source_snapshot_ref", "source_snapshot_version"}
+                or metadata["source_snapshot_version"] != 1
+                or type(child) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", child) is None
+            ):
+                raise contract_errors.AuditIntegrityError("Source snapshot operation metadata is malformed during purge")
+            children[metadata_ref] = child
+        return children
 
     def _validate_run_lifecycle_rows(self, conn: Connection) -> None:
         """Crash on impossible Tier-1 run lifecycle rows before purge queries."""
@@ -286,9 +332,21 @@ class PurgeManager:
             active_result = conn.execute(active_refs_query)
             active_refs = {row[0] for row in active_result}
 
+        # Snapshot spools are referenced inside completed source-load output
+        # metadata. Expand both sides before the active-run anti-join so a
+        # content-addressed spool shared with a retained run stays protected.
+        expired_children = self._source_snapshot_children(expired_refs)
+        expired_refs.update(expired_children.values())
+        active_refs.update(self._source_snapshot_children(active_refs).values())
+
         # Return refs that are ONLY in expired runs (not in any active run)
         safe_to_delete = expired_refs - active_refs
-        return list(safe_to_delete)
+        # Metadata must stay reachable while its child is protected by a
+        # retained run. Otherwise a later purge cannot discover that child.
+        for metadata_ref, child_ref in expired_children.items():
+            if child_ref in active_refs:
+                safe_to_delete.discard(metadata_ref)
+        return sorted(safe_to_delete)
 
     # SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999. Chunk IN clauses
     # to stay well under this limit (8 queries x chunk_size variables each).
@@ -422,13 +480,27 @@ class PurgeManager:
         """
         start_time = perf_counter()
 
+        # Delete snapshot children before their metadata, preserving a retry
+        # path on interruption. Do not add refs beyond the caller's admitted
+        # set: discovery may have excluded a child held by an active run.
+        snapshot_children = self._source_snapshot_children(set(refs))
+        child_refs = set(snapshot_children.values())
+        missing_children = {child for child in child_refs if child not in refs and self._payload_store.exists(child)}
+        if missing_children:
+            raise ValueError("Cannot purge source snapshot metadata without its admitted child payload")
+        refs = sorted(child_refs.intersection(refs)) + [ref for ref in refs if ref not in child_refs]
+
         # Step 1: Delete the payloads, tracking which refs were actually deleted
         deleted_count = 0
         skipped_count = 0
         failed_refs: list[str] = []
         deleted_refs: list[str] = []
+        failed_child_refs: set[str] = set()
 
         for ref in refs:
+            if ref in snapshot_children and snapshot_children[ref] in failed_child_refs:
+                failed_refs.append(ref)
+                continue  # Keep metadata reachable so the child can be retried.
             try:
                 deleted = self._payload_store.delete(ref)
             except OSError as e:
@@ -439,6 +511,8 @@ class PurgeManager:
                     error=str(e),
                 )
                 failed_refs.append(ref)
+                if ref in child_refs:
+                    failed_child_refs.add(ref)
                 continue
 
             if deleted:

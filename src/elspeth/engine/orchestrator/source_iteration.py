@@ -23,6 +23,7 @@ Dependencies held by this driver:
 from __future__ import annotations
 
 import enum
+import hashlib
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -59,6 +60,7 @@ from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
 from elspeth.engine.orchestrator.source_replay import AuditedSource, replay_source_rows
+from elspeth.engine.orchestrator.source_snapshot import SOURCE_SNAPSHOT_MAX_BYTES, decode_source_snapshot, encode_source_snapshot
 from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
     PipelineConfig,
@@ -572,6 +574,65 @@ class SourceIterationDriver:
                     raise OrchestrationInvariantError(f"Verify source {active_source_name!r} has no completely verified live snapshot")
                 source_rows = iter(ctx.verified_sources[active_source_name])
 
+        materialized_source = ctx.run_mode is RunMode.LIVE and active_source.config.get("snapshot_for_resume") is True
+        if materialized_source:
+            if ctx.payload_store is None:
+                raise OrchestrationInvariantError("Finite source snapshot requires a payload store")
+            # Complete the finite source and seal its exact emissions before any
+            # downstream transform can dispatch an effect. The completed
+            # source_load operation owns the content-addressed snapshot ref.
+            self.restore_source_iteration_context(ctx, source_id=source_id, source_operation_id=None)
+            self._lifecycle_recorder.record_run_source_lifecycle(
+                factory,
+                source_id,
+                active_source_name,
+                active_source,
+                RunSourceLifecycleState.LOADING,
+                coordination_token=coordination_token,
+            )
+            with (
+                self._span_factory.source_span(active_source.name, run_id=run_id),
+                track_operation(
+                    recorder=factory.execution,
+                    run_id=run_id,
+                    node_id=source_id,
+                    operation_type="source_load",
+                    ctx=ctx,
+                    input_data={"source_plugin": active_source.name, "snapshot_for_resume": True},
+                ) as snapshot_operation,
+            ):
+                content = encode_source_snapshot(
+                    self.load_source_with_events(run_id, ctx, active_source=active_source),
+                    source_name=active_source_name,
+                    max_bytes=SOURCE_SNAPSHOT_MAX_BYTES,
+                )
+                snapshot_ref = hashlib.sha256(content).hexdigest()
+                snapshot_operation.output_data = {
+                    "source_snapshot_ref": snapshot_ref,
+                    "source_snapshot_version": 1,
+                }
+            # The operation's metadata commits before the large blob is
+            # published. A crash at either side leaves no unreferenced source
+            # copy; lifecycle stays LOADING until both writes are complete.
+            stored_ref = ctx.payload_store.store(content)
+            if stored_ref != snapshot_ref:
+                raise OrchestrationInvariantError("Source snapshot store returned a different content hash")
+            source_rows = iter(decode_source_snapshot(content, source_name=active_source_name))
+            self._lifecycle_recorder.record_field_resolution(
+                factory,
+                active_source=active_source,
+                coordination_token=coordination_token,
+            )
+            self._record_source_contract(factory, source_id, ctx, active_source, None, coordination_token)
+            self._lifecycle_recorder.record_run_source_lifecycle(
+                factory,
+                source_id,
+                active_source_name,
+                active_source,
+                RunSourceLifecycleState.EXHAUSTED,
+                coordination_token=coordination_token,
+            )
+
         start_time = time.perf_counter()
         last_progress_time = start_time
 
@@ -580,7 +641,7 @@ class SourceIterationDriver:
         # verified snapshot without opening a duplicate source-load record.
         source_operation = (
             nullcontext(None)
-            if ctx.run_mode is RunMode.VERIFY
+            if ctx.run_mode is RunMode.VERIFY or materialized_source
             else track_operation(
                 recorder=factory.execution,
                 run_id=run_id,
@@ -603,15 +664,16 @@ class SourceIterationDriver:
                 source_id=source_id,
                 source_operation_id=source_operation_id,
             )
-            self._lifecycle_recorder.record_run_source_lifecycle(
-                factory,
-                source_id,
-                active_source_name,
-                active_source,
-                RunSourceLifecycleState.LOADING,
-                audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
-                coordination_token=coordination_token,
-            )
+            if not materialized_source:
+                self._lifecycle_recorder.record_run_source_lifecycle(
+                    factory,
+                    source_id,
+                    active_source_name,
+                    active_source,
+                    RunSourceLifecycleState.LOADING,
+                    audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
+                    coordination_token=coordination_token,
+                )
 
             if source_rows is None:
                 source_iterator = self.load_source_with_events(run_id, ctx, active_source=active_source)
@@ -894,7 +956,7 @@ class SourceIterationDriver:
                         audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
                         coordination_token=coordination_token,
                     )
-                    if interrupted_by_shutdown:
+                    if interrupted_by_shutdown and not materialized_source:
                         self._lifecycle_recorder.record_run_source_lifecycle(
                             factory,
                             source_id,
@@ -904,7 +966,7 @@ class SourceIterationDriver:
                             audited_source=audited_source if ctx.run_mode is RunMode.REPLAY else None,
                             coordination_token=coordination_token,
                         )
-                    elif not source_exhausted:
+                    elif not source_exhausted and not materialized_source:
                         self._lifecycle_recorder.record_run_source_lifecycle(
                             factory,
                             source_id,

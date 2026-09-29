@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -21,6 +23,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
@@ -38,6 +41,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
     tokens_table,
 )
+from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.retention.purge import PurgeManager
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
@@ -359,6 +363,51 @@ class TestPurgeResultValidation:
 
 
 class TestFindExpiredPayloadRefs:
+    def test_source_snapshot_child_is_protected_by_active_run_and_purged_with_metadata(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        old = now - timedelta(days=40)
+        recent = now - timedelta(days=1)
+        spool_ref = store.store(b"sealed source rows")
+        metadata = {"source_snapshot_ref": spool_ref, "source_snapshot_version": 1}
+        metadata_ref = store.store(json.dumps(metadata).encode())
+        with db.write_connection() as conn:
+            for run_id, completed_at in (("expired-snapshot", old), ("active-snapshot", recent)):
+                _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=completed_at)
+                _create_node(conn, run_id, f"source-{run_id}")
+                if run_id == "active-snapshot":
+                    _create_row(conn, run_id, f"source-{run_id}", "active-shared-row", row_index=0, source_data_ref=spool_ref)
+                else:
+                    conn.execute(
+                        operations_table.insert().values(
+                            operation_id=f"op-{run_id}",
+                            run_id=run_id,
+                            node_id=f"source-{run_id}",
+                            operation_type="source_load",
+                            started_at=now,
+                            status="completed",
+                            output_data_ref=metadata_ref,
+                            output_data_hash=stable_hash(metadata),
+                        )
+                    )
+
+        assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+        with pytest.raises(ValueError, match="without its admitted child"):
+            manager.purge_payloads([metadata_ref])
+        assert store.exists(spool_ref)
+        assert store.exists(metadata_ref)
+        with db.write_connection() as conn:
+            conn.execute(runs_table.update().where(runs_table.c.run_id == "active-snapshot").values(completed_at=old))
+        monkeypatch.setattr(store, "retrieve", lambda _ref: pytest.fail("purge used unbounded retrieve"))
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {spool_ref, metadata_ref}
+        result = manager.purge_payloads([spool_ref, metadata_ref])
+        assert result.deleted_count == 2
+        assert not store.exists(spool_ref)
+        assert not store.exists(metadata_ref)
+
     @pytest.mark.parametrize(
         ("status", "completed_at", "match"),
         (

@@ -64,6 +64,7 @@ class ResumeRefusalCause(StrEnum):
     FIRST_EFFECT_BOUNDARY_CROSSED = "first_effect_boundary_crossed"
     TERMINAL_STATUS_CHANGED = "terminal_status_changed"
     SOURCE_NOT_EXHAUSTED = "source_not_exhausted"
+    UNCERTAIN_REMOTE_EFFECT = "uncertain_remote_effect"
     GROUP_UNSATISFIABLE = "group_unsatisfiable"
     EXPORT_ALREADY_COMPLETED = "export_already_completed"
 

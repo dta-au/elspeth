@@ -34,6 +34,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -477,6 +478,32 @@ class TestResumeCheckpointCurrencyGuard:
     BEFORE the first mutation (``rebase_sequence`` / the seat CAS), mirroring
     the elspeth-2f23292372 status guard above.
     """
+
+    def test_post_search_refused_before_leadership_takeover(self, db: LandscapeDB) -> None:
+        from elspeth.contracts import NodeType, ResumeCheck
+        from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
+        from elspeth.core.dag import ExecutionGraph
+
+        graph = ExecutionGraph()
+        graph.add_node("search", node_type=NodeType.TRANSFORM, plugin_name="web_scrape", config={"method": "POST"})
+        topology_hash = CheckpointCompatibilityValidator().compute_full_topology_hash(graph)
+        run_id = "run-post-resume-refusal"
+        _insert_run(db, run_id, status=RunStatus.FAILED)
+        coordinator, checkpoints = _currency_coordinator(db, latest=_latest_checkpoint(run_id, topology_hash=topology_hash))
+
+        with (
+            patch("elspeth.engine.orchestrator.resume.check_implementation_compatibility", return_value=ResumeCheck(can_resume=True)),
+            pytest.raises(NonResumableRunError, match="pre-dispatch effect reservation") as exc_info,
+        ):
+            coordinator.resume(
+                _full_resume_point(run_id, topology_hash=topology_hash),
+                cast(Any, object()),
+                graph,
+                payload_store=MockPayloadStore(),
+            )
+
+        assert exc_info.value.cause is ResumeRefusalCause.UNCERTAIN_REMOTE_EFFECT
+        assert checkpoints.rebase_calls == []
 
     def test_missing_latest_checkpoint_refused_before_any_mutation(self, db: LandscapeDB) -> None:
         """A run with no checkpoint rows cannot validate a supplied resume point."""
