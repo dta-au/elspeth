@@ -22,9 +22,11 @@ from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResu
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import operations_table, rows_table, run_sources_table, token_outcomes_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
+from elspeth.engine.orchestrator.source_replay import prepare_audited_sources
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.sources.csv_source import CSVSource
@@ -145,6 +147,20 @@ def test_interrupted_file_source_refuses_resume_without_losing_unread_rows(
             [0, 2, 3, 4, 5],
             True,
         ),
+        (
+            "queries.jsonl",
+            '{"query":"Alpha"}\n123\n{"query":"Beta"}\n123\n{"query":"Gamma"}\n{"query":"Delta"}\n',
+            JSONSource,
+            [0, 1, 2, 3, 4, 5],
+            True,
+        ),
+        (
+            "queries.jsonl",
+            '{"query":"Alpha"}\n{"query":"Beta"}\n123\n123\n{"query":"Gamma"}\n{"query":"Delta"}\n',
+            JSONSource,
+            [0, 1, 2, 3, 4, 5],
+            True,
+        ),
     ],
 )
 @pytest.mark.parametrize("resume_stop_at", [100, 1])
@@ -208,6 +224,8 @@ def test_snapshot_file_source_resumes_remaining_rows_without_reopening_input(
         orchestrator.run(config, graph=graph, payload_store=payload_store, shutdown_event=shutdown_event)
     run_id = interrupted.value.run_id
     assert snapshot_published
+    factory = RecorderFactory(db, payload_store=payload_store)
+    original_error_ids = {error.error_id for error in factory.data_flow.get_validation_errors_for_run(run_id)}
     assert len(sink.results) == 2
     with db.engine.connect() as conn:
         lifecycle = conn.execute(select(run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)).scalar_one()
@@ -273,7 +291,14 @@ def test_snapshot_file_source_resumes_remaining_rows_without_reopening_input(
     assert source_indices == expected_indices
     assert len(completed_outcomes) == len(set(completed_outcomes)) == len(expected_indices)
     assert [row["query"] for row in sink.results] == ["Alpha", "Beta", "Gamma", "Delta"]
-    assert len(quarantine_sink.results) == int(quarantine)
+    assert len(quarantine_sink.results) == len(expected_indices) - 4
+    validation_errors = factory.data_flow.get_validation_errors_for_run(run_id)
+    assert {error.error_id for error in validation_errors} == original_error_ids
+    assert len(validation_errors) == len(quarantine_sink.results)
+    assert all(error.row_id is not None for error in validation_errors)
+    assert len({error.row_id for error in validation_errors}) == len(validation_errors)
+    audited = prepare_audited_sources(factory, run_id, {"primary": source_type(source_options)})
+    assert "primary" in audited
 
 
 def test_snapshot_mode_refuses_multi_source_pipeline_before_dispatch(tmp_path: Path) -> None:

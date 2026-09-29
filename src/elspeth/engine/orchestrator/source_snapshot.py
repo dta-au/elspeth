@@ -9,10 +9,11 @@ reopens the mutable input path or reruns source validation.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
@@ -23,6 +24,7 @@ SOURCE_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 
 if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
+    from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.landscape.factory import RecorderFactory
 
 
@@ -54,12 +56,34 @@ def load_committed_source_snapshot(
     if stable_hash(metadata) != operations[0].output_data_hash:
         raise AuditIntegrityError("Source snapshot metadata differs from the completed operation")
     snapshot_ref = metadata["source_snapshot_ref"]
-    if metadata["source_snapshot_version"] != _SNAPSHOT_VERSION or type(snapshot_ref) is not str:
+    if (
+        type(metadata["source_snapshot_version"]) is not int
+        or metadata["source_snapshot_version"] != _SNAPSHOT_VERSION
+        or type(snapshot_ref) is not str
+    ):
         raise AuditIntegrityError("Source snapshot metadata has an invalid version or reference")
     content = payload_store.retrieve_bounded(snapshot_ref, max_bytes=SOURCE_SNAPSHOT_MAX_BYTES)
     if content is None:
         raise AuditIntegrityError(f"Source {source_name!r} snapshot exceeds its byte bound")
     return decode_source_snapshot(content, source_name=source_name)
+
+
+def capture_source_snapshot_rows(rows: Iterable[SourceRow], ctx: PluginContext) -> Iterator[SourceRow]:
+    """Bind each quarantined emission to its already recorded validation error.
+
+    Consume provenance before requesting the next emission, while the source's
+    context still owns the pending error. Equal payloads remain separate
+    emissions with separate IDs; resume never reconstructs identity from data.
+    """
+    for source_row in rows:
+        if type(source_row) is not SourceRow:
+            raise TypeError("source snapshot requires SourceRow values")
+        if source_row.is_quarantined:
+            error_id = ctx.pop_pending_quarantine_validation_error_id(source_row.row)
+            if error_id is None:
+                raise OrchestrationInvariantError("quarantined source snapshot emission has no recorded validation error")
+            source_row = replace(source_row, validation_error_id=error_id)
+        yield source_row
 
 
 def encode_source_snapshot(rows: Iterable[SourceRow], *, source_name: str, max_bytes: int) -> bytes:
@@ -70,18 +94,26 @@ def encode_source_snapshot(rows: Iterable[SourceRow], *, source_name: str, max_b
     if len(content) > max_bytes:
         raise ValueError("source snapshot exceeds the configured byte cap")
     seen_indexes: set[int] = set()
+    seen_error_ids: set[str] = set()
     for source_row in rows:
         if type(source_row) is not SourceRow or source_row.source_row_index is None:
             raise TypeError("source snapshot requires indexed SourceRow values")
         if source_row.source_row_index in seen_indexes:
             raise ValueError("source snapshot contains duplicate source row indexes")
         seen_indexes.add(source_row.source_row_index)
+        if source_row.is_quarantined and source_row.validation_error_id is None:
+            raise ValueError("quarantined source snapshot emission has no validation error identity")
+        if source_row.validation_error_id is not None:
+            if source_row.validation_error_id in seen_error_ids:
+                raise ValueError("source snapshot contains duplicate validation error identities")
+            seen_error_ids.add(source_row.validation_error_id)
         record = {
             "source_row_index": source_row.source_row_index,
             "row": source_row.row,
             "is_quarantined": source_row.is_quarantined,
             "quarantine_error": source_row.quarantine_error,
             "quarantine_destination": source_row.quarantine_destination,
+            "validation_error_id": source_row.validation_error_id,
             "contract": source_row.contract.to_checkpoint_format() if source_row.contract is not None else None,
         }
         encoded = (checkpoint_dumps(record) + "\n").encode("utf-8")
@@ -98,10 +130,17 @@ def decode_source_snapshot(content: bytes, *, source_name: str) -> tuple[SourceR
         header = json.loads(lines[0])
     except (IndexError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise AuditIntegrityError("source snapshot header is invalid") from exc
-    if type(header) is not dict or header != {"version": _SNAPSHOT_VERSION, "source_name": source_name}:
+    if (
+        type(header) is not dict
+        or set(header) != {"version", "source_name"}
+        or type(header["version"]) is not int
+        or header["version"] != _SNAPSHOT_VERSION
+        or header["source_name"] != source_name
+    ):
         raise AuditIntegrityError("source snapshot identity or version differs from the admitted source")
     restored: list[SourceRow] = []
     seen_indexes: set[int] = set()
+    seen_error_ids: set[str] = set()
     for line in lines[1:]:
         try:
             record = checkpoint_loads(line)
@@ -111,6 +150,7 @@ def decode_source_snapshot(content: bytes, *, source_name: str) -> tuple[SourceR
                 "is_quarantined",
                 "quarantine_error",
                 "quarantine_destination",
+                "validation_error_id",
                 "contract",
             }:
                 raise AuditIntegrityError("source snapshot row has an invalid shape")
@@ -121,13 +161,21 @@ def decode_source_snapshot(content: bytes, *, source_name: str) -> tuple[SourceR
             if record["is_quarantined"] is True:
                 if record["contract"] is not None:
                     raise AuditIntegrityError("quarantined source snapshot row has a contract")
+                if type(record["validation_error_id"]) is not str or not record["validation_error_id"].strip():
+                    raise AuditIntegrityError("quarantined source snapshot row has no validation error identity")
+                if record["validation_error_id"] in seen_error_ids:
+                    raise AuditIntegrityError("source snapshot contains duplicate validation error identities")
+                seen_error_ids.add(record["validation_error_id"])
                 source_row = SourceRow.quarantined(
                     record["row"],
                     error=record["quarantine_error"],
                     destination=record["quarantine_destination"],
                     source_row_index=source_row_index,
+                    validation_error_id=record["validation_error_id"],
                 )
             elif record["is_quarantined"] is False:
+                if record["validation_error_id"] is not None:
+                    raise AuditIntegrityError("valid source snapshot row has validation error identity")
                 contract_data = record["contract"]
                 if type(contract_data) is not dict or type(record["row"]) is not dict:
                     raise AuditIntegrityError("valid source snapshot row has no row contract")

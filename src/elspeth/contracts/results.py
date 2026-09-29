@@ -832,6 +832,9 @@ class SourceRow:
     quarantine_destination: str | None = None
     contract: SchemaContract | None = None
     source_row_index: int | None = None
+    # Engine-owned provenance for sealed finite-source emissions. Ordinary
+    # streaming sources leave this unset; intake consumes their context queue.
+    validation_error_id: str | None = None
 
     def __post_init__(self) -> None:
         """Validate quarantine field invariants.
@@ -849,6 +852,8 @@ class SourceRow:
             _require_non_empty_str(self.quarantine_error, "quarantine_error")
             if self.quarantine_destination is None:
                 raise ValueError("Quarantined SourceRow must have quarantine_destination")
+            if self.validation_error_id is not None:
+                _require_non_empty_str(self.validation_error_id, "validation_error_id")
         else:
             if self.source_row_index is None:
                 raise ValueError("Valid SourceRow must have source_row_index. Pass source_row_index= to SourceRow.valid().")
@@ -857,6 +862,8 @@ class SourceRow:
                 raise ValueError(f"Non-quarantined SourceRow must not have quarantine_error, got: {self.quarantine_error!r}")
             if self.quarantine_destination is not None:
                 raise ValueError(f"Non-quarantined SourceRow must not have quarantine_destination, got: {self.quarantine_destination!r}")
+            if self.validation_error_id is not None:
+                raise ValueError("Non-quarantined SourceRow must not have validation_error_id")
             # Valid rows MUST have a contract — the engine requires it at
             # tokenization. Catching it here prevents a misleading crash later.
             if self.contract is None:
@@ -890,6 +897,7 @@ class SourceRow:
         destination: str,
         *,
         source_row_index: int,
+        validation_error_id: str | None = None,
     ) -> SourceRow:
         """Create a quarantined row result.
 
@@ -900,6 +908,7 @@ class SourceRow:
             destination: The sink name to route this row to
             source_row_index: Source-authored row position for emitted
                 quarantined rows.
+            validation_error_id: Existing audit identity sealed by engine intake.
         """
         return cls(
             row=row,
@@ -908,6 +917,7 @@ class SourceRow:
             quarantine_destination=destination,
             contract=None,  # Quarantined rows don't have contracts
             source_row_index=source_row_index,
+            validation_error_id=validation_error_id,
         )
 
     def to_pipeline_row(self) -> PipelineRow:

@@ -60,7 +60,12 @@ from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
 from elspeth.engine.orchestrator.source_replay import AuditedSource, replay_source_rows
-from elspeth.engine.orchestrator.source_snapshot import SOURCE_SNAPSHOT_MAX_BYTES, decode_source_snapshot, encode_source_snapshot
+from elspeth.engine.orchestrator.source_snapshot import (
+    SOURCE_SNAPSHOT_MAX_BYTES,
+    capture_source_snapshot_rows,
+    decode_source_snapshot,
+    encode_source_snapshot,
+)
 from elspeth.engine.orchestrator.types import (
     ExecutionCounters,
     PipelineConfig,
@@ -602,7 +607,7 @@ class SourceIterationDriver:
                 ) as snapshot_operation,
             ):
                 content = encode_source_snapshot(
-                    self.load_source_with_events(run_id, ctx, active_source=active_source),
+                    capture_source_snapshot_rows(self.load_source_with_events(run_id, ctx, active_source=active_source), ctx),
                     source_name=active_source_name,
                     max_bytes=SOURCE_SNAPSHOT_MAX_BYTES,
                 )
