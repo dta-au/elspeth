@@ -116,16 +116,11 @@ BLOCKED_IP_RANGES = [
 # Unconditionally blocked — no allowlist can bypass these.
 # Cloud metadata endpoints are the #1 SSRF target (IAM credential exfiltration).
 # Broadcast/multicast are never valid HTTP targets.
-#
-# NOTE: ::ffff:0:0/96 (IPv4-mapped IPv6) is intentionally NOT here — it is in
-# BLOCKED_IP_RANGES where it can be bypassed by allowed_ranges. This is correct:
-# in "allow_private" mode, ::ffff:10.x.x.x should be allowed (the operator asked
-# for private access). However, ::ffff:169.254.0.0/112 IS here to unconditionally
-# block the IPv4-mapped form of the metadata endpoint. Without this entry, a broad
-# IPv6 allowed_range covering ::ffff:0:0/96 would bypass the standard blocklist
-# before the IPv4 169.254.0.0/16 check could catch it (IPv6 addresses are checked
-# against IPv6 networks, not IPv4 networks). The IPv4-compatible, NAT64 and 6to4
-# forms of 169.254.0.0/16 are here for the same reason.
+# Recognized IPv4 embeddings are checked against these IPv4 policies before
+# any IPv6 allowlist admission. Explicit private access still permits mapped
+# private addresses. The local-use NAT64 prefix has deployment-specific subnet
+# lengths, so its translated destination cannot be determined from the address
+# alone; the entire prefix is refused even under an explicit allowlist.
 ALWAYS_BLOCKED_RANGES = (
     ipaddress.ip_network("169.254.0.0/16"),  # IPv4 link-local (AWS/Azure/GCP metadata)
     ipaddress.ip_network("::ffff:169.254.0.0/112"),  # IPv4-mapped metadata endpoint
@@ -134,10 +129,16 @@ ALWAYS_BLOCKED_RANGES = (
     ipaddress.ip_network("2002:a9fe::/32"),  # 6to4 metadata endpoint
     ipaddress.ip_network("fd00:ec2::254/128"),  # AWS EC2 IPv6 metadata endpoint
     ipaddress.ip_network("168.63.129.16/32"),  # Azure WireServer / platform endpoint
+    ipaddress.ip_network("64:ff9b:1::/48"),  # Local-use NAT64 translation is deployment-specific
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (same attack surface)
     ipaddress.ip_network("255.255.255.255/32"),  # IPv4 broadcast
     ipaddress.ip_network("224.0.0.0/4"),  # IPv4 multicast
     ipaddress.ip_network("ff00::/8"),  # IPv6 multicast
+)
+
+_LOW32_IPV4_EMBEDDING_PREFIXES = (
+    ipaddress.IPv6Network("::/96"),
+    ipaddress.IPv6Network("64:ff9b::/96"),
 )
 
 # Bounded thread pool for DNS resolution. Caps concurrent getaddrinfo threads
@@ -315,9 +316,19 @@ def _validate_ip_address(
         # "fe80::1%eth0"), block the request rather than allowing it through.
         raise SSRFBlockedError(f"Unparseable IP address: {ip_str!r}: {e}", kind="unparseable_ip") from e
 
-    # 1. Always-blocked — unconditional, no bypass
+    # 1. Always-blocked — unconditional, including the actual IPv4 destination
+    # behind a recognized IPv6 translation or mapping.
+    candidates: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...] = (ip,)
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = ip.ipv4_mapped
+        if embedded is None:
+            embedded = ip.sixtofour
+        if embedded is None and any(ip in prefix for prefix in _LOW32_IPV4_EMBEDDING_PREFIXES):
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        if embedded is not None:
+            candidates = (ip, embedded)
     for never_allow in ALWAYS_BLOCKED_RANGES:
-        if ip in never_allow:
+        if any(candidate in never_allow for candidate in candidates):
             raise SSRFBlockedError(f"Always-blocked IP range: {ip_str} in {never_allow}", kind="always_blocked_range")
 
     # 2. Allowlist — if IP matches an allowed range, skip blocklist

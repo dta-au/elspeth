@@ -477,6 +477,33 @@ class TestAlwaysBlockedRanges:
         with pytest.raises(SSRFBlockedError, match="Always-blocked"):
             _validate_ip_address("169.254.169.254", allowed_ranges=allow_private)
 
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "::ffff:168.63.129.16",
+            "::a83f:8110",
+            "64:ff9b::a83f:8110",
+            "2002:a83f:8110::1",
+            "::ffff:255.255.255.255",
+            "64:ff9b::e000:1",
+            "2002:e000:1::1",
+            "64:ff9b:1:a9fe:a9:fe00::",
+        ],
+    )
+    def test_embedded_unconditional_destinations_refuse_broad_allowlist(self, ip: str) -> None:
+        allowed = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+        with pytest.raises(SSRFBlockedError) as exc_info:
+            _validate_ip_address(ip, allowed_ranges=allowed)
+        assert exc_info.value.kind == "always_blocked_range"
+
+    @pytest.mark.parametrize("ip", ["::ffff:10.1.2.3", "64:ff9b::a01:203", "2002:a01:203::1"])
+    def test_private_embedded_destination_keeps_explicit_allowlist(self, ip: str) -> None:
+        _validate_ip_address(ip, allowed_ranges=(ipaddress.ip_network("::/0"),))
+
+    @pytest.mark.parametrize("ip", ["8.8.8.8", "2606:4700:4700::1111"])
+    def test_public_destination_keeps_default_admission(self, ip: str) -> None:
+        _validate_ip_address(ip)
+
     def test_aws_ipv6_metadata_blocked_even_with_broad_ipv6_allowlist(self) -> None:
         """fd00:ec2::254 blocked even when allowed_ranges covers IPv6."""
         broad_ipv6 = (ipaddress.ip_network("::/0"),)
@@ -593,13 +620,17 @@ class TestSpecialPurposeRanges:
             "240.0.0.1",  # reserved (RFC 1112)
             "::7f00:1",  # IPv4-compatible IPv6 embedding 127.0.0.1 (RFC 4291, deprecated)
             "64:ff9b::7f00:1",  # NAT64 well-known prefix embedding 127.0.0.1 (RFC 6052)
-            "64:ff9b:1::1",  # NAT64 local-use prefix (RFC 8215)
             "2002:7f00:1::1",  # 6to4 embedding 127.0.0.1 (RFC 3056)
         ],
     )
     def test_blocked_by_default(self, ip: str) -> None:
         with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
             _validate_ip_address(ip)
+
+    def test_local_use_nat64_refused_without_translation_configuration(self) -> None:
+        with pytest.raises(SSRFBlockedError) as exc_info:
+            _validate_ip_address("64:ff9b:1::1")
+        assert exc_info.value.kind == "always_blocked_range"
 
     @pytest.mark.parametrize(
         "ip",
