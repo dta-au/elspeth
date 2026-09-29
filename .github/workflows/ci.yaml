@@ -376,6 +376,13 @@ jobs:
     runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:${{ matrix.python-version }}-bookworm
+      # Docker 29 on the self-hosted runners starts containers with a soft
+      # open-file limit of 1024 (measured: `ulimit -Sn` in
+      # python:3.13-bookworm). With 2 workers each xdist process runs ~30k
+      # tests, and on 2026-09-29 worker gw0 hit `OSError: [Errno 24] Too many
+      # open files` at 25%: 108 failed + 1661 errors on that one worker, none
+      # on any other (run 36526535297).
+      options: --ulimit nofile=65536:524288
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
       PYTEST_WORKERS: ${{ matrix.workers }}
@@ -482,13 +489,19 @@ jobs:
           # 12 workers; the 3.13 coverage job was also SIGKILLed at 4 workers.
           # The trusted push 3.13 job also failed with 12 workers, including
           # coverage database errors. Bound concurrency for both event types.
+          #
+          # `-q -rfE`, not `-v`: `-v` printed ~120k lines, and the retrievable
+          # job log stops at ~71k (both lanes of run 36502389326 end at 59%,
+          # 20 minutes before the step failed), so the failure summary was
+          # never readable. The JUnit report is the complete record.
           uv run pytest tests/ \
             --cov=src/elspeth \
             --cov-report=xml \
             --cov-report=term-missing \
             --cov-fail-under=85 \
             -n "$PYTEST_WORKERS" \
-            -v
+            -q -rfE \
+            --junitxml=pytest-junit.xml
 
       - name: Enforce audit-critical coverage floors
         if: matrix.coverage
@@ -518,10 +531,20 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           # No `-m`: same reason as the coverage step above. Use the same
-          # per-lane worker cap as the coverage lane.
+          # per-lane worker cap as the coverage lane, and the same output
+          # flags and JUnit report.
           uv run pytest tests/ \
             -n "$PYTEST_WORKERS" \
-            -v
+            -q -rfE \
+            --junitxml=pytest-junit.xml
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pytest-junit-${{ matrix.python-version }}
+          path: ${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml
+          retention-days: 7
 
       - name: Upload coverage report
         if: matrix.coverage && always()
@@ -539,6 +562,8 @@ jobs:
     runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:3.13-bookworm
+      # Same open-file limit as the Test job (see the note there).
+      options: --ulimit nofile=65536:524288
     needs: [test]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))
     env:

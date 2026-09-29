@@ -102,11 +102,23 @@ jobs:
       push_ghcr: ${{ steps.registries.outputs.push_ghcr }}
       push_acr: ${{ steps.registries.outputs.push_acr }}
 
+    # Check out into a per-run directory, as ci.yaml does. The runners'
+    # default workspace still holds root-owned files left by container jobs
+    # (for example `.agents/skills`, 2026-05-21), which actions/checkout
+    # cannot remove as the runner user; run 35535091770 failed on exactly that
+    # (`EACCES: permission denied, rmdir …/.agents/skills`).
+    env:
+      CI_CHECKOUT_PATH: bp-${{ github.run_id }}-${{ github.run_attempt }}-build-push
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.IMAGE_SHA }}
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Verify required checks for image commit
         env:
@@ -258,7 +270,7 @@ jobs:
         if: steps.registries.outputs.push_ghcr == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
-          context: .
+          context: ${{ env.CI_CHECKOUT_PATH }}
           platforms: ${{ env.PLATFORMS }}
           build-args: INSTALL_EXTRAS=all
           push: true
@@ -305,7 +317,7 @@ jobs:
         if: steps.registries.outputs.push_acr == 'true' && steps.registries.outputs.push_ghcr != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
-          context: .
+          context: ${{ env.CI_CHECKOUT_PATH }}
           platforms: ${{ env.PLATFORMS }}
           build-args: INSTALL_EXTRAS=all
           push: true
@@ -378,11 +390,18 @@ jobs:
     # nothing to test (and the old job would have failed pulling a GHCR image
     # the workflow intentionally did not push).
     if: needs.build-push.outputs.push_ghcr == 'true' || needs.build-push.outputs.push_acr == 'true'
+    # Per-run checkout directory: see the build-push job.
+    env:
+      CI_CHECKOUT_PATH: bp-${{ github.run_id }}-${{ github.run_attempt }}-smoke-test
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code (for example files)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.IMAGE_SHA }}
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       # Bind smoke verification to the immutable action-output digests that the
       # release job will promote. When both registries are enabled the ACR
@@ -625,9 +644,17 @@ jobs:
     permissions:
       contents: write
       packages: write
+    # Per-run checkout directory: see the build-push job.
+    env:
+      CI_CHECKOUT_PATH: bp-${{ github.run_id }}-${{ github.run_attempt }}-release
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c

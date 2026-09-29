@@ -7,6 +7,17 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 - Composer guidance now teaches source-carried field names, typed transform outputs, projected template rows, batch output-mode capabilities, and routed batch or missing-field failures using current runtime rules.
+- **CI's Test job no longer runs out of file descriptors on the self-hosted
+  runners, and build-push can check out there.** Docker 29 starts containers
+  with a soft open-file limit of 1024; one xdist worker exhausted it mid-suite
+  (`OSError: [Errno 24] Too many open files`) and failed every later test it
+  ran. The Test and Integration containers now start with
+  `--ulimit nofile=65536:524288`. The Test job prints `-q -rfE` instead of `-v`,
+  whose ~120k lines pushed the failure summary past the end of the retrievable
+  log, and uploads a JUnit report whatever the outcome. build-push's three jobs
+  check out into per-run directories, as `ci.yaml` already does, because the
+  runners' default workspace holds root-owned files that `actions/checkout`
+  cannot remove.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
 to 71 for durable Composer progress, request lifecycle leases, identity owner
