@@ -7,6 +7,17 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 - Composer guidance now teaches source-carried field names, typed transform outputs, projected template rows, batch output-mode capabilities, and routed batch or missing-field failures using current runtime rules.
+- **CI audits both npm lockfiles, and neither has an open advisory.** The
+  `Dependency and License Audit` job now runs `npm audit --package-lock-only
+  --audit-level=low` on the frontend lockfile (compiled into the release image)
+  and on the root test-tooling lockfile, beside the existing `pip-audit` step;
+  any advisory fails CI. The frontend moves to `dompurify` 3.4.16 and `mermaid`
+  11.17.2 (which adds `fastdom` and `strictdom`), and its `undici` override for
+  `openapi-typescript` moves from 6.28.0 to 6.29.0. The root tooling moves to
+  `azurite` 3.37.0 and overrides `uuid` to `^11.1.1`.
+- **SECURITY.md names a security mailbox.** Reports go to GitHub private
+  vulnerability reporting or to `cloudengineering@dta.gov.au`; the public-issue
+  fallback is removed.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
 to 71 for durable Composer progress, request lifecycle leases, identity owner
