@@ -194,7 +194,7 @@ def _format_validation_error_cause(exc: ValidationError) -> str:
     still report every issue.
     """
     lines: list[str] = []
-    for error in exc.errors():
+    for error in exc.errors(include_input=False):
         loc = tuple(error["loc"])
         location = _format_validation_error_location(loc)
         message = error["msg"]

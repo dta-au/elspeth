@@ -23,6 +23,7 @@ from elspeth.contracts.audit_protocols import CallRecorder
 from elspeth.plugins.infrastructure.clients.http import (
     AuditedHTTPClient,
     HTTPResponseBodyTooLargeError,
+    HTTPResponseEncodingLimitError,
 )
 
 
@@ -39,11 +40,69 @@ def _make_client(*, max_response_body_bytes: int = 10 * 1024 * 1024) -> AuditedH
     )
 
 
+def _stream_encoded(body: bytes, *, encoding: str) -> httpx.Response:
+    return httpx.Response(200, stream=httpx.ByteStream(body), headers={"content-encoding": encoding, "content-type": "text/html"})
+
+
+def _raw_deflate(body: bytes) -> bytes:
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    return compressor.compress(body) + compressor.flush()
+
+
+def test_encoded_byte_cap_and_ratio_are_audited_failures() -> None:
+    decoded = b"x" * 10_000
+    compressed = gzip.compress(decoded)
+    recorder = MagicMock(spec=CallRecorder)
+    recorder.allocate_call_index.return_value = 0
+    for encoded_cap, ratio, expected in (
+        (len(compressed) - 1, 1000, "encoded_body_too_large"),
+        (len(compressed) + 1, 2, "decompression_ratio_exceeded"),
+    ):
+        client = AuditedHTTPClient(
+            execution=recorder,
+            state_id="state-1",
+            run_id="run-1",
+            telemetry_emit=lambda event: None,
+            max_response_body_bytes=20_000,
+            max_encoded_response_bytes=encoded_cap,
+            max_decompression_ratio=ratio,
+        )
+        with (
+            httpx.Client(transport=httpx.MockTransport(lambda request: _stream_encoded(compressed, encoding="gzip"))) as hc,
+            hc.stream("GET", "https://example.test/page") as streaming,
+            pytest.raises(HTTPResponseEncodingLimitError) as exc,
+        ):
+            client._consume_capped_response(streaming, full_url="https://example.test/page")
+        assert exc.value.reason == expected
+        assert exc.value.response_data["body"]["_reason"] == expected
+
+
+def test_unsupported_content_encoding_refuses_before_body_read() -> None:
+    client = _make_client()
+    with (
+        httpx.Client(transport=httpx.MockTransport(lambda request: _stream_encoded(b"anything", encoding="br"))) as hc,
+        hc.stream("GET", "https://example.test/page") as streaming,
+        pytest.raises(HTTPResponseEncodingLimitError) as exc,
+    ):
+        client._consume_capped_response(streaming, full_url="https://example.test/page")
+    assert exc.value.reason == "unsupported_content_encoding"
+
+
+def test_link_header_replay_transport_requires_audit_safe_exact_value() -> None:
+    client = _make_client()
+    request = httpx.Request("GET", "https://example.test/search")
+    safe = httpx.Response(200, content=b"ok", headers={"Link": '</search?page=2>; rel="next"'}, request=request)
+    unsafe = httpx.Response(200, content=b"ok", headers={"Link": '<https://example.test/search?token=SECRET>; rel="next"'}, request=request)
+    assert client._build_replay_transport(safe, logical_url="https://example.test/search") is not None
+    assert client._build_replay_transport(unsafe, logical_url="https://example.test/search") is None
+
+
 @pytest.mark.parametrize(
     ("encoding", "compress"),
     [
         ("gzip", gzip.compress),
         ("deflate", zlib.compress),
+        ("deflate", _raw_deflate),
     ],
 )
 def test_capped_response_decodes_once_not_double(encoding: str, compress) -> None:
@@ -69,12 +128,44 @@ def test_capped_response_decodes_once_not_double(encoding: str, compress) -> Non
     # Content-Encoding must be stripped so .text/.content do not re-decode the
     # already-decoded body.
     assert "content-encoding" not in result.headers
-    # The stale *compressed* content-length is dropped; httpx recomputes it from
-    # the reconstructed (decoded) content, so it now equals the decoded length
-    # rather than the smaller compressed wire size.
+    # The stale compressed length is replaced with the decoded length.
     assert result.headers["content-length"] == str(len(body))
-    assert len(encoded) < len(body)  # confirms the recomputed length is decoded, not wire
+    assert len(encoded) < len(body)
     assert result.text == body.decode()
+    assert result.content == body
+
+
+def test_raw_deflate_still_obeys_decoded_cap() -> None:
+    encoded = _raw_deflate(b"A" * (256 * 1024))
+    client = _make_client(max_response_body_bytes=4096)
+    with (
+        httpx.Client(transport=httpx.MockTransport(lambda request: _stream_encoded(encoded, encoding="deflate"))) as hc,
+        hc.stream("GET", "https://example.test/page") as streaming,
+        pytest.raises(HTTPResponseBodyTooLargeError) as exc,
+    ):
+        client._consume_capped_response(streaming, full_url="https://example.test/page")
+    assert exc.value.body_size > 4096
+
+
+def test_raw_deflate_stream_succeeds_with_encoded_and_decoded_limits() -> None:
+    body = b"<html><body>raw deflate works</body></html>" * 20
+    encoded = _raw_deflate(body)
+    recorder = MagicMock(spec=CallRecorder)
+    recorder.allocate_call_index.return_value = 0
+    client = AuditedHTTPClient(
+        execution=recorder,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=lambda event: None,
+        max_response_body_bytes=len(body),
+        max_encoded_response_bytes=len(encoded),
+        max_decompression_ratio=200,
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(lambda request: _stream_encoded(encoded, encoding="deflate"))) as hc,
+        hc.stream("GET", "https://example.test/page") as streaming,
+    ):
+        result = client._consume_capped_response(streaming, full_url="https://example.test/page")
     assert result.content == body
 
 

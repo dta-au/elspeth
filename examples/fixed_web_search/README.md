@@ -28,6 +28,13 @@ page response, bounded `candidates` list, and audit refs are retained. The
 pipeline does not claim that any match validates an entity. The runner refuses
 to overwrite earlier output or audit files.
 
+Run `./examples/fixed_web_search/run_fixture.sh pagination` for a two-page
+search fixture. It follows one CSS next link per page on the configured origin,
+combines bounded content and records into one output row per company, and
+records each page's request/response refs and selected next URL in audit
+metadata. The runner checks six live calls, six network-free replay calls, six
+verified calls, and the exact company/page pairs seen by the server.
+
 Run a 10,000-row hermetic batch with
 `./.venv/bin/python examples/fixed_web_search/run_batch.py --count 10000`.
 The runner writes to a fresh temporary directory, sets a high rate limit only

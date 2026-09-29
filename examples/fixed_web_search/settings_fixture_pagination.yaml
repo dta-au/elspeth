@@ -1,0 +1,71 @@
+sources:
+  primary:
+    plugin: csv
+    on_success: searches
+    options:
+      path: examples/fixed_web_search/input.csv
+      schema:
+        mode: fixed
+        fields:
+          - 'id: int'
+          - 'search_text: str'
+      on_validation_failure: discard
+transforms:
+  - name: search_pages
+    plugin: web_scrape
+    input: searches
+    on_success: results
+    on_error: search_failures
+    options:
+      url: http://127.0.0.1:8213/paginated-directory
+      query_fields: {q: search_text}
+      content_field: result_html
+      fingerprint_field: result_fingerprint
+      format: raw
+      headers: {Accept: text/html}
+      header_fields: {X-Requested-With: search_text}
+      records:
+        field: candidates
+        selector: main li
+        max_records: 10
+        columns:
+          - field: name
+            required: true
+      pagination:
+        mode: next_link_css
+        next_link_selector: a.next
+        max_pages: 2
+        max_total_body_bytes: 8192
+        max_total_content_chars: 8192
+        max_total_records: 10
+        max_elapsed_seconds: 30
+      http:
+        abuse_contact: examples@example.com
+        scraping_reason: Local paginated public search fixture
+        timeout: 5
+        allowed_hosts:
+          - 127.0.0.0/8
+        allowed_origins:
+          - http://127.0.0.1:8213
+      schema: {mode: observed}
+sinks:
+  results:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_pagination/results.jsonl
+      schema: {mode: observed}
+      format: jsonl
+  search_failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_pagination/failures.jsonl
+      schema: {mode: observed}
+      format: jsonl
+landscape:
+  url: sqlite:///examples/fixed_web_search/runs_pagination/audit.db
+payload_store:
+  base_path: examples/fixed_web_search/runs_pagination/payloads
+concurrency:
+  max_workers: 1

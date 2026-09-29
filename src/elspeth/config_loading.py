@@ -5,6 +5,7 @@ those with plugin declarations before any environment expansion can turn
 operator placeholders into output data.
 """
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, get_args, get_origin
@@ -26,6 +27,39 @@ from elspeth.core.config import (
     _reject_file_backed_template_options_for_in_memory_loader,
     load_bounded_pipeline_yaml,
 )
+
+_EXACT_ENV_SECRET = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
+
+
+@trust_boundary(
+    tier=3,
+    source="raw operator YAML or in-memory plugin options before environment expansion",
+    source_param="raw_config",
+    suppresses=("R5",),
+    invariant=(
+        "rejects a web_scrape auth.credential unless it is one exact environment secret reference; "
+        "unrecognized container shapes are left for settings validation"
+    ),
+    test_ref="tests/unit/core/test_config.py::test_web_scrape_auth_requires_exact_env_reference_for_file_settings",
+    test_fingerprint="d0f87cf48029d688444c32adda8315a742df4df4939cead1d6c6596756f8cfb1",
+)
+def _reject_web_scrape_auth_literal(raw_config: Mapping[str, object]) -> None:
+    """CLI credentials must come from named environment secrets, never YAML text."""
+    transforms = raw_config["transforms"] if "transforms" in raw_config else None
+    if not isinstance(transforms, list):
+        return
+    for transform in transforms:
+        if not isinstance(transform, Mapping) or "plugin" not in transform or transform["plugin"] != "web_scrape":
+            continue
+        options = transform["options"] if "options" in transform else None
+        if not isinstance(options, Mapping):
+            continue
+        auth = options["auth"] if "auth" in options else None
+        if not isinstance(auth, Mapping):
+            continue
+        credential = auth["credential"] if "credential" in auth else None
+        if not isinstance(credential, str) or _EXACT_ENV_SECRET.fullmatch(credential) is None:
+            raise ValueError("web_scrape auth.credential must be an exact environment secret reference")
 
 
 def _plugin_bearing_sections() -> dict[str, str]:
@@ -293,6 +327,7 @@ def load_settings(
     # Filter Dynaconf internals (now safe — all non-known keys are Dynaconf's)
     raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
     _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+    _reject_web_scrape_auth_literal(raw_config)
 
     # Lower `llm` transform nodes that select an operator profile alias into
     # their private executable provider config, mirroring the web
@@ -352,6 +387,8 @@ def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_
     raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
     _reject_file_backed_template_options_for_in_memory_loader(raw_config)
     _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
+    if expand_env_vars:
+        _reject_web_scrape_auth_literal(raw_config)
     # Structural profile-selector checks (unknown alias, ambiguous
     # profile+provider) always run; the credential-materializing rewrite only
     # runs when the caller opted into host environment expansion (see
