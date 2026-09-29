@@ -93,6 +93,7 @@ _DEFAULT_PLUGIN_POLICY_SUGGESTION = "Choose an available plugin or repair the re
 
 _WEB_HTTP_FETCH_MAX_TIMEOUT_SECONDS = 30
 _WEB_HTTP_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
+_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 _WEB_HTTP_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
 
 
@@ -608,6 +609,35 @@ def validate_web_resource_policy(
                                 f"{_WEB_HTTP_FETCH_MAX_BODY_BYTES} bytes."
                             ),
                             suggestion=f"Set {node.plugin}.http.max_body_bytes to {_WEB_HTTP_FETCH_MAX_BODY_BYTES} or less.",
+                            error_code="web_fetch_resource_limit_exceeded",
+                        )
+                    )
+            if "max_request_body_bytes" in http_options:
+                raw_max_request_body_bytes = http_options["max_request_body_bytes"]
+                parsed_max_request_body_bytes = _parse_resource_limit(
+                    raw_max_request_body_bytes,
+                    component_id=node.id,
+                    plugin_name=node.plugin,
+                    option_name="max_request_body_bytes",
+                    maximum=_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES,
+                )
+                if parsed_max_request_body_bytes.error is not None:
+                    errors.append(parsed_max_request_body_bytes.error)
+                elif (
+                    parsed_max_request_body_bytes.value is not None
+                    and parsed_max_request_body_bytes.value > _WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES
+                ):
+                    errors.append(
+                        ValidationError(
+                            component_id=node.id,
+                            component_type="transform",
+                            message=(
+                                f"{node.plugin}.http.max_request_body_bytes={parsed_max_request_body_bytes.value} "
+                                f"exceeds the web execution limit of {_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES} bytes."
+                            ),
+                            suggestion=(
+                                f"Set {node.plugin}.http.max_request_body_bytes to {_WEB_HTTP_FETCH_MAX_REQUEST_BODY_BYTES} or less."
+                            ),
                             error_code="web_fetch_resource_limit_exceeded",
                         )
                     )

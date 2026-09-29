@@ -460,6 +460,34 @@ def test_web_resource_phase_caps_web_scrape() -> None:
     assert all("web_scrape.http" in error.message for error in result.errors)
 
 
+@pytest.mark.parametrize(
+    ("raw_limit", "error_code"),
+    [
+        (10 * 1024 * 1024 + 1, "web_fetch_resource_limit_exceeded"),
+        ("not-an-int", "web_fetch_resource_config_invalid"),
+    ],
+)
+def test_web_resource_phase_caps_post_request_bytes_before_materialization(raw_limit: object, error_code: str) -> None:
+    state = _state(nodes=(_node(plugin="web_scrape", options={"http": {"max_request_body_bytes": raw_limit}}),))
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "web_fetch_resource_policy"
+    assert result.failed_check.affected_nodes == ("node",)
+    assert result.errors[0].error_code == error_code
+    assert "web_scrape.http.max_request_body_bytes" in result.errors[0].message
+
+
+def test_web_resource_phase_accepts_post_request_limit_at_cap() -> None:
+    state = _state(nodes=(_node(plugin="web_scrape", options={"http": {"max_request_body_bytes": 10 * 1024 * 1024}}),))
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseReport)
+    assert result.checks[0].passed is True
+
+
 def test_resource_limit_outcome_rejects_ambiguous_state() -> None:
     error = ValidationError(
         component_id="node",
