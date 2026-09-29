@@ -102,7 +102,7 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a36acc831f84db24"
+    source_file_hash: str | None = "sha256:500cf78b62c27090"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "
@@ -145,6 +145,7 @@ class ReportAssemble(BaseTransform):
                 issue_code=None,
                 summary="Assembles a flushed batch of text rows into one paginated report row.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use report_assemble under aggregations with a trigger; it requires aggregation_batch context.",
                     "text_field must be a string field present on every input row.",
                     "Choose format as plain_text, markdown, or html_fragment; html_fragment escapes text before wrapping paragraphs.",

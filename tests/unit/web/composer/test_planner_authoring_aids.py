@@ -1293,6 +1293,7 @@ class TestDiscoveryDigest:
                     # reads as a narrower rule than the one declared.
                     assert entry["not_for"] == plugin.usage_when_not_to_use
                 assert entry.get("capability_tags", []) == list(plugin.capability_tags)
+                assert entry.get("aggregation_output_modes", []) == list(plugin.aggregation_output_modes)
 
     def test_digest_fits_the_canonical_utf8_selection_budget(self) -> None:
         from elspeth.core.canonical import canonical_json

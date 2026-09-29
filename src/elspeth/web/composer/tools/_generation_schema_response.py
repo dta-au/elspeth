@@ -9,7 +9,7 @@ from pydantic import JsonValue
 
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability, WebConfigAuthority
-from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSecretRequirement
+from elspeth.web.catalog.schemas import AggregationOutputMode, PluginKind, PluginSchemaInfo, PluginSecretRequirement
 from elspeth.web.composer._schema_response_grammar import (
     JSONSchemaSnapshot,
     KnobSchemaSnapshot,
@@ -38,6 +38,7 @@ class PluginSchemaSnapshot:
     secret_requirements: tuple[SchemaSecretRequirement, ...]
     web_config_authority: WebConfigAuthority
     policy_capabilities: tuple[CapabilityDeclaration, ...]
+    aggregation_output_modes: tuple[AggregationOutputMode, ...] = ()
 
 
 def _bad() -> FrameworkBugError:
@@ -103,6 +104,9 @@ def _snapshot(value: object) -> PluginSchemaSnapshot:
     plugin_type = _text(value.plugin_type)
     if plugin_type not in ("source", "transform", "sink") or type(value.web_config_authority) is not WebConfigAuthority:
         raise _bad()
+    modes = _texts(value.aggregation_output_modes)
+    if modes not in ((), ("transform",), ("transform", "passthrough")) or (plugin_type != "transform" and modes):
+        raise _bad()
     return PluginSchemaSnapshot(
         _text(value.name),
         cast(PluginKind, plugin_type),
@@ -113,6 +117,7 @@ def _snapshot(value: object) -> PluginSchemaSnapshot:
         tuple(_secret(item, owned=type(value) is PluginSchemaSnapshot) for item in _tuple(value.secret_requirements)),
         value.web_config_authority,
         tuple(_capability(item) for item in _tuple(value.policy_capabilities)),
+        cast(tuple[AggregationOutputMode, ...], modes),
     )
 
 
@@ -124,6 +129,7 @@ def _encode(value: PluginSchemaSnapshot) -> dict[str, JsonValue]:
         "json_schema": value.json_schema.to_wire(),
         "knob_schema": value.knob_schema.to_wire(),
         "composer_hints": list(value.composer_hints),
+        "aggregation_output_modes": list(value.aggregation_output_modes),
         "secret_requirements": [{"field": item.field, "candidates": list(item.candidates)} for item in value.secret_requirements],
         "web_config_authority": value.web_config_authority.value,
         "policy_capabilities": [

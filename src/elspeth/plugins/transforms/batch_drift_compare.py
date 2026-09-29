@@ -150,7 +150,7 @@ class BatchDriftCompare(BaseTransform):
     name = "batch_drift_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ce057494803187e8"
+    source_file_hash: str | None = "sha256:187be834da2fa281"
     config_model = BatchDriftCompareConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -190,6 +190,7 @@ class BatchDriftCompare(BaseTransform):
                 issue_code=None,
                 summary="Compares baseline and current cohort distributions across a batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_drift_compare under aggregations with a trigger; it compares distributions after a batch flush.",
                     "cohort_field and value_field must differ; baseline_cohort defaults to the first-seen cohort.",
                     "Set value_type=numeric for mean and KS-style distance, or categorical for category shifts and total variation.",

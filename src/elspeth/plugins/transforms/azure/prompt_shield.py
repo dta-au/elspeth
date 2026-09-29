@@ -115,7 +115,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
     )
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:84f7dd1379fd9f43"
+    source_file_hash: str | None = "sha256:c49c3e68304b81b6"
     config_model = AzurePromptShieldConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "prompt-shield", "security")
@@ -151,6 +151,7 @@ class AzurePromptShield(BaseAzureSafetyTransform):
                     "Choose analysis_type deliberately: both requests two analyses and may incur both analysis costs, but sends one audited HTTP call.",
                     "Use user_prompt for direct user text; use document for retrieved context or untrusted documents.",
                     "Set fields to the string fields to inspect, or 'all' only when every string field should be scanned.",
+                    "A field-scoped shield proves coverage only for declared model inputs; required_input_fields omitted or [] is unprovable unless a dominating all-fields shield scans every field.",
                     "Detected attacks return errors; route on_error to quarantine or security review.",
                     "Malformed Azure responses fail closed instead of passing suspicious content through.",
                 ),

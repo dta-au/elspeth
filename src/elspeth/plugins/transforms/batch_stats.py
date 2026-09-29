@@ -127,7 +127,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:22cdfd69d10e19f5"
+    source_file_hash: str | None = "sha256:dc51745b4f352155"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -168,6 +168,7 @@ class BatchStats(BaseTransform):
                 issue_code=None,
                 summary="Aggregates a numeric field into count, sum, and optional mean rows.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_stats under aggregations with a trigger; it is not a per-row transform.",
                     "value_field must contain numeric int or float values; missing and non-finite values are skipped and reported.",
                     "Output is derived summary row(s) and does not preserve original row fields.",

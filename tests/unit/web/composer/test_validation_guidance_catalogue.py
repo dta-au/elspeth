@@ -16,6 +16,13 @@ from elspeth.web.plugin_policy.models import PluginUnavailableReason
 from tests.unit.web.composer.test_tools import _empty_state, _mock_catalog, execute_tool
 
 
+def test_runtime_union_collision_reason_has_guidance_without_build_code() -> None:
+    assert generation.explain_validation_code("union_field_collision") is None
+    result = execute_tool("explain_validation_error", {"error_text": "union_field_collision"}, _empty_state(), _mock_catalog())
+    assert result.success
+    assert "Composer cannot author" in result.data["suggested_fix"]
+
+
 def _historical_fixture():
     return json.loads(Path(__file__).with_name("validation_guidance_legacy_patterns.json").read_text())
 
@@ -292,7 +299,8 @@ def test_the_shared_batch_placement_code_teaches_every_arm_that_emits_it() -> No
 
     assert "node_type='transform'" in explanation
     assert "report_assemble" in explanation and "collector" in explanation
-    assert "batch_replicate" in explanation and "output_mode: transform" in explanation
+    assert "batch_replicate" in explanation and "one row per buffered row" in explanation
+    assert "output_mode: 'transform'" in fix
     assert "leaves the scope without a closer" in fix
     assert "downstream of the collector" in fix
     # The collector arm's own message gives the same remedy, never "make the collector an aggregation".

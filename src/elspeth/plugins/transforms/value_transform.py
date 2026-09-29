@@ -363,7 +363,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fa5e67e927f88255"
+    source_file_hash: str | None = "sha256:60e856c2e2543429"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -696,11 +696,11 @@ class ValueTransform(BaseTransform):
                     "NOT achievable here: regex (pattern extraction, splitting), title-casing, and method-call syntax "
                     "(row['x'].lower() is rejected; use lower(row['x'])). Only len, abs, lower, upper, strip, casefold "
                     "are callable. Route text rewriting beyond case folding through an llm transform.",
-                    "A value_transform node's schema: block declares what ARRIVES at the node, and a target it types is "
-                    "pinned to that type on output: a row whose computed value is another type goes to on_error. To change a "
-                    "declared field's type, declare it 'any' there.",
+                    "Declare arriving types for consumed fields and output types for new targets. A provably incompatible authored target is refused at build; a value-dependent mismatch routes to on_error.",
+                    "Treat any as its own type at typed consumers and union branches, never as a wildcard.",
                     "A target the schema does not type uses the expression's provable output type over declared inputs; "
                     "an unknown expression stays 'any'. Add a declaration or type_coerce before a typed consumer when needed.",
+                    "When reading or overwriting an existing field, use its carried name (normally normalized header or source mapping target), not another spelling. A genuinely new target may use any valid new name.",
                     "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
                     "error-route the row. Conditional row filtering is a gate node, not this transform.",
                     "A result may be nested (row['meta'], or a list, tuple or dict literal); its field is typed 'any'. A set "

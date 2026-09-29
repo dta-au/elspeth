@@ -526,11 +526,12 @@ Use `inspect_source` for existing blobs before declaring fixed fields. Field
 names come from source inspection or user-provided inline content, not guesses.
 
 Do not turn persona prose such as "approval status indicator" into a column name
-like `approval_status`. If the source is bound, inspect the source and use the
-literal observed header such as `approved`; if no source facts are available,
+like `approval_status`. If the source is bound, inspect its raw headers and
+declare the name rows carry (header `Approved` becomes `approved` unless a
+mapping renames it); if no source facts are available,
 ask a narrow column-identification question instead of fabricating a field.
 
-Declarations name a field as rows carry it. Every source normalizes its
+Declarations name a field as rows carry it. Headered sources normalize raw
 headers to lowercase identifiers (spaces and punctuation become `_`, a leading
 digit gains a `_` prefix, a Python keyword gains a `_` suffix), and
 `inspect_source`'s `observed_headers` are the RAW headers: header `Approved`
@@ -538,7 +539,7 @@ is declared `approved`, `First Name` is `first_name`, `Price USD` is
 `price_usd`. A source `field_mapping` renames after normalizing: under
 `field_mapping: {name: b}` header `Name` is declared `b`, and `Name`, `NAME`
 and the mapping key `name` are all refused as spellings of `b`. A headerless
-CSV source (`columns`, or `has_header: false`) renames each column as written:
+CSV source (`columns`, or `has_header: false`) carries each column as written:
 under `columns: [Name]` and `field_mapping: {Name: b}` declare `b`, not `Name`. A
 transform that renames a field carries its header with it: behind a rename of
 `name` to `c`, declare `c`, not `Name` or `name`. This holds for every DECLARATION on a transform, aggregation or
@@ -998,6 +999,11 @@ without the recommended control. Do not substitute content moderation for
 prompt-injection protection unless live assistance proves the selected control
 provides the required capability.
 
+A field-scoped prompt-injection control proves coverage from a model node's
+declared `required_input_fields` and each query's `input_fields`. With an omitted
+declaration or `[]`, coverage is unprovable unless a dominating control scans
+`fields: all`.
+
 ### Output data minimization
 
 When the user wants derived results rather than raw intermediate content, the
@@ -1251,6 +1257,7 @@ These are common one-shot mappings:
 | `declared_input_type_mismatch_against_source_schema` | A transform or output declares an input field with a concrete non-str type (e.g. `id: int`) while the field flows unchanged from an observed CSV source — it arrives as `str` and every row fails that consumer's input validation. Inspection's `inferred_types` are LEXICAL observations; they do not change what arrives. Declare the field's type in the SOURCE schema (e.g. `schema.mode='flexible'` with `schema.fields` including `id: int` — the source coerces at ingestion), or insert a `type_coerce` upstream converting the field, or declare the field as `str` on the consumer if string values are acceptable. Never declare the intended post-conversion type on the consuming node's own `schema:` block — it declares what ARRIVES. |
 | `field_name_header_spelling` | A declaration on the named consumer spells a field by its source HEADER (`Name`) instead of the normalized name rows carry (`name`). Rewrite each name in `missing_fields` to the name the message says to declare on that consumer (its normalized form, the source `field_mapping` target that renames it, or the name an upstream rename gave it) (`patch_node_options` / `patch_output_options`) — schema fields, `required_input_fields`, column-naming options, custom output-header keys. For a created name the normalized form overwrites the arriving field; for a new field pick a name no arriving field normalizes to. Do not insert a renaming node to restore the header spelling. |
 | `field_name_lookup_unreachable` | A template reads a declared field by a spelling other than its name (`row['Score_Text']` under `required_input_fields: [score_text]`), and no row reaching the node carries that spelling as the field's source header: on every path the field comes from a headerless source, a source `field_mapping` or rename target, a node that creates it, or a statistics-style aggregation or collector (each records the field under its own name only), or a transform renames the field that header names away. Rewrite the lookup to the declared name the message gives (`row['score_text']` / `row.score_text`) with `patch_node_options`; do not add a node to recreate the header spelling. |
+| `union_field_collision` (runtime reason) | A union merge received two values for the same field and the externally configured collision policy failed that merge group. Inspect the contributing branches and their field names in the run diagnostics; give branch results distinct names or change the external runtime policy outside Composer. Composer cannot author that policy. |
 | Joined or enriched field disagrees with a consumer's required type | Consult the producer's `get_plugin_schema` and `get_plugin_assistance` to establish actual output types. Preserve supplied reference data. Keep the consumer's contract aligned with those types when that meets the request; otherwise discover and configure an explicit conversion before the consumer. A type declaration alone is not proof of conversion. Any format change must be permitted by the user's data requirements. |
 | Producer guarantees are empty and producer is source | Patch source schema using inspected fields. |
 | Consumer requires a generated or inspected source field but source guarantees are empty | Declare that known field through the selected source's schema-defined contract mechanism, then retry; do not ask the user to confirm a field you authored or inspected. |

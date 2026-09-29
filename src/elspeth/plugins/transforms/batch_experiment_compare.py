@@ -138,7 +138,7 @@ class BatchExperimentCompare(BaseTransform):
     name = "batch_experiment_compare"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:626294f25b250e5d"
+    source_file_hash: str | None = "sha256:8e0f4b88f764ee55"
     config_model = BatchExperimentCompareConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -175,6 +175,7 @@ class BatchExperimentCompare(BaseTransform):
                 issue_code=None,
                 summary="Compares treatment or prompt variants by mean score over an aggregation batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_experiment_compare under aggregations with a trigger; it emits one row per non-baseline variant.",
                     "variant_field and score_field must differ; baseline_variant defaults to the first-seen variant.",
                     "score_field must be numeric; rows with missing or non-finite scores are counted in the comparison metadata, "

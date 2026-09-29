@@ -231,7 +231,7 @@ Operators:
 
 Literals:
   Strings, numbers, and the constants True, False, None
-  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — for membership tests
+  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — sets only for in-place membership tests
 
 Built-in functions (only these are allowed):
   len()       Length of a sequence or string
@@ -243,7 +243,10 @@ Built-in functions (only these are allowed):
 
 Case folding is function-call form only — row['x'].lower() is rejected.
 Type coercion functions (int, str, float, bool) are NOT available.
-Types are guaranteed by the source schema — no coercion is needed in expressions.
+Types come from upstream declarations (source, conversions, and authored outputs); expressions never coerce.
+A stored value_transform result cannot be a set: use a list. Its target type is
+derived when the expression is provable over declared inputs; otherwise it is any.
+Nested subscript results may be any.
 
 Examples:
   row['confidence'] >= 0.85
@@ -916,16 +919,15 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"coalesce_schema_mode_mixed|mixed observed/explicit schemas",
         "A union coalesce has both observed and explicit branch schemas. Runtime cannot safely merge those modes because an "
         "observed branch may omit fields promised by an explicit branch.",
-        "Keep the intended union row shape and make the branch schemas homogeneous: give every branch an explicit schema with "
-        "compatible fields, or set every branch schema to observed.",
+        "Keep the intended union row shape and make branch schemas homogeneous. Declare compatible fields on every branch's last node (mode: flexible). All-observed does not resolve an independent shared-field type conflict.",
     ),
     (
         r"coalesce_union_type_incompatible|[Ii]ncompatible types for field",
         "A union coalesce merges its branches into one row, so a field carried by more than one branch must have the same "
         "type on each; here two branches carry the same field with different types. 'any' is a distinct type, NOT a "
         "wildcard: 'any' against 'int' conflicts. A branch can also carry a field it never declared: a transform "
-        "contributes its own output fields to a branch's schema — a value_transform writing a target adds it as 'any' "
-        "when undeclared, and a field_mapper adds a target as 'any' only when neither the target nor, for a rename, the "
+        "contributes its own output fields to a branch's schema — a value_transform target uses its authored type or the type its expression proves over declared inputs, and 'any' only when unresolved. "
+        "A field_mapper adds a target as 'any' only when neither the target nor, for a rename, the "
         "renamed source is declared (a rename inherits the source's type when the source is declared). So the named field "
         "may appear in neither branch's authored schema. The rejection's 'coalesce_union_type' facts name the conflict, "
         "when present: 'field' is the shared field name; 'branch_a' and 'branch_b' are the two branch names as declared "
@@ -936,10 +938,10 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "fork_to entry, or, for an aggregation with no on_success, its own node id; if that producer is a gate (it has no "
         "schema), repeat from its input. That producer's schema, never the coalesce's branches, is where type_a/type_b "
         "come from; when that schema is observed, the type is still fixed before any row: the one the producer stamps on "
-        "a value it computes ('any' when undeclared) or, for a field it passes through or renames, the declaration it "
+        "a value it computes (derived from declared inputs where provable, otherwise 'any') or, for a field it passes through or renames, the declaration it "
         "carries from upstream (often the source's) — the rejection message names each declaring node. Declare the "
         "merged type on EVERY branch's producer (mode: flexible); the declaration wins over the type a transform would "
-        "otherwise contribute, including the 'any' a value_transform or field_mapper stamps on a value it computes. "
+        "otherwise contribute. Authored types must admit actual results; a provably incompatible value_transform target is refused at build, and residual value-dependent mismatches route at runtime. "
         "Three producers need another move: a type_coerce conversion's type is its 'to', so retype 'to'; a "
         "value_transform that rewrites a field arriving with another type reads that declaration as its input "
         "contract too, so write the result under a new name instead; for a field_mapper rename you may instead declare "
@@ -1067,7 +1069,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"plugin_options_invalid",
         "One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement — read it before hypothesising a cause.",
-        "Apply exactly what 'detail' names (it usually includes a ready repair, e.g. a patch_node_options call). Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) for the exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps, all equally likely: an llm node must declare options.required_input_fields matching its prompt_template's row.* references (or [] to opt out); schema options use {mode: observed} to infer types or explicit fields with mode fixed/flexible; the llm 'profile' must be one of the enum aliases from get_plugin_schema.",
+        "Apply exactly what 'detail' names (it usually includes a ready repair, e.g. a patch_node_options call). Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) for exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps: an llm node must declare the row fields its template reads; [] is for intentional whole-row or computed-key reads and a field-scoped shield cannot credit it. Observed source schemas report lexical types; created fields use output declarations or derived types. Declarations use carried field names; template filters and tests must exist; the llm profile must be one of the enum aliases from get_plugin_schema.",
     ),
     (
         r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
@@ -1237,20 +1239,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"aggregation_output_mode_invalid",
         "An aggregation's output_mode is not one of the allowed values.",
-        "Set output_mode to 'passthrough' or 'transform' (or omit it for the default).",
+        "Set output_mode to 'transform' (the default). Use 'passthrough' only for a batch plugin whose catalogue aggregation_output_modes includes it, meaning one flushed row per buffered row.",
     ),
     (
         r"batch_transform_misplaced",
         "A batch-aware plugin sits in a node kind it cannot run in. Three placements carry this code: a batch-only "
         "plugin as node_type='transform' (it processes a whole batch, never one row); a plugin that reads the "
         "aggregation flush window (report_assemble) as a collector, whose end-of-group flush has no window; and "
-        "batch_replicate as an aggregation without output_mode: transform.",
+        "a batch plugin under passthrough whose flush does not emit one row per buffered row (such as batch_stats, batch_replicate, or an annotator that skips rows).",
         "Read the message to see which placement was refused. A transform: re-emit the node with "
         "node_type='aggregation' and a trigger (e.g. trigger={'count': N}), or pick a row-level transform plugin. "
         "A collector: keep the collector, close the scope with a batch-aware plugin that reads no flush window "
         "(list_transforms, then get_plugin_schema), and if the refused plugin is still wanted, run it as an aggregation "
         "downstream of the collector. Turning the collector itself into an aggregation leaves the scope without a "
-        "closer. batch_replicate: set output_mode: 'transform'.",
+        "closer. For a non-1:1 batch plugin use output_mode: 'transform' (the default), or choose a plugin whose catalogue aggregation_output_modes includes passthrough.",
     ),
     (
         r"batch_required_fields_invalid",
@@ -1308,7 +1310,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "holding exactly its input_fields variables plus 'source_row', so an unbound reference raises 'Undefined variable' "
         "at runtime and that query fails for every row.",
         "Bind each missing name in that query's input_fields (template variable → row column), rename the reference to a "
-        "variable the query already binds, or use '{{ row.source_row.<column> }}' for direct access to the source row.",
+        "variable the query already binds, or use '{{ row.source_row.<column> }}' for a source column also declared in the node's required_input_fields.",
     ),
     # Ordered AFTER the two unbound-name entries deliberately: this code's
     # headline is "reads ... under 'row'", which neither of their patterns
@@ -1529,6 +1531,11 @@ def _direct_plugin_policy_guidance() -> tuple[DirectValidationGuidance, ...]:
 
 _DIRECT_VALIDATION_GUIDANCE: Final = (
     DirectValidationGuidance(
+        "edge_field_type_incompatible",
+        "A consumer's required or optional field type cannot be satisfied by the producer's declared type. An int satisfies float, and an LLM number binds float; other types do not widen automatically.",
+        "Match the actual producer type or convert upstream on a field every arriving row carries. A type_coerce input declares the old arriving type; its conversion determines the output type consumed downstream. A declaration alone does not convert a value.",
+    ),
+    DirectValidationGuidance(
         "quarantine_unknown_output",
         "The source on_validation_failure names an output that is not declared.",
         "Declare the intended quarantine output and reference its name in on_validation_failure, "
@@ -1606,11 +1613,11 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "such as a value_transform target — is compared as written, so the header spelling never meets the field. The "
         "rejection's 'contract' facts, when present, name the upstream node ('producer') and the rejected node "
         "('consumer') and list the header-spelled names in 'missing_fields'.",
-        "Rewrite each name in 'missing_fields' as its normalized form on the rejected consumer (patch_node_options for a "
+        "Rewrite each name in 'missing_fields' as the carried name the refusal gives: the normalized header, the source field_mapping target ({name: b} means declare b), or the headerless column as written. Patch the rejected consumer (patch_node_options for a "
         "transform, aggregation or collector; patch_output_options for 'output:<sink name>'). For a created target, the "
-        "normalized name OVERWRITES the arriving field; if you meant a new field, choose a name that does not normalize "
+        "carried name OVERWRITES the arriving field; if you meant a new field, choose a name that does not normalize "
         "to an arriving field. Never add a field_mapper to restore the header spelling to satisfy this — declare the "
-        "normalized name instead.",
+        "carried name instead.",
     ),
     DirectValidationGuidance(
         "field_name_lookup_unreachable",
@@ -1860,6 +1867,20 @@ def _execute_explain_validation_error(
     """Explain a validation error with human-readable diagnosis and fix."""
     validation = context.catalog.validate_composition_state(state).validation
     error_text = validated.error_text
+    # Runtime merge reasons are not validation error codes. Keep this exact
+    # reason separate from the closed build-time code registry.
+    if error_text == "union_field_collision":
+        return ToolResult(
+            success=True,
+            updated_state=state,
+            validation=validation,
+            affected_nodes=(),
+            data={
+                "error_text": error_text,
+                "explanation": "A union merge encountered more than one value for the same field and its runtime collision policy failed that merge group.",
+                "suggested_fix": "Inspect the contributing branches in run diagnostics and give independent results distinct field names. The collision policy is external runtime configuration; Composer cannot author it.",
+            },
+        )
     exact = explain_validation_code(error_text)
     if exact is not None:
         explanation, fix = exact
@@ -3082,11 +3103,11 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
                 suggested_repair=(
                     "Patch the source schema to declare the batched field with an explicit numeric type "
                     f"(for example {value_field}: float), or insert a type_coerce node upstream of the {node_kind} "
-                    f"with a conversions entry targeting the numeric type.{scope_clause} A type_coerce (or "
-                    f"value_transform) node's own schema: block declares what ARRIVES at the node — here {value_field} "
-                    "arrives as str — never the transformed result; the coerced type belongs to the node's output "
-                    "contract and is derived automatically from its conversions. Declaring the post-coercion type on "
-                    "the node's own schema is an unsatisfiable input contract and is rejected at the edge. If the "
+                    f"with a conversions entry targeting the numeric type.{scope_clause} At that type_coerce node, "
+                    f"a schema declaration for the consumed field {value_field} must match its arriving str value; "
+                    "the conversions entry determines the output type. A value_transform may declare the output "
+                    "type of a created target, or derive it from a provable expression. Declaring the post-coercion "
+                    "type for the consumed field as its arriving type is rejected at the edge. If the "
                     "field is categorical and you want counts/frequencies, use batch_top_k instead of a numeric "
                     "batch plugin."
                 ),
@@ -3214,8 +3235,9 @@ def _declared_input_type_diagnostics_for_observed_csv(
                 "ingestion), or insert a type_coerce node upstream with a conversions "
                 f"entry converting {field_def.name} to {field_def.field_type}, or declare "
                 f"the field as {field_def.name}: str on this consumer if string values are "
-                "acceptable. A node's own schema: block declares what ARRIVES at "
-                "the node, never what it should be converted to."
+                "acceptable. The consumed field's schema declaration must admit its arriving value; "
+                "a type_coerce conversion determines its output type. A newly created value_transform target "
+                "can separately have an authored or provable output type."
             ),
             evidence_locator={
                 "source": "blob",
@@ -3522,7 +3544,7 @@ def _compute_proof_diagnostics_for_source(
                             "For headered CSV, update the blob so line 1 contains the declared "
                             "schema field names. For headerless CSV, patch_source_options with "
                             "`columns` set to the declared field names, then re-run preview_pipeline. "
-                            "See pipeline_composer.md rule 10."
+                            "Use the source schema's carried names, then preview the same pipeline."
                         ),
                         evidence_locator={
                             "source": "blob",

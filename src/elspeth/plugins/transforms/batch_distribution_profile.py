@@ -124,7 +124,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b73a41fbd8f60e86"
+    source_file_hash: str | None = "sha256:e4a5e61cadd31134"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -239,6 +239,7 @@ class BatchDistributionProfile(BaseTransform):
                 issue_code=None,
                 summary="Aggregate numeric descriptive statistics — mean, stddev, quartiles, optionally per group. Numeric-only; categorical counts go to batch_top_k.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_distribution_profile under aggregations with a trigger; it summarizes a flushed batch.",
                     "value_field must be int or float. Strings (theme/category names) belong in batch_top_k, not here.",
                     "group_by partitions by a categorical field; omit it for a single distribution over all rows.",

@@ -89,7 +89,7 @@ class RetrievalOutputConfig(TransformDataConfig):
     query_field: str = Field(description="Input row field containing the retrieval query text.")
     query_template: str | None = Field(
         default=None,
-        description="Optional template used to build the retrieval query from row fields.",
+        description="Optional retrieval query template. Its row holds the query field plus declared required_input_fields; declare every other static row read.",
     )
     query_pattern: str | None = Field(
         default=None,
@@ -242,7 +242,7 @@ class RetrievalOutputConfig(TransformDataConfig):
             raise ValueError(
                 f"query_template references {names}, which the query render context does not define: a query "
                 "template sees 'query' (the query_field value) and 'row', so rendering fails with 'Undefined "
-                "variable' on every row. Rewrite each name as '{{ query }}' or '{{ row.<field> }}', or remove it."
+                "variable' on every row. Rewrite each name as '{{ query }}', or '{{ row.<field> }}' after declaring the field in required_input_fields (query_field is already available), or remove it."
             )
 
         usage = extract_jinja2_field_usage(template)
@@ -272,8 +272,7 @@ class RetrievalOutputConfig(TransformDataConfig):
                     f"query_template reads {fields} under 'row', but options.required_input_fields is not declared, "
                     f"so the template's row holds only the query field '{self.query_field}' and every row fails "
                     "at render with 'Undeclared field'. Declare the fields the query reads in "
-                    "options.required_input_fields (the upstream producer must guarantee them), or set "
-                    "options.required_input_fields: [] to opt out: the template then sees the whole row."
+                    "options.required_input_fields (the upstream producer must guarantee them)."
                 )
             declared_names = ", ".join(f"'{name}'" for name in sorted(declared))
             raise ValueError(

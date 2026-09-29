@@ -31,7 +31,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -74,7 +74,7 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -560,7 +560,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -602,7 +602,7 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -1076,7 +1076,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -1118,7 +1118,7 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {
@@ -1621,7 +1621,7 @@
       },
       {
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "item_kind": "text",
         "kind": "string-list",
         "label": "Required Input Fields",
@@ -1663,7 +1663,7 @@
       },
       {
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "item_schema": {
           "fields": [
             {

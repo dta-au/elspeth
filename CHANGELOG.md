@@ -6,6 +6,8 @@ All notable changes to ELSPETH are documented here.
 
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
+- Composer guidance now teaches source-carried field names, typed transform outputs, projected template rows, batch output-mode capabilities, and routed batch or missing-field failures using current runtime rules.
+
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
 to 71 for durable Composer progress, request lifecycle leases, identity owner
 foreign keys, approval revocation provenance, run admission decisions, sparse

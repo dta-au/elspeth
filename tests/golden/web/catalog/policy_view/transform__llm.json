@@ -1,4 +1,5 @@
 {
+  "aggregation_output_modes": [],
   "composer_hints": [
     "Call list_models before pinning 'model:' \u2014 deployments don't all ship the same providers.",
     "Interpolate every row field your prompt needs with `{{ row.<field> }}`. A template naming no varying field sends identical input to every row and identical output; to score, classify, or summarize content, inject the content field (e.g. `{{ row.content }}`), not an identifier.",
@@ -20,6 +21,8 @@
     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
     "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
     "Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str.",
+    "An authored node schema output type must admit the bound model type; number cannot narrow to int. If you declare <response_field>_usage, type it any.",
+    "Read declared template fields by carried name; use get, row | list for names, row | items for pairs, and dict(row) or row | tojson for the whole row. Read a method-named column with row['keys']. Source header aliases resolve only when that header reaches the node.",
     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",
@@ -466,7 +469,7 @@
           }
         ],
         "default": null,
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "title": "Queries"
       },
       "required_input_fields": {
@@ -482,7 +485,7 @@
           }
         ],
         "default": null,
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "title": "Required Input Fields"
       },
       "response_field": {
@@ -502,7 +505,7 @@
         "$ref": "#/$defs/SchemaConfig",
         "composer_description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
         "composer_placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
-        "description": "This transform's INPUT contract: the schema of rows arriving from upstream. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
+        "description": "This transform's schema declares arriving types for consumed fields and output types for fields it creates. Use 'schema: {mode: observed}' to infer types from data, or provide explicit field definitions with mode (fixed/flexible).",
         "title": "Schema"
       },
       "system_prompt": {
@@ -545,14 +548,14 @@
         "type": "object"
       },
       {
-        "description": "Fields this transform requires in input. Used for DAG validation to catch missing field errors at config time. For templates, use elspeth.core.templates.extract_jinja2_fields() to discover fields.",
+        "description": "Fields this transform requires in input, by the names rows carry. Used for DAG validation to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
         "name": "required_input_fields",
         "required": false,
         "tier": "common",
         "type": "object"
       },
       {
-        "description": "Multi-query specs (None = single-query mode)",
+        "description": "Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
         "name": "queries",
         "required": false,
         "tier": "common",

@@ -86,7 +86,7 @@ class BatchTopK(BaseTransform):
     name = "batch_top_k"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7ab92d9020563f77"
+    source_file_hash: str | None = "sha256:26510751574334a4"
     config_model = BatchTopKConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -126,6 +126,7 @@ class BatchTopK(BaseTransform):
                 issue_code=None,
                 summary="Reports the most frequent scalar values in a batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_top_k under aggregations with a trigger; it summarizes a flushed batch.",
                     "field must be scalar data such as str, int, float, bool, or None; arrays and objects are invalid.",
                     "Set include_missing=True only when missing values should appear in top_values.",

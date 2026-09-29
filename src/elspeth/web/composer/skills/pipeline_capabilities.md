@@ -135,10 +135,10 @@ component; `row_union` requires an explicit `on_success` connection.
   aggregation/transform sequence such as aggregation followed by replication.
   Give an aggregation `output_mode: transform` (the default): `passthrough`
   carries only a plugin whose flush emits exactly one row per buffered row.
-  `batch_rank` is the one discovered batch plugin that does (it adds a rank and
-  percentile to every row and keeps them all), so use it when the same rows
-  must continue past the aggregation; every other batch plugin reduces,
-  replicates or skips rows and is refused under `passthrough`.
+  The catalogue's `aggregation_output_modes` says which discovered plugins
+  support it. A plugin that reduces, replicates or skips rows is refused under
+  `passthrough`. If a batch fails, `on_error` applies to every buffered row;
+  `discard` records those rows as quarantined.
 - [capability-node:queue] A `queue` is the explicit fan-in point for multiple
   producers entering shared processing. Multiple named sources retain their
   independent schemas and identities.
@@ -279,12 +279,13 @@ cleanup node and then from the cleanup node to the sink.
 ### Declared Types And Row Templates
 
 A type you declare is checked on every row and never converted to fit: a row
-whose value has another type goes to `on_error` (an `int` satisfies `float`;
-nothing else is widened). Declare the type the value actually has, and `any`
+whose value has another type goes to `on_error` when the mismatch depends on
+the value; a provable contradiction can be refused at build (an `int`
+satisfies `float`; nothing else is widened). Declare the type the value actually has, and `any`
 for a created field whose type varies. A model node's structured output fields
 bind their row types — `integer` is `int`, `number` is `float`, `boolean` is
 `bool`, `string` and `enum` are `str` — so a node schema type on a field the
-model writes must be that type (validation refuses `int` over `number`), the
+model writes must admit that bound type (validation refuses `int` over `number`), the
 `<response>_usage` field is `any`, and a downstream consumer of a `number`
 field declares `float`.
 
@@ -295,10 +296,11 @@ Declare every field the template reads or tests, an attribute filter's
 (`attr('field')`, `map(attribute='field')`) included, and read each one by a
 fixed name (`row.field`, `row['field']`, a query's `row.source_row.field`): a key
 computed at render (`row[k]`, `row.get(expr)`, or either through
-`row.source_row`) is refused. Reading or testing any other
-field fails every row, including `'x' in row`, a row carried through a `set`
-or loop variable, and a multi-query `row.source_row` column. `[]` shows the
-whole row but proves nothing to a field-scoped prompt-injection control, so
+`row.source_row`) is refused under a declared list; `[]` intentionally allows
+a computed key but gives up provable field coverage. Under a declared list,
+reading or testing any other field fails every row, including `'x' in row`, a row carried through a `set`
+or loop variable, and an undeclared multi-query `row.source_row` column. `[]` shows the
+whole row to supported row operations but proves nothing to a field-scoped prompt-injection control, so
 declare the fields. A single-query prompt or retrieval template that never
 reads `row` declares none: the query field reaches a retrieval template as
 `query` without a declaration, and a declaration the template cannot use is
@@ -315,6 +317,8 @@ for name and value pairs `row | items | list` or `row | dictsort`, for a mapping
 name as `row['contract']`. A method on a field's value (`row.note.upper()`)
 is fine. With `required_input_fields` omitted, a model prompt may not use
 `row` as a whole (`{{ row }}`, `row | dictsort`): declare the fields it shows.
+For a multi-query template, `row.source_row` contains only columns the node
+declares in `required_input_fields`, including query `input_fields` values.
 A multi-query `input_fields` variable may not be named `source_row` or like a
 mapping method (`items`, `keys`, `values`, `get`).
 Besides the names it binds itself, a template reads `row`, `lookup` in a model
@@ -332,8 +336,8 @@ conversion's field, must be carried by every row that reaches the node.
 
 A field that two branches of a `merge: union` coalesce both carry must have one
 type on every branch, and `any` is a type of its own there, not a wildcard: a
-value computed without a declared type (an expression result, an extracted
-nested value) is `any`, and meeting a declared `int` on the other branch fails
+value whose expression type cannot be derived from declared inputs, or an
+untyped extracted nested value, is `any`, and meeting a declared `int` on the other branch fails
 every row, so validation refuses the coalesce
 (`coalesce_union_type_incompatible`). Declare the field's type on the schema
 of every branch's last node (`mode: flexible`), or write the computed value

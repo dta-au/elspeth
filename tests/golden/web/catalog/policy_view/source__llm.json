@@ -1,4 +1,5 @@
 {
+  "aggregation_output_modes": [],
   "composer_hints": [
     "Use this source only when the prompt needs no incoming row data; use the LLM transform for row-dependent prompts.",
     "The response field and its usage/model diagnostic fields are emitted automatically.",

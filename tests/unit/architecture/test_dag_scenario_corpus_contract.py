@@ -961,7 +961,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # from the merged manifest through the canonical corpus loader.
 # B3 runtime attribution: value_transform's three union-collision-fail pins
 # moved with its source hash; the reopen-resume case does not use that plugin.
-EXPECTED_CASE_REGISTRY_SHA256 = "24d0cdbacc2ce67ad8046905e4e50bbc7870370d53ef0251dfc19869fc055005"
+EXPECTED_CASE_REGISTRY_SHA256 = "f94b0669f1a58b9b946d20be8b97da7e36c69ce57218551afe687cc97b724d84"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

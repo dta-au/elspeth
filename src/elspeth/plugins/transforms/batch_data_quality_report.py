@@ -117,7 +117,7 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1a103c222ef37a45"
+    source_file_hash: str | None = "sha256:a8aa93a021ea783c"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -157,6 +157,7 @@ class BatchDataQualityReport(BaseTransform):
                 issue_code=None,
                 summary="Emits data-quality counts for configured fields across a batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_data_quality_report under aggregations with a trigger; it inspects a flushed batch.",
                     "inspect_fields must name existing input fields and must not be empty or duplicated.",
                     "It emits one report row per inspected field with missing, blank, non-finite, non-scalar, and type counts.",

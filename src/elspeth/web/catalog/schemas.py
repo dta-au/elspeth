@@ -17,6 +17,7 @@ from elspeth.contracts.enums import DerivedAuditCharacteristics
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability, WebConfigAuthority
 
 PluginKind = Literal["source", "transform", "sink"]
+AggregationOutputMode = Literal["transform", "passthrough"]
 
 
 class _StrictResponse(BaseModel):
@@ -75,6 +76,7 @@ class PluginSummary(_StrictResponse):
     usage_when_not_to_use: str | None = None
     example_use: str | None = None
     capability_tags: tuple[str, ...] = ()
+    aggregation_output_modes: tuple[AggregationOutputMode, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: tuple[CapabilityDeclaration, ...] = ()
     audit_characteristics: DerivedAuditCharacteristics = ()
@@ -117,6 +119,7 @@ class PluginSchemaInfo(_StrictResponse):
     secret_requirements: tuple[PluginSecretRequirement, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: tuple[CapabilityDeclaration, ...] = ()
+    aggregation_output_modes: tuple[AggregationOutputMode, ...] = ()
 
 
 class PluginPolicyCapabilityGroup(_StrictResponse):

@@ -102,7 +102,8 @@ class ReferenceJoinConfig(TransformDataConfig):
         ...,
         description=(
             "Map of output field name to an expression over the matched entry, bound as 'ref' "
-            "(for example \"ref['description']\" or \"ref['tax']['rate']\")."
+            "(for example \"ref['description']\" or \"ref['tax']['rate']\"). "
+            "A stored result cannot be a set because it has no canonical order; build a list instead."
         ),
     )
     on_miss: Literal["fail", "null", "default"] = Field(
@@ -550,7 +551,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6aa4025393448c89"
+    source_file_hash: str | None = "sha256:7cef9b2856911e69"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

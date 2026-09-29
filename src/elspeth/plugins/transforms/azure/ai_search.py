@@ -183,7 +183,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
                     "This is the Azure RAG plugin: pair it with an llm transform that reads {output_prefix}__rag_context.",
                     "field_content and field_id name INDEX fields and default to content / id; an index built by the portal import wizard needs chunk / chunk_id. Set field_title and field_url to emit source_name and source_link citation metadata.",
                     "vector and hybrid modes send the query as text, so the index must define an integrated vectorizer on field_vector; semantic mode needs semantic_config and scores by the 0-4 reranker score.",
-                    "Query template uses row-field interpolation; document what fields are read so downstream consumers can wire them.",
+                    "A query template sees its query_field and the row fields declared in required_input_fields; declare each other static row read by its carried name. [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
                     "top_k and min_score interact — high min_score plus low top_k may return zero chunks. Configure on_no_results to handle the empty-result case.",
                 ),
             )

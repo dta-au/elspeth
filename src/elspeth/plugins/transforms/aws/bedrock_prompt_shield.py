@@ -72,6 +72,7 @@ class AWSBedrockPromptShield(BedrockGuardrailTransformBase):
                 composer_hints=(
                     "Select only an opaque operator profile in web-authored pipelines.",
                     "List every untrusted prompt field that must be checked before an LLM call.",
+                    "A field-scoped shield proves coverage only for declared model inputs; required_input_fields omitted or [] is unprovable unless a dominating all-fields shield scans every field.",
                     "Both detect-only positives and Guardrail interventions are blocked.",
                 ),
             )

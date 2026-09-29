@@ -2063,12 +2063,13 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "description": (
                                 "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink "
                                 "name. For a gate it covers row expression-evaluation errors and is authored on the "
-                                "node, never as an edge; omit it to preserve fail-fast behavior."
+                                "node, never as an edge; omit it to preserve fail-fast behavior. A failed aggregation batch applies this policy to every buffered row; discard records quarantine outcomes."
                             ),
                         },
                         "options": {
                             "type": "object",
-                            "description": "Plugin-specific node config." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
+                            "description": "Plugin-specific node config. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target."
+                            + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE,
                         },
                         "condition": {"type": ["string", "null"]},
                         "routes": {
@@ -2101,7 +2102,10 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             },
                             "additionalProperties": False,
                         },
-                        "output_mode": {"type": ["string", "null"]},
+                        "output_mode": {
+                            "type": ["string", "null"],
+                            "description": "Aggregation mode: transform (default), or passthrough only when the plugin's catalogue aggregation_output_modes includes it; passthrough requires one emitted row per buffered row.",
+                        },
                         "expected_output_count": {
                             "type": ["integer", "null"],
                             "description": (
@@ -2216,7 +2220,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                 "description": (
                     f"Output specs. For {FILE_SINK_PLUGIN_SLASH_TEXT} file sinks in runnable web pipelines, "
                     "options must include path, schema, explicit mode ('write' or 'append'), and explicit "
-                    "collision_policy."
+                    "collision_policy. Sink schema.fields and custom header keys use carried row names, normally normalized source headers or mapping targets."
                 ),
             },
             "metadata": {

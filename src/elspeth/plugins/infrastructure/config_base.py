@@ -557,11 +557,11 @@ class TabularSourceDataConfig(SourceDataConfig):
 
     columns: NormalizedColumnsOption = Field(
         default=None,
-        description="Explicit normalized column names for headerless tabular input.",
+        description="Column names for headerless tabular input, in order, carried as written.",
     )
     field_mapping: NormalizedFieldMappingOption = Field(
         default=None,
-        description="Optional mapping from observed source field names to normalized pipeline field names.",
+        description="Optional mapping from normalized source names (or headerless columns as written) to the names rows carry downstream.",
     )
 
     @model_validator(mode="after")
@@ -742,7 +742,7 @@ class TransformDataConfig(DataPluginConfig):
         ...,
         alias="schema",
         description=(
-            "This transform's INPUT contract: the schema of rows arriving from upstream. "
+            "This transform's schema declares arriving types for consumed fields and output types for fields it creates. "
             "Use 'schema: {mode: observed}' to infer types from data, or "
             "provide explicit field definitions with mode (fixed/flexible)."
         ),
@@ -755,9 +755,8 @@ class TransformDataConfig(DataPluginConfig):
     required_input_fields: list[str] | None = Field(
         default=None,
         description=(
-            "Fields this transform requires in input. Used for DAG validation "
-            "to catch missing field errors at config time. For templates, use "
-            "elspeth.core.templates.extract_jinja2_fields() to discover fields."
+            "Fields this transform requires in input, by the names rows carry. Used for DAG validation "
+            "to catch missing fields. For templates, declare every static row field read; [] intentionally exposes the whole row but cannot prove field-scoped shield coverage."
         ),
     )
 

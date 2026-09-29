@@ -523,6 +523,7 @@ class _LLMProfileResolver:
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
             policy_capabilities=full_schema.policy_capabilities,
+            aggregation_output_modes=full_schema.aggregation_output_modes,
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
@@ -723,6 +724,7 @@ class _BedrockGuardrailProfileResolver:
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
             policy_capabilities=full_schema.policy_capabilities,
+            aggregation_output_modes=full_schema.aggregation_output_modes,
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
@@ -920,6 +922,7 @@ class _S3SourceProfileResolver:
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
             policy_capabilities=full_schema.policy_capabilities,
+            aggregation_output_modes=full_schema.aggregation_output_modes,
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
@@ -1112,6 +1115,7 @@ class _TextractProfileResolver:
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
             policy_capabilities=full_schema.policy_capabilities,
+            aggregation_output_modes=full_schema.aggregation_output_modes,
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
@@ -1306,6 +1310,7 @@ class _AzureSearchProfileResolver:
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
             policy_capabilities=full_schema.policy_capabilities,
+            aggregation_output_modes=full_schema.aggregation_output_modes,
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:

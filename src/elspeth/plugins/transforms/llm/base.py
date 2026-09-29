@@ -136,8 +136,8 @@ def multi_query_undeclared_columns_message(query_name: str, undeclared: Sequence
         f"input_fields values or 'row.source_row', which options.required_input_fields does not cover — it "
         f"declares {declared_names}. required_input_fields IS this node's input contract: it is what the DAG "
         "checks against the upstream producer's guarantees and what the engine verifies on every row. A column "
-        "outside it is required by nothing, so no producer is obliged to supply it, and every row that arrives "
-        f"without it fails this query with template_context_failed. {MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY}"
+        "outside it is excluded from the projected source_row; direct source_row reads of that column fail rendering even if the original row carries it. "
+        f"Missing declared input bindings fail during context construction. {MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY}"
     )
 
 
@@ -198,7 +198,8 @@ class LLMConfig(TransformDataConfig):
         description="LiteLLM catalog identity for audit costing; never changes endpoint routing",
     )
     queries: list[QueryDefinition] | dict[str, QueryDefinition] | None = Field(
-        None, description="Multi-query specs (None = single-query mode)"
+        None,
+        description="Multi-query specs (None = single-query mode). row.source_row exposes only columns declared in the node's required_input_fields; query input_fields bind named template variables to those columns.",
     )
     prompt_template: str | None = Field(None, description="Jinja2 fallback prompt template; required unless every query has a template")
     system_prompt: str | None = Field(None, description="Optional system prompt")
@@ -633,7 +634,7 @@ class LLMConfig(TransformDataConfig):
             f"({describe_dynamic_row_access(computed_keys)}). "
             "Dynamic row keys cannot be audited against options.required_input_fields. "
             "Use static row.field or row['field'] references, or set "
-            "options.required_input_fields: [] to explicitly opt out and accept runtime risk."
+            "options.required_input_fields: [] only for an intentional computed key or whole-row read; a field-scoped prompt shield cannot credit it."
         )
 
     @model_validator(mode="after")
@@ -712,11 +713,11 @@ class LLMConfig(TransformDataConfig):
                     f"options.required_input_fields is not declared.\n\n"
                     "You must explicitly declare field requirements inside the LLM node options:\n"
                     f"  options.required_input_fields: {required_fields_json}  # Require these fields\n"
-                    "  options.required_input_fields: []                    # Accept runtime risk (opt-out)\n\n"
+                    "  options.required_input_fields: []                    # Intentional whole-row or computed-key access; field-scoped shields cannot credit it\n\n"
                     "Composer repair examples:\n"
                     f'  patch_node_options({{"node_id": "<node_id>", "patch": {{"required_input_fields": {required_fields_json}}}}})\n'
                     f"  set_pipeline/upsert_node: include options.required_input_fields={required_fields_json} on the llm node.\n\n"
-                    "Use extract_jinja2_fields() from elspeth.core.templates to discover fields. "
+                    "List the static row fields the template reads by their carried names. "
                     "This explicit declaration enables DAG validation to catch missing fields at config time."
                 )
         return self
@@ -852,7 +853,7 @@ class LLMConfig(TransformDataConfig):
                     f"LLM prompt_template references {names}, which the prompt render context does not "
                     "define — row data is only available as 'row.<field>' and lookup data as "
                     "'lookup.<key>', so rendering fails with 'Undefined variable' at runtime and none of "
-                    "the row's data reaches the model. Rewrite each name as '{{ row.<field> }}' or "
+                    "the row's data reaches the model. Rewrite each row name as '{{ row.<field> }}' and declare that field in required_input_fields, or "
                     "'{{ lookup.<key> }}', or remove the reference."
                 )
             if self.required_input_fields:
@@ -908,7 +909,7 @@ class LLMConfig(TransformDataConfig):
                     "unbound reference fails with 'Undefined variable' and the query errors for every "
                     "row. Add the missing variables to input_fields (template variable → row column), "
                     "rename the reference to a bound variable, or use 'row.source_row.<column>' for "
-                    "direct row access."
+                    "direct row access only when the node also declares that column in required_input_fields."
                 )
 
         if node_template_specs:

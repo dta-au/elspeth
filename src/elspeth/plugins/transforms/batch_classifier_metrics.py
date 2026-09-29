@@ -175,7 +175,7 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d12cb55d7ed4c5c6"
+    source_file_hash: str | None = "sha256:39baa56eede74f4a"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -214,6 +214,7 @@ class BatchClassifierMetrics(BaseTransform):
                 issue_code=None,
                 summary="Computes classifier accuracy, confusion counts, and precision/recall/F1 metrics for a batch.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_classifier_metrics under aggregations with a trigger; it emits metric summary rows.",
                     "actual_field and predicted_field must be distinct scalar label fields.",
                     "Set positive_label only for binary metrics; macro, micro, and weighted metrics are always computed.",

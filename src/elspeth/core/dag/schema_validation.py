@@ -514,7 +514,7 @@ def validate_forgiven_field_ancestor_types(graph: ExecutionGraph) -> None:
                 f"  1. Align the consumer's declared type ('{field_name}: {resolved.field_type}') if it "
                 f"should accept what arrives, or\n"
                 f"  2. Insert a type_coerce transform before this consumer converting '{field_name}' to "
-                f"{expected_name} and declaring it in the transform's schema.fields, or\n"
+                f"{expected_name} on a field every arriving row carries (declare the transform's arriving type in schema.fields), or\n"
                 f"  3. Remove '{field_name}' from the consumer's declaration AND drop it before this "
                 f"consumer (a field_mapper with select_only: true) if the consumer does not need it",
                 from_node_id=str(from_id),

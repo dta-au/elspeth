@@ -287,8 +287,9 @@ def union_type_conflict_message(coalesce_label: str, conflict: UnionFieldTypeCon
         f"(declared by {', '.join(conflict.type_b.declared_by)}). "
         "Every row would fail this merge at runtime (contract_type_conflict); 'any' is a type of its own here, "
         "not a wildcard. A union coalesce needs one type per field: declare "
-        f"{declaration} on the output schema of every branch's last node (mode: flexible), "
-        "or write a rewritten value under a new name."
+        f"{declaration} on each branch's last node (mode: flexible) when that declaration matches the value it emits. "
+        "For a conversion, change its target type; if a value_transform rewrites an arriving field to another type, "
+        "write the result under a new name. Declarations do not convert values."
     )
 
 

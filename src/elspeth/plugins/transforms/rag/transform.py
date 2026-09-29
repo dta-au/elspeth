@@ -210,7 +210,7 @@ class RAGRetrievalTransform(RetrievalTransformBase):
                 summary="Vector retrieval against a configured backend (Chroma, etc). Builds a query from row fields, returns ranked chunks for downstream LLM grounding.",
                 composer_hints=(
                     "Name the Chroma collection in provider_config.collection. For Azure AI Search use the azure_ai_search plugin.",
-                    "Query template uses row-field interpolation; document what fields are read so downstream consumers can wire them.",
+                    "A query template sees its query_field and the row fields declared in required_input_fields; declare each other static row read by its carried name. [] intentionally exposes the whole row but cannot prove field-scoped shield coverage.",
                     "top_k and min_score interact — high min_score plus low top_k may return zero chunks. Configure on_no_results to handle the empty-result case.",
                     "The transform emits running mean/variance telemetry for retrieval scores — watch these to catch retrieval-quality regressions.",
                 ),

@@ -340,7 +340,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f18bc419ef56c5f3"
+    source_file_hash: str | None = "sha256:c1b155d1c89b28cc"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -585,10 +585,10 @@ class TypeCoerce(BaseTransform):
             return PluginAssistance(
                 plugin_name="type_coerce",
                 issue_code=None,
-                summary="Explicit type casting at a pipeline midpoint — str → int, str → float, etc. Use on_error to route un-coercible rows.",
+                summary="Explicit type casting for values arriving from sources or upstream transforms. Use on_error to route failed rows.",
                 composer_hints=(
-                    "Sources already validate/coerce; use type_coerce only when an upstream transform's output is the wrong type.",
-                    "Set on_error to a quarantine sink to capture un-coercible rows for audit, instead of crashing the run.",
+                    "Use type_coerce when values arrive with the wrong type: observed source values may be strings, and upstream transforms may emit an unresolved any.",
+                    "A missing declared conversion field routes as missing_field to on_error; an uncoercible present value routes too. Use a quarantine sink to retain failed rows; discard records them without output.",
                     "conversions is a LIST of {field, to} entries, e.g. conversions: [{field: price, to: float}, "
                     "{field: quantity, to: int}] — a field-to-type mapping is rejected; to accepts 'int', 'float', "
                     "'bool', 'str'.",

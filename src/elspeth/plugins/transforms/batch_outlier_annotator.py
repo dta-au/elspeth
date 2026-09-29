@@ -177,7 +177,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:21a4b6ceef9ea575"
+    source_file_hash: str | None = "sha256:2501c11261dd8660"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     # Not passthrough-capable: a row whose value is null or non-finite is not emitted, and a one-row emission is TransformResult.success.
@@ -223,6 +223,7 @@ class BatchOutlierAnnotator(BaseTransform):
                     "value_field must be numeric; missing and non-finite values are skipped and reported, and a present non-numeric value fails the whole batch.",
                     "output_prefix creates many annotation fields, so choose a prefix that cannot collide with input fields; an input row already carrying one fails the whole batch.",
                     "It emits one annotated row per finite input value and may drop skipped rows from success output.",
+                    "Use output_mode: transform; skipped invalid rows prevent the one-row-per-buffered-row guarantee required by passthrough. A failed batch applies on_error to all buffered rows; discard records quarantine outcomes.",
                 ),
             )
         return None

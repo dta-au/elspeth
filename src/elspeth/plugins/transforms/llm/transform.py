@@ -1212,7 +1212,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:06a7dff5378c1fcd"
+    source_file_hash: str | None = "sha256:d83ac4ae9b1b0b75"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -2058,6 +2058,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
                     "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
                     "Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str.",
+                    "An authored node schema output type must admit the bound model type; number cannot narrow to int. If you declare <response_field>_usage, type it any.",
+                    "Read declared template fields by carried name; use get, row | list for names, row | items for pairs, and dict(row) or row | tojson for the whole row. Read a method-named column with row['keys']. Source header aliases resolve only when that header reaches the node.",
                     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
                     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",
                     "Recommend an available authorized prompt-injection shield before the LLM; use azure_prompt_shield only when discovery lists it.",

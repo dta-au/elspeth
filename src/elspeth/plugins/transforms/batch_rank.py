@@ -127,7 +127,7 @@ class BatchRank(BaseTransform):
     name = "batch_rank"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:227225a4dc42b7f9"
+    source_file_hash: str | None = "sha256:bfcb04174bb43be1"
     config_model = BatchRankConfig
     is_batch_aware = True
     # Passthrough-capable: every successful flush is a success_multi of exactly
@@ -141,7 +141,7 @@ class BatchRank(BaseTransform):
     preserves_input_values = True
     usage_when_to_use: str = (
         "Use to add each row's rank and percentile of a numeric field within its aggregation batch while "
-        "keeping every row: the only batch plugin output_mode: passthrough accepts, so the same tokens "
+        "keeping every row: its one-row-per-buffered-row capability supports output_mode: passthrough, so the same tokens "
         "continue downstream (for example to a gate that keeps the top-ranked rows)."
     )
     usage_when_not_to_use: str = (
@@ -176,7 +176,7 @@ class BatchRank(BaseTransform):
                 issue_code=None,
                 summary="Adds each row's rank and percentile of a numeric field within its batch, keeping every row.",
                 composer_hints=(
-                    "batch_rank is the batch plugin to use under an aggregation with output_mode: passthrough; "
+                    "batch_rank supports aggregation output_mode: passthrough and transform; "
                     "it emits exactly one row per buffered row, in order, so the same tokens continue downstream.",
                     "It also runs under output_mode: transform, where each emitted row becomes a new child token.",
                     "Ranks restart in every batch: pick the trigger (count, timeout or condition) so a batch is the group to rank.",

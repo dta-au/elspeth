@@ -69,6 +69,20 @@ class TestCatalogService:
                 assert summary.example_use == plugin_cls.example_use
                 assert summary.capability_tags == plugin_cls.capability_tags
 
+    def test_aggregation_modes_follow_batch_class_declarations(self, catalog: CatalogServiceImpl) -> None:
+        summaries = {summary.name: summary for summary in catalog.list_transforms()}
+        assert summaries["batch_rank"].aggregation_output_modes == ("transform", "passthrough")
+        assert summaries["batch_outlier_annotator"].aggregation_output_modes == ("transform",)
+        assert summaries["value_transform"].aggregation_output_modes == ()
+        assert catalog.get_schema("transform", "batch_rank").aggregation_output_modes == ("transform", "passthrough")
+        assert catalog.get_schema("transform", "batch_outlier_annotator").aggregation_output_modes == ("transform",)
+        from elspeth.web.composer.planner_authoring_aids import planner_plugin_contract
+
+        assert planner_plugin_contract(catalog.get_schema("transform", "batch_rank")).to_dict()["aggregation_output_modes"] == [
+            "transform",
+            "passthrough",
+        ]
+
 
 class TestListSources:
     """list_sources() returns all registered source plugins."""

@@ -131,7 +131,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:27a09dd97ca24961"
+    source_file_hash: str | None = "sha256:a00352057226befe"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     # Not passthrough-capable: each row asks for its own number of copies.
@@ -181,6 +181,7 @@ class BatchReplicate(BaseTransform):
                 issue_code=None,
                 summary="Replicates rows within an aggregation batch based on a copy-count field.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_replicate under aggregations with output_mode=transform so emitted copies become new tokens.",
                     "copies_field must be an int when present: a row without the field uses default_copies, a present non-int value (null included) fails the whole batch, and integers outside 1..max_copies are quarantined.",
                     "include_copy_index=True adds copy_index and an input row already carrying copy_index fails the whole batch, so avoid input fields with that name or disable it.",

@@ -109,7 +109,7 @@ class BatchThresholdSummary(BaseTransform):
     name = "batch_threshold_summary"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9e8f259440811ec9"
+    source_file_hash: str | None = "sha256:7cb6f69881bb092a"
     config_model = BatchThresholdSummaryConfig
     is_batch_aware = True
     # Not passthrough-capable: a flush reduces the batch to summary rows, not one row per buffered row.
@@ -152,6 +152,7 @@ class BatchThresholdSummary(BaseTransform):
                 issue_code=None,
                 summary="Counts how many finite numeric batch values match named thresholds.",
                 composer_hints=(
+                    "Use output_mode: transform; passthrough requires one emitted row per buffered row. A failed batch applies on_error to every buffered input; discard records quarantine outcomes.",
                     "Use batch_threshold_summary under aggregations with a trigger; it emits one summary row per threshold.",
                     "value_field must be numeric; missing and non-finite values are skipped and counted, "
                     "and a non-numeric value fails the whole batch.",

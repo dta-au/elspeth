@@ -975,8 +975,9 @@ class TestStep3BlobDiscoveryTierMigration:
                 "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
                 "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
                 "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
-                "before declaring a fixed CSV/JSON schema — observed headers and inferred types "
-                "tell you which fields the source actually contains and what numeric coercion is "
+                "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
+                "Declare the normalized name (First Name becomes first_name), or the source field_mapping target; "
+                "headerless columns are carried as written. Inferred types are lexical observations that tell you what numeric coercion is "
                 "needed before any gate or value_transform numeric op. Never returns raw row "
                 "content; only summary facts."
             ),

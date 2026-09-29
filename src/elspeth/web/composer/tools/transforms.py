@@ -269,7 +269,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "description": (
                 "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink name. "
                 "For a gate it covers row expression-evaluation errors and is authored here, never as an "
-                "edge; omit it to preserve fail-fast behavior."
+                "edge; omit it to preserve fail-fast behavior. A failed aggregation batch applies this policy to every buffered row; discard records quarantine outcomes."
             ),
         },
         "options": {
@@ -277,8 +277,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "description": (
                 "Plugin-specific config for transform, aggregation, and collector nodes; a queue permits only its optional "
                 "description. Other structural kinds do not take plugin configuration. The schema: block declares what "
-                "ARRIVES at the node, never its transformed result; declare arriving types on the "
-                "SOURCE schema or via an upstream type_coerce (observed CSV fields arrive as str)." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+                "ARRIVES for consumed fields and the OUTPUT type for fields the node creates. "
+                "Convert arriving values at the source or with an upstream type_coerce; an output declaration checks values but does not convert them. "
+                "An int satisfies float. Row-column options use the field name carried by upstream rows, normally a normalized header or source field_mapping target."
+                + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
             ),
         },
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
@@ -311,7 +313,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "merge": {
             "type": ["string", "null"],
-            "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default — union's schema rules are enforced either way.",
+            "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default. A shared union field needs one compatible actual type on every branch; any counts as a type.",
         },
         "trigger": {
             "type": ["object", "null"],
@@ -337,7 +339,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "output_mode": {
             "type": ["string", "null"],
             "enum": ["passthrough", "transform", None],
-            "description": "Aggregation output mode (aggregation only). Defaults to 'transform' if omitted.",
+            "description": "Aggregation output mode (aggregation only). Defaults to 'transform'. Passthrough keeps the same row tokens and admits only a batch plugin that flushes exactly one row per buffered row; check its catalogue aggregation_output_modes. Otherwise use transform.",
         },
         "expected_output_count": {
             "type": ["integer", "null"],
@@ -1856,9 +1858,9 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                     "For a gate, edit on_error only with upsert_node. "
                     "If prompt_template_parts exists, edit that structure while preserving interpretation_ref entries; "
                     "do not change only the compiled prompt_template. "
-                    "A patched schema: block declares what ARRIVES at the node, never its transformed "
-                    "result; to change what arrives, declare the type on the SOURCE schema "
-                    "(patch_source_options) or insert a type_coerce upstream." + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
+                    "A patched schema declares arriving types for consumed fields and output types for created fields. "
+                    "To convert an arriving value, change the source contract (patch_source_options) or insert a type_coerce upstream; a declaration does not convert."
+                    + _LLM_OPTIONS_OWNERSHIP_SCHEMA_NOTE
                 ),
             },
         },

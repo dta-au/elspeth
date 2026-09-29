@@ -120,6 +120,7 @@ class _PluginDigestEntry(TypedDict):
     purpose_omitted: NotRequired[_OmittedPublicText]
     not_for_omitted: NotRequired[_OmittedPublicText]
     capability_tags: NotRequired[list[str]]
+    aggregation_output_modes: NotRequired[list[str]]
     profile_aliases: NotRequired[list[str]]
 
 
@@ -154,6 +155,7 @@ class _SchemaContractEvidenceEntry(TypedDict):
     schema_hash: str
     json_schema: dict[str, object]
     knob_schema: dict[str, object]
+    aggregation_output_modes: list[str]
 
 
 class _SchemaContractEvidenceOmission(TypedDict):
@@ -437,6 +439,7 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "downstream consumer sets input to the coalesce id. Do not author "
     "on_success on a coalesce unless it routes directly to a sink.",
     "Give each branch transform its own output field (an llm node's response_field) so the union merge carries every branch's result on one row.",
+    "A field shared by union branches must have one compatible actual type on every branch; any is a type, not a wildcard. A provable rewrite can retain that type; otherwise use a new field or declare compatible output types on the branches' last nodes. Declarations do not convert values.",
     # Session 60ab6a67: this exemplar modelled llm branches with a user prompt
     # only, and a planner asked for an A/B of two prompts cloned it key for
     # key — both arms shipped with no system prompt.
@@ -455,7 +458,7 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
     "results distinct. Structured output on one arm and free text on the other changes "
     "the experiment. Compare the saved branch options before claiming only one variable differs.",
     "Cleanup field_mapper mapping keys are existing INPUT fields; values are the desired OUTPUT names. "
-    "Its schema describes the INPUT row, so declare the arriving names there, not the renamed output names.",
+    "Its schema inherits arriving fields by their carried names and may also declare created target output types. Declare an arriving name as rows carry it (normally the normalized header or source mapping target); a target declaration does not convert its value.",
     "Do not author interpretation_requirements rows for llm_prompt_template "
     "or llm_model_choice — required LLM reviews auto-stage on every llm "
     "node. Author rows only for the planner-owned kinds (vague_term wired "
@@ -843,8 +846,8 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # Session 891b7b1e: hitting an Any/str edge mismatch, the planner
     # widened field_mapper AND the sink's fixed schema to 'any' instead of
     # narrowing once at a type_coerce.
-    "A producer's any-typed field (json_explode, blob_json_expand, "
-    "value_transform outputs) is narrowed by inserting a type_coerce "
+    "A value_transform target has its authored schema.fields output type, or the type its expression proves over declared inputs; an unresolved result is any. "
+    "A json_explode or blob_json_expand element is any: narrow it by inserting a type_coerce "
     "transform (options.conversions: [{field, to}]) with its defined "
     "per-conversion error path — never by widening every downstream "
     "consumer's declared type to 'any', which erases the contract the "
@@ -884,14 +887,13 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "prompt_template_parts, so a per-query token survives resolution and is "
     "rejected at the compose gate. Reviewed slots belong in the node-level "
     "template. A per-query template sees only 'row' and 'lookup': reference "
-    "each of its input_fields variables as {{ row.<variable> }} (the whole "
-    "source row is {{ row.source_row.<column> }}, lookups are "
+    "each of its input_fields variables as {{ row.<variable> }} (a source column is {{ row.source_row.<column> }} only when the node declares it in required_input_fields; lookups are "
     "{{ lookup.<key> }}); a bare {{ <variable> }} is rejected by the plugin "
     "schema as an undefined name (session 94f6f00c: the planner's first "
     "set_pipeline followed the old bare-name teaching and was rejected).",
     "Sink hygiene: the auto-appended <response_field>_usage / _model operational row "
     "fields ride the row automatically — do not map or require them into "
-    "sinks unless the user asked for token/model reporting.",
+    "sinks unless the user asked for token/model reporting. If <response_field>_usage is declared, its type is any.",
     # elspeth-15b400881f: the live planner named the three business columns in
     # its reply but left the CSV sink observed, so the first accepted row — not
     # reviewed configuration — chose the persisted header.  Keep the ownership
@@ -900,7 +902,7 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     # sink's fields are a consumer/output-shape declaration rather than a
     # producer guarantee.
     "When the user-facing output has known named business columns, declare "
-    "them in sink schema.fields with their types; do NOT leave that sink in "
+    "them in sink schema.fields with their types and carried names; do NOT leave that sink in "
     "mode: observed after promising those columns, because an observed CSV "
     "sink locks its header from the first accepted row. If the user asked for "
     "exactly those columns, put a schema-proven select-only projection "
@@ -1235,6 +1237,7 @@ class PlannerPluginContract:
     json_schema: Mapping[str, object]
     knob_schema: Mapping[str, object]
     composer_hints: tuple[str, ...]
+    aggregation_output_modes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "json_schema", "knob_schema", "composer_hints")
@@ -1246,6 +1249,7 @@ class PlannerPluginContract:
             "json_schema": deep_thaw(self.json_schema),
             "knob_schema": deep_thaw(self.knob_schema),
             "composer_hints": list(self.composer_hints),
+            "aggregation_output_modes": list(self.aggregation_output_modes),
         }
 
 
@@ -1253,7 +1257,9 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     """Project one admitted schema into the planner's bounded JIT contract."""
     if type(schema) is not PluginSchemaInfo:
         raise TypeError("schema must be an admitted PluginSchemaInfo")
-    return _planner_plugin_contract(schema.plugin_type, schema.name, schema.json_schema, schema.knob_schema, schema.composer_hints)
+    return _planner_plugin_contract(
+        schema.plugin_type, schema.name, schema.json_schema, schema.knob_schema, schema.composer_hints, schema.aggregation_output_modes
+    )
 
 
 def planner_plugin_contract_from_snapshot(schema: PluginSchemaSnapshot) -> PlannerPluginContract:
@@ -1261,7 +1267,12 @@ def planner_plugin_contract_from_snapshot(schema: PluginSchemaSnapshot) -> Plann
     if type(schema) is not PluginSchemaSnapshot:
         raise TypeError("schema must be an admitted PluginSchemaSnapshot")
     return _planner_plugin_contract(
-        schema.plugin_type, schema.name, schema.json_schema.to_wire(), schema.knob_schema.to_wire(), schema.composer_hints
+        schema.plugin_type,
+        schema.name,
+        schema.json_schema.to_wire(),
+        schema.knob_schema.to_wire(),
+        schema.composer_hints,
+        schema.aggregation_output_modes,
     )
 
 
@@ -1271,10 +1282,12 @@ def _planner_plugin_contract(
     raw_json_schema: Mapping[str, object],
     raw_knob_schema: Mapping[str, object],
     composer_hints: tuple[str, ...],
+    aggregation_output_modes: tuple[str, ...] = (),
 ) -> PlannerPluginContract:
     _assert_projection_input_bounds(raw_json_schema)
     _assert_projection_input_bounds(raw_knob_schema)
     _assert_projection_input_bounds(composer_hints)
+    _assert_projection_input_bounds(aggregation_output_modes)
     json_schema = _contract_json_schema(raw_json_schema)
     knob_schema = _contract_knob_schema(raw_knob_schema)
     if type(json_schema) is bool:
@@ -1284,6 +1297,7 @@ def _planner_plugin_contract(
         "json_schema": json_schema,
         "knob_schema": knob_schema,
         "composer_hints": list(composer_hints),
+        "aggregation_output_modes": list(aggregation_output_modes),
     }
     try:
         projected_size = len(canonical_json(projected).encode("utf-8"))
@@ -1291,13 +1305,14 @@ def _planner_plugin_contract(
         raise _SchemaContractProjectionUnsupported from exc
     if projected_size > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
         raise _SchemaContractProjectionUnsupported
-    contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema}
+    contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema, "aggregation_output_modes": list(aggregation_output_modes)}
     return PlannerPluginContract(
         plugin_id=f"{plugin_type}/{name}",
         schema_hash=stable_hash(contract_shape),
         json_schema=deep_freeze(json_schema),
         knob_schema=deep_freeze(knob_schema),
         composer_hints=tuple(composer_hints),
+        aggregation_output_modes=tuple(aggregation_output_modes),
     )
 
 
@@ -1682,6 +1697,7 @@ def build_schema_contract_evidence(
             "schema_hash": projected_contract.schema_hash,
             "json_schema": json_schema,
             "knob_schema": knob_schema,
+            "aggregation_output_modes": list(projected_contract.aggregation_output_modes),
         }
         prospective = _schema_evidence_envelope(
             policy_hash=snapshot.policy_hash,
@@ -1763,6 +1779,8 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
             entry["not_for"] = plugin.usage_when_not_to_use
         if plugin.capability_tags:
             entry["capability_tags"] = list(plugin.capability_tags)
+        if plugin.aggregation_output_modes:
+            entry["aggregation_output_modes"] = list(plugin.aggregation_output_modes)
         entries.append(entry)
     return entries
 
@@ -1920,7 +1938,8 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "the bounded contract for a chosen plugin. An entry's not_for is that plugin's own stated "
     "prohibition and is binding on selection: when the value you intend to "
     "write matches it, choose a different plugin or reshape the value upstream "
-    "first. capability_tags is the plugin's declared capability vocabulary. "
+    "first. capability_tags is the plugin's declared capability vocabulary; aggregation_output_modes lists class-derived batch admission modes. "
+    "A config_fields summary may show a named enum alias as object; use get_plugin_schema's current enum values for the chosen plugin. "
     "The budget block reports canonical_bytes_used and omitted_public_text_count. "
     "When public purpose or prohibition prose is omitted, its whole sha256 and details_via marker "
     "replace it; follow details_via before selecting that plugin because omitted prohibition text is still binding. "

@@ -4251,7 +4251,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
                         "unbound reference fails with 'Undefined variable' and the query errors for every "
                         "row. Add the missing variables to input_fields (template variable → row column), "
                         "rename the reference to a bound variable, or use 'row.source_row.<column>' for "
-                        "direct row access."
+                        "direct row access after declaring that column in the node's required_input_fields."
                     ),
                     severity="high",
                     error_code="query_template_unbound_row_fields",
@@ -5610,7 +5610,8 @@ def _check_schema_contracts(
                     f"node:{coalesce_node.id}",
                     f"Coalesce '{coalesce_node.id}' receives incompatible types for field '{conflict.field}' in union merge: "
                     f"branch '{conflict.branch_a}' has {conflict.type_a!r}, branch '{conflict.branch_b}' has {conflict.type_b!r}. "
-                    "Union merge requires every branch declaring a shared field to declare the same type for it.",
+                    "Union merge requires one compatible actual type for a shared field on every branch; any is a type, not a wildcard. "
+                    "Align the branch outputs or give a rewritten value a distinct name. A declaration does not convert values.",
                     "high",
                     "coalesce_union_type_incompatible",
                     coalesce_union_type=CoalesceUnionTypeDetail(

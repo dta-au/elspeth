@@ -169,7 +169,7 @@ class FieldMapperConfig(TransformDataConfig):
         EmittedToOutput("field_mapper uses mapping values as output row keys and downstream artifact columns"),
     ] = Field(
         default_factory=dict,
-        description="Mapping from existing input field names to output field names.",
+        description="Mapping keys locate existing input fields (header aliases may resolve when the source carries them); values create output names. An explicit target-only schema declaration can type a created target, but never converts its value.",
     )
     select_only: bool = Field(default=False, description="When true, emit only fields named in the mapping.")
 
@@ -322,13 +322,14 @@ class FieldMapper(BaseTransform):
 
     Every mapping source is a required input: a row missing one routes to
     ``on_error`` as ``missing_field``; a configured mapping is never skipped.
+    The strict option has been removed; missing mapping sources always route.
     """
 
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     preserves_input_values = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1b322bc8e2f94c9e"
+    source_file_hash: str | None = "sha256:9f4e287978efe335"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -922,10 +923,12 @@ class FieldMapper(BaseTransform):
             return PluginAssistance(
                 plugin_name="field_mapper",
                 issue_code=None,
-                summary="Rename, drop, or reorder row fields. Stateless and shape-changing — declares new field names in output_schema.",
+                summary="Rename, drop, or reorder row fields. Stateless and shape-changing; schema can declare created target output types.",
                 composer_hints=(
                     "Config keys are 'mapping' (dict of source->target), 'select_only' (bool, default false), plus 'schema'. Rename with {old: new}; keep a field with {x: x}; drop a field by omitting it under select_only: true.",
                     "Every mapping source is required: a row missing one routes to on_error as missing_field.",
+                    "The strict option is gone; remove it. Mapping keys locate existing inputs, including reachable source header aliases; values create new row names. A target-only schema declaration types its output but never converts a value.",
+                    "A dotted mapping source extracts a nested result typed any unless the target has an explicit output declaration; any conflicts with a concrete shared field type at a union coalesce.",
                     "field_mapper has no 'drop'/'include'/'rename_only' keys — dropping is done by omitting the field under select_only: true.",
                     "Use select_only: true when cleanup means 'save only these fields'; with select_only true, mapping should whitelist exactly the saved output fields.",
                     "A select_only whitelist must preserve every field required by the downstream sink; include each required field as a mapping target before routing the mapper to that sink.",

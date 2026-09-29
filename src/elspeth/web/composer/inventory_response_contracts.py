@@ -12,7 +12,7 @@ from pydantic import JsonValue
 from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability, WebConfigAuthority
-from elspeth.web.catalog.schemas import ConfigFieldSummary, PluginSecretRequirement, PluginSummary
+from elspeth.web.catalog.schemas import AggregationOutputMode, ConfigFieldSummary, PluginSecretRequirement, PluginSummary
 from elspeth.web.composer._response_json import FrozenResponseJSON, encode_response_json, parse_frozen_response_json, parse_response_json
 from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.plugin_policy.models import PluginUnavailableReason
@@ -81,6 +81,7 @@ class InventoryPlugin:
     usage_when_not_to_use: str | None
     example_use: str | None
     capability_tags: tuple[str, ...]
+    aggregation_output_modes: tuple[AggregationOutputMode, ...]
     web_config_authority: WebConfigAuthority
     policy_capabilities: tuple[CapabilityDeclaration, ...]
     audit_characteristics: tuple[AuditCharacteristic, ...]
@@ -166,6 +167,7 @@ _PLUGIN_FIELDS = (
     "usage_when_not_to_use",
     "example_use",
     "capability_tags",
+    "aggregation_output_modes",
     "web_config_authority",
     "policy_capabilities",
     "audit_characteristics",
@@ -183,6 +185,7 @@ def _plugin(value: object) -> InventoryPlugin:
             for items in (
                 value.config_fields,
                 value.capability_tags,
+                value.aggregation_output_modes,
                 value.policy_capabilities,
                 value.audit_characteristics,
                 value.composer_hints,
@@ -207,6 +210,7 @@ def _plugin(value: object) -> InventoryPlugin:
             "usage_when_not_to_use": value.usage_when_not_to_use,
             "example_use": value.example_use,
             "capability_tags": value.capability_tags,
+            "aggregation_output_modes": value.aggregation_output_modes,
             "web_config_authority": value.web_config_authority,
             "policy_capabilities": value.policy_capabilities,
             "audit_characteristics": value.audit_characteristics,
@@ -216,6 +220,9 @@ def _plugin(value: object) -> InventoryPlugin:
     row = _record(value, _PLUGIN_FIELDS)
     plugin_type = _text(row["plugin_type"])
     if plugin_type not in ("source", "transform", "sink"):
+        raise _bad()
+    modes = _texts(row["aggregation_output_modes"])
+    if modes not in ((), ("transform",), ("transform", "passthrough")) or (plugin_type != "transform" and modes):
         raise _bad()
     authority = row["web_config_authority"]
     if type(authority) is str:
@@ -238,6 +245,7 @@ def _plugin(value: object) -> InventoryPlugin:
         _nullable_text(row["usage_when_not_to_use"]),
         _nullable_text(row["example_use"]),
         _texts(row["capability_tags"]),
+        cast(tuple[AggregationOutputMode, ...], modes),
         authority,
         tuple(_capability(item) for item in _items(row["policy_capabilities"])),
         tuple(characteristics),
@@ -293,6 +301,7 @@ def _plugin_wire(value: InventoryPlugin) -> dict[str, JsonValue]:
         "usage_when_not_to_use": value.usage_when_not_to_use,
         "example_use": value.example_use,
         "capability_tags": list(value.capability_tags),
+        "aggregation_output_modes": list(value.aggregation_output_modes),
         "web_config_authority": value.web_config_authority.value,
         "policy_capabilities": [
             {
