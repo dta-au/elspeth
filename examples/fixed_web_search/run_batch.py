@@ -47,7 +47,14 @@ def main(count: int) -> int:
 
     with (batch / "server.log").open("w") as server_log:
         server = subprocess.Popen(
-            [sys.executable, str(repo / "examples/fixed_web_search/serve_fixture.py"), "--access-log", str(batch / "access.log")],
+            [
+                sys.executable,
+                str(repo / "examples/fixed_web_search/serve_fixture.py"),
+                "--access-log",
+                str(batch / "access.log"),
+                "--wire-log",
+                str(batch / "wire.log"),
+            ],
             stdout=server_log,
             stderr=subprocess.STDOUT,
             cwd=repo,
