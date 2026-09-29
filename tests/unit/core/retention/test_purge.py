@@ -23,7 +23,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.canonical import stable_hash
+from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
@@ -363,6 +363,385 @@ class TestPurgeResultValidation:
 
 
 class TestFindExpiredPayloadRefs:
+    def test_direct_purge_preserves_duplicate_reference_counts(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        ref = store.store(b"ordinary retained payload")
+        result = manager.purge_payloads([ref, ref])
+        assert result.deleted_count == 1
+        assert result.skipped_count == 1
+        assert not result.failed_refs
+        assert not store.exists(ref)
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "padded-metadata",
+            "large-snapshot",
+            "removed-marker-small",
+            "removed-marker-large",
+            "missing-input",
+            "large-input",
+            "malformed-input",
+            "nonmapping-input",
+            "mismatched-input-hash",
+            "missing-input-ref",
+            "invalid-input-flag",
+            "shared-output-snapshot-input",
+        ],
+    )
+    def test_source_output_classification_refuses_corruption_before_purge(self, db: LandscapeDB, tmp_path: Path, case: str) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        original = {"source_snapshot_ref": child_ref, "source_snapshot_version": 1}
+        metadata = original if case in {"padded-metadata", "large-snapshot"} else {"other_output": "x"}
+        if case == "large-snapshot":
+            metadata = {**original, "padding": "x" * 2048}
+        elif case not in {"padded-metadata", "removed-marker-small", "shared-output-snapshot-input"}:
+            metadata = {"other_output": "x" * 2048}
+        content = canonical_json(metadata).encode()
+        if case == "padded-metadata":
+            content += b" " * 2048
+        metadata_ref = store.store(content)
+        input_data = {"source_plugin": "json", "snapshot_for_resume": True}
+        input_content = canonical_json(input_data).encode()
+        input_hash = stable_hash(input_data)
+        if case == "large-input":
+            input_data = {**input_data, "padding": "x" * 2048}
+            input_content = canonical_json(input_data).encode()
+            input_hash = stable_hash(input_data)
+        elif case == "malformed-input":
+            input_content = b"{"
+            input_hash = store.store(input_content)
+        elif case == "nonmapping-input":
+            input_content = b"[]"
+            input_hash = store.store(input_content)
+        elif case == "invalid-input-flag":
+            input_content = canonical_json({"snapshot_for_resume": "true"}).encode()
+            input_hash = store.store(input_content)
+        input_ref = store.store(input_content)
+        if case == "missing-input":
+            store.delete(input_ref)
+        elif case == "mismatched-input-hash":
+            input_hash = stable_hash({"different": "input"})
+        elif case == "missing-input-ref":
+            input_ref = None
+        with db.write_connection() as conn:
+            _create_run(conn, "source-classification", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "source-classification", "source-classification-node")
+            inputs = [(input_ref, input_hash)]
+            if case == "shared-output-snapshot-input":
+                other_input = {"source_plugin": "json"}
+                inputs.insert(0, (store.store(canonical_json(other_input).encode()), stable_hash(other_input)))
+            for index, (operation_input_ref, operation_input_hash) in enumerate(inputs):
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id=f"classification-op-{index}",
+                        run_id="source-classification",
+                        node_id="source-classification-node",
+                        operation_type="source_load",
+                        occurrence_index=index,
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=operation_input_ref,
+                        input_data_hash=operation_input_hash,
+                        output_data_ref=metadata_ref,
+                        output_data_hash=stable_hash(metadata),
+                    )
+                )
+        with pytest.raises(AuditIntegrityError):
+            manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        with pytest.raises(AuditIntegrityError):
+            manager.purge_payloads([metadata_ref, child_ref])
+        assert store.exists(metadata_ref)
+        assert store.exists(child_ref)
+
+    @pytest.mark.parametrize("input_data", [None, {"source_plugin": "json"}, {"snapshot_for_resume": False}])
+    @pytest.mark.parametrize("large_output", [False, True])
+    def test_canonical_non_snapshot_source_output_can_be_purged(
+        self, db: LandscapeDB, tmp_path: Path, input_data: dict[str, object] | None, large_output: bool
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output_data = {"other_output": "x" * (2048 if large_output else 1)}
+        output_ref = store.store(canonical_json(output_data).encode())
+        input_ref = None if input_data is None else store.store(canonical_json(input_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "generic-source", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "generic-source", "generic-source-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="generic-source-op",
+                    run_id="generic-source",
+                    node_id="generic-source-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    input_data_ref=input_ref,
+                    input_data_hash=None if input_data is None else stable_hash(input_data),
+                    output_data_ref=output_ref,
+                    output_data_hash=stable_hash(output_data),
+                )
+            )
+        expected_refs = {output_ref} if input_ref is None else {output_ref, input_ref}
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == expected_refs
+        result = manager.purge_payloads(sorted(expected_refs))
+        assert result.deleted_count == len(expected_refs)
+        assert not store.exists(output_ref)
+
+    @pytest.mark.parametrize("large_output", [False, True])
+    @pytest.mark.parametrize("retention_case", ["failed-output", "retained-output", "active-shared-output"])
+    def test_generic_source_output_keeps_classification_input_until_output_removed(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, large_output: bool, retention_case: str
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output = {"other_output": "x" * (2048 if large_output else 1)}
+        output_ref = store.store(canonical_json(output).encode())
+        input_data = {"source_plugin": "json"}
+        input_ref = store.store(canonical_json(input_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "generic-retention", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "generic-retention", "generic-retention-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="generic-retention-op",
+                    run_id="generic-retention",
+                    node_id="generic-retention-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    input_data_ref=input_ref,
+                    input_data_hash=stable_hash(input_data),
+                    output_data_ref=output_ref,
+                    output_data_hash=stable_hash(output),
+                )
+            )
+            if retention_case == "active-shared-output":
+                active_input = {"source_plugin": "csv"}
+                active_input_ref = store.store(canonical_json(active_input).encode())
+                _create_run(conn, "shared-generic-active", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=1))
+                _create_node(conn, "shared-generic-active", "shared-generic-active-node")
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id="shared-generic-active-op",
+                        run_id="shared-generic-active",
+                        node_id="shared-generic-active-node",
+                        operation_type="source_load",
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=active_input_ref,
+                        input_data_hash=stable_hash(active_input),
+                        output_data_ref=output_ref,
+                        output_data_hash=stable_hash(output),
+                    )
+                )
+        if retention_case == "active-shared-output":
+            assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+            return
+        if retention_case == "retained-output":
+            first = manager.purge_payloads([input_ref])
+            assert first.deleted_count == 0
+            assert first.failed_refs == (input_ref,)
+        else:
+            delete = store.delete
+
+            def fail_output(ref: str) -> bool:
+                if ref == output_ref:
+                    raise OSError("simulated output deletion failure")
+                return delete(ref)
+
+            monkeypatch.setattr(store, "delete", fail_output)
+            first = manager.purge_payloads([input_ref, output_ref])
+            assert first.deleted_count == 0
+            assert set(first.failed_refs) == {input_ref, output_ref}
+            monkeypatch.setattr(store, "delete", delete)
+        assert store.exists(input_ref)
+        assert store.exists(output_ref)
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {input_ref, output_ref}
+        second = manager.purge_payloads([input_ref, output_ref])
+        assert second.deleted_count == 2
+        assert not second.failed_refs
+        assert not store.exists(input_ref)
+        assert not store.exists(output_ref)
+
+    def test_cyclic_classification_dependencies_refuse_before_deleting_any_payload(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        first_data = {"source_plugin": "json", "value": "first"}
+        second_data = {"source_plugin": "json", "value": "second"}
+        first_ref = store.store(canonical_json(first_data).encode())
+        second_ref = store.store(canonical_json(second_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "cyclic-generic", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "cyclic-generic", "cyclic-generic-node")
+            for index, (input_ref, output_ref) in enumerate(((first_ref, second_ref), (second_ref, first_ref))):
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id=f"cyclic-generic-op-{index}",
+                        run_id="cyclic-generic",
+                        node_id="cyclic-generic-node",
+                        operation_type="source_load",
+                        occurrence_index=index,
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=input_ref,
+                        input_data_hash=input_ref,
+                        output_data_ref=output_ref,
+                        output_data_hash=output_ref,
+                    )
+                )
+        with pytest.raises(ValueError, match="cyclic source-output payload dependencies"):
+            manager.purge_payloads([first_ref, second_ref])
+        assert store.exists(first_ref)
+        assert store.exists(second_ref)
+
+    def test_active_source_output_protects_all_transitive_classification_inputs(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        values = [{"source_plugin": label} for label in ("z", "a", "b", "c")]
+        refs = [store.store(canonical_json(value).encode()) for value in values]
+        with db.write_connection() as conn:
+            for run_id, age in (("chain-expired", 40), ("chain-active", 1)):
+                _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=now - timedelta(days=age))
+                _create_node(conn, run_id, f"source-{run_id}")
+            for index, (input_index, output_index, run_id) in enumerate(
+                ((0, 1, "chain-expired"), (1, 2, "chain-expired"), (2, 3, "chain-active"))
+            ):
+                conn.execute(
+                    operations_table.insert().values(
+                        operation_id=f"chain-op-{index}",
+                        run_id=run_id,
+                        node_id=f"source-{run_id}",
+                        operation_type="source_load",
+                        occurrence_index=index,
+                        started_at=now,
+                        status="completed",
+                        input_data_ref=refs[input_index],
+                        input_data_hash=refs[input_index],
+                        output_data_ref=refs[output_index],
+                        output_data_hash=refs[output_index],
+                    )
+                )
+        assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+
+    def test_already_missing_source_metadata_remains_a_normal_partial_purge(self, db: LandscapeDB, tmp_path: Path) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        output = {"source_snapshot_ref": store.store(b"source rows"), "source_snapshot_version": 1}
+        output_ref = store.store(canonical_json(output).encode())
+        store.delete(output_ref)
+        with db.write_connection() as conn:
+            _create_run(conn, "partly-purged", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "partly-purged", "partly-purged-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="partly-purged-op",
+                    run_id="partly-purged",
+                    node_id="partly-purged-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=output_ref,
+                    output_data_hash=stable_hash(output),
+                )
+            )
+        assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == [output_ref]
+        result = manager.purge_payloads([output_ref])
+        assert result.deleted_count == 0
+        assert result.skipped_count == 1
+
+    def test_snapshot_purge_retries_after_input_deleted_and_child_delete_failed(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        metadata = {"source_snapshot_ref": child_ref, "source_snapshot_version": 1}
+        metadata_ref = store.store(canonical_json(metadata).encode())
+        input_data = {"source_plugin": "json", "snapshot_for_resume": True}
+        input_ref = store.store(canonical_json(input_data).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "retry-snapshot", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "retry-snapshot", "retry-snapshot-node")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="retry-snapshot-op",
+                    run_id="retry-snapshot",
+                    node_id="retry-snapshot-node",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    input_data_ref=input_ref,
+                    input_data_hash=stable_hash(input_data),
+                    output_data_ref=metadata_ref,
+                    output_data_hash=stable_hash(metadata),
+                )
+            )
+        delete = store.delete
+
+        def fail_child_once(ref: str) -> bool:
+            if ref == child_ref:
+                raise OSError("simulated child deletion failure")
+            return delete(ref)
+
+        monkeypatch.setattr(store, "delete", fail_child_once)
+        first = manager.purge_payloads([input_ref, metadata_ref, child_ref])
+        assert first.deleted_count == 1
+        assert set(first.failed_refs) == {metadata_ref, child_ref}
+        assert not store.exists(input_ref)
+        assert store.exists(metadata_ref)
+        assert store.exists(child_ref)
+        assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == {input_ref, metadata_ref, child_ref}
+        monkeypatch.setattr(store, "delete", delete)
+        second = manager.purge_payloads([input_ref, metadata_ref, child_ref])
+        assert second.deleted_count == 2
+        assert second.skipped_count == 1
+        assert not store.exists(metadata_ref)
+        assert not store.exists(child_ref)
+
+    @pytest.mark.parametrize(
+        "content",
+        [b'{"source_snapshot_ref":', b"\xff", b"[]", b'{"source_snapshot_version":1}'],
+        ids=["malformed-json", "invalid-utf8", "nonmapping", "missing-marker"],
+    )
+    def test_corrupt_source_output_refuses_discovery_and_deletion(self, db: LandscapeDB, tmp_path: Path, content: bytes) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        original = {"source_snapshot_ref": child_ref, "source_snapshot_version": 1}
+        metadata_ref = store.store(content)
+        with db.write_connection() as conn:
+            _create_run(conn, "corrupt-source", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "corrupt-source", "source-corrupt")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="corrupt-source-op",
+                    run_id="corrupt-source",
+                    node_id="source-corrupt",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=metadata_ref,
+                    output_data_hash=stable_hash(original),
+                )
+            )
+        with pytest.raises(AuditIntegrityError):
+            manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        with pytest.raises(AuditIntegrityError):
+            manager.purge_payloads([metadata_ref])
+        assert store.exists(child_ref)
+        assert store.exists(metadata_ref)
+
     @pytest.mark.parametrize("version", [True, 1.0, "1", 2])
     def test_invalid_snapshot_version_refuses_discovery_and_deletion(self, db: LandscapeDB, tmp_path: Path, version: object) -> None:
         store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -370,7 +749,10 @@ class TestFindExpiredPayloadRefs:
         now = datetime(2026, 2, 8, tzinfo=UTC)
         child_ref = store.store(b"sealed source rows")
         metadata = {"source_snapshot_ref": child_ref, "source_snapshot_version": version}
-        metadata_ref = store.store(json.dumps(metadata).encode())
+        # Canonical JSON normalizes 1.0 to 1. Deliberately retain the corrupt
+        # float wire spelling to exercise refusal of noncanonical metadata.
+        content = json.dumps(metadata).encode() if type(version) is float else canonical_json(metadata).encode()
+        metadata_ref = store.store(content)
         with db.write_connection() as conn:
             _create_run(conn, "invalid-snapshot", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
             _create_node(conn, "invalid-snapshot", "source-invalid")
@@ -386,9 +768,9 @@ class TestFindExpiredPayloadRefs:
                     output_data_hash=stable_hash(metadata),
                 )
             )
-        with pytest.raises(AuditIntegrityError, match="metadata is malformed"):
+        with pytest.raises(AuditIntegrityError, match=r"metadata is malformed|canonical bindings"):
             manager.find_expired_payload_refs(retention_days=30, as_of=now)
-        with pytest.raises(AuditIntegrityError, match="metadata is malformed"):
+        with pytest.raises(AuditIntegrityError, match=r"metadata is malformed|canonical bindings"):
             manager.purge_payloads([child_ref, metadata_ref])
         assert store.exists(child_ref)
         assert store.exists(metadata_ref)
@@ -403,7 +785,7 @@ class TestFindExpiredPayloadRefs:
         recent = now - timedelta(days=1)
         spool_ref = store.store(b"sealed source rows")
         metadata = {"source_snapshot_ref": spool_ref, "source_snapshot_version": 1}
-        metadata_ref = store.store(json.dumps(metadata).encode())
+        metadata_ref = store.store(canonical_json(metadata).encode())
         with db.write_connection() as conn:
             for run_id, completed_at in (("expired-snapshot", old), ("active-snapshot", recent)):
                 _create_run(conn, run_id, status=RunStatus.COMPLETED, completed_at=completed_at)
