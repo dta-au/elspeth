@@ -95,6 +95,16 @@
         "tier": "common"
       },
       {
+        "default": null,
+        "description": "Row field containing ordered multipart text entries or payload-store blob references.",
+        "kind": "text",
+        "label": "Request Multipart Field",
+        "name": "request_multipart_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "description": "Static URL query parameters sent with each request.",
         "kind": "json-object",
         "label": "Query",

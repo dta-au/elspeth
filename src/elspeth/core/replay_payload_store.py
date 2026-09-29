@@ -44,7 +44,9 @@ def _audited_ref(value: object, *, location: str) -> str:
     return value
 
 
-def _row_refs(row: object, *, fields: frozenset[str], image_fields: frozenset[str], location: str) -> Iterable[str]:
+def _row_refs(
+    row: object, *, fields: frozenset[str], image_fields: frozenset[str], multipart_fields: frozenset[str], location: str
+) -> Iterable[str]:
     if type(row) not in (dict, MappingProxyType):
         raise AuditIntegrityError(f"{location}: audited row is not an object")
     row = cast("dict[str, object] | MappingProxyType[str, object]", row)
@@ -60,6 +62,29 @@ def _row_refs(row: object, *, fields: frozenset[str], image_fields: frozenset[st
                 yield _audited_ref(ref, location=f"{location}.{field_name}[{index}]")
         else:
             yield _audited_ref(value, location=f"{location}.{field_name}")
+    for field_name in multipart_fields:
+        if field_name not in row:
+            continue
+        parts = row[field_name]
+        if type(parts) not in (list, tuple):
+            raise AuditIntegrityError(f"{location}.{field_name}: invalid multipart manifest")
+        parts = cast("list[object] | tuple[object, ...]", parts)
+        if not 1 <= len(parts) <= 256:
+            raise AuditIntegrityError(f"{location}.{field_name}: invalid multipart manifest")
+        for index, part in enumerate(parts):
+            if type(part) not in (dict, MappingProxyType):
+                raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid multipart part")
+            part = cast("dict[str, object] | MappingProxyType[str, object]", part)
+            keys = set(part)
+            if keys == {"name", "value"}:
+                if type(part["name"]) is not str or not part["name"] or type(part["value"]) is not str:
+                    raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid text part")
+            elif keys == {"name", "blob_ref", "filename", "content_type"}:
+                if any(type(part[key]) is not str or not part[key] for key in ("name", "filename", "content_type")):
+                    raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid file part")
+                yield _audited_ref(part["blob_ref"], location=f"{location}.{field_name}[{index}].blob_ref")
+            else:
+                raise AuditIntegrityError(f"{location}.{field_name}[{index}]: invalid multipart part")
 
 
 def collect_source_payload_refs(
@@ -69,6 +94,7 @@ def collect_source_payload_refs(
     source_store: PayloadStore,
     blob_ref_fields: Collection[str],
     image_ref_fields: Collection[str] = (),
+    multipart_ref_fields: Collection[str] = (),
 ) -> SourcePayloadRefs:
     """Collect explicit blob refs from a source run and prove retained bytes.
 
@@ -79,7 +105,8 @@ def collect_source_payload_refs(
     """
     fields = frozenset(blob_ref_fields)
     image_fields = frozenset(image_ref_fields)
-    if any(type(field_name) is not str or not field_name for field_name in fields | image_fields):
+    multipart_fields = frozenset(multipart_ref_fields)
+    if any(type(field_name) is not str or not field_name for field_name in fields | image_fields | multipart_fields):
         raise ValueError("payload ref fields must contain admitted field names")
     input_refs: set[str] = set()
     output_refs: set[str] = set()
@@ -94,7 +121,11 @@ def collect_source_payload_refs(
             data = factory.query.get_row_data(row.row_id)
             if data.state is not RowDataState.AVAILABLE or data.data is None:
                 raise AuditIntegrityError(f"Source run {source_run_id}: row {row.row_id} payload unavailable")
-            input_refs.update(_row_refs(data.data, fields=fields, image_fields=image_fields, location=f"row {row.row_id}"))
+            input_refs.update(
+                _row_refs(
+                    data.data, fields=fields, image_fields=image_fields, multipart_fields=multipart_fields, location=f"row {row.row_id}"
+                )
+            )
 
     for token in factory.query.get_all_tokens_for_run(source_run_id):
         if token.token_data_ref is None:
@@ -107,7 +138,15 @@ def collect_source_payload_refs(
         if type(decoded) is not dict or set(decoded) != {"data", "contract"} or type(decoded["contract"]) is not dict:
             raise AuditIntegrityError(f"Source run {source_run_id}: token {token.token_id} has no data/contract envelope")
         SchemaContract.from_checkpoint(decoded["contract"])
-        input_refs.update(_row_refs(decoded["data"], fields=fields, image_fields=image_fields, location=f"token {token.token_id}"))
+        input_refs.update(
+            _row_refs(
+                decoded["data"],
+                fields=fields,
+                image_fields=image_fields,
+                multipart_fields=multipart_fields,
+                location=f"token {token.token_id}",
+            )
+        )
 
     for state in factory.query.get_all_node_states_for_run(source_run_id):
         if state.node_id in pdf_node_ids:
@@ -217,6 +256,23 @@ class SourceBoundPayloadStore:
         if self._mode is RunMode.REPLAY:
             return original
         current = self._current_store.retrieve(content_hash)
+        self._check_hash(content_hash, current)
+        if current != original:
+            raise IntegrityError("Current payload bytes differ from source-run evidence")
+        return current
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        if content_hash not in self._source_refs:
+            raise IntegrityError("Payload reference is absent from source-run audit evidence")
+        original = self._source_store.retrieve_bounded(content_hash, max_bytes=max_bytes)
+        if original is None:
+            return None
+        self._check_hash(content_hash, original)
+        if self._mode is RunMode.REPLAY:
+            return original
+        current = self._current_store.retrieve_bounded(content_hash, max_bytes=max_bytes)
+        if current is None:
+            raise IntegrityError("Current payload exceeds source-run payload size bound")
         self._check_hash(content_hash, current)
         if current != original:
             raise IntegrityError("Current payload bytes differ from source-run evidence")

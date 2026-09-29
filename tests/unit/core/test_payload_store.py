@@ -15,6 +15,7 @@ class TestPayloadStoreProtocol:
         # Protocol should define these methods
         assert hasattr(PayloadStore, "store")
         assert hasattr(PayloadStore, "retrieve")
+        assert hasattr(PayloadStore, "retrieve_bounded")
         assert hasattr(PayloadStore, "exists")
         assert hasattr(PayloadStore, "delete")
 
@@ -81,6 +82,15 @@ class TestFilesystemPayloadStore:
         assert original_path.read_bytes() == content
         assert not other_path.exists()
         assert store.retrieve(content_hash) == content
+
+    def test_bounded_retrieve_refuses_oversize_without_reading_whole_blob(self, tmp_path: Path) -> None:
+        from elspeth.core.payload_store import FilesystemPayloadStore
+
+        store = FilesystemPayloadStore(base_path=tmp_path)
+        content = b"x" * 1024
+        content_hash = store.store(content)
+        assert store.retrieve_bounded(content_hash, max_bytes=1024) == content
+        assert store.retrieve_bounded(content_hash, max_bytes=1023) is None
 
     def test_exists_returns_true_for_stored(self, tmp_path: Path) -> None:
         from elspeth.core.payload_store import FilesystemPayloadStore

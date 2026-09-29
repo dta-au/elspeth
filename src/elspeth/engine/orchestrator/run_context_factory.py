@@ -77,11 +77,17 @@ def build_agg_transform_lookup(config: PipelineConfig) -> dict[str, AggNodeEntry
     return agg_transform_lookup
 
 
-def _configured_replay_blob_fields(transforms: Sequence[TransformProtocol]) -> tuple[set[str], set[str]]:
-    """Resolve admitted scalar and image-list payload columns from plugin config."""
+def _configured_replay_blob_fields(transforms: Sequence[TransformProtocol]) -> tuple[set[str], set[str], set[str]]:
+    """Resolve admitted scalar, image-list, and multipart payload columns."""
     scalar_fields: set[str] = set()
     image_fields: set[str] = set()
+    multipart_fields: set[str] = set()
     for transform in transforms:
+        if transform.name == "web_scrape" and "request_multipart_field" in transform.config:
+            field_name = transform.config["request_multipart_field"]
+            if type(field_name) is not str or not field_name:
+                raise RuntimeError("Invalid request_multipart_field for web_scrape")
+            multipart_fields.add(field_name)
         if transform.name in {"blob_csv_expand", "blob_json_expand", "blob_text_expand", "pdf_rasterize", "aws_textract_inline_analysis"}:
             source = transform.config["source"] if "source" in transform.config else None
             if transform.name == "blob_csv_expand" and source == "field":
@@ -96,7 +102,7 @@ def _configured_replay_blob_fields(transforms: Sequence[TransformProtocol]) -> t
                 if type(spec) is not dict or "field" not in spec or type(spec["field"]) is not str or not spec["field"]:
                     raise RuntimeError("Invalid image_inputs field for llm")
                 image_fields.add(spec["field"])
-    return scalar_fields, image_fields
+    return scalar_fields, image_fields, multipart_fields
 
 
 class RunContextFactory:
@@ -188,13 +194,14 @@ class RunContextFactory:
             if factory.audited_sources is None:
                 raise RuntimeError("Replay/verify source snapshot was not admitted before plugin startup")
             admit_registered_graph(factory, source_run_id=source_run_id, current_run_id=run_id)
-            blob_ref_fields, image_ref_fields = _configured_replay_blob_fields(config.transforms)
+            blob_ref_fields, image_ref_fields, multipart_ref_fields = _configured_replay_blob_fields(config.transforms)
             refs = collect_source_payload_refs(
                 factory,
                 source_run_id,
                 source_store=payload_store,
                 blob_ref_fields=blob_ref_fields,
                 image_ref_fields=image_ref_fields,
+                multipart_ref_fields=multipart_ref_fields,
             )
             plugin_payload_store = SourceBoundPayloadStore(
                 mode=runtime_mode.mode,

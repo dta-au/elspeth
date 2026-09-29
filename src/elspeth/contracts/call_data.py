@@ -23,7 +23,9 @@ format stability.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import re
 import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,6 +34,7 @@ from typing import Any, Literal, Protocol, cast, get_args, runtime_checkable
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
+from elspeth.contracts.payload_store import IntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 
 # ---------------------------------------------------------------------------
@@ -320,6 +323,124 @@ def encode_urlencoded_form(form: Sequence[tuple[str, str]]) -> bytes:
     return urllib.parse.urlencode(form).encode("ascii")
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _multipart_header_text(value: str, *, field_name: str) -> str:
+    if type(value) is not str or not value or len(value) > 200 or any(ord(char) < 32 or ord(char) > 126 for char in value):
+        raise ValueError(f"multipart {field_name} must be 1-200 printable ASCII characters")
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class MultipartPart:
+    """One ordered text field or one content-addressed file field."""
+
+    name: str
+    value: str | None = None
+    blob_ref: str | None = None
+    filename: str | None = None
+    content_type: str | None = None
+
+    def __post_init__(self) -> None:
+        _multipart_header_text(self.name, field_name="name")
+        if (self.value is None) == (self.blob_ref is None):
+            raise ValueError("multipart part needs exactly one of value or blob_ref")
+        if self.value is not None:
+            if type(self.value) is not str or self.filename is not None or self.content_type is not None:
+                raise ValueError("multipart text part must contain only a string value")
+            return
+        if type(self.blob_ref) is not str or _SHA256_HEX.fullmatch(self.blob_ref) is None:
+            raise ValueError("multipart blob_ref must be a lowercase SHA-256 hash")
+        if self.filename is None or self.content_type is None:
+            raise ValueError("multipart blob part requires filename and content_type")
+        _multipart_header_text(self.filename, field_name="filename")
+        if "/" in self.filename or "\\" in self.filename:
+            raise ValueError("multipart filename must not contain path separators")
+        _multipart_header_text(self.content_type, field_name="content_type")
+        if "/" not in self.content_type:
+            raise ValueError("multipart content_type must be a MIME type")
+
+    def to_dict(self) -> dict[str, str]:
+        if self.value is not None:
+            return {"name": self.name, "value": self.value}
+        if self.blob_ref is None or self.filename is None or self.content_type is None:
+            raise ValueError("multipart blob part is incomplete")
+        return {"name": self.name, "blob_ref": self.blob_ref, "filename": self.filename, "content_type": self.content_type}
+
+
+@dataclass(frozen=True, slots=True)
+class MultipartMetadata:
+    """Versioned manifest and digest for exact multipart wire bytes."""
+
+    parts: tuple[MultipartPart, ...]
+    boundary: str
+    body_sha256: str
+    body_size: int
+
+    def __post_init__(self) -> None:
+        if not self.parts or any(type(part) is not MultipartPart for part in self.parts):
+            raise ValueError("multipart metadata needs typed parts")
+        if type(self.boundary) is not str or re.fullmatch(r"elspeth-[0-9a-f]{32}", self.boundary) is None:
+            raise ValueError("multipart metadata has invalid boundary")
+        if type(self.body_sha256) is not str or _SHA256_HEX.fullmatch(self.body_sha256) is None:
+            raise ValueError("multipart metadata has invalid body hash")
+        require_int(self.body_size, "body_size", min_value=1)
+
+    @property
+    def content_type(self) -> str:
+        return f"multipart/form-data; boundary={self.boundary}"
+
+
+def encode_multipart_form(
+    parts: tuple[MultipartPart, ...], blobs: Mapping[str, bytes], *, max_body_bytes: int
+) -> tuple[bytes, MultipartMetadata]:
+    """Encode ordered parts with a reproducible boundary and a hard byte cap."""
+    if not 1 <= len(parts) <= 256 or any(type(part) is not MultipartPart for part in parts):
+        raise ValueError("multipart form needs 1 to 256 typed parts")
+    if max_body_bytes <= 0:
+        raise ValueError("max_body_bytes must be positive")
+    if any(part.value is not None and len(part.value.encode("utf-8")) > max_body_bytes for part in parts):
+        raise ValueError("multipart text part exceeds max_body_bytes")
+    manifest = json.dumps([part.to_dict() for part in parts], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    boundary = "elspeth-" + hashlib.sha256(manifest).hexdigest()[:32]
+    boundary_bytes = boundary.encode("ascii")
+    body = bytearray()
+
+    def append(chunk: bytes) -> None:
+        if len(body) + len(chunk) > max_body_bytes:
+            raise ValueError("multipart body exceeds max_body_bytes")
+        body.extend(chunk)
+
+    for part in parts:
+        name = part.name.replace("\\", "\\\\").replace('"', '\\"')
+        disposition = f'Content-Disposition: form-data; name="{name}"'
+        if part.value is not None:
+            content = part.value.encode("utf-8")
+        else:
+            if part.blob_ref is None or part.filename is None or part.content_type is None:
+                raise ValueError("multipart blob part is incomplete")
+            content = blobs[part.blob_ref]
+            if type(content) is not bytes or hashlib.sha256(content).hexdigest() != part.blob_ref:
+                raise IntegrityError("Multipart blob bytes do not match the declared reference")
+            filename = part.filename.replace("\\", "\\\\").replace('"', '\\"')
+            disposition += f'; filename="{filename}"'
+        if b"--" + boundary_bytes in content:
+            raise ValueError("multipart content contains the generated boundary")
+        append(b"--" + boundary_bytes + b"\r\n")
+        append(disposition.encode("ascii") + b"\r\n")
+        if part.content_type is not None:
+            append(f"Content-Type: {part.content_type}\r\n".encode("ascii"))
+        append(b"\r\n")
+        append(content)
+        append(b"\r\n")
+    append(b"--" + boundary_bytes + b"--\r\n")
+    encoded = bytes(body)
+    return encoded, MultipartMetadata(
+        parts=parts, boundary=boundary, body_sha256=hashlib.sha256(encoded).hexdigest(), body_size=len(encoded)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class HTTPCallRequest:
     """Audit record for an outbound HTTP request.
@@ -340,6 +461,7 @@ class HTTPCallRequest:
     headers: Mapping[str, str]
     json: Mapping[str, Any] | None = None
     form: tuple[tuple[str, str], ...] | None = None
+    multipart: MultipartMetadata | None = None
     params: Mapping[str, Any] | None = None
     audit_metadata: Mapping[str, Any] | None = None
     resolved_ip: str | None = None
@@ -354,9 +476,11 @@ class HTTPCallRequest:
         _require_non_empty_str(self.url, "url")
         _require_string_mapping(self.headers, "headers")
         if self.form is not None:
-            if method != "POST" or self.json is not None:
+            if method != "POST" or self.json is not None or self.multipart is not None:
                 raise ValueError("form requires POST without a JSON body")
             encode_urlencoded_form(self.form)
+        if self.multipart is not None and (method != "POST" or self.json is not None or self.form is not None):
+            raise ValueError("multipart requires POST without another body")
         require_int(self.hop_number, "hop_number", optional=True, min_value=1)
         if self.resolved_ip is not None:
             _require_non_empty_str(self.resolved_ip, "resolved_ip")
@@ -395,6 +519,12 @@ class HTTPCallRequest:
             d["form"] = deep_thaw(self.form)
             d["body_encoding"] = "urlencoded-v1"
             d["body_sha256"] = hashlib.sha256(encode_urlencoded_form(self.form)).hexdigest()
+        if self.multipart is not None:
+            d["multipart"] = [part.to_dict() for part in self.multipart.parts]
+            d["body_encoding"] = "multipart-v1"
+            d["body_sha256"] = self.multipart.body_sha256
+            d["body_size"] = self.multipart.body_size
+            d["body_boundary"] = self.multipart.boundary
         if self.params is not None or self.method == "GET":
             d["params"] = deep_thaw(self.params) if self.params is not None else None
         if self.audit_metadata is not None:

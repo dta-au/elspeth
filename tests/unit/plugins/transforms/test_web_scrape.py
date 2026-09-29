@@ -19,6 +19,7 @@ from elspeth.contracts.audit import Call
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -264,6 +265,66 @@ def test_web_scrape_get_rejects_body_field() -> None:
     options["request_json_field"] = "query_body"
     with pytest.raises(PluginConfigError, match="request_json_field"):
         WebScrapeTransform(options)
+
+
+@respx.mock
+def test_web_scrape_multipart_sends_ordered_text_and_blob_parts(mock_ctx: PluginContext, tmp_path) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/upload").mock(
+        return_value=httpx.Response(200, text="<main>received</main>", headers={"content-type": "text/html"})
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update({"url": "https://example.com/upload", "method": "POST", "request_multipart_field": "parts", "format": "raw"})
+    options["http"]["max_request_body_bytes"] = 4096
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    store = FilesystemPayloadStore(base_path=tmp_path)
+    blob = b"%PDF-1.7\r\ncontent"
+    ref = store.store(blob)
+    transform._payload_store = store
+    row = make_pipeline_row(
+        {
+            "parts": [
+                {"name": "q", "value": "A B"},
+                {"name": "document", "blob_ref": ref, "filename": "form.pdf", "content_type": "application/pdf"},
+                {"name": "q", "value": "Café"},
+            ]
+        }
+    )
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(row, mock_ctx)
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    request = endpoint.calls[0].request
+    assert request.headers["content-type"].startswith("multipart/form-data; boundary=elspeth-")
+    assert request.content.index(b"A B") < request.content.index(blob) < request.content.index("Café".encode())
+    assert request.content.count(b'name="q"') == 2
+
+
+def test_web_scrape_multipart_oversized_blob_refused_before_dns(mock_ctx: PluginContext, tmp_path) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update({"url": "https://example.com/upload", "method": "POST", "request_multipart_field": "parts"})
+    options["http"]["max_request_body_bytes"] = 128
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    store = FilesystemPayloadStore(base_path=tmp_path)
+    ref = store.store(b"x" * 1024)
+    transform._payload_store = store
+
+    with patch("socket.getaddrinfo") as resolve:
+        result = transform.process(
+            make_pipeline_row(
+                {"parts": [{"name": "file", "blob_ref": ref, "filename": "data.bin", "content_type": "application/octet-stream"}]}
+            ),
+            mock_ctx,
+        )
+
+    resolve.assert_not_called()
+    assert result.status == "error"
+    assert result.reason is not None and "max_request_body_bytes" in str(result.reason)
 
 
 @respx.mock

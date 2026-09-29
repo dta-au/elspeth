@@ -15,6 +15,7 @@ import re
 import secrets
 import stat
 from pathlib import Path
+from typing import overload
 
 import elspeth.contracts.payload_store as payload_contracts
 from elspeth.contracts.payload_store import PayloadNotFoundError
@@ -122,7 +123,13 @@ class FilesystemPayloadStore:
                 os.chmod(parent, 0o700)
         return self._open_validated_directory(parent)
 
-    def _read_payload_file(self, dir_fd: int, filename: str) -> bytes:
+    @overload
+    def _read_payload_file(self, dir_fd: int, filename: str, *, max_bytes: None = None) -> bytes: ...
+
+    @overload
+    def _read_payload_file(self, dir_fd: int, filename: str, *, max_bytes: int) -> bytes | None: ...
+
+    def _read_payload_file(self, dir_fd: int, filename: str, *, max_bytes: int | None = None) -> bytes | None:
         """Read a payload file through a validated parent directory fd."""
         try:
             file_fd = os.open(filename, os.O_RDONLY | _O_NOFOLLOW, dir_fd=dir_fd)
@@ -132,7 +139,10 @@ class FilesystemPayloadStore:
             raise ValueError(f"Invalid payload store file: cannot open {filename}") from exc
 
         with os.fdopen(file_fd, "rb", closefd=True) as fd:
-            return fd.read()
+            content = fd.read(max_bytes + 1) if max_bytes is not None else fd.read()
+        if max_bytes is not None and len(content) > max_bytes:
+            return None
+        return content
 
     def _payload_file_exists(self, dir_fd: int, filename: str) -> bool:
         """Check for a payload file without following a symlink."""
@@ -286,6 +296,27 @@ class FilesystemPayloadStore:
         if not hmac.compare_digest(actual_hash, content_hash):
             raise payload_contracts.IntegrityError(f"Payload integrity check failed: expected {content_hash}, got {actual_hash}")
 
+        return content
+
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        """Read at most max_bytes + 1 bytes and verify accepted content."""
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be nonnegative")
+        path = self._path_for_hash(content_hash)
+        dir_fd = self._open_payload_parent(path.parent, create=False)
+        if dir_fd is None:
+            raise PayloadNotFoundError(content_hash)
+        try:
+            content = self._read_payload_file(dir_fd, path.name, max_bytes=max_bytes)
+        except FileNotFoundError as exc:
+            raise PayloadNotFoundError(content_hash) from exc
+        finally:
+            os.close(dir_fd)
+        if content is None:
+            return None
+        actual_hash = hashlib.sha256(content).hexdigest()
+        if not hmac.compare_digest(actual_hash, content_hash):
+            raise payload_contracts.IntegrityError(f"Payload integrity check failed: expected {content_hash}, got {actual_hash}")
         return content
 
     def exists(self, content_hash: str) -> bool:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import re
 import time
 from collections.abc import Mapping, Sequence
@@ -29,6 +30,7 @@ from elspeth.contracts.call_data import (
     HTTPCallResponse,
     HTTPRedirectReplayHop,
     HTTPResponseTransport,
+    MultipartMetadata,
     RawCallPayload,
     encode_urlencoded_form,
 )
@@ -917,6 +919,7 @@ class AuditedHTTPClient(AuditedClientBase):
         timeout: float | None = None,
         json: Mapping[str, Any] | None = None,
         form: tuple[tuple[str, str], ...] | None = None,
+        multipart_body: bytes | None = None,
         params: dict[str, str | int | float] | None = None,
         extensions: dict[str, str] | None = None,
     ) -> httpx.Response:
@@ -924,7 +927,9 @@ class AuditedHTTPClient(AuditedClientBase):
         request_kwargs: dict[str, Any] = {"headers": headers}
         if timeout is not None:
             request_kwargs["timeout"] = timeout
-        if form is not None:
+        if multipart_body is not None:
+            request_kwargs["content"] = multipart_body
+        elif form is not None:
             request_kwargs["content"] = encode_urlencoded_form(form)
         elif json is not None or method == "POST":
             request_kwargs["json"] = json
@@ -1179,6 +1184,7 @@ class AuditedHTTPClient(AuditedClientBase):
         extensions: dict[str, str] | None,
         json: Mapping[str, Any] | None,
         form: tuple[tuple[str, str], ...] | None,
+        multipart_body: bytes | None,
         params: dict[str, str | int | float] | None,
     ) -> httpx.Response:
         """Send one IP-pinned request with method-specific httpx handling."""
@@ -1188,6 +1194,7 @@ class AuditedHTTPClient(AuditedClientBase):
             connection_url,
             json=json,
             form=form,
+            multipart_body=multipart_body,
             params=params,
             headers=headers,
             extensions=extensions,
@@ -1201,6 +1208,8 @@ class AuditedHTTPClient(AuditedClientBase):
         headers: dict[str, str] | None = None,
         json: Mapping[str, Any] | None = None,
         form: tuple[tuple[str, str], ...] | None = None,
+        multipart_body: bytes | None = None,
+        multipart_metadata: MultipartMetadata | None = None,
         params: dict[str, str | int | float] | None = None,
         follow_redirects: bool = False,
         max_redirects: int = 10,
@@ -1244,11 +1253,22 @@ class AuditedHTTPClient(AuditedClientBase):
         """
         method_upper = method.upper()
         if form is not None:
-            if method_upper != "POST" or json is not None:
+            if method_upper != "POST" or json is not None or multipart_body is not None:
                 raise ValueError("form requires POST without a JSON body")
             encode_urlencoded_form(form)
             if any(key.casefold() == "content-type" for key in (headers or {})):
                 raise ValueError("form content type is controlled by AuditedHTTPClient")
+        if (multipart_body is None) != (multipart_metadata is None):
+            raise ValueError("multipart body and metadata must be supplied together")
+        if multipart_metadata is not None:
+            if method_upper != "POST" or json is not None or form is not None or follow_redirects:
+                raise ValueError("multipart requires POST without another body or redirects")
+            if type(multipart_body) is not bytes or len(multipart_body) != multipart_metadata.body_size:
+                raise ValueError("multipart body size does not match metadata")
+            if hashlib.sha256(multipart_body).hexdigest() != multipart_metadata.body_sha256:
+                raise ValueError("multipart body hash does not match metadata")
+            if any(key.casefold() == "content-type" for key in (headers or {})):
+                raise ValueError("multipart content type is controlled by AuditedHTTPClient")
         validate_allowed_http_origin(request.original_url, allowed_origins)
         if self._semantic_managed_identity_verify:
             if not verify_source_call_id:
@@ -1269,6 +1289,8 @@ class AuditedHTTPClient(AuditedClientBase):
         }
         if form is not None:
             merged_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+        if multipart_metadata is not None:
+            merged_headers["Content-Type"] = multipart_metadata.content_type
 
         connection_url = request.connection_url
         logical_request_url = str(httpx.Request(method_upper, request.original_url, params=params).url) if params else request.original_url
@@ -1287,6 +1309,7 @@ class AuditedHTTPClient(AuditedClientBase):
             headers=self._filter_request_headers(merged_headers),
             json=json,
             form=form,
+            multipart=multipart_metadata,
             params=_fingerprint_params(params),
             resolved_ip=request.resolved_ip,
         )
@@ -1343,6 +1366,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     extensions=extensions if extensions else None,
                     json=json,
                     form=form,
+                    multipart_body=multipart_body,
                     params=params,
                 )
 

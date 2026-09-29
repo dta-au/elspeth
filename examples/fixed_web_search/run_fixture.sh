@@ -15,6 +15,7 @@ case "$variant" in
     directory) suffix="" ;;
     registry) suffix="_registry" ;;
     form) suffix="_form" ;;
+    multipart) suffix="_multipart" ;;
     *) echo "Unknown fixture variant: $variant" >&2; exit 2 ;;
 esac
 RUNS="$EXAMPLE/runs$suffix"
@@ -28,6 +29,31 @@ for artifact in "$RUNS/audit.db" "$RUNS/access.log" "$RUNS/server.log" "$RUNS/pi
         exit 2
     fi
 done
+
+if [ "$variant" = multipart ]; then
+    "$PYTHON_BIN" - "$RUNS" <<'PY'
+import json
+import pathlib
+import sys
+
+from elspeth.core.payload_store import FilesystemPayloadStore
+
+runs = pathlib.Path(sys.argv[1])
+ref = FilesystemPayloadStore(runs / "payloads").store(b"public-search-fixture")
+rows = ["Australian Taxation Office", "Commonwealth Bank", "Café Not Found"]
+with (runs / "input.jsonl").open("w", encoding="utf-8") as output:
+    for index, query in enumerate(rows, start=1):
+        output.write(json.dumps({
+            "id": index,
+            "search_text": query,
+            "search_parts": [
+                {"name": "q", "value": query},
+                {"name": "attachment", "blob_ref": ref, "filename": "query.txt", "content_type": "text/plain"},
+                {"name": "scope", "value": "public"},
+            ],
+        }, ensure_ascii=False) + "\n")
+PY
+fi
 
 server_pid=""
 stop_server() {
@@ -84,7 +110,7 @@ assert len(requests) == 3, requests
 assert {row["search_text"] for row in rows} == set(requests)
 assert all(row["fetch_status"] == 200 for row in rows)
 assert sorted(len(row["candidates"]) for row in rows) == [0, 1, 2]
-candidate_fields = {"name"} if variant in {"directory", "form"} else {"name", "detail_path", "registration"}
+candidate_fields = {"name"} if variant in {"directory", "form", "multipart"} else {"name", "detail_path", "registration"}
 assert all(set(candidate) == candidate_fields for row in rows for candidate in row["candidates"])
 assert not (output / "failures.jsonl").exists()
 print(f"verified_rows={len(rows)} verified_requests={len(requests)}")
@@ -157,5 +183,14 @@ if variant == "form":
         assert request["body_encoding"] == "urlencoded-v1"
         encoded = urllib.parse.urlencode([tuple(pair) for pair in form]).encode("ascii")
         assert request["body_sha256"] == hashlib.sha256(encoded).hexdigest()
+if variant == "multipart":
+    refs = [row[0] for row in conn.execute("SELECT request_ref FROM calls WHERE call_type = 'http'")]
+    assert len(refs) == 9, refs
+    for ref in refs:
+        request = json.loads((runs / "payloads" / ref[:2] / ref).read_text())
+        assert request["body_encoding"] == "multipart-v1", request
+        assert [part["name"] for part in request["multipart"]] == ["q", "attachment", "scope"]
+        assert request["body_size"] <= 8192
+        assert len(request["body_sha256"]) == 64
 print(f"verified_replay_without_network=3 verified_live_calls={verdicts[1]}")
 PY

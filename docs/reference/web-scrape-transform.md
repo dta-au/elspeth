@@ -1,7 +1,7 @@
 # Web Scrape Transform
 
 Fetch webpages from URLs, convert content to markdown/text, and generate fingerprints for change detection.
-It can also POST a JSON object or URL-encoded form from each row to a read-only data endpoint.
+It can also POST a JSON object, URL-encoded form, or multipart form from each row to a read-only data endpoint.
 
 ## Configuration
 
@@ -127,6 +127,25 @@ and at most 256 fields are accepted. Form values and a digest of the exact
 encoded body are retained in HTTP audit evidence; do not put credentials in
 the form row. This mode submits HTTP form data; filling a rendered browser
 form is a separate planned browser capability.
+
+For a multipart search, use `request_multipart_field` instead of the JSON or
+URL-encoded form field. The row value is an ordered list of up to 256 parts:
+
+```json
+[
+  {"name": "q", "value": "Café"},
+  {"name": "attachment", "blob_ref": "<sha256 payload-store ref>", "filename": "query.txt", "content_type": "text/plain"},
+  {"name": "scope", "value": "public"}
+]
+```
+
+File parts read only content-addressed payload-store bytes. Local file paths
+are not accepted. Parts retain their order and repeated names. The complete
+encoded body must fit `http.max_request_body_bytes`; a missing or oversized
+blob fails before DNS. The audit request records each part, the content type,
+boundary, exact body size, and SHA-256 digest. Replay binds each file reference
+to the source run's declared multipart field and verifies the retained bytes.
+Do not put credentials in text or file parts.
 
 For an HTML search page, `records` extracts a bounded list of candidate
 records into one output field:

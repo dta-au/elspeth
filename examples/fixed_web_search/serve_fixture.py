@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import html
+from email.parser import BytesParser
+from email.policy import default
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlsplit
@@ -59,21 +61,48 @@ class SearchHandler(BaseHTTPRequestHandler):
         self._send_html(body)
 
     def do_POST(self) -> None:
-        if urlsplit(self.path).path != "/form-search":
+        path = urlsplit(self.path).path
+        if path not in {"/form-search", "/multipart-search"}:
             self.send_error(404)
-            return
-        if self.headers.get("Content-Type") != "application/x-www-form-urlencoded; charset=utf-8":
-            self.send_error(415)
             return
         try:
             length = int(self.headers["Content-Length"])
             if not 0 < length <= 8192:
                 raise ValueError("form length out of fixture bounds")
-            fields = parse_qsl(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+            wire_body = self.rfile.read(length)
+            if path == "/form-search":
+                if self.headers.get("Content-Type") != "application/x-www-form-urlencoded; charset=utf-8":
+                    self.send_error(415)
+                    return
+                fields = parse_qsl(wire_body.decode("utf-8"), keep_blank_values=True)
+                valid = [name for name, _ in fields] == ["q", "scope", "scope"] and [value for _, value in fields[1:]] == [
+                    "public",
+                    "active",
+                ]
+            else:
+                content_type = self.headers.get("Content-Type", "")
+                if not content_type.startswith("multipart/form-data; boundary="):
+                    self.send_error(415)
+                    return
+                message = BytesParser(policy=default).parsebytes(
+                    b"Content-Type: " + content_type.encode("ascii") + b"\r\nMIME-Version: 1.0\r\n\r\n" + wire_body
+                )
+                parts = list(message.iter_parts())
+                fields = [(part.get_param("name", header="content-disposition"), part.get_payload(decode=True)) for part in parts]
+                valid = (
+                    len(fields) == 3
+                    and [name for name, _ in fields] == ["q", "attachment", "scope"]
+                    and fields[1][1] == b"public-search-fixture"
+                    and fields[2][1] == b"public"
+                    and parts[1].get_filename() == "query.txt"
+                    and parts[1].get_content_type() == "text/plain"
+                )
+                if valid:
+                    fields = [("q", fields[0][1].decode("utf-8")), ("attachment", ""), ("scope", "public")]
         except (KeyError, ValueError, UnicodeError):
             self.send_error(400)
             return
-        if [name for name, _ in fields] != ["q", "scope", "scope"] or [value for _, value in fields[1:]] != ["public", "active"]:
+        if not valid:
             self.send_error(400)
             return
         query = fields[0][1]

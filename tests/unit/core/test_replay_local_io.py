@@ -38,6 +38,11 @@ class _MemoryStore:
         self.reads.append(content_hash)
         return self.blobs[content_hash]
 
+    def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+        self.reads.append(content_hash)
+        content = self.blobs[content_hash]
+        return content if len(content) <= max_bytes else None
+
     def store(self, content: bytes) -> str:
         content_hash = hashlib.sha256(content).hexdigest()
         self.blobs[content_hash] = content
@@ -134,6 +139,8 @@ def test_replay_payload_reads_only_source_run_evidence_and_restores_archived_out
     )
 
     assert store.retrieve(input_hash) == input_bytes
+    assert store.retrieve_bounded(input_hash, max_bytes=len(input_bytes)) == input_bytes
+    assert store.retrieve_bounded(input_hash, max_bytes=len(input_bytes) - 1) is None
     assert current.reads == []
     with pytest.raises(IntegrityError, match="absent from source-run"):
         store.retrieve(output_hash)
@@ -316,6 +323,38 @@ def test_payload_collector_reads_configured_image_ref_list() -> None:
     collected = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), image_ref_fields={"photos"})
 
     assert collected.input_refs == set(refs)
+
+
+def test_payload_collector_admits_only_configured_multipart_file_refs() -> None:
+    body = b"signed public registry form attachment"
+    ref = hashlib.sha256(body).hexdigest()
+    unrelated = "f" * 64
+    row = {
+        "parts": [
+            {"name": "q", "value": "company"},
+            {"name": "attachment", "blob_ref": ref, "filename": "query.txt", "content_type": "text/plain"},
+        ],
+        "unrelated": [{"name": "file", "blob_ref": unrelated, "filename": "x.txt", "content_type": "text/plain"}],
+    }
+    store = _MemoryStore({ref: body})
+    factory = SimpleNamespace(
+        query=SimpleNamespace(
+            iter_rows_for_run=lambda _run_id: [[SimpleNamespace(row_id="row")]],
+            get_row_data=lambda _row_id: RowDataResult(state=RowDataState.AVAILABLE, data=row),
+            get_all_tokens_for_run=lambda _run_id: [],
+            get_all_node_states_for_run=lambda _run_id: [],
+            get_all_calls_for_run=lambda _run_id: [],
+        ),
+        data_flow=SimpleNamespace(get_nodes=lambda _run_id: []),
+    )
+
+    collected = collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"})
+    assert collected.input_refs == {ref}
+    assert unrelated not in store.reads
+
+    row["parts"][1]["blob_ref"] = unrelated
+    with pytest.raises(KeyError):
+        collect_source_payload_refs(factory, "source-run", source_store=store, blob_ref_fields=(), multipart_ref_fields={"parts"})
 
 
 def test_payload_collector_accepts_failed_pdf_state_with_refusal_receipt() -> None:

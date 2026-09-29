@@ -11,13 +11,15 @@ hostname, and port. It is independent of `allowed_hosts`, which still validates
 the resolved IP address. Set the origins to the site you are approved to query;
 the ABN address is only an example.
 
-Run the three three-row local fixtures with
+Run the four three-row local fixtures with
 `./examples/fixed_web_search/run_fixture.sh directory` and
 `./examples/fixed_web_search/run_fixture.sh registry`, then
-`./examples/fixed_web_search/run_fixture.sh form`. The first uses `q` and
+`./examples/fixed_web_search/run_fixture.sh form` and
+`./examples/fixed_web_search/run_fixture.sh multipart`. The first uses `q` and
 HTML list items; the second uses `term` and HTML articles with detail links
 and registration text. The form variant sends ordered URL-encoded POST fields,
-including a repeated `scope` field and a Unicode search value. All three
+including a repeated `scope` field and a Unicode search value. The multipart
+variant submits ordered text and a content-addressed file part. All four
 assert three HTTP requests and three output rows, including one result,
 multiple possible results, and no results. Each replays
 its three calls offline and verifies them against the restarted fixture. The

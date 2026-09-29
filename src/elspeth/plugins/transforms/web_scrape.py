@@ -26,12 +26,19 @@ from pydantic import AfterValidator, BaseModel, Field, field_validator, model_va
 
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
-from elspeth.contracts.call_data import HTTPCallRequest, encode_urlencoded_form
+from elspeth.contracts.call_data import (
+    HTTPCallRequest,
+    MultipartMetadata,
+    MultipartPart,
+    encode_multipart_form,
+    encode_urlencoded_form,
+)
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.plugin_capabilities import ContentTrust
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
@@ -130,6 +137,31 @@ def _parse_form_fields(value: object) -> tuple[tuple[str, str], ...]:
             raise ValueError("POST form fields require a nonempty string name and string value")
         fields.append((name, field_value))
     return tuple(fields)
+
+
+def _parse_multipart_parts(value: object) -> tuple[MultipartPart, ...]:
+    """Copy an ordered row multipart manifest; local paths are never accepted."""
+    if type(value) is not list or not 1 <= len(value) <= 256:
+        raise ValueError("POST multipart must be a list of 1 to 256 parts")
+    parts: list[MultipartPart] = []
+    for item in value:
+        if type(item) is not dict:
+            raise ValueError("POST multipart entries must be objects")
+        keys = set(item)
+        if keys == {"name", "value"}:
+            parts.append(MultipartPart(name=item["name"], value=item["value"]))
+        elif keys == {"name", "blob_ref", "filename", "content_type"}:
+            parts.append(
+                MultipartPart(
+                    name=item["name"],
+                    blob_ref=item["blob_ref"],
+                    filename=item["filename"],
+                    content_type=item["content_type"],
+                )
+            )
+        else:
+            raise ValueError("POST multipart entry must be a text value or a payload-store blob reference")
+    return tuple(parts)
 
 
 def _validate_cidr_entry(entry: str) -> str:
@@ -251,6 +283,9 @@ class WebScrapeConfig(TransformDataConfig):
     method: Literal["GET", "POST"] = Field(default="GET", description="HTTP method for fetching the row URL.")
     request_json_field: str | None = Field(default=None, description="Row field containing a JSON object to send as a POST body.")
     request_form_field: str | None = Field(default=None, description="Row field containing ordered URL-encoded POST form entries.")
+    request_multipart_field: str | None = Field(
+        default=None, description="Row field containing ordered multipart text entries or payload-store blob references."
+    )
     query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.")
     query_fields: dict[str, str] = Field(default_factory=dict, description="Map URL query parameter names to input row field names.")
     format: Literal["markdown", "text", "raw"] = Field(
@@ -277,7 +312,9 @@ class WebScrapeConfig(TransformDataConfig):
     records: CSSRecordsConfig | None = Field(default=None, description="Bounded CSS-selected result records emitted as a row field.")
     http: WebScrapeHTTPConfig = Field(description="HTTP fetching policy, timeout, contact, and host allowlist settings.")
 
-    @field_validator("url_field", "content_field", "fingerprint_field", "request_json_field", "request_form_field")
+    @field_validator(
+        "url_field", "content_field", "fingerprint_field", "request_json_field", "request_form_field", "request_multipart_field"
+    )
     @classmethod
     def _reject_empty_field_names(cls, v: str | None, info: Any) -> str | None:
         if v == "":
@@ -293,6 +330,8 @@ class WebScrapeConfig(TransformDataConfig):
             fields.add(self.request_json_field)
         if self.request_form_field is not None:
             fields.add(self.request_form_field)
+        if self.request_multipart_field is not None:
+            fields.add(self.request_multipart_field)
         fields.update(self.query_fields.values())
         return super().declared_input_fields | frozenset(fields)
 
@@ -330,11 +369,15 @@ class WebScrapeConfig(TransformDataConfig):
 
     @model_validator(mode="after")
     def _validate_request_body_option(self) -> "WebScrapeConfig":
-        body_sources = [field for field in (self.request_json_field, self.request_form_field) if field is not None]
+        body_sources = [
+            field for field in (self.request_json_field, self.request_form_field, self.request_multipart_field) if field is not None
+        ]
         if self.method == "POST" and len(body_sources) != 1:
-            raise ValueError("exactly one of request_json_field or request_form_field is required when method is POST")
+            raise ValueError(
+                "exactly one of request_json_field, request_form_field or request_multipart_field is required when method is POST"
+            )
         if self.method == "GET" and body_sources:
-            raise ValueError("request_json_field and request_form_field are only valid when method is POST")
+            raise ValueError("request_json_field, request_form_field and request_multipart_field are only valid when method is POST")
         return self
 
     @model_validator(mode="after")
@@ -345,6 +388,8 @@ class WebScrapeConfig(TransformDataConfig):
             raise ValueError("request_json_field and url_field must differ")
         if self.url_field is not None and self.request_form_field == self.url_field:
             raise ValueError("request_form_field and url_field must differ")
+        if self.url_field is not None and self.request_multipart_field == self.url_field:
+            raise ValueError("request_multipart_field and url_field must differ")
         if self.records is not None and self.records.field in {
             self.content_field,
             self.fingerprint_field,
@@ -389,6 +434,8 @@ class WebScrapeConfig(TransformDataConfig):
             option_key_to_value["request_json_field"] = self.request_json_field
         if self.request_form_field is not None:
             option_key_to_value["request_form_field"] = self.request_form_field
+        if self.request_multipart_field is not None:
+            option_key_to_value["request_multipart_field"] = self.request_multipart_field
         for name, field_name in self.query_fields.items():
             option_key_to_value[f"query_fields.{name}"] = field_name
 
@@ -640,7 +687,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:98106ac4c5446c6d"
+    source_file_hash: str | None = "sha256:8356f3abd6ce56db"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -703,6 +750,7 @@ class WebScrapeTransform(BaseTransform):
         self._method = cfg.method
         self._request_json_field = cfg.request_json_field
         self._request_form_field = cfg.request_form_field
+        self._request_multipart_field = cfg.request_multipart_field
         self._query = cfg.query
         self._query_fields = cfg.query_fields
         self._records = cfg.records
@@ -725,6 +773,8 @@ class WebScrapeTransform(BaseTransform):
             input_options["request_json_field"] = cfg.request_json_field
         if cfg.request_form_field is not None:
             input_options["request_form_field"] = cfg.request_form_field
+        if cfg.request_multipart_field is not None:
+            input_options["request_multipart_field"] = cfg.request_multipart_field
         input_options.update({f"query_fields.{name}": field_name for name, field_name in cfg.query_fields.items()})
         self._reject_input_options_naming_created_fields(input_options)
 
@@ -800,10 +850,10 @@ class WebScrapeTransform(BaseTransform):
             return PluginAssistance(
                 plugin_name="web_scrape",
                 issue_code=None,
-                summary="Fetch a fixed or row-provided URL with SSRF protection, audit recording, and content-fingerprinting. GET can map row fields into query parameters; POST sends JSON or URL-encoded form fields from a row. Output formats: raw, text, markdown.",
+                summary="Fetch a fixed or row-provided URL with SSRF protection, audit recording, and content-fingerprinting. GET can map row fields into query parameters; POST sends JSON, URL-encoded form, or bounded multipart fields from a row. Output formats: raw, text, markdown.",
                 composer_hints=(
                     "web_scrape is a transform, not a source: set exactly one of url (fixed node address) or url_field (row URL); it writes content_field.",
-                    "For read-only POST data retrieval, set method: POST and exactly one of request_json_field or request_form_field. Form entries are ordered name/value string objects; use format: raw for application/json responses.",
+                    "For read-only POST data retrieval, set method: POST and exactly one of request_json_field, request_form_field, or request_multipart_field. Multipart entries are ordered text values or payload-store blob references; use format: raw for application/json responses.",
                     "For a public search endpoint, set url to the fixed HTTP(S) address and query_fields to a mapping from query parameter names to input row fields; query holds static parameters. Do not put credentials in URLs or row query values.",
                     "POST bodies are retained in HTTP audit evidence; do not put credentials in them. POST redirects are rejected and POST failures are not automatically retried.",
                     "If you saw Unknown source plugin: web_scrape, use a URL row source first, then add web_scrape as a transform.",
@@ -885,6 +935,10 @@ class WebScrapeTransform(BaseTransform):
             probe = self._augment_invariant_probe_row(probe, field_name=self._request_json_field, value={})
         if self._request_form_field is not None:
             probe = self._augment_invariant_probe_row(probe, field_name=self._request_form_field, value=[{"name": "q", "value": "probe"}])
+        if self._request_multipart_field is not None:
+            probe = self._augment_invariant_probe_row(
+                probe, field_name=self._request_multipart_field, value=[{"name": "q", "value": "probe"}]
+            )
         for field_name in self._query_fields.values():
             probe = self._augment_invariant_probe_row(probe, field_name=field_name, value="probe")
         return [probe]
@@ -909,9 +963,10 @@ class WebScrapeTransform(BaseTransform):
             probe_ctx: TransformContext,
             request_json: _PostRequestBody | None = None,
             request_form: tuple[tuple[str, str], ...] | None = None,
+            request_multipart: tuple[bytes, MultipartMetadata] | None = None,
             request_params: dict[str, str | int | float] | None = None,
         ) -> tuple[httpx.Response, str, _InvariantCall]:
-            del probe_ctx, request_json, request_form
+            del probe_ctx, request_json, request_form, request_multipart
             logical_url = str(httpx.Request(self._method, safe_request.original_url, params=request_params).url)
             return (
                 httpx.Response(
@@ -978,6 +1033,7 @@ class WebScrapeTransform(BaseTransform):
         """
         request_json: _PostRequestBody | None = None
         request_form: tuple[tuple[str, str], ...] | None = None
+        request_multipart: tuple[bytes, MultipartMetadata] | None = None
         request_params: dict[str, str | int | float] = dict(self._query)
         if self._query_fields:
             values = row.to_dict()
@@ -1040,6 +1096,43 @@ class WebScrapeTransform(BaseTransform):
                         "max_body_bytes": self._max_request_body_bytes,
                     }
                 )
+        if self._request_multipart_field is not None:
+            values = row.to_dict()
+            if self._request_multipart_field not in values:
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST multipart field '{self._request_multipart_field}' is missing"}
+                )
+            try:
+                parts = _parse_multipart_parts(values[self._request_multipart_field])
+            except ValueError:
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST multipart field '{self._request_multipart_field}' is invalid"}
+                )
+            blobs: dict[str, bytes] = {}
+            for part in parts:
+                if part.blob_ref is None or part.blob_ref in blobs:
+                    continue
+                try:
+                    blob_content = self._payload_store.retrieve_bounded(part.blob_ref, max_bytes=self._max_request_body_bytes)
+                except PayloadNotFoundError:
+                    return TransformResult.error({"reason": "blob_not_found", "blob_ref": part.blob_ref})
+                if blob_content is None:
+                    return TransformResult.error(
+                        {
+                            "reason": "validation_failed",
+                            "error": f"POST multipart exceeds max_request_body_bytes {self._max_request_body_bytes}",
+                        }
+                    )
+                blobs[part.blob_ref] = blob_content
+            try:
+                request_multipart = encode_multipart_form(parts, blobs, max_body_bytes=self._max_request_body_bytes)
+            except ValueError:
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "error": f"POST multipart is invalid or exceeds max_request_body_bytes {self._max_request_body_bytes}",
+                    }
+                )
 
         # Validate URL and pin resolved IP (SSRF prevention with DNS rebinding defense)
         try:
@@ -1088,11 +1181,13 @@ class WebScrapeTransform(BaseTransform):
                             "X-Scraping-Reason": self._scraping_reason,
                             "Host": archived_safe.host_header,
                             **({"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"} if request_form is not None else {}),
+                            **({"Content-Type": request_multipart[1].content_type} if request_multipart is not None else {}),
                         }
                     ),
                     params=fingerprint_params(request_params) if request_params else None,
                     json=request_json,
                     form=request_form,
+                    multipart=request_multipart[1] if request_multipart is not None else None,
                 )
                 session.preflight_verify_http_request(
                     request_data=pre_dns_request.to_dict(),
@@ -1115,7 +1210,14 @@ class WebScrapeTransform(BaseTransform):
 
         # Fetch URL using pinned IP (prevents DNS rebinding between validation and fetch)
         try:
-            if request_form is not None:
+            if request_multipart is not None:
+                if request_params:
+                    response, final_hostname_url, call = self._fetch_url(
+                        safe_request, ctx, request_multipart=request_multipart, request_params=request_params
+                    )
+                else:
+                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_multipart=request_multipart)
+            elif request_form is not None:
                 if request_params:
                     response, final_hostname_url, call = self._fetch_url(
                         safe_request, ctx, request_form=request_form, request_params=request_params
@@ -1288,6 +1390,7 @@ class WebScrapeTransform(BaseTransform):
         ctx: TransformContext,
         request_json: _PostRequestBody | None = None,
         request_form: tuple[tuple[str, str], ...] | None = None,
+        request_multipart: tuple[bytes, MultipartMetadata] | None = None,
         request_params: dict[str, str | int | float] | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """Fetch URL using SSRF-safe IP pinning with audit recording.
@@ -1344,6 +1447,8 @@ class WebScrapeTransform(BaseTransform):
                     headers=headers,
                     json=request_json,
                     form=request_form,
+                    multipart_body=request_multipart[0] if request_multipart is not None else None,
+                    multipart_metadata=request_multipart[1] if request_multipart is not None else None,
                     params=request_params or None,
                     follow_redirects=False,
                     allowed_ranges=self._allowed_ranges,
