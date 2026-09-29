@@ -129,7 +129,6 @@ def _encode(value: PluginSchemaSnapshot) -> dict[str, JsonValue]:
         "json_schema": value.json_schema.to_wire(),
         "knob_schema": value.knob_schema.to_wire(),
         "composer_hints": list(value.composer_hints),
-        "aggregation_output_modes": list(value.aggregation_output_modes),
         "secret_requirements": [{"field": item.field, "candidates": list(item.candidates)} for item in value.secret_requirements],
         "web_config_authority": value.web_config_authority.value,
         "policy_capabilities": [
@@ -140,6 +139,7 @@ def _encode(value: PluginSchemaSnapshot) -> dict[str, JsonValue]:
             }
             for item in value.policy_capabilities
         ],
+        "aggregation_output_modes": list(value.aggregation_output_modes),
     }
 
 

@@ -103,7 +103,9 @@ async def test_real_rejection_schema_labels_and_persisted_associations(
     stored = json.loads(content)
     # Audit canonicalization sorts original keys before its redactor runs.
     # The a-key's scalar schema is therefore first even when authored second.
-    stored_properties = stored["plugin_schemas"][_LABEL_1][_LABEL_2]["properties"]
+    stored_schema = stored["plugin_schemas"][_LABEL_1]
+    assert stored_schema[_LABEL_1] == []  # The newly published aggregation modes sort before json_schema.
+    stored_properties = stored_schema["_redacted_response_field_3"]["properties"]
     expected_stored = {_LABEL_1: redacted_scalar_schema, _LABEL_2: redacted_nested}
     if insert_safe:
         expected_stored["description"] = {"description": _TEXT}
@@ -130,7 +132,7 @@ async def test_real_rejection_schema_labels_and_persisted_associations(
     assert len(loaded) == 1
     assert loaded[0].content == row.content
     assert loaded[0].tool_calls == tuple(row.tool_calls)
-    reloaded_properties = json.loads(loaded[0].content)["plugin_schemas"][_LABEL_1][_LABEL_2]["properties"]
+    reloaded_properties = json.loads(loaded[0].content)["plugin_schemas"][_LABEL_1]["_redacted_response_field_3"]["properties"]
     assert reloaded_properties == expected_stored
     assert list(reloaded_properties) == list(stored_properties)
     persisted = json.dumps({"content": loaded[0].content, "envelopes": row.tool_calls})

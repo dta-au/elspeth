@@ -698,7 +698,10 @@ class TestBuildSystemPrompt:
         flattened = " ".join(result.split())
 
         assert 'Do not turn persona prose such as "approval status indicator" into a column name like `approval_status`' in flattened
-        assert "inspect the source and use the literal observed header such as `approved`" in flattened
+        assert (
+            "inspect its raw headers and declare the name rows carry (header `Approved` becomes `approved` unless a mapping renames it)"
+            in flattened
+        )
         assert "choose output plugins and formats from the user's requested result" in flattened
         assert "each policy-visible sink's live contract" in flattened
         assert "Do not infer sink behavior from the source plugin's name or from static format lore" in flattened

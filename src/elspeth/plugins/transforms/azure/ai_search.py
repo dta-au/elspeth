@@ -82,7 +82,7 @@ class AzureAISearchTransform(RetrievalTransformBase):
 
     name = "azure_ai_search"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9f6868cfb9180327"
+    source_file_hash: str | None = "sha256:aa1e5d1b37f919a6"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = AzureAISearchConfig
     passes_through_input = True

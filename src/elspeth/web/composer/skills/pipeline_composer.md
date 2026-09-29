@@ -288,6 +288,14 @@ lists the component ids the call touched; `data` is the tool-specific
 payload each tool's own description names. `validation` is always present.
 <!-- taught:end -->
 
+<!-- taught:begin plugin-schema * plugin_schemas.<kind/plugin>.aggregation_output_modes; tool-data get_plugin_schema data.aggregation_output_modes -->
+In a selected plugin schema or `get_plugin_schema` result, `aggregation_output_modes`
+reports the class-declared batch modes. `transform` is the standard aggregation
+mode; `passthrough` is available only when the plugin emits one flushed row per
+buffered row. An empty list means the class has no batch output mode. Check
+validation for other placement constraints.
+<!-- taught:end -->
+
 <!-- taught:begin validation * validation.is_valid; validation * validation.errors; validation * validation.warnings; validation * validation.suggestions; validation * validation.errors[].*; validation * validation.warnings[].*; validation * validation.suggestions[].*; delta * validation_delta.new_errors[].*; delta * validation_delta.resolved_errors[].*; delta * validation_delta.new_warnings[].*; delta * validation_delta.resolved_warnings[].* -->
 The whole-document validation check after the call carries `is_valid`, and `errors` /
 `warnings` / `suggestions` entries, each with `component`, `message`,

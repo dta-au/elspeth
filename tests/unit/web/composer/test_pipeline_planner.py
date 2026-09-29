@@ -1681,7 +1681,7 @@ async def test_generic_linear_plan_reuses_initial_information_and_needs_one_disc
         if message["role"] != "tool":
             continue
         contract = json.loads(message["content"])["data"]
-        assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints"}
+        assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints", "aggregation_output_modes"}
     assert final_messages[-1]["content"] == "All declared information gaps are closed; emit the terminal proposal now."
 
 
