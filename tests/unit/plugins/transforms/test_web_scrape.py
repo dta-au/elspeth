@@ -1799,6 +1799,76 @@ def test_structured_provenance_field_rejects_output_collision() -> None:
         WebScrapeTransform(options)
 
 
+def test_resolved_record_links_require_exact_origin_configuration() -> None:
+    options = _make_basic_transform_options()
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main a",
+        "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True}],
+    }
+    with pytest.raises(PluginConfigError, match="allowed_origins"):
+        WebScrapeTransform(options)
+
+
+def test_resolved_record_link_uses_redirect_final_url_and_keeps_provenance_safe(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/start"
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "candidate_sources",
+        "selector": "main a",
+        "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True, "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    response = httpx.Response(
+        200,
+        text='<main><a href="../detail/42">Company</a></main>',
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", f"https://{_TEST_IP}:443/search/results/page"),
+    )
+    final_url = "https://example.com/search/results/page?access_token=secret-value"
+    call = mock_ctx.landscape.record_call.return_value
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()), patch.object(transform, "_fetch_url", return_value=(response, final_url, call)):
+        result = transform.process(make_pipeline_row({"search_text": "Company"}), mock_ctx)
+    assert result.status == "success"
+    assert result.row is not None
+    emitted = result.row.to_dict()
+    assert emitted["candidates"] == [{"detail_url": "https://example.com/search/detail/42"}]
+    assert "secret-value" not in repr(emitted)
+    assert emitted["candidate_sources"][0]["detail_url"]["source_url"] == emitted["fetch_url_final"]
+
+
+def test_resolved_record_link_refusal_is_value_free(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/start"
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main a",
+        "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True, "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    response = httpx.Response(
+        200,
+        text='<main><a href="/detail/42?access_token=secret-value">Company</a></main>',
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", f"https://{_TEST_IP}:443/search/results"),
+    )
+    call = mock_ctx.landscape.record_call.return_value
+    with (
+        patch("socket.getaddrinfo", _mock_getaddrinfo()),
+        patch.object(transform, "_fetch_url", return_value=(response, "https://example.com/search/results", call)),
+    ):
+        result = transform.process(make_pipeline_row({"search_text": "Company"}), mock_ctx)
+    assert result.status == "error"
+    assert "secret-value" not in repr(result.reason)
+
+
 @respx.mock
 def test_search_candidate_limit_refuses_unreported_matches(mock_ctx: PluginContext) -> None:
     respx.get(f"https://{_TEST_IP}:443/directory").mock(

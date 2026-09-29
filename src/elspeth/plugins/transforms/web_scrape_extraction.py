@@ -5,7 +5,7 @@ element stripping.
 """
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -39,6 +39,7 @@ class CSSRecordColumn(BaseModel):
     required: bool = False
     multiple: Literal["first", "one", "all"] = "first"
     max_values: int = Field(default=16, ge=1, le=256)
+    resolve_url: bool = False
 
     @field_validator("field", "attribute")
     @classmethod
@@ -51,6 +52,12 @@ class CSSRecordColumn(BaseModel):
     @classmethod
     def _validate_selector(cls, value: str | None) -> str | None:
         return _validate_css_selector(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def _validate_url_resolution(self) -> "CSSRecordColumn":
+        if self.resolve_url and self.attribute != "href":
+            raise ValueError("resolve_url requires attribute: href")
+        return self
 
 
 class CSSRecordsConfig(BaseModel):
@@ -136,6 +143,7 @@ def _extract_css_records(
     strip_elements: list[str],
     *,
     source_url: str | None,
+    url_resolver: Callable[[str], str] | None,
 ) -> CSSRecordExtraction:
     if source_url is not None and (not source_url or len(source_url) > 2048):
         raise ValueError("source_url must be nonempty and at most 2048 characters")
@@ -182,6 +190,10 @@ def _extract_css_records(
                             values.append(" ".join(attribute_value))
                         else:
                             raise ValueError(f"record attribute {column.attribute!r} has an unsupported value")
+                if column.resolve_url:
+                    if url_resolver is None:
+                        raise ValueError("resolved href column requires a URL resolver")
+                    values = [url_resolver(value) for value in values]
                 if column.required and not any(values):
                     raise ValueError(f"required record column {column.field!r} is missing")
                 for value in values:
@@ -231,9 +243,15 @@ def _extract_css_records(
         raise ValueError("HTML record extraction failed on malformed content") from exc
 
 
-def extract_css_records(html: str, config: CSSRecordsConfig, strip_elements: list[str]) -> list[dict[str, str | list[str] | None]]:
+def extract_css_records(
+    html: str,
+    config: CSSRecordsConfig,
+    strip_elements: list[str],
+    *,
+    url_resolver: Callable[[str], str] | None = None,
+) -> list[dict[str, str | list[str] | None]]:
     """Extract bounded candidate records from untrusted HTML without truncation."""
-    return _extract_css_records(html, config, strip_elements, source_url=None).to_record_rows()
+    return _extract_css_records(html, config, strip_elements, source_url=None, url_resolver=url_resolver).to_record_rows()
 
 
 def extract_css_records_with_provenance(
@@ -242,6 +260,7 @@ def extract_css_records_with_provenance(
     strip_elements: list[str],
     *,
     source_url: str,
+    url_resolver: Callable[[str], str] | None = None,
 ) -> CSSRecordExtraction:
     """Extract records with selector evidence; caller must supply a persistence-safe URL.
 
@@ -249,7 +268,7 @@ def extract_css_records_with_provenance(
     same sanitized/fingerprinted URL used for persisted fetch provenance.
     Values remain untrusted row data; this function does not bless HTML text.
     """
-    return _extract_css_records(html, config, strip_elements, source_url=source_url)
+    return _extract_css_records(html, config, strip_elements, source_url=source_url, url_resolver=url_resolver)
 
 
 def extract_content(

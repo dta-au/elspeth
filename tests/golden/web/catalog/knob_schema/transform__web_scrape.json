@@ -191,7 +191,7 @@
       },
       {
         "default": null,
-        "description": "Bounded CSS-selected result records emitted as a row field.",
+        "description": "Bounded CSS-selected result records emitted as a row field. An href column may set resolve_url: true to emit an approved absolute URL; this requires http.allowed_origins.",
         "kind": "json-object",
         "label": "Records",
         "name": "records",

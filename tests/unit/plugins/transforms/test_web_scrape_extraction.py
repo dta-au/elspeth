@@ -8,11 +8,50 @@ from hypothesis.strategies import characters, text
 from elspeth.contracts.plugin_semantics import TextFraming
 from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
 from elspeth.plugins.transforms.web_scrape_extraction import (
+    CSSRecordColumn,
     CSSRecordsConfig,
     extract_content,
     extract_css_records,
     extract_css_records_with_provenance,
 )
+
+
+def test_resolved_href_requires_href_attribute_and_resolver() -> None:
+    with pytest.raises(ValueError, match=r"attribute.*href"):
+        CSSRecordColumn.model_validate({"field": "link", "attribute": "src", "resolve_url": True})
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "links",
+            "selector": "main a",
+            "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True, "required": True}],
+        }
+    )
+    with pytest.raises(ValueError, match="resolver"):
+        extract_css_records('<main><a href="/detail/42">Company</a></main>', config, [])
+    assert extract_css_records(
+        '<main><a href="/detail/42">Company</a></main>',
+        config,
+        [],
+        url_resolver=lambda href: "https://register.example.gov" + href,
+    ) == [{"detail_url": "https://register.example.gov/detail/42"}]
+
+
+def test_resolved_href_counts_normalized_url_in_output_budget() -> None:
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "links",
+            "selector": "main a",
+            "max_value_chars": 12,
+            "columns": [{"field": "detail_url", "attribute": "href", "resolve_url": True}],
+        }
+    )
+    with pytest.raises(ValueError, match="max_value_chars"):
+        extract_css_records(
+            '<main><a href="/detail/42">Company</a></main>',
+            config,
+            [],
+            url_resolver=lambda href: "https://register.example.gov" + href,
+        )
 
 
 def test_extract_content_markdown():

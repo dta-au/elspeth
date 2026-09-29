@@ -91,6 +91,7 @@ from elspeth.plugins.transforms.web_scrape_extraction import (
     extract_css_records_with_provenance,
 )
 from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
+from elspeth.plugins.transforms.web_scrape_links import resolve_discovered_href
 from elspeth.plugins.transforms.web_scrape_request_headers import build_request_headers
 
 if TYPE_CHECKING:
@@ -318,7 +319,14 @@ class WebScrapeConfig(TransformDataConfig):
         default_factory=lambda: ["script", "style"],
         description="HTML element names to remove before extracting page text.",
     )
-    records: CSSRecordsConfig | None = Field(default=None, description="Bounded CSS-selected result records emitted as a row field.")
+    records: CSSRecordsConfig | None = Field(
+        default=None,
+        description=(
+            "Bounded CSS-selected result records emitted as a row field. "
+            "An href column may set resolve_url: true to emit an approved absolute URL; "
+            "this requires http.allowed_origins."
+        ),
+    )
     http: WebScrapeHTTPConfig = Field(description="HTTP fetching policy, timeout, contact, and host allowlist settings.")
 
     @field_validator(
@@ -384,6 +392,12 @@ class WebScrapeConfig(TransformDataConfig):
                 validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
                 raise ValueError(f"url: {exc}") from exc
+        return self
+
+    @model_validator(mode="after")
+    def _validate_resolved_link_policy(self) -> "WebScrapeConfig":
+        if self.records is not None and any(column.resolve_url for column in self.records.columns) and not self.http.allowed_origins:
+            raise ValueError("records columns with resolve_url require http.allowed_origins")
         return self
 
     @model_validator(mode="after")
@@ -719,7 +733,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:75eaa95bbffb095f"
+    source_file_hash: str | None = "sha256:5f11520bab7bd702"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1398,17 +1412,27 @@ class WebScrapeTransform(BaseTransform):
             if content_type_lower not in {"text/html", "application/xhtml+xml"}:
                 return TransformResult.error({"reason": "content_extraction_failed", "error": "CSS records require an HTML response"})
             try:
+
+                def resolve_link(href: str) -> str:
+                    return resolve_discovered_href(
+                        href,
+                        base_url=final_hostname_url,
+                        allowed_origins=self._allowed_origins,
+                        allowed_ranges=self._allowed_ranges,
+                    )
+
                 if self._records.provenance_field is not None:
                     extracted = extract_css_records_with_provenance(
                         response.text,
                         self._records,
                         self._strip_elements,
                         source_url=fingerprint_url(final_hostname_url),
+                        url_resolver=resolve_link,
                     )
                     records = extracted.to_record_rows()
                     record_provenance = extracted.to_provenance_rows()
                 else:
-                    records = extract_css_records(response.text, self._records, self._strip_elements)
+                    records = extract_css_records(response.text, self._records, self._strip_elements, url_resolver=resolve_link)
             except (ValueError, UnicodeError) as e:
                 return TransformResult.error({"reason": "content_extraction_failed", "error": str(e), "error_type": type(e).__name__})
 
