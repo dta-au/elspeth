@@ -1,6 +1,7 @@
 # Web Scrape Transform
 
 Fetch webpages from URLs, convert content to markdown/text, and generate fingerprints for change detection.
+It can also POST a JSON object from each row to a read-only data endpoint.
 
 ## Configuration
 
@@ -26,6 +27,37 @@ transforms:
         - style
         - nav
 ```
+
+GET is the default. To request data with POST, add a JSON object to each input
+row and name its field explicitly:
+
+```yaml
+transforms:
+  - plugin: web_scrape
+    options:
+      url_field: endpoint_url
+      method: POST
+      request_json_field: query_body
+      content_field: response_text
+      fingerprint_field: response_fingerprint
+      format: raw
+      http:
+        abuse_contact: compliance@example.com
+        scraping_reason: Public data retrieval
+        max_request_body_bytes: 1048576
+      schema: {mode: observed}
+```
+
+`request_json_field` must name a row field containing a JSON object. Missing,
+invalid, or oversized bodies fail that row before DNS resolution or any HTTP
+request. The serialized body limit defaults to 1 MiB. `format: raw` returns a
+JSON response as text, ready for a downstream JSON transform; `markdown` and
+`text` accept HTML and other text responses, not `application/json`.
+
+POST does not follow redirects or retry failed requests automatically. A
+restarted run may still issue the request again, so use this mode only for
+endpoints where repeated retrieval is safe. Request JSON is retained in the
+HTTP audit trail; do not put credentials in the body.
 
 ## Output Fields
 

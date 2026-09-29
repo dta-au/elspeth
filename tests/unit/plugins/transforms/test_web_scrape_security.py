@@ -294,6 +294,83 @@ def test_web_scrape_replay_uses_archived_pin_without_dns(transform, mock_ctx, mo
 
 
 @respx.mock
+def test_web_scrape_post_audits_the_sent_json_body(mock_ctx) -> None:
+    endpoint = respx.post("https://93.184.216.34:443/search").mock(
+        return_value=httpx.Response(200, text="found", headers={"content-type": "text/plain"})
+    )
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "method": "POST",
+            "request_json_field": "query",
+            "format": "raw",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "Public data search"},
+        }
+    )
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo("93.184.216.34")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query": {"term": "found"}}), mock_ctx)
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    calls = mock_ctx.landscape.record_call.calls
+    assert len(calls) == 1
+    request = calls[0].kwargs["request_data"].to_dict()
+    assert request["method"] == "POST"
+    assert request["json"] == {"term": "found"}
+    assert request["resolved_ip"] == "93.184.216.34"
+
+
+def test_web_scrape_post_verify_preflight_binds_body_before_dns(mock_ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.web_scrape as web_scrape_module
+
+    url = "https://example.com/search"
+    preflight: list[dict[str, Any]] = []
+
+    class _VerifySession:
+        mode = RunMode.VERIFY
+
+        def replay_ssrf_request(self, **_kwargs: Any) -> ReplaySSRFRequest:
+            return ReplaySSRFRequest(url, "93.184.216.34", "example.com", 443, "/search", "https", "example.com")
+
+        def preflight_verify_http_request(self, *, request_data: dict[str, Any], **_kwargs: Any) -> None:
+            preflight.append(request_data)
+            raise RuntimeError("stop after preflight")
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> object:
+        raise AssertionError("DNS called before POST body preflight")
+
+    monkeypatch.setattr(web_scrape_module, "validate_url_for_ssrf", _dns_forbidden)
+    transform = WebScrapeTransform(
+        {
+            "schema": {"mode": "observed"},
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "method": "POST",
+            "request_json_field": "query",
+            "format": "raw",
+            "http": {"abuse_contact": "test@example.com", "scraping_reason": "Public data search"},
+        }
+    )
+    transform.on_start(mock_ctx)
+    mock_ctx.call_mode_session = _VerifySession()
+    mock_ctx.run_mode = RunMode.VERIFY
+    mock_ctx.replay_from = "source-run"
+
+    with pytest.raises(RuntimeError, match="stop after preflight"):
+        transform.process(make_pipeline_row({"url": url, "query": {"term": "found"}}), mock_ctx)
+
+    assert len(preflight) == 1
+    assert preflight[0]["method"] == "POST"
+    assert preflight[0]["json"] == {"term": "found"}
+    assert "resolved_ip" not in preflight[0]
+
+
+@respx.mock
 def test_ssrf_allows_public_ip(transform, mock_ctx):
     """Public IPs should be allowed (request goes to pinned IP)."""
     # Mock the IP-based URL that get_ssrf_safe() will actually request

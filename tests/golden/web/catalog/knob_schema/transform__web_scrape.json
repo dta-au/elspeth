@@ -50,8 +50,32 @@
         "tier": "common"
       },
       {
+        "default": "GET",
+        "description": "HTTP method for fetching the row URL.",
+        "enum": [
+          "GET",
+          "POST"
+        ],
+        "kind": "enum",
+        "label": "Method",
+        "name": "method",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field containing a JSON object to send as a POST body.",
+        "kind": "text",
+        "label": "Request JSON Field",
+        "name": "request_json_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "default": "markdown",
-        "description": "Content extraction format to emit: markdown, plain text, or raw HTML.",
+        "description": "Content extraction format to emit: markdown, plain text, or raw HTML/JSON text.",
         "enum": [
           "markdown",
           "text",

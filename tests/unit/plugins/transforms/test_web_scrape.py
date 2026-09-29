@@ -193,6 +193,233 @@ def test_web_scrape_success_markdown(mock_ctx):
     assert result.row["fetch_status"] == 200
 
 
+def _make_basic_transform_options() -> dict[str, Any]:
+    return {
+        "schema": {"mode": "observed"},
+        "url_field": "url",
+        "content_field": "response_text",
+        "fingerprint_field": "response_fingerprint",
+        "format": "raw",
+        "http": {
+            "abuse_contact": "test@example.com",
+            "scraping_reason": "Read-only public data retrieval",
+        },
+    }
+
+
+def _make_post_transform(*, format: str = "raw", max_request_body_bytes: int = 1024) -> WebScrapeTransform:
+    options = _make_basic_transform_options()
+    options["format"] = format
+    options["method"] = "POST"
+    options["request_json_field"] = "query_body"
+    options["http"]["max_request_body_bytes"] = max_request_body_bytes
+    return WebScrapeTransform(options)
+
+
+def test_web_scrape_post_requires_body_field() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    with pytest.raises(PluginConfigError, match="request_json_field"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_post_declares_body_field_and_probes_it(mock_ctx) -> None:
+    transform = _make_post_transform()
+    assert "query_body" in transform.declared_input_fields
+    probe_rows = transform.forward_invariant_probe_rows(make_pipeline_row({"unrelated": "value"}))
+    probe = probe_rows[0]
+    assert probe["query_body"] == {}
+    result = transform.execute_forward_invariant_probe(probe_rows, mock_ctx)
+    assert result.status == "success"
+    assert result.row["unrelated"] == "value"
+
+
+def test_web_scrape_post_rejects_body_field_created_by_transform() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    options["request_json_field"] = "fetch_status"
+    with pytest.raises(PluginConfigError, match="request_json_field names 'fetch_status'"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_post_rejects_body_field_used_as_url() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    options["request_json_field"] = "url"
+    with pytest.raises(PluginConfigError, match="request_json_field and url_field must differ"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_post_rejects_body_option_name_in_schema_columns() -> None:
+    options = _make_basic_transform_options()
+    options["method"] = "POST"
+    options["request_json_field"] = "query_body"
+    options["schema"] = {"mode": "observed", "guaranteed_fields": ["request_json_field"]}
+    with pytest.raises(PluginConfigError, match="request_json_field"):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_get_rejects_body_field() -> None:
+    options = _make_basic_transform_options()
+    options["request_json_field"] = "query_body"
+    with pytest.raises(PluginConfigError, match="request_json_field"):
+        WebScrapeTransform(options)
+
+
+@respx.mock
+def test_web_scrape_post_sends_row_json_and_returns_raw_json(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, text='{"items":["found"]}', headers={"content-type": "application/json"})
+    )
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {"term": "found"}}), mock_ctx)
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    assert endpoint.calls[0].request.method == "POST"
+    assert endpoint.calls[0].request.headers["content-type"] == "application/json"
+    assert endpoint.calls[0].request.content == b'{"term":"found"}'
+    assert result.row["response_text"] == '{"items":["found"]}'
+    assert result.row["fetch_status"] == 200
+
+
+@respx.mock
+def test_web_scrape_post_invalid_body_refuses_before_dns_or_http(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="ok"))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": ["secret-example"]}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert "secret-example" not in str(result.reason)
+    assert endpoint.call_count == 0
+
+
+def test_web_scrape_post_missing_row_body_refuses_before_dns(mock_ctx) -> None:
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search"}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason["reason"] == "validation_failed"
+
+
+@respx.mock
+def test_web_scrape_post_oversized_body_refuses_before_dns_or_http(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="ok"))
+    transform = _make_post_transform(max_request_body_bytes=16)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {"term": "too long"}}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert endpoint.call_count == 0
+
+
+@pytest.mark.parametrize("body", [{"items": [float("nan")]}, {1: "not a string key"}, {"item": b"not JSON"}])
+def test_web_scrape_post_rejects_non_json_values_before_dns(mock_ctx, body: object) -> None:
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": body}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert "not a string key" not in str(result.reason)
+
+
+@respx.mock
+def test_web_scrape_post_redirect_is_not_followed(mock_ctx) -> None:
+    first = respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(307, headers={"location": "http://127.0.0.1/admin"})
+    )
+    next_hop = respx.get("http://127.0.0.1/admin").mock(return_value=httpx.Response(200, text="wrong"))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert first.call_count == 1
+    assert next_hop.call_count == 0
+
+
+@pytest.mark.parametrize("status", [408, 429, 503])
+@respx.mock
+def test_web_scrape_post_server_error_is_not_retried(mock_ctx, status: int) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(status))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert endpoint.call_count == 1
+
+
+@respx.mock
+def test_web_scrape_post_connection_failure_is_not_retried_or_leaked(mock_ctx) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(side_effect=httpx.ConnectError("remote unavailable"))
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(
+            make_pipeline_row({"url": "https://example.com/search", "query_body": {"token": "secret-example"}}), mock_ctx
+        )
+    assert result.status == "error"
+    assert result.retryable is False
+    assert endpoint.call_count == 1
+    assert "secret-example" not in str(result.reason)
+
+
+@respx.mock
+def test_web_scrape_post_html_response_uses_existing_extraction(mock_ctx) -> None:
+    respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, text="<html><body><h1>Found</h1></body></html>", headers={"content-type": "text/html"})
+    )
+    transform = _make_post_transform(format="markdown")
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {"q": "Found"}}), mock_ctx)
+    assert result.status == "success"
+    assert "# Found" in result.row["response_text"]
+
+
+@respx.mock
+def test_web_scrape_post_json_requires_raw_format(mock_ctx) -> None:
+    respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, text='{"items":[]}', headers={"content-type": "application/json"})
+    )
+    transform = _make_post_transform(format="text")
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.reason["reason"] == "non_text_content_type"
+
+
+@respx.mock
+def test_web_scrape_post_binary_response_is_rejected(mock_ctx) -> None:
+    respx.post(f"https://{_TEST_IP}:443/search").mock(
+        return_value=httpx.Response(200, content=b"\x00\x01", headers={"content-type": "application/octet-stream"})
+    )
+    transform = _make_post_transform()
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
+    assert result.status == "error"
+    assert result.retryable is False
+    assert result.reason["reason"] == "non_text_content_type"
+
+
 @respx.mock
 def test_web_scrape_404_returns_error(mock_ctx):
     """404 should return error result (non-retryable)."""

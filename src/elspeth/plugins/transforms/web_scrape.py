@@ -16,6 +16,7 @@ Audit Trail:
 """
 
 import ipaddress
+import math
 from collections.abc import Mapping
 from ipaddress import IPv4Network, IPv6Network
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -82,6 +83,30 @@ WEBSCRAPE_AUDIT_FIELDS: tuple[str, ...] = (
 )
 
 
+def _is_json_value(value: object, *, depth: int = 0) -> bool:
+    """Accept only JSON values without coercing row data into new types."""
+    if depth > 64:
+        return False
+    if value is None or type(value) in (str, bool, int):
+        return True
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is list:
+        return all(_is_json_value(item, depth=depth + 1) for item in value)
+    if type(value) is dict:
+        return all(type(key) is str and _is_json_value(item, depth=depth + 1) for key, item in value.items())
+    return False
+
+
+class _PostRequestBody(dict[str, object]):
+    """Owned JSON object, copied only after strict validation of row data."""
+
+    def __init__(self, value: object) -> None:
+        if type(value) is not dict or not _is_json_value(value):
+            raise ValueError("POST body must be a JSON object")
+        super().__init__(value)
+
+
 def _validate_cidr_entry(entry: str) -> str:
     """Validate a single ``allowed_hosts`` CIDR string at the Tier-3 config boundary.
 
@@ -131,6 +156,7 @@ class WebScrapeHTTPConfig(BaseModel):
             "preventing OOM on hostile or misconfigured Tier-3 endpoints (B3.10)."
         ),
     )
+    max_request_body_bytes: int = Field(default=1024 * 1024, gt=0, description="Maximum serialized POST JSON body size in bytes.")
     # SSRF allowlist. The two scalar keywords are a closed set (declared as a
     # Literal so Pydantic validates the arm natively); the list arm is one-or-more
     # CIDR strings, each well-formedness-checked by CidrStr's AfterValidator, with
@@ -186,9 +212,11 @@ class WebScrapeConfig(TransformDataConfig):
     )
     content_field: str = Field(description="Output field that receives the fetched page content.")
     fingerprint_field: str = Field(description="Output field that receives the page fingerprint.")
+    method: Literal["GET", "POST"] = Field(default="GET", description="HTTP method for fetching the row URL.")
+    request_json_field: str | None = Field(default=None, description="Row field containing a JSON object to send as a POST body.")
     format: Literal["markdown", "text", "raw"] = Field(
         default="markdown",
-        description="Content extraction format to emit: markdown, plain text, or raw HTML.",
+        description="Content extraction format to emit: markdown, plain text, or raw HTML/JSON text.",
     )
     text_separator: Annotated[
         str,
@@ -209,21 +237,34 @@ class WebScrapeConfig(TransformDataConfig):
     )
     http: WebScrapeHTTPConfig = Field(description="HTTP fetching policy, timeout, contact, and host allowlist settings.")
 
-    @field_validator("url_field", "content_field", "fingerprint_field")
+    @field_validator("url_field", "content_field", "fingerprint_field", "request_json_field")
     @classmethod
-    def _reject_empty_field_names(cls, v: str, info: Any) -> str:
-        if not v:
+    def _reject_empty_field_names(cls, v: str | None, info: Any) -> str | None:
+        if v == "":
             raise ValueError(f"{info.field_name} must not be empty")
         return v
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
-        return super().declared_input_fields | frozenset({self.url_field})
+        fields = {self.url_field}
+        if self.request_json_field is not None:
+            fields.add(self.request_json_field)
+        return super().declared_input_fields | frozenset(fields)
+
+    @model_validator(mode="after")
+    def _validate_request_body_option(self) -> "WebScrapeConfig":
+        if self.method == "POST" and self.request_json_field is None:
+            raise ValueError("request_json_field is required when method is POST")
+        if self.method == "GET" and self.request_json_field is not None:
+            raise ValueError("request_json_field is only valid when method is POST")
+        return self
 
     @model_validator(mode="after")
     def _reject_field_collisions(self) -> "WebScrapeConfig":
         if self.content_field == self.fingerprint_field:
             raise ValueError(f"content_field and fingerprint_field must differ, both are '{self.content_field}'")
+        if self.request_json_field == self.url_field:
+            raise ValueError("request_json_field and url_field must differ")
         return self
 
     @model_validator(mode="after")
@@ -255,6 +296,8 @@ class WebScrapeConfig(TransformDataConfig):
             "content_field": self.content_field,
             "fingerprint_field": self.fingerprint_field,
         }
+        if self.request_json_field is not None:
+            option_key_to_value["request_json_field"] = self.request_json_field
 
         list_name_to_entries: dict[str, tuple[str, ...] | None] = {
             "guaranteed_fields": self.schema_config.guaranteed_fields,
@@ -495,7 +538,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2958fbbd405f4505"
+    source_file_hash: str | None = "sha256:8c138fb80b3833b7"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -504,7 +547,8 @@ class WebScrapeTransform(BaseTransform):
 
     usage_when_to_use = (
         "Use when each row contains a public HTTP(S) page URL and you need an audited fetch, "
-        "Markdown or plain text extraction, and a change fingerprint. Returned remote content is "
+        "Markdown or plain text extraction, and a change fingerprint. A read-only POST can send a "
+        "row's JSON object to a public data endpoint and return JSON as raw text. Returned remote content is "
         "untrusted before LLM consumption, so apply the appropriate prompt-injection control first."
     )
     usage_when_not_to_use = (
@@ -552,6 +596,8 @@ class WebScrapeTransform(BaseTransform):
         self._url_field = cfg.url_field
         self._content_field = cfg.content_field
         self._fingerprint_field = cfg.fingerprint_field
+        self._method = cfg.method
+        self._request_json_field = cfg.request_json_field
 
         # Declare output fields for centralized collision detection in TransformExecutor.
         self.declared_output_fields = frozenset(
@@ -563,7 +609,10 @@ class WebScrapeTransform(BaseTransform):
                 "fetch_url_final_ip",
             ]
         )
-        self._reject_input_options_naming_created_fields({"url_field": cfg.url_field})
+        input_options = {"url_field": cfg.url_field}
+        if cfg.request_json_field is not None:
+            input_options["request_json_field"] = cfg.request_json_field
+        self._reject_input_options_naming_created_fields(input_options)
 
         # Format and fingerprint mode
         self._format = cfg.format
@@ -575,6 +624,7 @@ class WebScrapeTransform(BaseTransform):
         self._scraping_reason = cfg.http.scraping_reason
         self._timeout = cfg.http.timeout
         self._max_body_bytes = cfg.http.max_body_bytes
+        self._max_request_body_bytes = cfg.http.max_request_body_bytes
 
         # Compute allowed_ranges from allowed_hosts config
         allowed_hosts = cfg.http.allowed_hosts
@@ -634,9 +684,11 @@ class WebScrapeTransform(BaseTransform):
             return PluginAssistance(
                 plugin_name="web_scrape",
                 issue_code=None,
-                summary="Fetch a URL over HTTP(S) with SSRF protection, audit recording, and content-fingerprinting for change detection. Output formats: raw HTML, text, markdown.",
+                summary="Fetch a URL with SSRF protection, audit recording, and content-fingerprinting. GET is the default; POST sends a JSON object from a row field. Output formats: raw, text, markdown.",
                 composer_hints=(
                     "web_scrape is a transform, not a source: it consumes URL rows from csv/json/text/blob via url_field and writes content_field.",
+                    "For read-only POST data retrieval, set method: POST and request_json_field to a row field containing a JSON object; use format: raw for application/json responses.",
+                    "POST bodies are retained in HTTP audit evidence; do not put credentials in them. POST redirects are rejected and POST failures are not automatically retried.",
                     "If you saw Unknown source plugin: web_scrape, use a URL row source first, then add web_scrape as a transform.",
                     "URLs MUST include explicit scheme (http:// or https://). Bare hostnames are rejected by the SSRF guard at fetch time.",
                     "schema is required; use schema: {mode: observed} unless you need fixed/flexible field contracts. For raw HTML, set format to raw, not html.",
@@ -706,13 +758,14 @@ class WebScrapeTransform(BaseTransform):
 
     def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Inject a deterministic public-IP URL for invariant probing."""
-        return [
-            self._augment_invariant_probe_row(
-                probe,
-                field_name=self._url_field,
-                value="https://93.184.216.34/invariant-probe",
-            )
-        ]
+        probe = self._augment_invariant_probe_row(
+            probe,
+            field_name=self._url_field,
+            value="https://93.184.216.34/invariant-probe",
+        )
+        if self._request_json_field is not None:
+            probe = self._augment_invariant_probe_row(probe, field_name=self._request_json_field, value={})
+        return [probe]
 
     def execute_forward_invariant_probe(
         self,
@@ -732,13 +785,14 @@ class WebScrapeTransform(BaseTransform):
         def _fake_fetch_url(
             safe_request: SSRFSafeRequest,
             probe_ctx: TransformContext,
+            request_json: _PostRequestBody | None = None,
         ) -> tuple[httpx.Response, str, _InvariantCall]:
-            del probe_ctx
+            del probe_ctx, request_json
             return (
                 httpx.Response(
                     200,
                     text="<html><body><h1>Probe</h1><p>safe</p></body></html>",
-                    request=httpx.Request("GET", safe_request.connection_url),
+                    request=httpx.Request(self._method, safe_request.connection_url),
                 ),
                 safe_request.original_url,
                 _InvariantCall(),
@@ -793,6 +847,36 @@ class WebScrapeTransform(BaseTransform):
             WebScrapeError: For retryable failures (5xx, 429, network)
                 Engine RetryManager handles these with exponential backoff
         """
+        request_json: _PostRequestBody | None = None
+        if self._request_json_field is not None:
+            values = row.to_dict()
+            if self._request_json_field not in values:
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST body field '{self._request_json_field}' is missing"}
+                )
+            try:
+                candidate = _PostRequestBody(values[self._request_json_field])
+            except ValueError:
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST body field '{self._request_json_field}' must contain a JSON object"}
+                )
+            try:
+                encoded_body = httpx.Request("POST", "https://example.invalid/", json=candidate).content
+            except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST body field '{self._request_json_field}' cannot be JSON encoded"}
+                )
+            if len(encoded_body) > self._max_request_body_bytes:
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "error": f"POST body exceeds max_request_body_bytes {self._max_request_body_bytes}",
+                        "body_size": len(encoded_body),
+                        "max_body_bytes": self._max_request_body_bytes,
+                    }
+                )
+            request_json = candidate
+
         # Validate URL and pin resolved IP (SSRF prevention with DNS rebinding defense)
         try:
             url = row[self._url_field]
@@ -818,7 +902,7 @@ class WebScrapeTransform(BaseTransform):
                 )
                 archived_safe = validate_archived_ssrf_request(url, archived, allowed_ranges=self._allowed_ranges)
                 pre_dns_request = HTTPCallRequest(
-                    method="GET",
+                    method=self._method,
                     url=fingerprint_url(url),
                     headers=fingerprint_headers(
                         {
@@ -828,6 +912,7 @@ class WebScrapeTransform(BaseTransform):
                         }
                     ),
                     params=None,
+                    json=request_json,
                 )
                 session.preflight_verify_http_request(
                     request_data=pre_dns_request.to_dict(),
@@ -850,7 +935,10 @@ class WebScrapeTransform(BaseTransform):
 
         # Fetch URL using pinned IP (prevents DNS rebinding between validation and fetch)
         try:
-            response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
+            if self._method == "POST":
+                response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_json)
+            else:
+                response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
             final_resolved_ip = _final_response_ip(response)
         except BodyTooLargeError as e:
             # Rebuild the message from structured fields — str(e) carries the
@@ -864,7 +952,7 @@ class WebScrapeTransform(BaseTransform):
                 }
             )
         except WebScrapeError as e:
-            if e.retryable:
+            if e.retryable and self._method == "GET":
                 # Re-raise retryable errors for engine RetryManager
                 raise
             # Non-retryable errors return error result
@@ -888,11 +976,14 @@ class WebScrapeTransform(BaseTransform):
         content_type_raw = response.headers.get("content-type")
         content_type_lower = None if content_type_raw is None else content_type_raw.split(";", 1)[0].strip().lower()
         _TEXT_CONTENT_TYPES = ("text/", "application/xhtml+xml")
-        if content_type_lower is None or not any(content_type_lower.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES):
+        allowed_json = self._format == "raw" and content_type_lower == "application/json"
+        if content_type_lower is None or (
+            not allowed_json and not any(content_type_lower.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES)
+        ):
             return TransformResult.error(
                 {
                     "reason": "non_text_content_type",
-                    "error": f"non-text content-type {content_type_raw!r}; expected text/*",
+                    "error": f"non-text content-type {content_type_raw!r}; expected text/* or application/json with format raw",
                     "content_type": content_type_raw,
                 }
             )
@@ -983,7 +1074,9 @@ class WebScrapeTransform(BaseTransform):
             },
         )
 
-    def _fetch_url(self, safe_request: SSRFSafeRequest, ctx: TransformContext) -> tuple[httpx.Response, str, Call]:
+    def _fetch_url(
+        self, safe_request: SSRFSafeRequest, ctx: TransformContext, request_json: _PostRequestBody | None = None
+    ) -> tuple[httpx.Response, str, Call]:
         """Fetch URL using SSRF-safe IP pinning with audit recording.
 
         Args:
@@ -1031,12 +1124,17 @@ class WebScrapeTransform(BaseTransform):
         }
 
         try:
-            response, final_hostname_url, call = client.get_ssrf_safe(
-                safe_request,
-                headers=headers,
-                follow_redirects=True,
-                allowed_ranges=self._allowed_ranges,
-            )
+            if self._method == "POST":
+                response, final_hostname_url, call = client.request_ssrf_safe(
+                    "POST", safe_request, headers=headers, json=request_json, follow_redirects=False, allowed_ranges=self._allowed_ranges
+                )
+            else:
+                response, final_hostname_url, call = client.get_ssrf_safe(
+                    safe_request,
+                    headers=headers,
+                    follow_redirects=True,
+                    allowed_ranges=self._allowed_ranges,
+                )
 
             # Check status code and raise appropriate errors
             if response.status_code == 404:
@@ -1050,7 +1148,10 @@ class WebScrapeTransform(BaseTransform):
             elif 500 <= response.status_code < 600:
                 raise ServerError(f"HTTP {response.status_code}")
             elif 300 <= response.status_code < 400:
-                # Unresolved redirect (e.g. 3xx without Location header) -- treat as error
+                # POST does not follow redirects; GET can still reach this arm
+                # for a response without a usable Location header.
+                if self._method == "POST":
+                    raise InvalidURLError(f"Unfollowed POST redirect HTTP {response.status_code}")
                 raise InvalidURLError(f"Unresolved redirect HTTP {response.status_code} (missing or empty Location header)")
             elif 400 <= response.status_code < 500:
                 # Catch-all for unenumerated 4xx codes (400, 402, 405, 406, 408,
