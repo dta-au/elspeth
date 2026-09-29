@@ -7,6 +7,15 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 - Composer guidance now teaches source-carried field names, typed transform outputs, projected template rows, batch output-mode capabilities, and routed batch or missing-field failures using current runtime rules.
+- **Web fetches refuse the IPv6 unspecified address and IPv4-embedding and
+  special-purpose ranges.** The SSRF address policy now blocks `::` (which
+  reaches local listeners like `0.0.0.0`), `192.0.0.0/24`, `198.18.0.0/15`,
+  `240.0.0.0/4`, and the IPv4-compatible (`::/96`), NAT64 (`64:ff9b::/96`,
+  `64:ff9b:1::/48`) and 6to4 (`2002::/16`) prefixes by default. Those
+  embedded forms of the metadata address `169.254.169.254`, and Azure
+  WireServer `168.63.129.16`, are always blocked, even under an operator
+  `allowed_ranges` policy; previously `64:ff9b::a9fe:a9fe` passed an
+  allow-everything policy.
 - **CI audits both npm lockfiles, and neither has an open advisory.** The
   `Dependency and License Audit` job now runs `npm audit --package-lock-only
   --audit-level=low` on the frontend lockfile (compiled into the release image)
