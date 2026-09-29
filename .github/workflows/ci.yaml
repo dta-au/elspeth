@@ -886,8 +886,8 @@ jobs:
           # pip-audit "Fix Versions" column is empty). chromadb backs the
           # chroma_sink + rag_retrieval plugins; remove this ignore and bump the
           # pin once an upstream fix ships. PyJWT advisories PYSEC-2026-175/177/
-          # 178/179 are NOT ignored — they are resolved by the uv.lock bump to
-          # PyJWT 2.13.0 (constraint already permitted it).
+          # 178/179 and CVE-2026-102274 are NOT ignored — the authored floor
+          # and uv.lock select PyJWT 2.14.0 or newer.
           #
           # CVE-2026-45830 / CVE-2026-45831 / CVE-2026-45833 (added 2026-09-10)
           # likewise have no fixed chromadb release. All three are defects in the
