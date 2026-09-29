@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Literal, Protocol
 
 from jsonschema import Draft202012Validator
 
@@ -12,8 +12,7 @@ from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditI
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, TextractProfiledAuditIdentity
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
-from elspeth.web.catalog.protocol import CatalogService
-from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
 from elspeth.web.plugin_policy.coverage import (
@@ -23,8 +22,25 @@ from elspeth.web.plugin_policy.coverage import (
     control_coverage_findings,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
-from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
+from elspeth.web.plugin_policy.profiles import LoweredPluginConfig
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+
+
+class ProfileValidationCatalog(Protocol):
+    """Schema reads needed by pure policy validation; never a dispatch guard."""
+
+    def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo: ...
+
+
+class ProfileValidationRegistry(Protocol):
+    """Pure profile operations shared by live discovery and detached facts."""
+
+    def public_schema(
+        self, plugin_id: PluginId, full_schema: PluginSchemaInfo, *, available_aliases: tuple[str, ...]
+    ) -> PluginSchemaInfo: ...
+
+    def lower_options(self, plugin_id: PluginId, *, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig: ...
+
 
 PolicyValidationStage = Literal[
     "plugin_enablement",
@@ -132,8 +148,8 @@ def validate_plugin_policy(
     state: CompositionState,
     *,
     snapshot: PluginAvailabilitySnapshot,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
 ) -> PluginPolicyValidationResult:
     """Validate identities/controls and lower public profile options in memory.
 
@@ -426,8 +442,8 @@ def _lower_profiled_components(
     state: CompositionState,
     *,
     snapshot: PluginAvailabilitySnapshot,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
 ) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...], S3ProfiledAuditIdentities, TextractProfiledAuditIdentities]:
     aliases_by_plugin = dict(snapshot.usable_profile_aliases)
     components = _components(state)
@@ -670,8 +686,8 @@ def validate_authored_composition_state(
     state: CompositionState,
     *,
     snapshot: PluginAvailabilitySnapshot,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
 ) -> ProfileAwareValidationResult:
     """Validate authored state once through the principal's policy boundary."""
     if snapshot.is_trained_operator:
@@ -735,8 +751,8 @@ def _profile_lowering_context(
     component: _Component,
     *,
     aliases_by_plugin: Mapping[PluginId, tuple[str, ...]],
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService,
+    profile_registry: ProfileValidationRegistry | None,
+    catalog: ProfileValidationCatalog,
     findings: list[PluginPolicyFinding],
 ) -> tuple[PluginId, tuple[str, ...], PluginSchemaInfo] | None:
     """Resolve the public profile schema or record one closed failure."""
@@ -770,7 +786,7 @@ def _normalized_profile_findings(findings: list[PluginPolicyFinding]) -> tuple[P
 
 
 def _lower_profile_options(
-    profile_registry: OperatorProfileRegistry,
+    profile_registry: ProfileValidationRegistry,
     plugin_id: PluginId,
     *,
     alias: str,
