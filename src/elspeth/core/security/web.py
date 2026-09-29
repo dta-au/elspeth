@@ -98,6 +98,7 @@ BLOCKED_IP_RANGES = [
     ipaddress.ip_network("100.64.0.0/10"),  # CGNAT (RFC 6598) - shared ISP space, often internal
     # IPv6 ranges
     ipaddress.ip_network("::1/128"),  # IPv6 loopback
+    ipaddress.ip_network("::/128"),  # IPv6 unspecified - like 0.0.0.0, connects to local listeners
     ipaddress.ip_network("fc00::/7"),  # IPv6 unique local (RFC 4193) - private
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local (RFC 4291) - can reach metadata
     ipaddress.ip_network("::ffff:0:0/96"),  # IPv4-mapped IPv6 - CRITICAL: bypass vector!

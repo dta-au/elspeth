@@ -566,6 +566,21 @@ class TestAllowedRanges:
         allowed = (ipaddress.ip_network("::1/128"),)
         _validate_ip_address("::1", allowed_ranges=allowed)  # OK
 
+    def test_ipv6_unspecified_blocked_without_allowed_ranges(self) -> None:
+        """``::`` is blocked by default, like its IPv4 twin 0.0.0.0.
+
+        Connecting to the unspecified address reaches listeners on the local
+        host, so a hostname resolving to ``::`` must not pass as public.
+        """
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            _validate_ip_address("::")
+
+    def test_ipv6_unspecified_not_admitted_by_loopback_allowlist(self) -> None:
+        """Allowing ``::1/128`` does not also admit ``::``."""
+        allowed = (ipaddress.ip_network("::1/128"),)
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            _validate_ip_address("::", allowed_ranges=allowed)
+
 
 # ===========================================================================
 # allowed_ranges through validate_url_for_ssrf
@@ -581,6 +596,12 @@ class TestAllowedRangesFullPath:
         allowed = (ipaddress.ip_network("127.0.0.0/8"),)
         result = validate_url_for_ssrf("http://localhost/page", allowed_ranges=allowed)
         assert result.resolved_ip == "127.0.0.1"
+
+    def test_hostname_resolving_to_ipv6_unspecified_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A hostname whose only address is ``::`` is refused before any connection."""
+        monkeypatch.setattr("elspeth.core.security.web._resolve_hostname", lambda h: ["::"])
+        with pytest.raises(SSRFBlockedError, match="Blocked IP range"):
+            validate_url_for_ssrf("http://attacker.example/")
 
     def test_cloud_metadata_blocked_via_full_validation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """169.254.169.254 blocked via full path even with allow_private."""
