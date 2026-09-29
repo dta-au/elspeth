@@ -4260,7 +4260,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         fingerprint="060f65def285276f",
         ordinal=1,
         authority=None,
-        line=5652,
+        line=5651,
         connection_escape=False,
     ),
     WriterIdentity(
