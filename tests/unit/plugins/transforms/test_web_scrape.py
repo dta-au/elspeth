@@ -5,6 +5,7 @@ known resolved IP, then mock respx to match the IP-based URL that
 get_ssrf_safe() actually sends.
 """
 
+import base64
 import hashlib
 import os
 import socket
@@ -26,7 +27,7 @@ from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
-from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
+from elspeth.plugins.transforms.web_scrape import WebScrapeConfig, WebScrapeTransform
 from elspeth.plugins.transforms.web_scrape_errors import (
     NetworkError,
     RateLimitError,
@@ -218,6 +219,177 @@ def _make_post_transform(*, format: str = "raw", max_request_body_bytes: int = 1
     options["request_json_field"] = "query_body"
     options["http"]["max_request_body_bytes"] = max_request_body_bytes
     return WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize(
+    ("scheme", "credential", "header_name", "expected_name", "expected_value"),
+    [
+        ("basic", "operator:password", None, "Authorization", "Basic " + base64.b64encode(b"operator:password").decode("ascii")),
+        ("bearer", "token-123", None, "Authorization", "Bearer token-123"),
+        ("api_key", "key-123", "X-Subscription", "X-Subscription", "key-123"),
+    ],
+)
+def test_web_scrape_auth_header_builder_and_audit_fingerprint(
+    scheme: str, credential: str, header_name: str | None, expected_name: str, expected_value: str
+) -> None:
+    from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers
+    from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
+
+    config = WebScrapeAuthConfig(scheme=scheme, origin="https://example.com", credential=credential, header_name=header_name)
+    name, value = config.header()
+    assert (name, value) == (expected_name, expected_value)
+    safe_headers = fingerprint_headers({name: value}, force_fingerprint_names=frozenset({name.casefold()}))
+    assert credential not in repr(config)
+    assert credential not in repr(safe_headers)
+    assert expected_value not in repr(safe_headers)
+    assert "fingerprint:" in repr(safe_headers)
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"scheme": "bearer", "origin": "http://example.com", "credential": "token"},
+        {"scheme": "bearer", "origin": "https://other.example", "credential": "token"},
+        {"scheme": "api_key", "origin": "https://example.com", "credential": "key", "header_name": "Host"},
+        {"scheme": "api_key", "origin": "https://example.com", "credential": "key", "header_name": "Cookie"},
+        {"scheme": "api_key", "origin": "https://example.com", "credential": "key", "header_name": "Accept"},
+    ],
+)
+def test_web_scrape_auth_config_refuses_unsafe_binding(auth: dict[str, str]) -> None:
+    options = _make_basic_transform_options()
+    options["url_field"] = None
+    options["url"] = "https://example.com/page"
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    options["auth"] = auth
+    with pytest.raises(PluginConfigError):
+        WebScrapeTransform(options)
+
+
+def test_web_scrape_auth_secret_ref_preflight_and_literal_policy() -> None:
+    from elspeth.core.secrets import (
+        collect_credential_field_violations,
+        collect_disallowed_secret_ref_markers,
+        redact_secret_refs_for_validation,
+    )
+
+    options = _make_basic_transform_options()
+    options["auth"] = {
+        "scheme": "bearer",
+        "origin": "https://example.com",
+        "credential": {"secret_ref": "WEB_SEARCH_TOKEN"},
+    }
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    assert collect_credential_field_violations(options) == []
+    assert collect_disallowed_secret_ref_markers(options) == []
+    redacted = redact_secret_refs_for_validation({"options": options})["options"]
+    WebScrapeTransform(redacted)
+    options["auth"]["credential"] = "literal-token"
+    assert collect_credential_field_violations(options) == ["credential"]
+
+
+def test_web_scrape_basic_auth_accepts_printable_password_space() -> None:
+    from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
+
+    auth = WebScrapeAuthConfig(scheme="basic", origin="https://example.com", credential="operator:pass phrase")
+    assert auth.header() == ("Authorization", "Basic " + base64.b64encode(b"operator:pass phrase").decode("ascii"))
+
+
+@respx.mock
+def test_web_scrape_auth_remains_closed_until_response_evidence_is_secret_safe(mock_ctx) -> None:
+    route = respx.get(f"https://{_TEST_IP}:443/page").mock(return_value=httpx.Response(200, text="result"))
+    options = _make_basic_transform_options()
+    options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": "token"}
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/page"}), mock_ctx)
+    assert result.status == "error"
+    assert result.reason["reason"] == "validation_failed"
+    assert "response evidence is secret safe" in result.reason["error"]
+    assert route.call_count == 0
+    assert mock_ctx.landscape.record_call.call_count == 0
+
+
+def test_web_scrape_auth_is_hidden_from_composer_catalog() -> None:
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    info = CatalogServiceImpl(get_shared_plugin_manager())._schema_cache[("transform", "web_scrape")]
+    assert "auth" not in {field["name"] for field in info.knob_schema["fields"]}
+
+
+@pytest.mark.parametrize("invalid_auth", [{"origin": "http://example.com"}, {"scheme": "api_key", "header_name": "Host"}])
+def test_auth_validation_diagnostics_hide_resolved_credential(invalid_auth: dict[str, str]) -> None:
+    from pydantic import ValidationError
+
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+    from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
+
+    credential = "CUSTODY42"
+    # Keep the short credential last so Pydantic's abbreviated input rendering
+    # cannot make the negative control pass by truncating the offending value.
+    auth = {"scheme": "bearer", "origin": "https://x.test", **invalid_auth, "credential": credential}
+    with pytest.raises(ValidationError) as standalone:
+        WebScrapeAuthConfig.model_validate(auth)
+    assert credential not in str(standalone.value)
+    assert credential not in repr(standalone.value)
+    assert credential not in repr(standalone.value.errors(include_input=False))
+
+    options = _make_basic_transform_options()
+    options["auth"] = auth
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    with pytest.raises(ValidationError) as parent:
+        WebScrapeConfig.model_validate(options)
+    assert credential not in str(parent.value)
+    assert credential not in repr(parent.value)
+    with pytest.raises(PluginConfigError) as production:
+        WebScrapeTransform(options)
+    assert credential not in str(production.value)
+    assert credential not in repr(production.value)
+    assert credential not in str(production.value.__cause__)
+    projected = validate_transform_config("web_scrape", options)
+    assert projected
+    assert credential not in repr(projected)
+    assert all(error.value is None for error in projected)
+
+
+def test_parent_auth_validation_error_hides_resolved_credential_on_unrelated_failure() -> None:
+    from pydantic import ValidationError
+
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+
+    credential = "CUSTODY42"
+    options = _make_basic_transform_options()
+    options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": credential}
+    options["http"]["allowed_origins"] = []
+    with pytest.raises(ValidationError) as parent:
+        WebScrapeConfig.model_validate(options)
+    assert credential not in str(parent.value)
+    assert credential not in repr(parent.value)
+    with pytest.raises(PluginConfigError) as production:
+        WebScrapeTransform(options)
+    assert credential not in str(production.value)
+    assert credential not in str(production.value.__cause__)
+    projected = validate_transform_config("web_scrape", options)
+    assert projected
+    assert credential not in repr(projected)
+    assert all(error.value is None for error in projected)
+
+
+@pytest.mark.parametrize("schema", [None, {"mode": "invalid"}])
+def test_wrapped_schema_diagnostics_omit_resolved_auth_input(schema: object) -> None:
+    from elspeth.plugins.infrastructure.validation import validate_transform_config
+
+    credential = "CUSTODY42"
+    options = _make_basic_transform_options()
+    options["schema"] = schema
+    options["auth"] = {"scheme": "bearer", "origin": "https://example.com", "credential": credential}
+    options["http"]["allowed_origins"] = ["https://example.com"]
+    projected = validate_transform_config("web_scrape", options)
+    assert projected
+    assert credential not in repr(projected)
+    assert all(error.value is None for error in projected)
 
 
 def test_web_scrape_post_requires_body_field() -> None:
@@ -546,6 +718,62 @@ def test_web_scrape_post_json_requires_raw_format(mock_ctx) -> None:
         result = transform.process(make_pipeline_row({"url": "https://example.com/search", "query_body": {}}), mock_ctx)
     assert result.status == "error"
     assert result.reason["reason"] == "non_text_content_type"
+
+
+@respx.mock
+def test_web_scrape_strict_json_mode_rejects_invalid_document_before_fingerprint(mock_ctx) -> None:
+    respx.get(f"https://{_TEST_IP}:443/data").mock(
+        return_value=httpx.Response(200, content=b'{"value":NaN}', headers={"content-type": "application/json"})
+    )
+    options = _make_basic_transform_options()
+    options["response_mode"] = "json"
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/data"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "invalid_json"
+    assert result.row is None
+
+
+@respx.mock
+def test_web_scrape_json_records_refuse_invalid_unicode_before_fingerprint(mock_ctx) -> None:
+    respx.get(f"https://{_TEST_IP}:443/data").mock(
+        return_value=httpx.Response(200, content=b'[{"x":"\\ud800"}]', headers={"content-type": "application/json"})
+    )
+    options = _make_basic_transform_options()
+    options["response_mode"] = "json"
+    options["records"] = {"field": "records", "columns": [{"field": "x", "path": ["x"]}]}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/data"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "content_extraction_failed"
+    assert result.reason["error"] == "JSON record column contains an invalid Unicode scalar"
+    assert result.row is None
+
+
+@respx.mock
+def test_web_scrape_xml_mode_accepts_well_formed_document(mock_ctx) -> None:
+    xml = b"<results><name>Example</name></results>"
+    respx.get(f"https://{_TEST_IP}:443/data").mock(
+        return_value=httpx.Response(200, content=xml, headers={"content-type": "application/xml; charset=utf-8"})
+    )
+    options = _make_basic_transform_options()
+    options["response_mode"] = "xml"
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/data"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row["response_text"] == xml.decode()
 
 
 @respx.mock

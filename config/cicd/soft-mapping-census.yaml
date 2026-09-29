@@ -20,7 +20,7 @@ files:
     dict[str, Any]: 2
   src/elspeth/config_loading.py:
     Mapping[str, object]: 1
-    boundary: 1
+    boundary: 2
   src/elspeth/contracts/audit.py:
     Mapping[str, object]: 3
     dict[str, Any]: 1
@@ -595,6 +595,7 @@ files:
   src/elspeth/plugins/transforms/web_scrape.py:
     Mapping[str, object]: 1
     dict[str, Any]: 2
+    dict[str, object]: 2
   src/elspeth/telemetry/exporters/azure_monitor.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 2
@@ -1032,7 +1033,7 @@ totals:
   Mapping[str, Any]: 738
   Mapping[str, object]: 297
   MutableMapping[str, Any]: 8
-  boundary: 58
+  boundary: 59
   dict[str, Any]: 1061
-  dict[str, object]: 375
-  soft: 2479
+  dict[str, object]: 377
+  soft: 2481

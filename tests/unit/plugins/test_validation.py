@@ -74,6 +74,19 @@ def test_validator_rejects_invalid_field_type():
     assert "skip_rows" in errors[0].field
 
 
+def test_configuration_error_projection_preserves_field_and_message_without_input():
+    credential = "CUSTODY42"
+    errors = validate_source_config(
+        "csv",
+        {"path": "/tmp/test.csv", "skip_rows": credential, "schema": {"mode": "observed"}, "on_validation_failure": "quarantine"},
+    )
+    assert len(errors) == 1
+    assert errors[0].field == "skip_rows"
+    assert "integer" in errors[0].message.lower()
+    assert errors[0].value is None
+    assert credential not in repr(errors)
+
+
 def test_validator_accepts_null_source_with_empty_config():
     """null_source has no config class, validation should pass with empty dict."""
 
@@ -363,7 +376,7 @@ def test_validator_returns_structured_error_for_invalid_plugin_schema(
 
     assert len(errors) > 0
     assert errors[0].field == "schema"
-    assert errors[0].value == {"mode": "bad"}
+    assert errors[0].value is None
     assert "mode" in errors[0].message.lower()
 
 

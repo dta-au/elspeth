@@ -11,11 +11,15 @@ run_elspeth() {
 }
 EXAMPLE=examples/fixed_web_search
 variant="${1:-directory}"
+if [ "$variant" = pagination ]; then
+    export ELSPETH_FINGERPRINT_KEY="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+fi
 case "$variant" in
     directory) suffix="" ;;
     registry) suffix="_registry" ;;
     form) suffix="_form" ;;
     multipart) suffix="_multipart" ;;
+    pagination) suffix="_pagination" ;;
     *) echo "Unknown fixture variant: $variant" >&2; exit 2 ;;
 esac
 RUNS="$EXAMPLE/runs$suffix"
@@ -108,11 +112,12 @@ variant = sys.argv[3]
 rows = [json.loads(line) for line in (output / "results.jsonl").read_text().splitlines()]
 requests = (runs / "access.log").read_text().splitlines()
 assert len(rows) == 3, len(rows)
-assert len(requests) == 3, requests
+expected_requests = 6 if variant == "pagination" else 3
+assert len(requests) == expected_requests, requests
 assert {row["search_text"] for row in rows} == set(requests)
 assert all(row["fetch_status"] == 200 for row in rows)
 assert sorted(len(row["candidates"]) for row in rows) == [0, 1, 2]
-candidate_fields = {"name"} if variant in {"directory", "form", "multipart"} else {"name", "detail_path", "registration"}
+candidate_fields = {"name"} if variant in {"directory", "form", "multipart", "pagination"} else {"name", "detail_path", "registration"}
 assert all(set(candidate) == candidate_fields for row in rows for candidate in row["candidates"])
 if variant == "multipart":
     failures = [json.loads(line) for line in (output / "failures.jsonl").read_text().splitlines()]
@@ -179,8 +184,29 @@ variant = sys.argv[2]
 requests = (runs / "access.log").read_text().splitlines()
 conn = sqlite3.connect(runs / "audit.db")
 verdicts = conn.execute("SELECT COUNT(*), SUM(is_match) FROM call_verifications").fetchone()
-assert len(requests) == 6, requests
-assert verdicts == (3, 3), verdicts
+expected_wire_requests = 12 if variant == "pagination" else 6
+assert len(requests) == expected_wire_requests, requests
+expected_verifications = 6 if variant == "pagination" else 3
+assert verdicts == (expected_verifications, expected_verifications), verdicts
+if variant == "pagination":
+    refs = [row[0] for row in conn.execute("SELECT request_ref FROM calls WHERE call_type = 'http'")]
+    assert len(refs) == 18, refs
+    audited_pairs = []
+    for ref in refs:
+        request = json.loads((runs / "payloads" / ref[:2] / ref).read_text())
+        url_query = urllib.parse.parse_qs(urllib.parse.urlsplit(request["url"]).query)
+        query = (request.get("params") or url_query)["q"]
+        if isinstance(query, list):
+            query = query[0]
+        page = url_query.get("page", ["1"])[0]
+        audited_pairs.append((query, page))
+    wire_pairs = [(entry["query"], entry["page"]) for entry in map(json.loads, (runs / "wire.log").read_text().splitlines())]
+    assert len(wire_pairs) == 12 and len(set(wire_pairs)) == 6, wire_pairs
+    assert Counter(audited_pairs) == Counter({pair: 3 for pair in wire_pairs})
+    assert Counter(wire_pairs) == Counter({pair: 2 for pair in wire_pairs})
+    mutant = Counter(audited_pairs)
+    mutant[("wrong-company", "2")] += 1
+    assert mutant != Counter({pair: 3 for pair in wire_pairs})
 if variant == "form":
     refs = [row[0] for row in conn.execute("SELECT request_ref FROM calls WHERE call_type = 'http'")]
     assert len(refs) == 9, refs
@@ -219,5 +245,5 @@ if variant == "multipart":
     swapped = dict(wire_by_id)
     swapped[first_id], swapped[second_id] = swapped[second_id], swapped[first_id]
     assert swapped != audited_by_id
-print(f"verified_replay_without_network=3 verified_live_calls={verdicts[1]}")
+print(f"verified_replay_without_network={expected_verifications} verified_live_calls={verdicts[1]}")
 PY

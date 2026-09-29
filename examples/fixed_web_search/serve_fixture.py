@@ -9,7 +9,7 @@ from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, parse_qsl, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlsplit
 
 _ENTITY_MATCHES = {
     "Riverdale Council": (("Riverdale Council", "RC-001"),),
@@ -76,6 +76,23 @@ class SearchHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
             body = b"ok"
+        elif parsed.path == "/paginated-directory":
+            query = parse_qs(parsed.query).get("q", [""])[0]
+            if self.headers["Accept"] != "text/html" or self.headers["X-Requested-With"] != query:
+                self.send_error(400)
+                return
+            page = parse_qs(parsed.query).get("page", ["1"])[0]
+            if page not in {"1", "2"}:
+                self.send_error(404)
+                return
+            matches = self._matches(query)
+            page_matches = matches[:1] if page == "1" else matches[1:]
+            entries = "".join(f"<li>{html.escape(match)}</li>" for match in page_matches)
+            next_link = f'<a class="next" href="/paginated-directory?q={quote(query, safe="")}&amp;page=2">Next</a>' if page == "1" else ""
+            body = f"<main><h1>Results for {html.escape(query)}</h1><ul>{entries}</ul>{next_link}</main>".encode()
+            self._record_query(query)
+            with self.wire_log.open("a", encoding="utf-8") as log:
+                log.write(json.dumps({"query": query, "page": page}, ensure_ascii=False) + "\n")
         elif parsed.path in {"/directory", "/registry"}:
             query_key = "q" if parsed.path == "/directory" else "term"
             query = parse_qs(parsed.query).get(query_key, [""])[0]
