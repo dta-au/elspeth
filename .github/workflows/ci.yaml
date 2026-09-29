@@ -378,7 +378,7 @@ jobs:
       image: python:${{ matrix.python-version }}-bookworm
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
-      PYTEST_WORKERS: ${{ github.event_name == 'pull_request' && '4' || '12' }}
+      PYTEST_WORKERS: ${{ github.event_name == 'pull_request' && matrix.hosted_workers || '12' }}
     # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
@@ -391,8 +391,10 @@ jobs:
         include:
           - python-version: "3.12"
             coverage: false
+            hosted_workers: "4"
           - python-version: "3.13"
             coverage: true
+            hosted_workers: "2"
 
     steps:
       - name: Checkout code
@@ -476,9 +478,10 @@ jobs:
           # were selected, tests/conftest.py refused them with a UsageError
           # inside every xdist worker, and xdist reported that as a crashed
           # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
-          # PR #212's hosted 3.12 and 3.13 jobs were SIGKILLed before pytest
-          # finished with the default 12 workers. Bound hosted concurrency;
-          # trusted push jobs retain the 12-worker capacity of their runner.
+          # PR #212's hosted 3.12 and 3.13 jobs were SIGKILLed with the default
+          # 12 workers; the 3.13 coverage job was also SIGKILLed at 4 workers.
+          # Bound hosted concurrency per matrix lane. Trusted push jobs retain
+          # the 12-worker capacity of their runner.
           uv run pytest tests/ \
             --cov=src/elspeth \
             --cov-report=xml \

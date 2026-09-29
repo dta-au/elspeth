@@ -2000,6 +2000,7 @@ _REQUIRED_ENV_FOR_RATE_LIMIT_TESTS = {
 }
 
 
+@pytest.mark.usefixtures("required_web_env")
 def test_settings_from_env_reads_execution_rate_limit_block(monkeypatch: pytest.MonkeyPatch) -> None:
     """The operator's run rate-limit block must be settable from the environment.
 
@@ -2023,6 +2024,7 @@ def test_settings_from_env_reads_execution_rate_limit_block(monkeypatch: pytest.
     assert configured.get_service_config("bedrock").requests_per_minute == 60
 
 
+@pytest.mark.usefixtures("required_web_env")
 @pytest.mark.parametrize(
     ("raw", "error"),
     [
