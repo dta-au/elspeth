@@ -33,6 +33,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.proposal_authority import _pipeline_private_arguments_hash
+from elspeth.web.sessions.proposal_projection import project_composition_proposal
 from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -513,6 +514,16 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
     assert row.tool_arguments_hash == stable_hash(plan.proposal.pipeline)
     assert row.pipeline_metadata is not None
     assert row.pipeline_metadata.draft_hash == plan.proposal.draft_hash
+    projected = project_composition_proposal(row)
+    assert projected.pipeline_metadata is not None
+    assert projected.pipeline_metadata.model_dump() == {
+        "draft_hash": row.pipeline_metadata.draft_hash,
+        "base": deep_thaw(row.pipeline_metadata.base),
+        "repair_count": row.pipeline_metadata.repair_count,
+        "skill_hash": row.pipeline_metadata.skill_hash,
+        "audit_payload_hash": row.pipeline_metadata.audit_payload_hash,
+        "custody_result": row.pipeline_metadata.custody_result,
+    }
     assert not hasattr(row.pipeline_metadata, "surface")
     assert not hasattr(row.pipeline_metadata, "reviewed_anchor_hash")
     events = await service.list_proposal_events(session_id)

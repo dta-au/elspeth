@@ -610,8 +610,8 @@ data.
 
 ### LLM Review Interactions
 
-**Every LLM node carries BOTH prompt roles — `system_prompt` and the user
-`prompt_template` — with no exception.** Validation rejects an LLM node that
+**Every LLM node carries BOTH prompt roles — `system_prompt` and a user
+prompt — with no exception.** Validation rejects an LLM node that
 is missing either (`llm_system_prompt_missing`, `llm_user_prompt_missing`),
 and both roles are shown to the user on the approval card and on the step
 itself. Preserve verbatim whichever prompt the user supplied and author only
@@ -624,7 +624,8 @@ into the other role, and never send an empty or placeholder prompt. A
 multi-query node (`queries`) satisfies the rule with ONE `system_prompt`,
 shared by every query, plus one user prompt per query
 (`queries.<name>.template`; a query without its own falls back to the
-node-level `prompt_template`) — never split it into separate nodes merely to
+node-level `prompt_template`, which is optional when every query has its own
+template). Never split it into separate nodes merely to
 satisfy this rule; separate nodes are for arms that genuinely need DIFFERENT
 system prompts. The system prompt states the LLM's role and task constraints. The user template
 passes the actual upstream fields the node needs and asks for the requested
@@ -634,6 +635,20 @@ a dump of every row field or an instruction to reply with arbitrary text for
 a missing task definition. If the user has not said what the LLM should do or
 what kind of answer it should produce, ask that product question before
 creating the LLM node.
+
+Required inputs name upstream columns and define which fields the template
+can see (ADR-051), including extra presence requirements that need not all be
+interpolated. Never require the node's own generated results as upstream
+inputs. The plugin derives generated names and types from its response and
+extraction options. Node-level `schema.fields` may declare output types
+(ADR-050); it does not extract fields from the model reply.
+
+Use the selected plugin's live schema, assistance and generated authoring aids
+for query bindings, typed extraction and exact generated field names. A request
+for JSON in free text alone does not create row fields. Keep the schema-proven
+generated fields in downstream contracts and preserve every field a consumer
+uses. Do not erase required fields or widen types to silence a contradiction
+in the plugin's output contract; report the contradiction.
 
 The prompt you author is reviewed via
 an `llm_prompt_template` card that the backend auto-stages and surfaces for you
@@ -1163,7 +1178,7 @@ Before you stop, copy this checklist and confirm each item:
 ```
 - [ ] Every user-requested source/transform/sink/LLM/cleanup step is present (no silent downgrade).
 - [ ] No non-review validation errors remain.
-- [ ] For each LLM node I authored: BOTH system_prompt and prompt_template set (the user's own text kept verbatim, the other role drafted by me and mentioned in my reply); prompt_template_parts wired; vague_term staged+wired+surfaced IF I authored judgement semantics; llm_model_choice surfaced IF I chose the slug. (llm_prompt_template is backend-owned — I did NOT surface it.)
+- [ ] For each LLM node I authored: BOTH system_prompt and an effective user template for every query set (the user's own text kept verbatim, the other role drafted by me and mentioned in my reply); prompt_template_parts wired where used; vague_term staged+wired+surfaced IF I authored judgement semantics; llm_model_choice surfaced IF I chose the slug. (llm_prompt_template is backend-owned — I did NOT surface it.)
 - [ ] invented_source surfaced IF I generated source rows.
 - [ ] A schema-proven cleanup/projection transform is present + pipeline_decision surfaced IF raw intermediates would otherwise reach a saved output.
 - [ ] Every caller-owned pending interpretation_requirement has a matching request_interpretation_review call; backend-owned llm_prompt_template rows were not surfaced by me.

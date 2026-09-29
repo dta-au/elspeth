@@ -2530,6 +2530,17 @@ class TestNamedButMissingFile:
         assert "named gap" in rules
 
 
+def test_llm_rules_distinguish_upstream_requirements_from_generated_output_declarations() -> None:
+    view, _snapshot = _trained_view()
+    rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+    assert "declares any guaranteed prefixed fields" not in rendered
+    assert "STILL required" not in rendered
+    assert "required_input_fields names upstream columns" in rendered
+    assert "schema.fields can declare output types (ADR-050)" in rendered
+    assert "output_fields" in rendered and "downstream" in rendered
+    assert "every query supplies" in rendered
+
+
 class TestRun2PackEdits:
     """Pack pressure-suite run-2 gap closures (G2/G3/G4/G6/G9), pinned.
 
