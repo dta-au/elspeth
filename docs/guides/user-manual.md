@@ -339,7 +339,49 @@ elspeth purge --database ./runs/audit.db --payload-dir ./runs/payloads --retenti
 
 ## Resuming Failed Runs
 
-If a run fails (e.g., API timeout, network error), you can resume from the last checkpoint:
+If a run fails, check whether its retained checkpoint, source lifecycle and
+effect records permit resume. Ordinary streaming runs cannot resume while
+unread source rows may remain. Opt-in source snapshots can retain those rows
+before downstream processing begins.
+
+### Retain a Finite Source for Resume
+
+For normal live execution with exactly one `csv` or `json` source, enable
+`snapshot_for_resume` in its options before starting the run. This source
+section assumes a sink named `output` in the rest of the pipeline:
+
+```yaml
+sources:
+  primary:
+    plugin: csv
+    on_success: output
+    options:
+      path: input.csv
+      snapshot_for_resume: true
+      schema:
+        mode: observed
+      on_validation_failure: discard
+```
+
+The default is `false`; JSONL is also supported through the `json` plugin.
+Multi-source pipelines refuse the flag. Snapshot mode reads and validates the
+whole finite source, then seals its emissions in the payload store before
+downstream rows run. Its **64 MiB serialized spool limit is not a RAM limit**:
+memory use can be higher, and the full capture delays downstream processing.
+
+After sealing and source-lifecycle completion, resume can process remaining
+emissions even if the original file has changed or been deleted. It preserves
+row contracts, source indexes, quarantines and original validation-error IDs
+without rerunning source validation. Retain the audit database, checkpoint
+state and original payload store, and use the same compatible configuration.
+Missing/corrupt snapshot references or bytes refuse recovery. A crash before
+the snapshot and lifecycle complete still refuses mid-stream recovery.
+
+Other resume gates continue to apply: `web_scrape` configured with POST or any
+other non-GET method refuses automatic resume because a prior remote effect
+may be unrecorded. See the
+[resume runbook](../runbooks/resume-failed-run.md#opt-in-source-snapshots)
+for the retention requirements and refusal cases.
 
 ### Check Resume Status
 
@@ -370,7 +412,9 @@ elspeth resume run-abc123 --execute --format json
 ```
 
 Resume mode:
-- Uses `NullSource` (data comes from stored payloads)
+
+- Uses stored row payloads and, when enabled and sealed, the source snapshot;
+  it does not reload the original input file
 - Appends to existing output files (doesn't overwrite)
 - Continues from last successful checkpoint
 - Exits with the same [exit codes](#exit-codes) as `elspeth run --execute`
@@ -380,11 +424,13 @@ Resume mode:
 In a multi-worker pack (`elspeth run` leader plus `elspeth join` followers),
 a leader that is killed mid-run leaves the run `running` with an expired
 seat. Followers notice the dead seat and exit 2. `elspeth resume` can take
-the seat over, but it refuses while any source is still `loading`: resume
-replays only the rows that were persisted, so it cannot prove that no unread
-source rows exist. Because a source is recorded `exhausted` only after its
-last row has finished processing, that refusal covers almost the whole life
-of a run.
+the seat over, but it refuses while any source is still `loading`: it cannot
+prove that all source emissions were retained. In ordinary streaming mode,
+the source is recorded `exhausted` only after its last row has finished
+processing, so that refusal covers almost the whole life of a run. With an
+opt-in source snapshot, sealing and source completion happen before downstream
+rows run; an interruption afterward may be resumable. An interruption during
+capture still refuses. Use the dry run to check the actual retained state.
 
 `elspeth abandon` is the way out. It takes the dead leader's seat through the
 same takeover CAS resume uses and finalizes the run as `interrupted` under
