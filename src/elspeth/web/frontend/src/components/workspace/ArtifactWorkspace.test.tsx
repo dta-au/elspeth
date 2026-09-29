@@ -1604,7 +1604,7 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       expect(await within(panel).findByText(/Audit ready/)).toBeInTheDocument();
     });
 
-    it("announces the merged all-clear in the tab name with a non-color glyph badge", () => {
+    it("announces the merged all-clear with a fixed vector mark", () => {
       renderArtifactWorkspace();
 
       const checks = screen.getByRole("tab", { name: "Checks: Ready" });
@@ -1612,7 +1612,13 @@ describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
       expect(badge).not.toBeNull();
       expect(badge).toHaveAttribute("data-tone", "success");
       expect(badge).toHaveAttribute("aria-hidden", "true");
-      expect(badge).toHaveTextContent("✓");
+      const mark = badge?.querySelector("svg");
+      expect(mark).not.toBeNull();
+      expect(mark).toHaveAttribute("viewBox", "0 0 16 16");
+      expect(mark?.querySelector("path")).toHaveAttribute(
+        "d",
+        "M3 8l3.2 3.2L13 4.5",
+      );
     });
 
     it("sums validation errors and audit issues into the badge count and tab name", () => {

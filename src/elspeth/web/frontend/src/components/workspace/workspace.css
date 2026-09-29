@@ -264,6 +264,12 @@
   background-color: var(--color-surface-elevated);
 }
 
+.artifact-tab-badge--glyph svg {
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.125em;
+}
+
 .artifact-tab-badge--glyph[data-tone="success"] {
   background-color: var(--color-success-bg);
   color: var(--color-success);
