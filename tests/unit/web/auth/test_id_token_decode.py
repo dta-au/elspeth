@@ -92,6 +92,22 @@ class TestTheHappyPathIsActuallyReachable:
         payload = _decode(validator, token, build_rsa_jwk(public_key))
         assert payload.subject == "subject-1"
 
+    @pytest.mark.parametrize("malformed_key_first", [True, False])
+    def test_valid_token_survives_unrelated_malformed_rsa_jwk(self, validator, rsa_keypair, malformed_key_first: bool) -> None:
+        """One invalid private exponent must not deny authentication with a valid sibling key."""
+        private_key, public_key = rsa_keypair
+        document = build_rsa_jwk(public_key)
+        malformed_key = {**document["keys"][0], "kid": "malformed-key", "d": "AAAAAA"}
+        if malformed_key_first:
+            document["keys"].insert(0, malformed_key)
+        else:
+            document["keys"].append(malformed_key)
+
+        token = make_rsa_token(private_key, _claims())
+        payload = _decode(validator, token, document)
+
+        assert payload.subject == "subject-1"
+
 
 @pytest.mark.parametrize("token_issuer", ["https://accounts.google.com", "accounts.google.com"])
 def test_google_accepts_both_documented_token_issuers(rsa_keypair, token_issuer: str) -> None:
