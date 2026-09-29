@@ -3661,10 +3661,9 @@ class TestLLMDeclaredOutputFieldContracts:
         The output schema config declares every field it guarantees — a
         guaranteed-but-undeclared field is the invalid SchemaConfig state
         that made the output contract forbid the transform's own outputs
-        (elspeth-97487736ca). The side fields are declared as required
-        any-typed fields, so the restamp reaches them: declared source,
-        required, object-typed. Before that fix they stayed inferred and
-        optional, understating what the plugin has always guaranteed.
+        (elspeth-97487736ca). Successful response and model fields are
+        strings; usage retains its provider-dependent type. All three are
+        required and restamped as declared fields.
         """
         transform, mock_provider = _make_transform_with_mock_provider(
             _make_config(schema=DECLARED_SCHEMA),
@@ -3682,14 +3681,36 @@ class TestLLMDeclaredOutputFieldContracts:
         assert result.row is not None
         assert transform._output_schema_config is not None
         declared_by_name = {field.name: field for field in transform._output_schema_config.fields}
-        for side_field in ("llm_response", "llm_response_usage", "llm_response_model"):
+        for side_field, field_type in (("llm_response", "str"), ("llm_response_usage", "any"), ("llm_response_model", "str")):
             assert side_field in declared_by_name
-            assert declared_by_name[side_field].field_type == "any"
+            assert declared_by_name[side_field].field_type == field_type
             emitted = result.row.contract.get_field(side_field)
             assert emitted.source == "declared"
             assert emitted.required is True
         # Guarantees continue to admit them, and the declaration now matches.
         assert {"llm_response", "llm_response_usage", "llm_response_model"} <= set(transform._output_schema_config.guaranteed_fields)
+
+
+@pytest.mark.parametrize("multi_query", [False, True])
+def test_generated_output_contract_uses_successful_runtime_types(multi_query: bool) -> None:
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    schema = {"mode": "flexible", "fields": ["text: str", "answer: any?"]}
+    query = {"input_fields": {"text": "text"}, "template": "{{ row.text }}", "output_fields": [{"suffix": "answer", "type": "string"}]}
+    config = (
+        _make_config(schema=schema, queries={"quality": query})
+        if multi_query
+        else _make_config(schema=schema, output_fields=[{"suffix": "answer", "type": "string"}])
+    )
+    transform = LLMTransform(config)
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is not None
+    generated = "quality_answer" if multi_query else "answer"
+    fields = {field.name: field for field in transform._output_schema_config.fields}
+    assert fields[generated].field_type == "str"
+    assert fields[generated].required is True
+    assert fields[generated].nullable is False
+    assert transform.output_schema.model_fields[generated].annotation is str
 
 
 # ---------------------------------------------------------------------------

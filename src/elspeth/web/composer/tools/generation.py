@@ -56,6 +56,8 @@ from elspeth.web.composer.state import (
     _LLM_USER_PROMPT_MISSING_FIX,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_EXPLANATION,
     _PROMPT_TEMPLATE_UNDECLARED_ROW_FIELDS_FIX,
+    _QUERY_GENERATED_FIELDS_REQUIRED_EXPLANATION,
+    _QUERY_GENERATED_FIELDS_REQUIRED_FIX,
     _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
     _QUERY_INPUT_COLUMNS_UNDECLARED_FIX,
     _TRANSFORM_DECLARED_NOT_GUARANTEED_EXPLANATION,
@@ -1564,6 +1566,11 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "query_input_columns_undeclared",
         _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION,
         _QUERY_INPUT_COLUMNS_UNDECLARED_FIX,
+    ),
+    DirectValidationGuidance(
+        "query_generated_fields_required",
+        _QUERY_GENERATED_FIELDS_REQUIRED_EXPLANATION,
+        _QUERY_GENERATED_FIELDS_REQUIRED_FIX,
     ),
     # Gate analogue of coalesce_config_invalid: GateSettings has no options
     # field, so lowering drops every non-metadata gate option.

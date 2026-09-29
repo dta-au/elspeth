@@ -321,6 +321,29 @@ does not pause for first login:
 Keep the configured SSO provider throughout these stages. Neither local
 registration credentials nor an anonymous readiness response establishes an
 admitted acceptance user.
+
+### 0.8.1 fix-on-fail cycle
+
+Run each acceptance attempt against an exact candidate commit and published
+image digest. Give each attempt a fresh `ACCEPTANCE_RUN_ID` and private
+`EVIDENCE_DIR`, retaining the candidate SHA, digest, resolved parameters and
+compatibility record. For a local-auth installation, run the complete driver:
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+bash deploy/azure-container-apps/scripts/acceptance.sh all
+```
+
+Treat a nonzero exit or `bundle.json` with `passed: false` as a failed attempt.
+Inspect the retained stage evidence, `restore.log`, `cleanup.log` and Resource
+Graph result. Complete restoration and cleanup if the automatic attempt failed.
+Fix the source, configuration or operator inputs and rerun the affected local
+checks. A source fix needs a new candidate SHA and image digest. Each retry
+needs a fresh run ID and the full acceptance sequence. For SSO, use the staged
+procedure above with a fresh attempt and complete all stages. Never combine
+receipts from different attempts or candidate identities. Keep the public
+desktop-acceptance wording until a live result has been reviewed.
+
 The standalone `probes` stage can consume the prepared session inputs listed
 above. The driver stops at the first
 failure; inspect retained evidence before resuming. Explicit cleanup remains
@@ -906,12 +929,14 @@ The facade validates the bundle of receipts (`verify-doctor-job`,
 `replica-progress`, `single-revision-fence-conflict`, `single-revision-progress`,
 `resource-graph-cleanup`, `testcontainer-run` — the last
 through the shared gate, which refuses the bundle without exactly one passing
-run) and writes the sanitized
-receipt to `docs/operator/evidence/azure-container-apps/0.8.1.json` only after
-the live procedure completes and its evidence passes validation. Never create
-a receipt from desktop analysis or treat skipped or failed probes as passes.
-If a run fails, retain its diagnostics, fix the defect and rerun before claiming
-live acceptance. A first run, second clean run and receipt-conditioned docs
-promotion are not prerequisites to closing `elspeth-5ec3befc1a`; that task
-already closed through desktop acceptance. Any later documentation claim about
-live results must cite the actual validated receipt and its measured scope.
+run). The driver captures the `bundle-validate` verdict in private
+`$EVIDENCE_DIR/bundle.json` and exits nonzero when validation fails. It does
+not create a public receipt. Review the protected receipts and publish a
+sanitized account of measured facts at
+`docs/operator/evidence/azure-container-apps/0.8.1.json` only after the live
+procedure completes and the bundle passes. Never create a receipt from desktop
+analysis or treat skipped or failed probes as passes. If a run fails, retain
+its diagnostics, fix the defect and rerun before claiming live acceptance.
+Task `elspeth-5ec3befc1a` already closed through desktop acceptance. Any later
+documentation claim about live results must cite the validated receipt and its
+measured scope.

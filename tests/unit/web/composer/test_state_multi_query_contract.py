@@ -22,6 +22,27 @@ from elspeth.web.composer.tools.generation import _CLOSED_VALIDATION_ERROR_CODES
 _CODE = "query_input_columns_undeclared"
 
 
+def test_generated_input_conflict_reaches_stage_one_with_plugin_message() -> None:
+    options = _options(
+        ["body", "classify_answer"],
+        {
+            "classify": {
+                "input_fields": {"text": "body"},
+                "template": "{{ row.text }}",
+                "output_fields": [{"suffix": "answer", "type": "string"}],
+            }
+        },
+    )
+    result = _state(options).validate()
+    (entry,) = [error for error in result.errors if error.error_code == "query_generated_fields_required"]
+    assert entry.component == "node:classify"
+    assert entry.message in _plugin_message(options)
+    assert "query_generated_fields_required" in _CLOSED_VALIDATION_ERROR_CODES
+    guidance = explain_validation_code("query_generated_fields_required")
+    assert guidance is not None
+    assert "downstream" in guidance[1]
+
+
 def _options(required: list[str] | None, queries: Any, template: str = "Classify") -> dict[str, Any]:
     options: dict[str, Any] = {
         "provider": "azure",

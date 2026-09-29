@@ -580,6 +580,14 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         release_audit = threading.Event()
         audit_finished = threading.Event()
 
+        async def wait_for_event(event: threading.Event) -> bool:
+            # Keep a loop timer active: thread completion alone may not wake
+            # the selector promptly in sandboxed test environments.
+            deadline = asyncio.get_running_loop().time() + 2
+            while not event.is_set() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            return event.is_set()
+
         def record_required_audit(_token: str) -> None:
             audit_entered.set()
             assert release_audit.wait(timeout=2)
@@ -595,12 +603,12 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 record_token_issued=record_required_audit,
             )
         )
-        assert await asyncio.to_thread(audit_entered.wait, 2)
+        assert await wait_for_event(audit_entered)
         task.cancel()
         release_audit.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert await asyncio.to_thread(audit_finished.wait, 2)
+        assert await wait_for_event(audit_finished)
 
         token = await provider.login("alice", "password123")
         assert len(token.split(".")) == 3

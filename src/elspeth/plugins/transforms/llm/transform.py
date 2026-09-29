@@ -60,6 +60,7 @@ from elspeth.plugins.transforms.llm import (
     _build_multi_query_output_schema,
     _FieldType,
     _llm_created_output_fields,
+    _llm_generated_output_fields,
     build_llm_audit_metadata,
     get_llm_guaranteed_fields,
     populate_llm_operational_fields,
@@ -1212,7 +1213,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d83ac4ae9b1b0b75"
+    source_file_hash: str | None = "sha256:e77cde4e084eab3f"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1573,7 +1574,6 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # Output schema config with prefixed fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
-            self._output_schema_config = _build_llm_output_schema_config(schema_config, prefixed_guaranteed)
             self._created_output_fields: tuple[FieldDefinition, ...] = tuple(
                 definition
                 for spec in query_specs
@@ -1590,6 +1590,14 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     extracted[spec.name] = tuple(
                         (f"{spec.name}_{f.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[f.type.value]) for f in spec.output_fields
                     )
+            generated_fields = tuple(
+                field
+                for spec in query_specs
+                for field in _llm_generated_output_fields(f"{spec.name}_{self._response_field}", extracted.get(spec.name, ()))
+            )
+            self._output_schema_config = _build_llm_output_schema_config(
+                schema_config, prefixed_guaranteed, generated_fields=generated_fields
+            )
             self.output_schema = _build_multi_query_output_schema(
                 base_schema_config=schema_config,
                 response_field=self._response_field,
@@ -1630,7 +1638,9 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             # Output schema config with LLM output fields for DAG contract propagation.
             # INVARIANT: guaranteed_fields must be a superset of declared_output_fields.
             # See: docs/specs/2026-03-20-output-schema-contract-enforcement-design.md
-            self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed)
+            extracted_single = tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
+            generated_fields = _llm_generated_output_fields(self._response_field, extracted_single)
+            self._output_schema_config = _build_llm_output_schema_config(schema_config, guaranteed, generated_fields=generated_fields)
             self._created_output_fields = _llm_created_output_fields(self._response_field, "", single_output_fields)
 
             # Pydantic output schema with unprefixed LLM fields (structured
@@ -1639,8 +1649,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 base_schema_config=schema_config,
                 response_field=self._response_field,
                 schema_name=f"{self.name}OutputSchema",
-                extracted_fields=tuple((field.suffix, _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in single_output_fields)
-                or None,
+                extracted_fields=extracted_single or None,
             )
 
         # Provider instance — deferred to on_start() when recorder/telemetry available
@@ -1976,6 +1985,28 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 summary="Call an LLM provider (Azure OpenAI, OpenRouter, or AWS Bedrock) on each row and write the response into a field. Tracks model identity, token usage, and finish reason in the audit trail.",
                 examples=(
                     PluginAssistanceExample(
+                        title="Separate colour inputs from generated answers",
+                        before={"required_input_fields": ["colour", "good_colour_pair_answer", "approximate_hex_answer"]},
+                        after={
+                            "schema": {"mode": "flexible", "fields": ["colour: str"]},
+                            "required_input_fields": ["colour"],
+                            "queries": {
+                                "good_colour_pair": {
+                                    "input_fields": {"shade": "colour"},
+                                    "template": "Name a colour paired with {{ row.shade }} as answer.",
+                                    "response_format": "structured",
+                                    "output_fields": [{"suffix": "answer", "type": "string"}],
+                                },
+                                "approximate_hex": {
+                                    "input_fields": {"shade": "colour"},
+                                    "template": "Give an approximate hex code for {{ row.shade }} as answer.",
+                                    "response_format": "structured",
+                                    "output_fields": [{"suffix": "answer", "type": "string"}],
+                                },
+                            },
+                        },
+                    ),
+                    PluginAssistanceExample(
                         # A minimal before/after option diff (the established example
                         # shape) showing the one load-bearing lesson: interpolate the
                         # per-row content, not just an identifier. A summarization task
@@ -2054,11 +2085,15 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Objective extraction such as identifying primary colours used does not by itself need a vague_term review unless you add subjective scoring, ranking, thresholds, or category semantics.",
                     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
-                    "If downstream cleanup, sink, mapper, or transform needs the LLM response, guarantee the response_field by name in the LLM node schema. If downstream also needs source or scrape fields that pass through the LLM, also guarantee pass-through fields such as URL or identifier fields.",
+                    "options.schema declares INPUT fields arriving from upstream; required_input_fields names required upstream columns. Never require this node's generated fields as input or hand-add their guarantees.",
+                    "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
+                    "In multi-query mode, input_fields maps template variables to upstream columns. Per-query output_fields generates <queryname>_<suffix>; downstream consumers use those exact names.",
+                    "For the colour example, require colour on the LLM and good_colour_pair_answer / approximate_hex_answer downstream.",
                     "Single-query LLM output is written to response_field as raw text. Prompt wording alone does not create separate JSON fields; preserve response_field through cleanup when no output_fields are configured.",
                     "Configure single-query output_fields to parse JSON into typed, unprefixed row fields within the LLM transform; no downstream parser is needed. The raw response_field and automatic usage/model fields remain available.",
                     "Each output_fields type is the row type downstream nodes receive: integer -> int (5.0 arrives as 5; 5.5 fails the row), number -> float (7 arrives as 7.0), boolean -> bool, string and enum -> str.",
                     "An authored node schema output type must admit the bound model type; number cannot narrow to int. If you declare <response_field>_usage, type it any.",
+                    "Keep downstream requirements for every field the consumer uses. Do not erase them or widen to any/flexible to silence a contradictory plugin output contract; report that contradiction.",
                     "Read declared template fields by carried name; use get, row | list for names, row | items for pairs, and dict(row) or row | tojson for the whole row. Read a method-named column with row['keys']. Source header aliases resolve only when that header reaches the node.",
                     "The LLM transform preserves upstream row fields while adding response_field; it does not remove raw scrape fields. If a web_scrape-to-LLM workflow must save results without raw HTML or fingerprints, put a field_mapper cleanup node between the LLM and the sink.",
                     "The prompt-injection shield advisory covers LLM nodes consuming externally-fetched remote content (a web_scrape-family producer upstream) without an authorized shield between them; it is always advisory (never blocking).",

@@ -138,6 +138,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "proof_repair_exhausted",
         "quarantine_unknown_output",
         "query_input_columns_undeclared",
+        "query_generated_fields_required",
         "query_template_unbound_row_fields",
         "queue_config_invalid",
         "queue_name_collision",

@@ -18,6 +18,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict, cast, get_args
 
 from jinja2 import TemplateSyntaxError
+from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.enums import UNIQUE_NODE_NAMES_RULE, OutputMode
@@ -91,11 +92,18 @@ from elspeth.plugins.sources.field_normalization import (
 )
 from elspeth.plugins.transforms.field_mapper import FieldMapperConfig
 from elspeth.plugins.transforms.llm.base import (
+    MULTI_QUERY_GENERATED_INPUT_EXPLANATION,
+    MULTI_QUERY_GENERATED_INPUT_REMEDY,
     MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY,
+    LLMConfig,
     multi_query_context_names,
+    multi_query_generated_input_conflicts,
+    multi_query_generated_input_message,
     multi_query_source_row_columns,
     multi_query_undeclared_columns_message,
 )
+from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig
+from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
 from elspeth.web.composer._validation_probe import (
     DeferredBlobContractProbe,
     is_inline_content_reference,
@@ -2014,6 +2022,8 @@ _QUERY_INPUT_COLUMNS_UNDECLARED_EXPLANATION: Final[str] = (
     "and the fields declared."
 )
 _QUERY_INPUT_COLUMNS_UNDECLARED_FIX: Final[str] = MULTI_QUERY_UNDECLARED_COLUMNS_REMEDY
+_QUERY_GENERATED_FIELDS_REQUIRED_EXPLANATION: Final[str] = MULTI_QUERY_GENERATED_INPUT_EXPLANATION
+_QUERY_GENERATED_FIELDS_REQUIRED_FIX: Final[str] = MULTI_QUERY_GENERATED_INPUT_REMEDY
 
 # Catalogue guidance for the two prompt-role codes. The plugin runtime accepts
 # an llm node with no system prompt (a YAML author may omit one); the composer
@@ -4373,6 +4383,67 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
                 )
             )
     return tuple(errors)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored multi-query input and output declarations",
+    source_param="node",
+    suppresses=("R1",),
+    invariant=(
+        "parses frozen query options into QueryDefinition and QuerySpec; emits a high-severity generated-input "
+        "conflict or plugin_options_invalid for malformed authored values; framework errors propagate"
+    ),
+)
+def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject fields a query generates as inputs to the same node."""
+    if node.plugin != "llm":
+        return ()
+    queries = node.options.get("queries")
+    if queries is None:
+        return ()
+    try:
+        definitions: dict[str, QueryDefinition] | list[QueryDefinition] = TypeAdapter(
+            dict[str, QueryDefinition] | list[QueryDefinition]
+        ).validate_python(LLMConfig._inject_mapping_query_names(deep_thaw(queries)))
+        specs = resolve_queries(definitions)
+        required_names: list[str] | None = TypeAdapter(list[str] | None).validate_python(
+            deep_thaw(node.options.get("required_input_fields"))
+        )
+        required = set(required_names or ())
+        schema = SchemaConfig.from_dict(deep_thaw(node.options.get("schema")))
+        required.update(schema.required_fields or ())
+        images: list[ImageInputConfig] | None = TypeAdapter(list[ImageInputConfig] | None).validate_python(
+            deep_thaw(node.options.get("image_inputs"))
+        )
+        if images is not None:
+            required.update(name for image in images for name in (image.field, image.format_field) if name is not None)
+        response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
+        node_template: str | None = TypeAdapter(str | None).validate_python(node.options.get("prompt_template"))
+        for spec in specs:
+            template = spec.template if spec.template is not None else node_template
+            if template is not None:
+                required.update(multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)))
+    except (ValueError, TemplateSyntaxError):
+        return (
+            ValidationEntry(
+                component=f"node:{node.id}",
+                message="Invalid multi-query options. Check queries, input declarations, schema, image_inputs and prompt templates against the plugin schema.",
+                severity="high",
+                error_code="plugin_options_invalid",
+            ),
+        )
+    conflicts = multi_query_generated_input_conflicts(specs, response_field, required)
+    if not conflicts:
+        return ()
+    return (
+        ValidationEntry(
+            component=f"node:{node.id}",
+            message=multi_query_generated_input_message(conflicts),
+            severity="high",
+            error_code="query_generated_fields_required",
+        ),
+    )
 
 
 def _locked_input_field_set(options: Mapping[str, Any], owner: str) -> frozenset[str] | None:
@@ -8416,6 +8487,7 @@ class CompositionState:
             errors.extend(_validate_prompt_template_variable_bindings(node))
             errors.extend(_validate_multi_query_template_variable_bindings(node))
             errors.extend(_validate_multi_query_required_input_columns(node))
+            errors.extend(_validate_multi_query_generated_input_requirements(node))
 
             # ``timeout_seconds`` is a top-level structural-barrier field.
             # Queue rejects it through queue_node_contract_error below so every
