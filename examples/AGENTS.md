@@ -173,6 +173,15 @@ elspeth run --settings examples/chaosweb/settings.yaml --execute
 |---------|------|-------|
 | `replay_verify` | 3 per run | `run.sh` starts its OWN deterministic page server on 8204 (`serve_pages.py`). It records a LIVE `web_scrape` run, REPLAYS it with the server stopped (asserts 0 requests and 3 `calls.source_call_id` bindings), then VERIFIES it with the server restarted (asserts 3/3 `call_verifications.is_match = 1`). Ends exit 0. The three negative arms are INTERNAL and asserted on their reason: missing `replay_from` (exit 1), drifted settings (exit 4), changed page under verify (exit 4, run `failed`). Replay/verify settings are GENERATED into `runs/` because `replay_from` must be literal YAML. Do not swap in ChaosLLM: OpenRouter replay always refuses, and verify never matches a server that sends `Date` or per-response ids (see the README's "Known limitations (0.8.1)") |
 
+### Fixed web search (own fixture server, no credentials)
+
+Run `./examples/fixed_web_search/run_fixture.sh`. The script starts a local
+search server on port 8213, runs `web_scrape` with a fixed node URL and row
+field mapped to query parameter `q`, and asserts three requests and output
+rows, then offline replay and live verification. It refuses to overwrite an existing audit DB or output. The separate
+`settings_abn_page.yaml` targets the public ABN Lookup results page as a small
+live example; it is not part of the offline fixture check.
+
 ### Chroma RAG (embedded, no external server)
 
 ChromaDB runs embedded — no server setup needed, but requires `chromadb` package.

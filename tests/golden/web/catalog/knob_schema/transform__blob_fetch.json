@@ -23,12 +23,23 @@
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Input row field containing the absolute HTTP(S) URL to fetch.",
         "kind": "text",
         "label": "URL Field",
         "name": "url_field",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fixed absolute HTTP(S) URL for every row; exclusive with url_field.",
+        "kind": "text",
+        "label": "URL",
+        "name": "url",
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {

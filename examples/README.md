@@ -28,6 +28,7 @@ Some examples need setup or use multiple configurations:
 | `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
 | `join_refused` | `./examples/join_refused/run.sh` |
 | `replay_verify` | `./examples/replay_verify/run.sh` |
+| `fixed_web_search` (local fixture) | `./examples/fixed_web_search/run_fixture.sh` |
 | `multi_worker` | `./examples/multi_worker/run.sh` |
 | `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
 | `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
@@ -159,6 +160,7 @@ shown in the individual READMEs.
 | Example | What It Demonstrates |
 |---------|---------------------|
 | [`replay_verify`](replay_verify/) | `run_mode: live` → `replay` → `verify` against one recorded run. `web_scrape` fetches pages from a deterministic local server, then replay answers from the audit trail with the server stopped, and verify re-fetches and records a verdict per call in `call_verifications`. `run.sh` also asserts three negative cases: a missing `replay_from` run, drifted settings, and a changed page. The README lists the 0.8.1 limitations, including OpenRouter replay and verify against real servers |
+| [`fixed_web_search`](fixed_web_search/) | A fixed node URL plus a row-mapped query value; the local fixture and ABN Lookup configuration use different addresses and query names. The fixture runner asserts three live requests, offline replay, and three matching verification calls. |
 
 ### Expected Non-Complete Demonstrations
 
@@ -228,6 +230,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Schema contracts** | [`schema_contracts_demo`](schema_contracts_demo/) (pure data) or [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) (with LLM) |
 | **Jinja2 templates** | [`template_lookups`](template_lookups/) — field extraction and template-driven prompts |
 | **Web scraping** | [`chaosweb`](chaosweb/) — fault-injected scraping with content gates |
+| **Fixed-site web search** | [`fixed_web_search`](fixed_web_search/) — row-sourced search terms against a fixed URL |
 | **Database output** | [`database_sink`](database_sink/) — write to SQLite or PostgreSQL |
 | **Replaying or re-verifying a recorded run** | [`replay_verify`](replay_verify/) — `run_mode: replay` / `verify` with `replay_from`, verdicts in `call_verifications` |
 | **Crash recovery / resume** | [`checkpoint_resume`](checkpoint_resume/) — checkpoint + Ctrl-C + `elspeth resume` |

@@ -1,7 +1,7 @@
 # Web Scrape Transform
 
 Fetch webpages from URLs, convert content to markdown/text, and generate fingerprints for change detection.
-It can also POST a JSON object from each row to a read-only data endpoint.
+It can also POST a JSON object or URL-encoded form from each row to a read-only data endpoint.
 
 ## Configuration
 
@@ -27,6 +27,37 @@ transforms:
         - style
         - nav
 ```
+
+Set exactly one URL source: `url_field` names a field containing an absolute
+HTTP(S) address in each row; `url` fixes the absolute address in the node.
+The latter is useful when many rows search the same site. Both use the same
+request-time SSRF validation and IP pinning. A fixed URL is also checked at
+config time without DNS resolution. `blob_fetch` supports the same URL choice.
+
+For a public search endpoint, keep the destination in `url` and map each
+query parameter to a row field with `query_fields`:
+
+```yaml
+transforms:
+  - plugin: web_scrape
+    options:
+      url: https://abr.business.gov.au/Search/ResultsActive
+      query_fields: {SearchText: search_text}
+      content_field: search_results
+      fingerprint_field: search_fingerprint
+      format: raw
+      http:
+        abuse_contact: compliance@example.com
+        scraping_reason: Approved public register search
+      schema: {mode: observed}
+```
+
+This ABN Lookup address is an example of a government search result page. The
+same options work with another page by changing its URL and query names. Use
+`query` for fixed parameters, such as `{page: '1'}`. A row-bound query value
+must be a string; missing, invalid, or oversized URLs fail before DNS. Query
+parameter names associated with credentials are rejected. Query values and the
+resulting URL are audit evidence, so search terms should not contain secrets.
 
 GET is the default. To request data with POST, add a JSON object to each input
 row and name its field explicitly:
@@ -58,6 +89,35 @@ POST does not follow redirects or retry failed requests automatically. A
 restarted run may still issue the request again, so use this mode only for
 endpoints where repeated retrieval is safe. Request JSON is retained in the
 HTTP audit trail; do not put credentials in the body.
+
+For an HTML form, set `method: POST`, a fixed `url` or a row `url_field`, and
+`request_form_field` instead of `request_json_field`:
+
+```yaml
+transforms:
+  - plugin: web_scrape
+    options:
+      url: https://example.org/search
+      method: POST
+      request_form_field: search_form
+      content_field: result_html
+      fingerprint_field: result_hash
+      format: raw
+      http:
+        abuse_contact: compliance@example.com
+        scraping_reason: Approved public search
+      schema: {mode: observed}
+```
+
+Each row's `search_form` is an ordered list of `{name: string, value: string}`
+objects, for example `[{'name': 'q', 'value': 'A B'}, {'name': 'q', 'value':
+'Café'}]`. Duplicate names and order are preserved; values are UTF-8 encoded
+as `application/x-www-form-urlencoded`. An invalid or oversized form fails
+before DNS. The body limit is `http.max_request_body_bytes` (1 MiB by default)
+and at most 256 fields are accepted. Form values and a digest of the exact
+encoded body are retained in HTTP audit evidence; do not put credentials in
+the form row. This mode submits HTTP form data; filling a rendered browser
+form is a separate planned browser capability.
 
 ## Output Fields
 

@@ -22,7 +22,9 @@ format stability.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -308,6 +310,16 @@ class LLMCallError:
 # ---------------------------------------------------------------------------
 
 
+def encode_urlencoded_form(form: Sequence[tuple[str, str]]) -> bytes:
+    """Encode ordered form fields for both the wire request and audit digest."""
+    if not form:
+        raise ValueError("form must contain at least one field")
+    for pair in form:
+        if type(pair) is not tuple or len(pair) != 2 or type(pair[0]) is not str or type(pair[1]) is not str or not pair[0]:
+            raise ValueError("form fields must be nonempty names paired with string values")
+    return urllib.parse.urlencode(form).encode("ascii")
+
+
 @dataclass(frozen=True, slots=True)
 class HTTPCallRequest:
     """Audit record for an outbound HTTP request.
@@ -327,6 +339,7 @@ class HTTPCallRequest:
     url: str
     headers: Mapping[str, str]
     json: Mapping[str, Any] | None = None
+    form: tuple[tuple[str, str], ...] | None = None
     params: Mapping[str, Any] | None = None
     audit_metadata: Mapping[str, Any] | None = None
     resolved_ip: str | None = None
@@ -334,12 +347,16 @@ class HTTPCallRequest:
     redirect_from: str | None = None
 
     def __post_init__(self) -> None:
-        freeze_fields(self, "headers", "json", "params", "audit_metadata")
+        freeze_fields(self, "headers", "json", "form", "params", "audit_metadata")
         method = _require_non_empty_str(self.method, "method")
         if method.upper() != method:
             raise ValueError(f"method must be uppercase, got {method!r}")
         _require_non_empty_str(self.url, "url")
         _require_string_mapping(self.headers, "headers")
+        if self.form is not None:
+            if method != "POST" or self.json is not None:
+                raise ValueError("form requires POST without a JSON body")
+            encode_urlencoded_form(self.form)
         require_int(self.hop_number, "hop_number", optional=True, min_value=1)
         if self.resolved_ip is not None:
             _require_non_empty_str(self.resolved_ip, "resolved_ip")
@@ -374,6 +391,10 @@ class HTTPCallRequest:
         # All other methods emit json/params when non-None — no silent drops.
         if self.json is not None or self.method == "POST":
             d["json"] = deep_thaw(self.json) if self.json is not None else None
+        if self.form is not None:
+            d["form"] = deep_thaw(self.form)
+            d["body_encoding"] = "urlencoded-v1"
+            d["body_sha256"] = hashlib.sha256(encode_urlencoded_form(self.form)).hexdigest()
         if self.params is not None or self.method == "GET":
             d["params"] = deep_thaw(self.params) if self.params is not None else None
         if self.audit_metadata is not None:

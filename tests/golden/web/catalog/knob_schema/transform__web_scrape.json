@@ -23,12 +23,23 @@
         "tier": "common"
       },
       {
+        "default": null,
         "description": "Name of the row field whose value is the absolute URL to fetch. Values MUST include an explicit 'http://' or 'https://' scheme; bare hostnames (e.g. 'www.example.gov.au') are rejected at fetch time by the SSRF guard. If the upstream source emits scheme-less values, normalize them in the source data or add an upstream value_transform that prepends 'https://' before this transform.",
         "kind": "text",
         "label": "URL Field",
         "name": "url_field",
-        "nullable": false,
-        "required": true,
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Fixed absolute HTTP(S) URL for every row; exclusive with url_field.",
+        "kind": "text",
+        "label": "URL",
+        "name": "url",
+        "nullable": true,
+        "required": false,
         "tier": "common"
       },
       {
@@ -70,6 +81,34 @@
         "label": "Request JSON Field",
         "name": "request_json_field",
         "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "Row field containing ordered URL-encoded POST form entries.",
+        "kind": "text",
+        "label": "Request Form Field",
+        "name": "request_form_field",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Static URL query parameters sent with each request.",
+        "kind": "json-object",
+        "label": "Query",
+        "name": "query",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "description": "Map URL query parameter names to input row field names.",
+        "kind": "json-object",
+        "label": "Query Fields",
+        "name": "query_fields",
+        "nullable": false,
         "required": false,
         "tier": "common"
       },

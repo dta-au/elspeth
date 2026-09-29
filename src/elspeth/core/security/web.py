@@ -335,6 +335,27 @@ def validate_literal_ip_for_ssrf(
     _validate_ip_address(host, allowed_ranges=allowed_ranges)
 
 
+def validate_configured_url_for_ssrf(
+    url: str,
+    *,
+    allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+) -> None:
+    """Validate a fixed HTTP(S) URL without causing DNS traffic at config time.
+
+    Runtime dispatch still calls ``validate_url_for_ssrf`` to resolve and pin
+    the destination IP immediately before connecting.
+    """
+    validate_url_scheme(url)
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    if not hostname:
+        raise SSRFBlockedError("URL has no hostname", kind="missing_hostname")
+    port = _validated_url_port(url, parsed)
+    if port == 0:
+        raise SSRFBlockedError("Port 0 is not allowed", kind="port_zero")
+    validate_literal_ip_for_ssrf(hostname, allowed_ranges=allowed_ranges)
+
+
 @dataclass(frozen=True, slots=True)
 class SSRFSafeRequest:
     """Request with pre-validated IP to prevent DNS rebinding attacks.

@@ -7,6 +7,8 @@ old inline dict construction that it replaces.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from elspeth.contracts.call_data import (
@@ -439,6 +441,21 @@ class TestHTTPCallRequest:
         ).to_dict()
         assert new_dict == old_dict
         assert stable_hash(new_dict) == stable_hash(old_dict)
+
+    def test_ordered_urlencoded_form_records_exact_body_hash(self) -> None:
+        form = (("q", "A B"), ("q", "Café"))
+        body = b"q=A+B&q=Caf%C3%A9"
+        request = HTTPCallRequest(
+            method="POST",
+            url="https://example.com/search",
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+            form=form,
+        )
+
+        assert request.to_dict()["form"] == [["q", "A B"], ["q", "Café"]]
+        assert request.to_dict()["body_encoding"] == "urlencoded-v1"
+        assert request.to_dict()["body_sha256"] == hashlib.sha256(body).hexdigest()
+        assert request.to_dict()["json"] is None
 
     def test_standard_get_hash_stability(self) -> None:
         old_dict: dict[str, object] = {

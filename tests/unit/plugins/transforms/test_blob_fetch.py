@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import socket
 import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
@@ -79,6 +80,94 @@ def _config(**overrides: Any) -> dict[str, Any]:
     }
     config.update(overrides)
     return config
+
+
+def test_blob_fetch_fixed_url_needs_no_url_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.plugins.transforms.blob_fetch as blob_fetch_module
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    fixed_url = "https://example.test/data.csv"
+    seen: list[str] = []
+
+    def _validate(url: str, *, allowed_ranges: Any = ()) -> SSRFSafeRequest:
+        del allowed_ranges
+        seen.append(url)
+        return _safe_request_for(url)
+
+    monkeypatch.setattr(blob_fetch_module, "validate_url_for_ssrf", _validate)
+    options = _config(url=fixed_url, schema={"mode": "observed"})
+    options.pop("url_field")
+    transform = BlobFetch(options)
+    transform._payload_store = _PayloadStoreFake()
+    response = httpx.Response(
+        200,
+        content=b"id,name\n1,alice\n",
+        headers={"content-type": "text/csv"},
+        request=httpx.Request("GET", "https://203.0.113.10:443/data.csv"),
+    )
+    monkeypatch.setattr(transform, "_fetch_url", lambda _safe, _ctx: (response, fixed_url, _call()))
+
+    result = transform.process(make_pipeline_row({"batch_id": "run-1"}), make_context())
+
+    assert transform.declared_input_fields == frozenset()
+    assert seen == [fixed_url]
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row["batch_id"] == "run-1"
+    assert result.row["fetch_url_final"] == fixed_url
+
+
+def test_blob_fetch_fixed_url_invariant_probe_is_offline_and_restores_configured_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    options = _config(url="https://example.invalid/data.csv", schema={"mode": "observed"})
+    options.pop("url_field")
+    transform = BlobFetch(options)
+    rows = transform.forward_invariant_probe_rows(make_pipeline_row({"batch_id": "run-1"}))
+
+    def _probe_ip_only(host: str, *_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
+        assert host == "93.184.216.34", "probe must not resolve the configured hostname"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 0))]
+
+    monkeypatch.setattr("socket.getaddrinfo", _probe_ip_only)
+    result = transform.execute_forward_invariant_probe(rows, make_context())
+
+    assert result.status == "success"
+    assert transform._url == "https://example.invalid/data.csv"
+
+
+@pytest.mark.parametrize(
+    ("url", "include_url_field"),
+    [(None, False), ("https://example.test/data.csv", True)],
+)
+def test_blob_fetch_requires_exactly_one_url_source(url: str | None, include_url_field: bool) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    options = _config()
+    if not include_url_field:
+        options.pop("url_field")
+    if url is not None:
+        options["url"] = url
+
+    with pytest.raises(PluginConfigError, match=r"url.*url_field"):
+        BlobFetch(options)
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "http://127.0.0.1/private", "https://example.test:0/"])
+def test_blob_fetch_rejects_unsafe_fixed_url_before_dns(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.blob_fetch import BlobFetch
+
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("configuration must not resolve DNS")
+
+    monkeypatch.setattr("socket.getaddrinfo", _dns_forbidden)
+    options = _config(url=url, schema={"mode": "observed"})
+    options.pop("url_field")
+
+    with pytest.raises(PluginConfigError, match="url"):
+        BlobFetch(options)
 
 
 def test_blob_fetch_stores_body_and_emits_blob_reference(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -287,6 +287,54 @@ def test_web_scrape_post_sends_row_json_and_returns_raw_json(mock_ctx) -> None:
 
 
 @respx.mock
+def test_web_scrape_post_sends_ordered_urlencoded_form_to_fixed_url(mock_ctx: PluginContext) -> None:
+    endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options.update(url="https://example.com/search", method="POST", request_form_field="search_form")
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(
+            make_pipeline_row({"company_id": "1", "search_form": [{"name": "q", "value": "A B"}, {"name": "q", "value": "Café"}]}),
+            mock_ctx,
+        )
+
+    assert result.status == "success"
+    assert endpoint.call_count == 1
+    request = endpoint.calls[0].request
+    assert request.headers["content-type"] == "application/x-www-form-urlencoded; charset=utf-8"
+    assert request.content == b"q=A+B&q=Caf%C3%A9"
+    assert result.row is not None
+    assert result.row["company_id"] == "1"
+    assert result.row["fetch_url_final"] == "https://example.com/search"
+
+
+def test_web_scrape_post_rejects_malformed_form_before_dns(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.update(method="POST", request_form_field="search_form")
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")):
+        result = transform.process(
+            make_pipeline_row({"url": "https://example.com/search", "search_form": {"q": "secret-example"}}), mock_ctx
+        )
+
+    assert result.status == "error"
+    assert result.retryable is False
+    assert "secret-example" not in str(result.reason)
+
+
+def test_web_scrape_rejects_multiple_post_body_sources() -> None:
+    options = _make_basic_transform_options()
+    options.update(method="POST", request_json_field="query_body", request_form_field="search_form")
+    with pytest.raises(PluginConfigError, match=r"exactly one.*request_json_field.*request_form_field"):
+        WebScrapeTransform(options)
+
+
+@respx.mock
 def test_web_scrape_post_invalid_body_refuses_before_dns_or_http(mock_ctx) -> None:
     endpoint = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="ok"))
     transform = _make_post_transform()
@@ -1482,6 +1530,122 @@ class TestWebScrapeDeclaredInputFields:
         transform = WebScrapeTransform(_base_config(required_input_fields=["tenant_id"]))
 
         assert transform.declared_input_fields == frozenset({"url", "tenant_id"})
+
+
+@respx.mock
+def test_fixed_url_search_uses_row_data_without_url_column(mock_ctx: PluginContext) -> None:
+    fixed_url = "https://example.com/search"
+    route = respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = fixed_url
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"company_query": "Acme"}), mock_ctx)
+
+    assert transform.declared_input_fields == frozenset()
+    assert route.call_count == 1
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row["company_query"] == "Acme"
+    assert result.row["fetch_url_final"] == fixed_url
+
+
+@respx.mock
+def test_fixed_url_search_maps_row_field_to_query_parameter(mock_ctx: PluginContext) -> None:
+    route = respx.get(f"https://{_TEST_IP}:443/Search/ResultsActive?SearchText=ACME+%26+Co").mock(
+        return_value=httpx.Response(200, text="<main>Matching names</main>")
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/Search/ResultsActive"
+    options["query_fields"] = {"SearchText": "company_query"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"company_query": "ACME & Co"}), mock_ctx)
+
+    assert transform.declared_input_fields == frozenset({"company_query"})
+    assert route.call_count == 1
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row["fetch_url_final"] == "https://example.com/Search/ResultsActive?SearchText=ACME+%26+Co"
+
+
+def test_query_field_invalid_value_is_row_error_before_dns(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/search"
+    options["query_fields"] = {"SearchText": "company_query"}
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", side_effect=AssertionError("DNS should not be reached")):
+        result = transform.process(make_pipeline_row({"company_query": ["not", "a", "string"]}), mock_ctx)
+
+    assert result.status == "error"
+
+
+def test_query_options_reject_sensitive_names_and_duplicate_bindings() -> None:
+    options = _make_basic_transform_options()
+    options["query_fields"] = {"token": "company_query"}
+    with pytest.raises(PluginConfigError, match="query"):
+        WebScrapeTransform(options)
+
+    options["query_fields"] = {"SearchText": "company_query"}
+    options["query"] = {"SearchText": "static"}
+    with pytest.raises(PluginConfigError, match="SearchText"):
+        WebScrapeTransform(options)
+
+
+def test_fixed_url_invariant_probe_is_offline_and_restores_configured_url(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.invalid/search"
+    transform = WebScrapeTransform(options)
+    rows = transform.forward_invariant_probe_rows(make_pipeline_row({"company_query": "Acme"}))
+
+    def _probe_ip_only(host: str, *_args: Any, **_kwargs: Any) -> list[tuple[Any, ...]]:
+        assert host == "93.184.216.34", "probe must not resolve the configured hostname"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 0))]
+
+    with patch("socket.getaddrinfo", _probe_ip_only):
+        result = transform.execute_forward_invariant_probe(rows, mock_ctx)
+
+    assert result.status == "success"
+    assert transform._url == "https://example.invalid/search"
+
+
+@pytest.mark.parametrize(
+    ("url", "include_url_field"),
+    [(None, False), ("https://example.com/search", True)],
+)
+def test_web_scrape_requires_exactly_one_url_source(url: str | None, include_url_field: bool) -> None:
+    options = _make_basic_transform_options()
+    if not include_url_field:
+        options.pop("url_field")
+    if url is not None:
+        options["url"] = url
+
+    with pytest.raises(PluginConfigError, match=r"url.*url_field"):
+        WebScrapeTransform(options)
+
+
+@pytest.mark.parametrize("url", ["ftp://example.com/file", "https://169.254.169.254/latest", "https://example.com:0/"])
+def test_web_scrape_rejects_unsafe_fixed_url_before_dns(url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _dns_forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("configuration must not resolve DNS")
+
+    monkeypatch.setattr("socket.getaddrinfo", _dns_forbidden)
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = url
+
+    with pytest.raises(PluginConfigError, match="url"):
+        WebScrapeTransform(options)
 
 
 class TestUrlFieldMustNotNameACreatedField:

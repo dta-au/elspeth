@@ -24,7 +24,13 @@ from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.security.web import NetworkError as SSRFNetworkError
-from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, validate_archived_ssrf_request, validate_url_for_ssrf
+from elspeth.core.security.web import (
+    SSRFBlockedError,
+    SSRFSafeRequest,
+    validate_archived_ssrf_request,
+    validate_configured_url_for_ssrf,
+    validate_url_for_ssrf,
+)
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
@@ -112,7 +118,8 @@ class BlobFetchHTTPConfig(BaseModel):
 class BlobFetchConfig(TransformDataConfig):
     """Configuration for blob_fetch."""
 
-    url_field: str = Field(description="Input row field containing the absolute HTTP(S) URL to fetch.")
+    url_field: str | None = Field(default=None, description="Input row field containing the absolute HTTP(S) URL to fetch.")
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
     blob_ref_field: str = Field(default="blob_ref", description="Output field receiving the payload-store content hash.")
     content_type_field: str = Field(default="blob_content_type", description="Output field receiving the normalized response Content-Type.")
     size_bytes_field: str = Field(default="blob_size_bytes", description="Output field receiving the response body size.")
@@ -131,7 +138,9 @@ class BlobFetchConfig(TransformDataConfig):
 
     @field_validator("url_field")
     @classmethod
-    def _reject_empty_input_field(cls, value: str) -> str:
+    def _reject_empty_input_field(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if not value.strip():
             raise ValueError("url_field must not be empty")
         return value.strip()
@@ -166,7 +175,25 @@ class BlobFetchConfig(TransformDataConfig):
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
-        return super().declared_input_fields | frozenset({self.url_field})
+        return super().declared_input_fields | (frozenset({self.url_field}) if self.url_field is not None else frozenset())
+
+    @model_validator(mode="after")
+    def _validate_url_source(self) -> BlobFetchConfig:
+        if (self.url is None) == (self.url_field is None):
+            raise ValueError("exactly one of url or url_field is required")
+        if self.url is not None:
+            allowed_hosts = self.http.allowed_hosts
+            if allowed_hosts == "public_only":
+                allowed_ranges: tuple[IPv4Network | IPv6Network, ...] = ()
+            elif allowed_hosts == "allow_private":
+                allowed_ranges = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+            else:
+                allowed_ranges = _parse_allowed_ranges(allowed_hosts)
+            try:
+                validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
+            except SSRFBlockedError as exc:
+                raise ValueError(f"url: {exc}") from exc
+        return self
 
     @model_validator(mode="after")
     def _reject_output_collisions(self) -> BlobFetchConfig:
@@ -182,7 +209,7 @@ class BlobFetchConfig(TransformDataConfig):
         duplicates = sorted({field for field in output_fields if output_fields.count(field) > 1})
         if duplicates:
             raise ValueError(f"Output fields must be unique; duplicates: {duplicates!r}")
-        if self.url_field in output_fields:
+        if self.url_field is not None and self.url_field in output_fields:
             raise ValueError(f"url_field {self.url_field!r} collides with a blob_fetch output field")
         return self
 
@@ -292,7 +319,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5c5f3cb31af5a344"
+    source_file_hash: str | None = "sha256:9a98ca4a95aeecbd"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -340,6 +367,7 @@ class BlobFetch(BaseTransform):
         self._initialize_declared_input_fields(cfg)
 
         self._url_field = cfg.url_field
+        self._url = cfg.url
         self._blob_ref_field = cfg.blob_ref_field
         self._content_type_field = cfg.content_type_field
         self._size_bytes_field = cfg.size_bytes_field
@@ -398,6 +426,8 @@ class BlobFetch(BaseTransform):
         (elspeth-6244cb5472). The address matches the ``allowed_hosts`` entry in
         ``probe_config()``, so SSRF validation resolves without DNS.
         """
+        if self._url_field is None:
+            return [probe]
         return [
             self._augment_invariant_probe_row(
                 probe,
@@ -451,11 +481,15 @@ class BlobFetch(BaseTransform):
             original_payload_store = self.__dict__["_payload_store"]
         had_fetch_override = "_fetch_url" in self.__dict__
         original_fetch = self._fetch_url
+        original_url = self._url
         try:
+            if original_url is not None:
+                self._url = "https://93.184.216.34/invariant-probe"
             self.__dict__["_payload_store"] = _InvariantPayloadStore()
             self.__dict__["_fetch_url"] = _fake_fetch_url
             return super().execute_forward_invariant_probe(probe_rows, ctx)
         finally:
+            self._url = original_url
             if had_payload_store:
                 self.__dict__["_payload_store"] = original_payload_store
             else:
@@ -480,7 +514,12 @@ class BlobFetch(BaseTransform):
 
     def process(self, row: PipelineRow, ctx: TransformContext) -> TransformResult:
         try:
-            url = row[self._url_field]
+            if self._url is not None:
+                url = self._url
+            elif self._url_field is not None:
+                url = row[self._url_field]
+            else:
+                raise FrameworkBugError("blob_fetch has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
             session = ctx.call_mode_session

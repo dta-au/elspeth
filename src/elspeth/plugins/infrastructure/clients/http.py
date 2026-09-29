@@ -30,6 +30,7 @@ from elspeth.contracts.call_data import (
     HTTPRedirectReplayHop,
     HTTPResponseTransport,
     RawCallPayload,
+    encode_urlencoded_form,
 )
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
@@ -651,7 +652,8 @@ class AuditedHTTPClient(AuditedClientBase):
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks logical URL")
         if _fingerprint_url(logical_url) != logical_url:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has unsafe logical URL")
-        if redirect_count == 0 and logical_url != request.original_url:
+        expected_logical_url = str(httpx.Request(method, request.original_url, params=params).url)
+        if redirect_count == 0 and logical_url != expected_logical_url:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} changed URL")
         if redirect_count and (logical_url != last_hop_url or transport["request_url"] != last_hop_transport_url):
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has inconsistent final redirect")
@@ -909,6 +911,7 @@ class AuditedHTTPClient(AuditedClientBase):
         headers: dict[str, str],
         timeout: float | None = None,
         json: Mapping[str, Any] | None = None,
+        form: tuple[tuple[str, str], ...] | None = None,
         params: dict[str, str | int | float] | None = None,
         extensions: dict[str, str] | None = None,
     ) -> httpx.Response:
@@ -916,7 +919,9 @@ class AuditedHTTPClient(AuditedClientBase):
         request_kwargs: dict[str, Any] = {"headers": headers}
         if timeout is not None:
             request_kwargs["timeout"] = timeout
-        if json is not None or method == "POST":
+        if form is not None:
+            request_kwargs["content"] = encode_urlencoded_form(form)
+        elif json is not None or method == "POST":
             request_kwargs["json"] = json
         if params is not None or method == "GET":
             request_kwargs["params"] = params
@@ -1168,6 +1173,7 @@ class AuditedHTTPClient(AuditedClientBase):
         headers: dict[str, str],
         extensions: dict[str, str] | None,
         json: Mapping[str, Any] | None,
+        form: tuple[tuple[str, str], ...] | None,
         params: dict[str, str | int | float] | None,
     ) -> httpx.Response:
         """Send one IP-pinned request with method-specific httpx handling."""
@@ -1176,6 +1182,7 @@ class AuditedHTTPClient(AuditedClientBase):
             method,
             connection_url,
             json=json,
+            form=form,
             params=params,
             headers=headers,
             extensions=extensions,
@@ -1188,6 +1195,7 @@ class AuditedHTTPClient(AuditedClientBase):
         *,
         headers: dict[str, str] | None = None,
         json: Mapping[str, Any] | None = None,
+        form: tuple[tuple[str, str], ...] | None = None,
         params: dict[str, str | int | float] | None = None,
         follow_redirects: bool = False,
         max_redirects: int = 10,
@@ -1229,6 +1237,12 @@ class AuditedHTTPClient(AuditedClientBase):
             SSRFBlockedError: If redirect target resolves to blocked IP
         """
         method_upper = method.upper()
+        if form is not None:
+            if method_upper != "POST" or json is not None:
+                raise ValueError("form requires POST without a JSON body")
+            encode_urlencoded_form(form)
+            if any(key.casefold() == "content-type" for key in (headers or {})):
+                raise ValueError("form content type is controlled by AuditedHTTPClient")
         if self._semantic_managed_identity_verify:
             if not verify_source_call_id:
                 raise AuditIntegrityError("Managed identity verify requires a preflight source call")
@@ -1246,8 +1260,11 @@ class AuditedHTTPClient(AuditedClientBase):
             **(headers or {}),
             "Host": request.host_header,
         }
+        if form is not None:
+            merged_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
 
         connection_url = request.connection_url
+        logical_request_url = str(httpx.Request(method_upper, request.original_url, params=params).url) if params else request.original_url
         effective_timeout = self._timeout
 
         # TLS SNI: use original hostname for certificate verification
@@ -1262,6 +1279,7 @@ class AuditedHTTPClient(AuditedClientBase):
             url=_fingerprint_url(request.original_url),
             headers=self._filter_request_headers(merged_headers),
             json=json,
+            form=form,
             params=_fingerprint_params(params),
             resolved_ip=request.resolved_ip,
         )
@@ -1316,19 +1334,20 @@ class AuditedHTTPClient(AuditedClientBase):
                     headers=merged_headers,
                     extensions=extensions if extensions else None,
                     json=json,
+                    form=form,
                     params=params,
                 )
 
             # Handle redirects with SSRF validation at each hop
             redirect_count = 0
-            final_hostname_url = request.original_url
+            final_hostname_url = logical_request_url
             if follow_redirects:
                 response, redirect_count, final_hostname_url = self._follow_redirects_safe(
                     response,
                     max_redirects,
                     effective_timeout,
                     merged_headers,
-                    original_url=request.original_url,
+                    original_url=logical_request_url,
                     allowed_ranges=allowed_ranges,
                     replay_hops=replay_hops,
                 )

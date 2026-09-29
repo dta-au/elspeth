@@ -26,7 +26,7 @@ from pydantic import AfterValidator, BaseModel, Field, field_validator, model_va
 
 from elspeth.contracts import CallType, Determinism
 from elspeth.contracts.audit import Call
-from elspeth.contracts.call_data import HTTPCallRequest
+from elspeth.contracts.call_data import HTTPCallRequest, encode_urlencoded_form
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.emitted_option import EmittedToOutput
@@ -43,10 +43,16 @@ from elspeth.core.security.web import (
     SSRFBlockedError,
     SSRFSafeRequest,
     validate_archived_ssrf_request,
+    validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
-from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
+from elspeth.plugins.infrastructure.clients.fingerprinting import (
+    fingerprint_headers,
+    fingerprint_params,
+    fingerprint_url,
+    is_sensitive_query_param,
+)
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -107,6 +113,22 @@ class _PostRequestBody(dict[str, object]):
         super().__init__(value)
 
 
+def _parse_form_fields(value: object) -> tuple[tuple[str, str], ...]:
+    """Copy an ordered row form after validating its complete wire shape."""
+    if type(value) is not list or not 1 <= len(value) <= 256:
+        raise ValueError("POST form must be a list of 1 to 256 fields")
+    fields: list[tuple[str, str]] = []
+    for item in value:
+        if type(item) is not dict or set(item) != {"name", "value"}:
+            raise ValueError("POST form entries require name and value")
+        name = item["name"]
+        field_value = item["value"]
+        if type(name) is not str or not name or type(field_value) is not str:
+            raise ValueError("POST form fields require a nonempty string name and string value")
+        fields.append((name, field_value))
+    return tuple(fields)
+
+
 def _validate_cidr_entry(entry: str) -> str:
     """Validate a single ``allowed_hosts`` CIDR string at the Tier-3 config boundary.
 
@@ -156,7 +178,7 @@ class WebScrapeHTTPConfig(BaseModel):
             "preventing OOM on hostile or misconfigured Tier-3 endpoints (B3.10)."
         ),
     )
-    max_request_body_bytes: int = Field(default=1024 * 1024, gt=0, description="Maximum serialized POST JSON body size in bytes.")
+    max_request_body_bytes: int = Field(default=1024 * 1024, gt=0, description="Maximum encoded POST body size in bytes.")
     # SSRF allowlist. The two scalar keywords are a closed set (declared as a
     # Literal so Pydantic validates the arm natively); the list arm is one-or-more
     # CIDR strings, each well-formedness-checked by CidrStr's AfterValidator, with
@@ -200,7 +222,8 @@ class WebScrapeHTTPConfig(BaseModel):
 class WebScrapeConfig(TransformDataConfig):
     """Configuration for web scrape transform."""
 
-    url_field: str = Field(
+    url_field: str | None = Field(
+        default=None,
         description=(
             "Name of the row field whose value is the absolute URL to fetch. "
             "Values MUST include an explicit 'http://' or 'https://' scheme; "
@@ -210,10 +233,14 @@ class WebScrapeConfig(TransformDataConfig):
             "value_transform that prepends 'https://' before this transform."
         ),
     )
+    url: str | None = Field(default=None, description="Fixed absolute HTTP(S) URL for every row; exclusive with url_field.")
     content_field: str = Field(description="Output field that receives the fetched page content.")
     fingerprint_field: str = Field(description="Output field that receives the page fingerprint.")
     method: Literal["GET", "POST"] = Field(default="GET", description="HTTP method for fetching the row URL.")
     request_json_field: str | None = Field(default=None, description="Row field containing a JSON object to send as a POST body.")
+    request_form_field: str | None = Field(default=None, description="Row field containing ordered URL-encoded POST form entries.")
+    query: dict[str, str] = Field(default_factory=dict, description="Static URL query parameters sent with each request.")
+    query_fields: dict[str, str] = Field(default_factory=dict, description="Map URL query parameter names to input row field names.")
     format: Literal["markdown", "text", "raw"] = Field(
         default="markdown",
         description="Content extraction format to emit: markdown, plain text, or raw HTML/JSON text.",
@@ -237,7 +264,7 @@ class WebScrapeConfig(TransformDataConfig):
     )
     http: WebScrapeHTTPConfig = Field(description="HTTP fetching policy, timeout, contact, and host allowlist settings.")
 
-    @field_validator("url_field", "content_field", "fingerprint_field", "request_json_field")
+    @field_validator("url_field", "content_field", "fingerprint_field", "request_json_field", "request_form_field")
     @classmethod
     def _reject_empty_field_names(cls, v: str | None, info: Any) -> str | None:
         if v == "":
@@ -246,25 +273,64 @@ class WebScrapeConfig(TransformDataConfig):
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
-        fields = {self.url_field}
+        fields: set[str] = set()
+        if self.url_field is not None:
+            fields.add(self.url_field)
         if self.request_json_field is not None:
             fields.add(self.request_json_field)
+        if self.request_form_field is not None:
+            fields.add(self.request_form_field)
+        fields.update(self.query_fields.values())
         return super().declared_input_fields | frozenset(fields)
 
     @model_validator(mode="after")
+    def _validate_query_options(self) -> "WebScrapeConfig":
+        duplicate_names = self.query.keys() & self.query_fields.keys()
+        if duplicate_names:
+            raise ValueError(f"query and query_fields repeat parameter {sorted(duplicate_names)[0]!r}")
+        for name in self.query.keys() | self.query_fields.keys():
+            if not name or is_sensitive_query_param(name):
+                raise ValueError(f"query parameter {name!r} must be nonempty and must not carry credentials")
+        for field_name in self.query_fields.values():
+            if not field_name:
+                raise ValueError("query_fields row field names must not be empty")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_url_source(self) -> "WebScrapeConfig":
+        if (self.url is None) == (self.url_field is None):
+            raise ValueError("exactly one of url or url_field is required")
+        if self.url is not None:
+            allowed_hosts = self.http.allowed_hosts
+            if allowed_hosts == "public_only":
+                allowed_ranges: tuple[IPv4Network | IPv6Network, ...] = ()
+            elif allowed_hosts == "allow_private":
+                allowed_ranges = (ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0"))
+            else:
+                allowed_ranges = _parse_allowed_ranges(allowed_hosts)
+            try:
+                validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
+            except SSRFBlockedError as exc:
+                raise ValueError(f"url: {exc}") from exc
+        return self
+
+    @model_validator(mode="after")
     def _validate_request_body_option(self) -> "WebScrapeConfig":
-        if self.method == "POST" and self.request_json_field is None:
-            raise ValueError("request_json_field is required when method is POST")
-        if self.method == "GET" and self.request_json_field is not None:
-            raise ValueError("request_json_field is only valid when method is POST")
+        body_sources = [field for field in (self.request_json_field, self.request_form_field) if field is not None]
+        if self.method == "POST" and len(body_sources) != 1:
+            raise ValueError("exactly one of request_json_field or request_form_field is required when method is POST")
+        if self.method == "GET" and body_sources:
+            raise ValueError("request_json_field and request_form_field are only valid when method is POST")
         return self
 
     @model_validator(mode="after")
     def _reject_field_collisions(self) -> "WebScrapeConfig":
         if self.content_field == self.fingerprint_field:
             raise ValueError(f"content_field and fingerprint_field must differ, both are '{self.content_field}'")
-        if self.request_json_field == self.url_field:
+        if self.url_field is not None and self.request_json_field == self.url_field:
             raise ValueError("request_json_field and url_field must differ")
+        if self.url_field is not None and self.request_form_field == self.url_field:
+            raise ValueError("request_form_field and url_field must differ")
         return self
 
     @model_validator(mode="after")
@@ -292,12 +358,17 @@ class WebScrapeConfig(TransformDataConfig):
         value matches the key.
         """
         option_key_to_value: dict[str, str] = {
-            "url_field": self.url_field,
             "content_field": self.content_field,
             "fingerprint_field": self.fingerprint_field,
         }
+        if self.url_field is not None:
+            option_key_to_value["url_field"] = self.url_field
         if self.request_json_field is not None:
             option_key_to_value["request_json_field"] = self.request_json_field
+        if self.request_form_field is not None:
+            option_key_to_value["request_form_field"] = self.request_form_field
+        for name, field_name in self.query_fields.items():
+            option_key_to_value[f"query_fields.{name}"] = field_name
 
         list_name_to_entries: dict[str, tuple[str, ...] | None] = {
             "guaranteed_fields": self.schema_config.guaranteed_fields,
@@ -496,12 +567,15 @@ class WebScrapeTransform(BaseTransform):
     - Fingerprinting: Change detection with normalization
 
     Configuration:
+        url: Fixed absolute HTTP(S) URL for every row; exclusive with url_field.
         url_field: Field containing URL to fetch. Values MUST include an
             explicit 'http://' or 'https://' scheme; bare hostnames such as
             'www.example.gov.au' are rejected by the SSRF guard with
             ``SSRFBlockedError: URL is missing a scheme``. If the source
             emits scheme-less values, fix them in the source data or
             prepend the scheme via an upstream value_transform.
+        query: Static, non-credential URL query parameters.
+        query_fields: Map query parameter names to input row field names.
         content_field: Field to store extracted content
         fingerprint_field: Field to store content fingerprint
         format: Output format ("markdown", "text", "raw")
@@ -532,13 +606,13 @@ class WebScrapeTransform(BaseTransform):
                 scraping_reason: Regulatory monitoring
     """
 
-    # url_field is an INPUT column (the row field holding the URL to fetch);
-    # these two choose where the fetched content is WRITTEN.
+    # url_field is an INPUT column when the URL varies by row; url is fixed
+    # node configuration. These two keys choose where fetched content is written.
     output_naming_config_keys = frozenset({"content_field", "fingerprint_field"})
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8c138fb80b3833b7"
+    source_file_hash: str | None = "sha256:1e22a71e6e6e043b"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -546,9 +620,10 @@ class WebScrapeTransform(BaseTransform):
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")
 
     usage_when_to_use = (
-        "Use when each row contains a public HTTP(S) page URL and you need an audited fetch, "
-        "Markdown or plain text extraction, and a change fingerprint. A read-only POST can send a "
-        "row's JSON object to a public data endpoint and return JSON as raw text. Returned remote content is "
+        "Use when a node has a fixed public HTTP(S) URL or each row carries one, and you need an audited fetch, "
+        "Markdown or plain text extraction, and a change fingerprint. Map row fields into URL query parameters "
+        "for searches against a fixed site. A read-only POST can send a "
+        "row's JSON object or ordered form fields to a public data endpoint. Returned remote content is "
         "untrusted before LLM consumption, so apply the appropriate prompt-injection control first."
     )
     usage_when_not_to_use = (
@@ -594,10 +669,14 @@ class WebScrapeTransform(BaseTransform):
 
         # Required fields
         self._url_field = cfg.url_field
+        self._url = cfg.url
         self._content_field = cfg.content_field
         self._fingerprint_field = cfg.fingerprint_field
         self._method = cfg.method
         self._request_json_field = cfg.request_json_field
+        self._request_form_field = cfg.request_form_field
+        self._query = cfg.query
+        self._query_fields = cfg.query_fields
 
         # Declare output fields for centralized collision detection in TransformExecutor.
         self.declared_output_fields = frozenset(
@@ -609,9 +688,14 @@ class WebScrapeTransform(BaseTransform):
                 "fetch_url_final_ip",
             ]
         )
-        input_options = {"url_field": cfg.url_field}
+        input_options: dict[str, str] = {}
+        if cfg.url_field is not None:
+            input_options["url_field"] = cfg.url_field
         if cfg.request_json_field is not None:
             input_options["request_json_field"] = cfg.request_json_field
+        if cfg.request_form_field is not None:
+            input_options["request_form_field"] = cfg.request_form_field
+        input_options.update({f"query_fields.{name}": field_name for name, field_name in cfg.query_fields.items()})
         self._reject_input_options_naming_created_fields(input_options)
 
         # Format and fingerprint mode
@@ -684,10 +768,11 @@ class WebScrapeTransform(BaseTransform):
             return PluginAssistance(
                 plugin_name="web_scrape",
                 issue_code=None,
-                summary="Fetch a URL with SSRF protection, audit recording, and content-fingerprinting. GET is the default; POST sends a JSON object from a row field. Output formats: raw, text, markdown.",
+                summary="Fetch a fixed or row-provided URL with SSRF protection, audit recording, and content-fingerprinting. GET can map row fields into query parameters; POST sends JSON or URL-encoded form fields from a row. Output formats: raw, text, markdown.",
                 composer_hints=(
-                    "web_scrape is a transform, not a source: it consumes URL rows from csv/json/text/blob via url_field and writes content_field.",
-                    "For read-only POST data retrieval, set method: POST and request_json_field to a row field containing a JSON object; use format: raw for application/json responses.",
+                    "web_scrape is a transform, not a source: set exactly one of url (fixed node address) or url_field (row URL); it writes content_field.",
+                    "For read-only POST data retrieval, set method: POST and exactly one of request_json_field or request_form_field. Form entries are ordered name/value string objects; use format: raw for application/json responses.",
+                    "For a public search endpoint, set url to the fixed HTTP(S) address and query_fields to a mapping from query parameter names to input row fields; query holds static parameters. Do not put credentials in URLs or row query values.",
                     "POST bodies are retained in HTTP audit evidence; do not put credentials in them. POST redirects are rejected and POST failures are not automatically retried.",
                     "If you saw Unknown source plugin: web_scrape, use a URL row source first, then add web_scrape as a transform.",
                     "URLs MUST include explicit scheme (http:// or https://). Bare hostnames are rejected by the SSRF guard at fetch time.",
@@ -758,13 +843,18 @@ class WebScrapeTransform(BaseTransform):
 
     def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
         """Inject a deterministic public-IP URL for invariant probing."""
-        probe = self._augment_invariant_probe_row(
-            probe,
-            field_name=self._url_field,
-            value="https://93.184.216.34/invariant-probe",
-        )
+        if self._url_field is not None:
+            probe = self._augment_invariant_probe_row(
+                probe,
+                field_name=self._url_field,
+                value="https://93.184.216.34/invariant-probe",
+            )
         if self._request_json_field is not None:
             probe = self._augment_invariant_probe_row(probe, field_name=self._request_json_field, value={})
+        if self._request_form_field is not None:
+            probe = self._augment_invariant_probe_row(probe, field_name=self._request_form_field, value=[{"name": "q", "value": "probe"}])
+        for field_name in self._query_fields.values():
+            probe = self._augment_invariant_probe_row(probe, field_name=field_name, value="probe")
         return [probe]
 
     def execute_forward_invariant_probe(
@@ -786,15 +876,18 @@ class WebScrapeTransform(BaseTransform):
             safe_request: SSRFSafeRequest,
             probe_ctx: TransformContext,
             request_json: _PostRequestBody | None = None,
+            request_form: tuple[tuple[str, str], ...] | None = None,
+            request_params: dict[str, str | int | float] | None = None,
         ) -> tuple[httpx.Response, str, _InvariantCall]:
-            del probe_ctx, request_json
+            del probe_ctx, request_json, request_form
+            logical_url = str(httpx.Request(self._method, safe_request.original_url, params=request_params).url)
             return (
                 httpx.Response(
                     200,
                     text="<html><body><h1>Probe</h1><p>safe</p></body></html>",
-                    request=httpx.Request(self._method, safe_request.connection_url),
+                    request=httpx.Request(self._method, safe_request.connection_url, params=request_params),
                 ),
-                safe_request.original_url,
+                logical_url,
                 _InvariantCall(),
             )
 
@@ -804,11 +897,15 @@ class WebScrapeTransform(BaseTransform):
             original_payload_store = self.__dict__["_payload_store"]
         had_fetch_override = "_fetch_url" in self.__dict__
         original_fetch = self._fetch_url
+        original_url = self._url
         try:
+            if original_url is not None:
+                self._url = "https://93.184.216.34/invariant-probe"
             self.__dict__["_payload_store"] = _InvariantPayloadStore()
             self.__dict__["_fetch_url"] = _fake_fetch_url
             return super().execute_forward_invariant_probe(probe_rows, ctx)
         finally:
+            self._url = original_url
             if had_payload_store:
                 self.__dict__["_payload_store"] = original_payload_store
             else:
@@ -848,6 +945,19 @@ class WebScrapeTransform(BaseTransform):
                 Engine RetryManager handles these with exponential backoff
         """
         request_json: _PostRequestBody | None = None
+        request_form: tuple[tuple[str, str], ...] | None = None
+        request_params: dict[str, str | int | float] = dict(self._query)
+        if self._query_fields:
+            values = row.to_dict()
+            for name, field_name in self._query_fields.items():
+                if field_name not in values:
+                    return TransformResult.error({"reason": "validation_failed", "error": f"query row field '{field_name}' is missing"})
+                value = values[field_name]
+                if type(value) is not str:
+                    return TransformResult.error(
+                        {"reason": "validation_failed", "error": f"query row field '{field_name}' must contain a string"}
+                    )
+                request_params[name] = value
         if self._request_json_field is not None:
             values = row.to_dict()
             if self._request_json_field not in values:
@@ -876,12 +986,47 @@ class WebScrapeTransform(BaseTransform):
                     }
                 )
             request_json = candidate
+        if self._request_form_field is not None:
+            values = row.to_dict()
+            if self._request_form_field not in values:
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST form field '{self._request_form_field}' is missing"}
+                )
+            try:
+                request_form = _parse_form_fields(values[self._request_form_field])
+                encoded_form = encode_urlencoded_form(request_form)
+            except ValueError:
+                return TransformResult.error(
+                    {"reason": "validation_failed", "error": f"POST form field '{self._request_form_field}' is invalid"}
+                )
+            if len(encoded_form) > self._max_request_body_bytes:
+                return TransformResult.error(
+                    {
+                        "reason": "validation_failed",
+                        "error": f"POST form exceeds max_request_body_bytes {self._max_request_body_bytes}",
+                        "body_size": len(encoded_form),
+                        "max_body_bytes": self._max_request_body_bytes,
+                    }
+                )
 
         # Validate URL and pin resolved IP (SSRF prevention with DNS rebinding defense)
         try:
-            url = row[self._url_field]
+            if self._url is not None:
+                url = self._url
+            elif self._url_field is not None:
+                url = row[self._url_field]
+            else:
+                raise FrameworkBugError("web_scrape has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
+            if request_params:
+                try:
+                    query_url = httpx.Request(self._method, url, params=request_params).url
+                    encoded_url_size = len(str(query_url).encode("utf-8"))
+                except (TypeError, ValueError, UnicodeError):
+                    return TransformResult.error({"reason": "validation_failed", "error": "query parameters cannot be URL encoded"})
+                if encoded_url_size > 8192:
+                    return TransformResult.error({"reason": "validation_failed", "error": "URL with query parameters exceeds 8192 bytes"})
             session = ctx.call_mode_session
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
@@ -909,10 +1054,12 @@ class WebScrapeTransform(BaseTransform):
                             "X-Abuse-Contact": self._abuse_contact,
                             "X-Scraping-Reason": self._scraping_reason,
                             "Host": archived_safe.host_header,
+                            **({"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"} if request_form is not None else {}),
                         }
                     ),
-                    params=None,
+                    params=fingerprint_params(request_params) if request_params else None,
                     json=request_json,
+                    form=request_form,
                 )
                 session.preflight_verify_http_request(
                     request_data=pre_dns_request.to_dict(),
@@ -935,10 +1082,23 @@ class WebScrapeTransform(BaseTransform):
 
         # Fetch URL using pinned IP (prevents DNS rebinding between validation and fetch)
         try:
-            if self._method == "POST":
-                response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_json)
+            if request_form is not None:
+                if request_params:
+                    response, final_hostname_url, call = self._fetch_url(
+                        safe_request, ctx, request_form=request_form, request_params=request_params
+                    )
+                else:
+                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_form=request_form)
+            elif self._method == "POST":
+                if request_params:
+                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_json, request_params=request_params)
+                else:
+                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_json)
             else:
-                response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
+                if request_params:
+                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx, request_params=request_params)
+                else:
+                    response, final_hostname_url, call = self._fetch_url(safe_request, ctx)
             final_resolved_ip = _final_response_ip(response)
         except BodyTooLargeError as e:
             # Rebuild the message from structured fields — str(e) carries the
@@ -1075,7 +1235,12 @@ class WebScrapeTransform(BaseTransform):
         )
 
     def _fetch_url(
-        self, safe_request: SSRFSafeRequest, ctx: TransformContext, request_json: _PostRequestBody | None = None
+        self,
+        safe_request: SSRFSafeRequest,
+        ctx: TransformContext,
+        request_json: _PostRequestBody | None = None,
+        request_form: tuple[tuple[str, str], ...] | None = None,
+        request_params: dict[str, str | int | float] | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """Fetch URL using SSRF-safe IP pinning with audit recording.
 
@@ -1126,15 +1291,32 @@ class WebScrapeTransform(BaseTransform):
         try:
             if self._method == "POST":
                 response, final_hostname_url, call = client.request_ssrf_safe(
-                    "POST", safe_request, headers=headers, json=request_json, follow_redirects=False, allowed_ranges=self._allowed_ranges
-                )
-            else:
-                response, final_hostname_url, call = client.get_ssrf_safe(
+                    "POST",
                     safe_request,
                     headers=headers,
-                    follow_redirects=True,
+                    json=request_json,
+                    form=request_form,
+                    params=request_params or None,
+                    follow_redirects=False,
                     allowed_ranges=self._allowed_ranges,
                 )
+            else:
+                if request_params:
+                    response, final_hostname_url, call = client.request_ssrf_safe(
+                        "GET",
+                        safe_request,
+                        headers=headers,
+                        params=request_params,
+                        follow_redirects=True,
+                        allowed_ranges=self._allowed_ranges,
+                    )
+                else:
+                    response, final_hostname_url, call = client.get_ssrf_safe(
+                        safe_request,
+                        headers=headers,
+                        follow_redirects=True,
+                        allowed_ranges=self._allowed_ranges,
+                    )
 
             # Check status code and raise appropriate errors
             if response.status_code == 404:
