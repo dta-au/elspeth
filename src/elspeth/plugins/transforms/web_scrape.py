@@ -18,7 +18,6 @@ Audit Trail:
 import ipaddress
 import math
 from collections.abc import Mapping
-from dataclasses import asdict
 from ipaddress import IPv4Network, IPv6Network
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -720,7 +719,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:351f5be80c180abe"
+    source_file_hash: str | None = "sha256:75eaa95bbffb095f"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -1406,10 +1405,8 @@ class WebScrapeTransform(BaseTransform):
                         self._strip_elements,
                         source_url=fingerprint_url(final_hostname_url),
                     )
-                    records = extracted.records
-                    record_provenance = [
-                        {field: asdict(evidence) for field, evidence in row_provenance.items()} for row_provenance in extracted.provenance
-                    ]
+                    records = extracted.to_record_rows()
+                    record_provenance = extracted.to_provenance_rows()
                 else:
                     records = extract_css_records(response.text, self._records, self._strip_elements)
             except (ValueError, UnicodeError) as e:

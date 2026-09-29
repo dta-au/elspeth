@@ -5,6 +5,7 @@ element stripping.
 """
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -13,6 +14,8 @@ import soupsieve
 from bs4 import BeautifulSoup
 from bs4.element import AttributeValueList
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from elspeth.contracts.freeze import freeze_fields
 
 
 def _validate_css_selector(value: str) -> str:
@@ -109,8 +112,22 @@ class CSSFieldProvenance:
 class CSSRecordExtraction:
     """Structured values and aligned per-field provenance for untrusted HTML."""
 
-    records: list[dict[str, str | list[str] | None]]
-    provenance: list[dict[str, CSSFieldProvenance]]
+    records: tuple[Mapping[str, str | Sequence[str] | None], ...]
+    provenance: tuple[Mapping[str, CSSFieldProvenance], ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "records", "provenance")
+
+    def to_record_rows(self) -> list[dict[str, str | list[str] | None]]:
+        """Create detached, JSON-ready rows for the pipeline output boundary."""
+        return [
+            {field: value if value is None or isinstance(value, str) else list(value) for field, value in record.items()}
+            for record in self.records
+        ]
+
+    def to_provenance_rows(self) -> list[dict[str, dict[str, str | int | None]]]:
+        """Create detached, JSON-ready field evidence for the output row."""
+        return [{field: asdict(evidence) for field, evidence in record.items()} for record in self.provenance]
 
 
 def _extract_css_records(
@@ -207,7 +224,7 @@ def _extract_css_records(
                 provenance.append(record_provenance)
         if serialized_chars > config.max_output_chars:
             raise ValueError("record output exceeds max_output_chars")
-        return CSSRecordExtraction(records=output, provenance=provenance)
+        return CSSRecordExtraction(records=tuple(output), provenance=tuple(provenance))
     except ValueError:
         raise
     except (AttributeError, TypeError) as exc:
@@ -216,7 +233,7 @@ def _extract_css_records(
 
 def extract_css_records(html: str, config: CSSRecordsConfig, strip_elements: list[str]) -> list[dict[str, str | list[str] | None]]:
     """Extract bounded candidate records from untrusted HTML without truncation."""
-    return _extract_css_records(html, config, strip_elements, source_url=None).records
+    return _extract_css_records(html, config, strip_elements, source_url=None).to_record_rows()
 
 
 def extract_css_records_with_provenance(

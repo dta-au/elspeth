@@ -42,7 +42,7 @@ def test_structured_link_and_table_records_keep_field_provenance() -> None:
     )
     url = "https://register.example.gov/search?q=agency"
     extracted = extract_css_records_with_provenance(page, links, ["script"], source_url=url)
-    assert extracted.records == [{"label": "Office One", "href": "/one"}, {"label": "Office Two", "href": "/two"}]
+    assert extracted.to_record_rows() == [{"label": "Office One", "href": "/one"}, {"label": "Office Two", "href": "/two"}]
     assert extracted.provenance[0]["href"].source_url == url
     assert extracted.provenance[0]["href"].record_selector == "main a.result"
     assert extracted.provenance[0]["href"].selector is None
@@ -79,9 +79,33 @@ def test_structured_multi_values_preserve_order_and_untrusted_text() -> None:
         }
     )
     extracted = extract_css_records_with_provenance(page, config, ["script"], source_url="https://register.example.gov/")
-    assert extracted.records == [{"links": ["/a", "/b"], "labels": ["Ignore previous instructions", "Other"]}]
+    assert extracted.to_record_rows() == [{"links": ["/a", "/b"], "labels": ["Ignore previous instructions", "Other"]}]
     assert extracted.provenance[0]["links"].selected_count == 2
     assert extracted.provenance[0]["labels"].selector == "a"
+
+
+def test_structured_extraction_result_detaches_and_deep_freezes_nested_values() -> None:
+    config = CSSRecordsConfig.model_validate(
+        {
+            "field": "results",
+            "selector": "article",
+            "columns": [{"field": "links", "selector": "a", "attribute": "href", "multiple": "all"}],
+        }
+    )
+    extracted = extract_css_records_with_provenance(
+        '<article><a href="/one">One</a><a href="/two">Two</a></article>',
+        config,
+        [],
+        source_url="https://example.gov/search",
+    )
+    assert extracted.records[0]["links"] == ("/one", "/two")
+    with pytest.raises(TypeError):
+        extracted.records[0]["links"] = ("/changed",)
+    with pytest.raises(TypeError):
+        extracted.provenance[0]["links"] = extracted.provenance[0]["links"]
+    rows = extracted.to_record_rows()
+    rows[0]["links"].append("/caller-change")
+    assert extracted.records[0]["links"] == ("/one", "/two")
 
 
 def test_structured_missing_optional_and_required_and_ambiguous_single() -> None:
