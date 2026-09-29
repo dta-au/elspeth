@@ -22,6 +22,13 @@ transforms:
       content_field: result_html
       fingerprint_field: result_fingerprint
       format: raw
+      records:
+        field: candidates
+        selector: main li
+        max_records: 10
+        columns:
+          - field: name
+            required: true
       http:
         abuse_contact: examples@example.com
         scraping_reason: Local public search fixture

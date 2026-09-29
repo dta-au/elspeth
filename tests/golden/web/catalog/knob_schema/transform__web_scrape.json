@@ -162,6 +162,16 @@
         "tier": "common"
       },
       {
+        "default": null,
+        "description": "Bounded CSS-selected result records emitted as a row field.",
+        "kind": "json-object",
+        "label": "Records",
+        "name": "records",
+        "nullable": true,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "description": "HTTP fetching policy, timeout, contact, and host allowlist settings.",
         "kind": "json-object",
         "label": "HTTP",

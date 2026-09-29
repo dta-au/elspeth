@@ -1575,6 +1575,106 @@ def test_fixed_url_search_maps_row_field_to_query_parameter(mock_ctx: PluginCont
     assert result.row["fetch_url_final"] == "https://example.com/Search/ResultsActive?SearchText=ACME+%26+Co"
 
 
+@respx.mock
+def test_fixed_site_search_extracts_bounded_candidate_records(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory?q=Shared+Name").mock(
+        return_value=httpx.Response(
+            200,
+            text='<main><ul><li><a href="/one" class="office primary">Agency One</a><span class="state">ACT</span></li>'
+            '<li><a href="/two">Agency Two</a></li></ul></main>',
+            headers={"content-type": "text/html"},
+        )
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["query_fields"] = {"q": "search_text"}
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main li",
+        "max_records": 10,
+        "columns": [
+            {"field": "name", "selector": "a", "required": True},
+            {"field": "detail_path", "selector": "a", "attribute": "href", "required": True},
+            {"field": "tags", "selector": "a", "attribute": "class"},
+            {"field": "state", "selector": ".state"},
+        ],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Shared Name"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row is not None
+    assert result.row.to_dict()["candidates"] == [
+        {"name": "Agency One", "detail_path": "/one", "tags": "office primary", "state": "ACT"},
+        {"name": "Agency Two", "detail_path": "/two", "tags": None, "state": None},
+    ]
+    assert "candidates" in transform.declared_output_fields
+
+
+@respx.mock
+def test_search_candidate_limit_refuses_unreported_matches(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory").mock(
+        return_value=httpx.Response(200, text="<main><li>One</li><li>Two</li></main>", headers={"content-type": "text/html"})
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main li",
+        "max_records": 1,
+        "columns": [{"field": "name", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Shared Name"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "content_extraction_failed"
+
+
+@respx.mock
+def test_search_required_column_refuses_incomplete_candidate(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory").mock(
+        return_value=httpx.Response(200, text="<main><li>No link</li></main>", headers={"content-type": "text/html"})
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "selector": "main li",
+        "columns": [{"field": "detail_path", "selector": "a", "attribute": "href", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Shared Name"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "content_extraction_failed"
+
+
+def test_search_record_selector_is_validated_at_config_time() -> None:
+    options = _make_basic_transform_options()
+    options["records"] = {
+        "field": "candidates",
+        "selector": "[",
+        "columns": [{"field": "name", "selector": "a"}],
+    }
+    with pytest.raises(PluginConfigError, match="selector"):
+        WebScrapeTransform(options)
+
+
 def test_query_field_invalid_value_is_row_error_before_dns(mock_ctx: PluginContext) -> None:
     options = _make_basic_transform_options()
     options.pop("url_field")

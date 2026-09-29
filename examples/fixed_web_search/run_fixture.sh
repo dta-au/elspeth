@@ -68,6 +68,8 @@ assert len(rows) == 3, len(rows)
 assert len(requests) == 3, requests
 assert {row["search_text"] for row in rows} == set(requests)
 assert all(row["fetch_status"] == 200 for row in rows)
+assert sorted(len(row["candidates"]) for row in rows) == [0, 1, 2]
+assert all(set(candidate) == {"name"} for row in rows for candidate in row["candidates"])
 assert not (example / "output/failures.jsonl").exists()
 print(f"verified_rows={len(rows)} verified_requests={len(requests)}")
 PY

@@ -73,7 +73,7 @@ from elspeth.plugins.transforms.web_scrape_errors import (
     row_url_policy_refusal,
     row_url_value_refusal,
 )
-from elspeth.plugins.transforms.web_scrape_extraction import extract_content
+from elspeth.plugins.transforms.web_scrape_extraction import CSSRecordsConfig, extract_content, extract_css_records
 from elspeth.plugins.transforms.web_scrape_fingerprint import compute_fingerprint
 
 if TYPE_CHECKING:
@@ -262,6 +262,7 @@ class WebScrapeConfig(TransformDataConfig):
         default_factory=lambda: ["script", "style"],
         description="HTML element names to remove before extracting page text.",
     )
+    records: CSSRecordsConfig | None = Field(default=None, description="Bounded CSS-selected result records emitted as a row field.")
     http: WebScrapeHTTPConfig = Field(description="HTTP fetching policy, timeout, contact, and host allowlist settings.")
 
     @field_validator("url_field", "content_field", "fingerprint_field", "request_json_field", "request_form_field")
@@ -331,6 +332,14 @@ class WebScrapeConfig(TransformDataConfig):
             raise ValueError("request_json_field and url_field must differ")
         if self.url_field is not None and self.request_form_field == self.url_field:
             raise ValueError("request_form_field and url_field must differ")
+        if self.records is not None and self.records.field in {
+            self.content_field,
+            self.fingerprint_field,
+            "fetch_status",
+            "fetch_url_final",
+            "fetch_url_final_ip",
+        }:
+            raise ValueError("records field must differ from other web_scrape output fields")
         return self
 
     @model_validator(mode="after")
@@ -422,15 +431,20 @@ def _parse_allowed_ranges(entries: list[str]) -> tuple[IPv4Network | IPv6Network
     return tuple(networks)
 
 
-def _web_scrape_added_output_fields(content_field: str, fingerprint_field: str) -> tuple[FieldDefinition, ...]:
+def _web_scrape_added_output_fields(
+    content_field: str, fingerprint_field: str, records_field: str | None = None
+) -> tuple[FieldDefinition, ...]:
     """Return the typed fields WebScrape guarantees on successful output rows."""
-    return (
+    fields = (
         FieldDefinition(name=content_field, field_type="str", required=True),
         FieldDefinition(name=fingerprint_field, field_type="str", required=True),
         FieldDefinition(name="fetch_status", field_type="int", required=True),
         FieldDefinition(name="fetch_url_final", field_type="str", required=True),
         FieldDefinition(name="fetch_url_final_ip", field_type="str", required=True),
     )
+    if records_field is not None:
+        return (*fields, FieldDefinition(name=records_field, field_type="any", required=True))
+    return fields
 
 
 def _build_web_scrape_output_schema_config(
@@ -438,13 +452,14 @@ def _build_web_scrape_output_schema_config(
     *,
     content_field: str,
     fingerprint_field: str,
+    records_field: str | None = None,
 ) -> SchemaConfig:
     """Build the typed output contract for WebScrape's pass-through enrichment."""
     field_by_name: dict[str, FieldDefinition] = {}
     if schema_config.fields is not None:
         field_by_name.update((field.name, field) for field in schema_config.fields)
 
-    added_fields = _web_scrape_added_output_fields(content_field, fingerprint_field)
+    added_fields = _web_scrape_added_output_fields(content_field, fingerprint_field, records_field)
     field_by_name.update((field.name, field) for field in added_fields)
 
     base_guaranteed = set(schema_config.guaranteed_fields or ())
@@ -612,7 +627,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1e22a71e6e6e043b"
+    source_file_hash: str | None = "sha256:d38c155493aecf52"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -677,6 +692,7 @@ class WebScrapeTransform(BaseTransform):
         self._request_form_field = cfg.request_form_field
         self._query = cfg.query
         self._query_fields = cfg.query_fields
+        self._records = cfg.records
 
         # Declare output fields for centralized collision detection in TransformExecutor.
         self.declared_output_fields = frozenset(
@@ -686,6 +702,7 @@ class WebScrapeTransform(BaseTransform):
                 "fetch_status",
                 "fetch_url_final",
                 "fetch_url_final_ip",
+                *([cfg.records.field] if cfg.records is not None else []),
             ]
         )
         input_options: dict[str, str] = {}
@@ -739,6 +756,7 @@ class WebScrapeTransform(BaseTransform):
             cfg.schema_config,
             content_field=cfg.content_field,
             fingerprint_field=cfg.fingerprint_field,
+            records_field=cfg.records.field if cfg.records is not None else None,
         )
         self.output_schema = create_schema_from_config(
             self._output_schema_config,
@@ -1179,6 +1197,15 @@ class WebScrapeTransform(BaseTransform):
                 }
             )
 
+        records: list[dict[str, str | None]] | None = None
+        if self._records is not None:
+            if content_type_lower not in {"text/html", "application/xhtml+xml"}:
+                return TransformResult.error({"reason": "content_extraction_failed", "error": "CSS records require an HTML response"})
+            try:
+                records = extract_css_records(response.text, self._records, self._strip_elements)
+            except (ValueError, UnicodeError) as e:
+                return TransformResult.error({"reason": "content_extraction_failed", "error": str(e), "error_type": type(e).__name__})
+
         # Compute fingerprint
         fingerprint = compute_fingerprint(content, mode=self._fingerprint_mode)
 
@@ -1204,6 +1231,8 @@ class WebScrapeTransform(BaseTransform):
         output = row.to_dict()
         output[self._content_field] = content
         output[self._fingerprint_field] = fingerprint
+        if records is not None and self._records is not None:
+            output[self._records.field] = records
         output["fetch_status"] = response.status_code
         # Redirects are attacker-influenced and this value is PERSISTED — onto the
         # row and through it into the audit trail — so userinfo and the fragment
@@ -1225,7 +1254,11 @@ class WebScrapeTransform(BaseTransform):
             PipelineRow(output, output_contract),
             success_reason={
                 "action": "enriched",
-                "fields_added": [self._content_field, self._fingerprint_field],
+                "fields_added": [
+                    self._content_field,
+                    self._fingerprint_field,
+                    *([self._records.field] if self._records is not None else []),
+                ],
                 "metadata": {
                     "fetch_request_hash": request_hash,
                     "fetch_response_raw_hash": response_raw_hash,

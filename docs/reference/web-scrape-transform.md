@@ -119,6 +119,30 @@ encoded body are retained in HTTP audit evidence; do not put credentials in
 the form row. This mode submits HTTP form data; filling a rendered browser
 form is a separate planned browser capability.
 
+For an HTML search page, `records` extracts a bounded list of candidate
+records into one output field:
+
+```yaml
+records:
+  field: candidates
+  selector: main li.result
+  max_records: 100
+  columns:
+    - {field: name, selector: a, required: true}
+    - {field: detail_path, selector: a, attribute: href}
+    - {field: status, selector: .status}
+```
+
+Each selected element produces one object. A column without a selector reads
+the selected element itself; `attribute` reads an HTML attribute instead of
+text. Missing optional values become `null`; missing required values fail the
+row. Invalid selectors fail configuration validation. More than `max_records`
+matches fails the row instead of silently dropping candidates. The default
+limits are 200 records, 4,096 characters per value, and 100,000 characters
+across all extracted values. This only accepts HTML responses. Configure
+selectors for each site after inspecting its current markup, and treat every
+candidate as unverified source data.
+
 ## Output Fields
 
 | Field | Type | Description |
@@ -128,6 +152,7 @@ form is a separate planned browser capability.
 | `fetch_status` | int | HTTP status code |
 | `fetch_url_final` | str | Final URL after redirects |
 | `fetch_url_final_ip` | str | Final resolved IP after redirects |
+| `{records.field}` | list | CSS-selected candidate objects, when `records` is configured |
 
 ## Text Extraction And Line Splitting
 
