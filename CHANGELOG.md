@@ -7,6 +7,15 @@ All notable changes to ELSPETH are documented here.
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
 - Composer guidance now teaches source-carried field names, typed transform outputs, projected template rows, batch output-mode capabilities, and routed batch or missing-field failures using current runtime rules.
+- **Web fetches refuse the IPv6 unspecified address and IPv4-embedding and
+  special-purpose ranges.** The SSRF address policy now blocks `::` (which
+  reaches local listeners like `0.0.0.0`), `192.0.0.0/24`, `198.18.0.0/15`,
+  `240.0.0.0/4`, and the IPv4-compatible (`::/96`), NAT64 (`64:ff9b::/96`,
+  `64:ff9b:1::/48`) and 6to4 (`2002::/16`) prefixes by default. Those
+  embedded forms of the metadata address `169.254.169.254`, and Azure
+  WireServer `168.63.129.16`, are always blocked, even under an operator
+  `allowed_ranges` policy; previously `64:ff9b::a9fe:a9fe` passed an
+  allow-everything policy.
 - **CI audits both npm lockfiles, and neither has an open advisory.** The
   `Dependency and License Audit` job now runs `npm audit --package-lock-only
   --audit-level=low` on the frontend lockfile (compiled into the release image)
@@ -18,6 +27,17 @@ All notable changes to ELSPETH are documented here.
 - **SECURITY.md names a security mailbox.** Reports go to GitHub private
   vulnerability reporting or to `cloudengineering@dta.gov.au`; the public-issue
   fallback is removed.
+- **CI's Test job no longer runs out of file descriptors on the self-hosted
+  runners, and build-push can check out there.** Docker 29 starts containers
+  with a soft open-file limit of 1024; one xdist worker exhausted it mid-suite
+  (`OSError: [Errno 24] Too many open files`) and failed every later test it
+  ran. The Test and Integration containers now start with
+  `--ulimit nofile=65536:524288`. The Test job prints `-q -rfE` instead of `-v`,
+  whose ~120k lines pushed the failure summary past the end of the retrievable
+  log, and uploads a JUnit report whatever the outcome. build-push's three jobs
+  check out into per-run directories, as `ci.yaml` already does, because the
+  runners' default workspace holds root-owned files that `actions/checkout`
+  cannot remove.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 53
 to 71 for durable Composer progress, request lifecycle leases, identity owner
