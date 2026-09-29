@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from operator import setitem
 from pathlib import Path
 from uuid import uuid4
 
@@ -42,7 +43,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
-from elspeth.core.retention.purge import PurgeManager
+from elspeth.core.retention.purge import PurgeManager, _SourceOutputDependencies
 from tests.fixtures.audit_hashing import fake_sha256
 from tests.fixtures.landscape import make_landscape_db
 from tests.fixtures.stores import MockPayloadStore
@@ -363,6 +364,21 @@ class TestPurgeResultValidation:
 
 
 class TestFindExpiredPayloadRefs:
+    def test_source_dependency_dto_detaches_mutable_aliases_and_refuses_mutation(self) -> None:
+        children = {"metadata": "child"}
+        builder_inputs = {"input"}
+        classification_inputs = {"output": frozenset(builder_inputs)}
+        dependencies = _SourceOutputDependencies(children, classification_inputs)
+        children["metadata"] = "substituted-child"
+        classification_inputs["output"] = frozenset({"substituted-input"})
+        builder_inputs.add("additional-input")
+        assert dependencies.snapshot_children == {"metadata": "child"}
+        assert dependencies.classification_inputs == {"output": frozenset({"input"})}
+        with pytest.raises(TypeError):
+            setitem(dependencies.snapshot_children, "metadata", "substituted-child")
+        with pytest.raises(TypeError):
+            setitem(dependencies.classification_inputs, "output", frozenset({"substituted-input"}))
+
     def test_direct_purge_preserves_duplicate_reference_counts(self, db: LandscapeDB, tmp_path: Path) -> None:
         store = FilesystemPayloadStore(tmp_path / "payloads")
         manager = PurgeManager(db, store)
@@ -487,6 +503,10 @@ class TestFindExpiredPayloadRefs:
                 )
             )
         expected_refs = {output_ref} if input_ref is None else {output_ref, input_ref}
+        dependencies = manager._source_output_dependencies({output_ref})
+        assert dependencies.classification_inputs == ({} if input_ref is None else {output_ref: frozenset({input_ref})})
+        with pytest.raises(TypeError):
+            setitem(dependencies.classification_inputs, output_ref, frozenset({"substituted-input"}))
         assert set(manager.find_expired_payload_refs(retention_days=30, as_of=now)) == expected_refs
         result = manager.purge_payloads(sorted(expected_refs))
         assert result.deleted_count == len(expected_refs)
@@ -807,6 +827,10 @@ class TestFindExpiredPayloadRefs:
                     )
 
         assert manager.find_expired_payload_refs(retention_days=30, as_of=now) == []
+        dependencies = manager._source_output_dependencies({metadata_ref})
+        assert dependencies.snapshot_children == {metadata_ref: spool_ref}
+        with pytest.raises(TypeError):
+            setitem(dependencies.snapshot_children, metadata_ref, "substituted-child")
         with pytest.raises(ValueError, match="without its admitted child"):
             manager.purge_payloads([metadata_ref])
         assert store.exists(spool_ref)

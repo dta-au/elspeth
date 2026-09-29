@@ -7,6 +7,7 @@ for audit integrity.
 
 import re
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from graphlib import CycleError, TopologicalSorter
@@ -21,6 +22,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.core.canonical import stable_hash
@@ -70,8 +72,11 @@ logger = structlog.get_logger()
 
 @dataclass(frozen=True, slots=True)
 class _SourceOutputDependencies:
-    snapshot_children: dict[str, str]
-    classification_inputs: dict[str, set[str]]
+    snapshot_children: Mapping[str, str]
+    classification_inputs: Mapping[str, frozenset[str]]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "snapshot_children", "classification_inputs")
 
 
 _PURGE_ELIGIBLE_RUN_STATUSES = (
@@ -182,7 +187,7 @@ class PurgeManager:
                 raise contract_errors.AuditIntegrityError("Source snapshot operation metadata is malformed during purge")
             if metadata_ref in refs:
                 children[metadata_ref] = child
-        return _SourceOutputDependencies(children, classification_inputs)
+        return _SourceOutputDependencies(children, {ref: frozenset(inputs) for ref, inputs in classification_inputs.items()})
 
     def _source_input_declares_snapshot(self, input_ref: str | None, input_hash: str | None) -> bool:
         """Classify owned source-load input without an unbounded payload read."""
@@ -578,8 +583,8 @@ class PurgeManager:
         Returns:
             PurgeResult with deletion statistics. Note that skipped_count
             tracks refs that didn't exist (already purged or never stored),
-            while failed_refs tracks deletion errors and dependency refs
-            retained because their dependent output could not be deleted.
+            while failed_refs tracks deletion errors and refs retained to keep
+            payload dependencies reachable.
         """
         start_time = perf_counter()
         requested_counts = Counter(refs)
