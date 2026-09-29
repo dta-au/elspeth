@@ -11,6 +11,7 @@ variant="${1:-directory}"
 case "$variant" in
     directory) suffix="" ;;
     registry) suffix="_registry" ;;
+    form) suffix="_form" ;;
     *) echo "Unknown fixture variant: $variant" >&2; exit 2 ;;
 esac
 RUNS="$EXAMPLE/runs$suffix"
@@ -80,7 +81,7 @@ assert len(requests) == 3, requests
 assert {row["search_text"] for row in rows} == set(requests)
 assert all(row["fetch_status"] == 200 for row in rows)
 assert sorted(len(row["candidates"]) for row in rows) == [0, 1, 2]
-candidate_fields = {"name"} if variant == "directory" else {"name", "detail_path", "registration"}
+candidate_fields = {"name"} if variant in {"directory", "form"} else {"name", "detail_path", "registration"}
 assert all(set(candidate) == candidate_fields for row in rows for candidate in row["candidates"])
 assert not (output / "failures.jsonl").exists()
 print(f"verified_rows={len(rows)} verified_requests={len(requests)}")
@@ -127,16 +128,31 @@ if [ "$verify_exit" -ne 0 ]; then
     exit "$verify_exit"
 fi
 
-"$PYTHON_BIN" - "$RUNS" <<'PY'
+"$PYTHON_BIN" - "$RUNS" "$variant" <<'PY'
+import hashlib
+import json
 import pathlib
 import sqlite3
 import sys
+import urllib.parse
 
 runs = pathlib.Path(sys.argv[1])
+variant = sys.argv[2]
 requests = (runs / "access.log").read_text().splitlines()
 conn = sqlite3.connect(runs / "audit.db")
 verdicts = conn.execute("SELECT COUNT(*), SUM(is_match) FROM call_verifications").fetchone()
 assert len(requests) == 6, requests
 assert verdicts == (3, 3), verdicts
+if variant == "form":
+    refs = [row[0] for row in conn.execute("SELECT request_ref FROM calls WHERE call_type = 'http'")]
+    assert len(refs) == 9, refs
+    for ref in refs:
+        request = json.loads((runs / "payloads" / ref[:2] / ref).read_text())
+        form = request["form"]
+        assert [pair[0] for pair in form] == ["q", "scope", "scope"], form
+        assert [pair[1] for pair in form[1:]] == ["public", "active"], form
+        assert request["body_encoding"] == "urlencoded-v1"
+        encoded = urllib.parse.urlencode([tuple(pair) for pair in form]).encode("ascii")
+        assert request["body_sha256"] == hashlib.sha256(encoded).hexdigest()
 print(f"verified_replay_without_network=3 verified_live_calls={verdicts[1]}")
 PY

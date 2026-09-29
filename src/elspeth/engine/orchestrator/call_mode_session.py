@@ -99,7 +99,7 @@ def _mi_non_auth_request(data: Mapping[str, Any], *, before_dns: bool) -> dict[s
             raise AuditIntegrityError("Managed-identity HTTP request lacks fingerprinted Authorization")
         if _FINGERPRINTED_AUTH.fullmatch(fingerprint) is None:
             raise AuditIntegrityError("Managed-identity HTTP Authorization is not a fingerprint")
-    comparison = dict(data)
+    comparison = {key: deep_thaw(value) for key, value in data.items()}
     comparison["headers"] = {name: value for name, value in raw_headers.items() if name not in auth_names}
     if before_dns and "resolved_ip" in comparison:
         del comparison["resolved_ip"]
@@ -493,7 +493,7 @@ class AuditedCallModeSession:
     ) -> ArchivedCallRequestEvidence:
         if self._mode is not RunMode.VERIFY:
             raise AuditIntegrityError("HTTP preflight requires verify mode")
-        current = dict(request_data)
+        current = {key: deep_thaw(value) for key, value in request_data.items()}
         if "resolved_ip" in current:
             del current["resolved_ip"]
         candidates: list[ArchivedCallRequestEvidence] = []
@@ -507,7 +507,7 @@ class AuditedCallModeSession:
             if archived.state is not CallDataState.AVAILABLE or archived.data is None:
                 raise AuditIntegrityError(f"Source HTTP request {call.call_id} is unavailable")
             _require_archived_dns_pin(archived.data)
-            source = dict(archived.data)
+            source = {key: deep_thaw(value) for key, value in archived.data.items()}
             del source["resolved_ip"]
             if source == current:
                 candidates.append(ArchivedCallRequestEvidence(source_call_id=call.call_id, request_data=archived.data))

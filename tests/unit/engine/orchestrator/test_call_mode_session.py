@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from elspeth.contracts.call_data import HTTPCallRequest
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
@@ -350,6 +351,34 @@ def test_managed_identity_verify_accepts_rotating_auth_after_non_auth_preflight(
     assert factory.execution.find_call_for_current_parent.call_args.kwargs["request_hash"] is None
 
 
+def test_managed_identity_preflight_compares_frozen_form_without_auth_value() -> None:
+    factory, call = _factory()
+    request = HTTPCallRequest(
+        method="POST",
+        url="https://example.org/search",
+        headers={
+            "Host": "example.org",
+            "Authorization": f"<fingerprint:{'0' * 64}>",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        },
+        form=(("q", "Café"), ("scope", "public")),
+    ).to_dict()
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    factory.execution.get_call_request_data.return_value = CallDataResult(
+        state=CallDataState.AVAILABLE, data={**request, "resolved_ip": "93.184.216.34"}
+    )
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
+    partial = {key: value for key, value in request.items() if key != "resolved_ip"}
+    partial["headers"] = {"Host": "example.org", "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}
+
+    evidence = session.preflight_verify_http_managed_identity(
+        request_data=partial, current_state_id="current-state", current_operation_id=None
+    )
+    assert evidence.source_call_id == "source-call"
+
+
 def test_managed_identity_verify_refuses_missing_auth_and_ambiguous_parent() -> None:
     factory, call = _factory()
     archived = {
@@ -400,6 +429,30 @@ def test_http_verify_refuses_missing_or_invalid_archived_dns_pin_before_egress(m
         preflight = session.preflight_verify_http_request
     with pytest.raises(AuditIntegrityError, match="archived DNS pin"):
         preflight(request_data=request, current_state_id="current-state", current_operation_id=None)
+
+
+def test_http_verify_preflight_compares_frozen_form_request_to_current_wire_shape() -> None:
+    factory, call = _factory()
+    request = HTTPCallRequest(
+        method="POST",
+        url="https://example.org/search",
+        headers={"Host": "example.org", "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        form=(("q", "Café"), ("scope", "public"), ("scope", "active")),
+    ).to_dict()
+    factory.execution.list_source_calls_for_current_parent.return_value = [call]
+    factory.execution.get_call_request_data.return_value = CallDataResult(
+        state=CallDataState.AVAILABLE, data={**request, "resolved_ip": "93.184.216.34"}
+    )
+    session = AuditedCallModeSession(
+        factory, current_run_id="current", source_run_id="source", mode=RunMode.VERIFY, coordination_token=_CURRENT_TOKEN
+    )
+
+    evidence = session.preflight_verify_http_request(request_data=request, current_state_id="current-state", current_operation_id=None)
+    assert evidence.source_call_id == "source-call"
+
+    changed = {**request, "form": [["q", "Different"], ["scope", "public"], ["scope", "active"]]}
+    with pytest.raises(AuditIntegrityError, match="missing or ambiguous"):
+        session.preflight_verify_http_request(request_data=changed, current_state_id="current-state", current_operation_id=None)
 
 
 def test_source_load_managed_identity_requires_pre_token_admission_and_verdict() -> None:
