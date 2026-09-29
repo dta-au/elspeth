@@ -4,6 +4,10 @@ Converts HTML to markdown, text, or raw format with configurable
 element stripping.
 """
 
+import json
+from dataclasses import asdict, dataclass
+from typing import Literal
+
 import html2text
 import soupsieve
 from bs4 import BeautifulSoup
@@ -30,6 +34,8 @@ class CSSRecordColumn(BaseModel):
     selector: str | None = Field(default=None, max_length=512)
     attribute: str | None = Field(default=None, max_length=128)
     required: bool = False
+    multiple: Literal["first", "one", "all"] = "first"
+    max_values: int = Field(default=16, ge=1, le=256)
 
     @field_validator("field", "attribute")
     @classmethod
@@ -54,6 +60,7 @@ class CSSRecordsConfig(BaseModel):
     columns: list[CSSRecordColumn] = Field(min_length=1, max_length=32)
     max_records: int = Field(default=200, ge=1, le=1000)
     max_value_chars: int = Field(default=4096, ge=1, le=65536)
+    max_total_values: int = Field(default=10000, ge=1, le=100000)
     max_output_chars: int = Field(default=100000, ge=1, le=1000000)
 
     @field_validator("field")
@@ -76,8 +83,35 @@ class CSSRecordsConfig(BaseModel):
         return self
 
 
-def extract_css_records(html: str, config: CSSRecordsConfig, strip_elements: list[str]) -> list[dict[str, str | None]]:
-    """Extract a bounded candidate set from untrusted HTML without truncation."""
+@dataclass(frozen=True)
+class CSSFieldProvenance:
+    """Selector evidence for one extracted field; source_url must be persistence-safe."""
+
+    source_url: str
+    record_selector: str
+    selector: str | None
+    attribute: str | None
+    match_policy: Literal["first", "one", "all"]
+    selected_count: int
+
+
+@dataclass(frozen=True)
+class CSSRecordExtraction:
+    """Structured values and aligned per-field provenance for untrusted HTML."""
+
+    records: list[dict[str, str | list[str] | None]]
+    provenance: list[dict[str, CSSFieldProvenance]]
+
+
+def _extract_css_records(
+    html: str,
+    config: CSSRecordsConfig,
+    strip_elements: list[str],
+    *,
+    source_url: str | None,
+) -> CSSRecordExtraction:
+    if source_url is not None and (not source_url or len(source_url) > 2048):
+        raise ValueError("source_url must be nonempty and at most 2048 characters")
     try:
         soup = BeautifulSoup(html, "html.parser")
         for tag_name in strip_elements:
@@ -87,39 +121,108 @@ def extract_css_records(html: str, config: CSSRecordsConfig, strip_elements: lis
         if len(selected) > config.max_records:
             raise ValueError(f"record count exceeds max_records {config.max_records}")
 
-        output: list[dict[str, str | None]] = []
+        output: list[dict[str, str | list[str] | None]] = []
+        provenance: list[dict[str, CSSFieldProvenance]] = []
         output_chars = 0
+        serialized_chars = 2 + (32 if source_url is not None else 0)  # Lists and optional wrapper field names.
+        total_values = 0
         for element in selected:
-            record: dict[str, str | None] = {}
+            record: dict[str, str | list[str] | None] = {}
+            record_provenance: dict[str, CSSFieldProvenance] = {}
             for column in config.columns:
-                target = element.select_one(column.selector) if column.selector is not None else element
-                value: str | None = None
-                if target is not None:
+                if column.selector is None:
+                    targets = [element]
+                else:
+                    limit = column.max_values + 1 if column.multiple == "all" else 2 if column.multiple == "one" else 1
+                    targets = element.select(column.selector, limit=limit)
+                if column.multiple == "one" and len(targets) > 1:
+                    raise ValueError(f"record column {column.field!r} has multiple matches")
+                if column.multiple == "all" and len(targets) > column.max_values:
+                    raise ValueError(f"record column {column.field!r} exceeds max_values")
+                total_values += len(targets)
+                if total_values > config.max_total_values:
+                    raise ValueError("record extraction exceeds max_total_values")
+
+                values: list[str] = []
+                for target in targets:
                     if column.attribute is None:
-                        value = " ".join(target.stripped_strings)
+                        values.append(" ".join(target.stripped_strings))
                     elif column.attribute in target.attrs:
                         attribute_value = target.attrs[column.attribute]
                         if type(attribute_value) is str:
-                            value = attribute_value
+                            values.append(attribute_value)
                         elif type(attribute_value) is AttributeValueList and all(type(part) is str for part in attribute_value):
-                            value = " ".join(attribute_value)
+                            values.append(" ".join(attribute_value))
                         else:
                             raise ValueError(f"record attribute {column.attribute!r} has an unsupported value")
-                if column.required and not value:
+                if column.required and not any(values):
                     raise ValueError(f"required record column {column.field!r} is missing")
-                if value is not None:
+                for value in values:
                     if len(value) > config.max_value_chars:
                         raise ValueError(f"record column {column.field!r} exceeds max_value_chars")
                     output_chars += len(value)
-                    if output_chars > config.max_output_chars:
-                        raise ValueError("record output exceeds max_output_chars")
-                record[column.field] = value
+                output_chars += len(column.field)
+                if source_url is not None:
+                    output_chars += len(column.field) + len(source_url) + len(config.selector) + len(column.selector or "")
+                    output_chars += len(column.attribute or "") + len(column.multiple)
+                    record_provenance[column.field] = CSSFieldProvenance(
+                        source_url=source_url,
+                        record_selector=config.selector,
+                        selector=column.selector,
+                        attribute=column.attribute,
+                        match_policy=column.multiple,
+                        selected_count=len(targets),
+                    )
+                if output_chars > config.max_output_chars:
+                    raise ValueError("record output exceeds max_output_chars")
+                field_value: str | list[str] | None = values if column.multiple == "all" else values[0] if values else None
+                record[column.field] = field_value
+            serialized_chars += len(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+            if output:
+                serialized_chars += 1  # Record separator.
+            if source_url is not None:
+                serialized_chars += len(
+                    json.dumps(
+                        {field: asdict(evidence) for field, evidence in record_provenance.items()},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+                if provenance:
+                    serialized_chars += 1
+            if serialized_chars > config.max_output_chars:
+                raise ValueError("record output exceeds max_output_chars")
             output.append(record)
-        return output
+            if source_url is not None:
+                provenance.append(record_provenance)
+        if serialized_chars > config.max_output_chars:
+            raise ValueError("record output exceeds max_output_chars")
+        return CSSRecordExtraction(records=output, provenance=provenance)
     except ValueError:
         raise
     except (AttributeError, TypeError) as exc:
         raise ValueError("HTML record extraction failed on malformed content") from exc
+
+
+def extract_css_records(html: str, config: CSSRecordsConfig, strip_elements: list[str]) -> list[dict[str, str | list[str] | None]]:
+    """Extract bounded candidate records from untrusted HTML without truncation."""
+    return _extract_css_records(html, config, strip_elements, source_url=None).records
+
+
+def extract_css_records_with_provenance(
+    html: str,
+    config: CSSRecordsConfig,
+    strip_elements: list[str],
+    *,
+    source_url: str,
+) -> CSSRecordExtraction:
+    """Extract records with selector evidence; caller must supply a persistence-safe URL.
+
+    A fetched URL can contain credentials or sensitive query values. Pass the
+    same sanitized/fingerprinted URL used for persisted fetch provenance.
+    Values remain untrusted row data; this function does not bless HTML text.
+    """
+    return _extract_css_records(html, config, strip_elements, source_url=source_url)
 
 
 def extract_content(
