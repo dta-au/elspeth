@@ -157,11 +157,23 @@ function activeArtifact(
  *  carries a non-colour form — the finding count, ✓ for the all-clear, ! for
  *  a zero-count failure. Only the no-verdict tones (neutral, busy) remain
  *  plain dots. */
-function checksBadgeGlyph(status: WorkspaceStatus): string | null {
+function checksBadgeGlyph(status: WorkspaceStatus): React.ReactNode {
   if (status.issueCount > 0) return String(status.issueCount);
   switch (status.tone) {
     case "success":
-      return "✓";
+      // A text check falls back to a host font: Inter's Latin subset does
+      // not contain U+2713, making visual baselines differ across runners.
+      return (
+        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M3 8l3.2 3.2L13 4.5"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
     case "error":
     case "warning":
       // One shared glyph: today a zero-count warning is unreachable (every

@@ -378,6 +378,7 @@ jobs:
       image: python:${{ matrix.python-version }}-bookworm
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
+      PYTEST_WORKERS: ${{ github.event_name == 'pull_request' && '4' || '12' }}
     # Run tests even if static analysis fails, so both results are visible.
     strategy:
       fail-fast: false
@@ -475,11 +476,15 @@ jobs:
           # were selected, tests/conftest.py refused them with a UsageError
           # inside every xdist worker, and xdist reported that as a crashed
           # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
+          # PR #212's hosted 3.12 and 3.13 jobs were SIGKILLed before pytest
+          # finished with the default 12 workers. Bound hosted concurrency;
+          # trusted push jobs retain the 12-worker capacity of their runner.
           uv run pytest tests/ \
             --cov=src/elspeth \
             --cov-report=xml \
             --cov-report=term-missing \
             --cov-fail-under=85 \
+            -n "$PYTEST_WORKERS" \
             -v
 
       - name: Enforce audit-critical coverage floors
@@ -509,8 +514,10 @@ jobs:
         if: ${{ !matrix.coverage }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          # No `-m`: same reason as the coverage step above.
+          # No `-m`: same reason as the coverage step above. Use the same
+          # hosted-runner worker cap as the coverage lane.
           uv run pytest tests/ \
+            -n "$PYTEST_WORKERS" \
             -v
 
       - name: Upload coverage report
@@ -608,9 +615,10 @@ jobs:
     # expose. ubuntu-24.04 ships Docker preinstalled for both push and PR runs.
     runs-on: ubuntu-24.04
     # Run PostgreSQL proofs even if static analysis fails. CI Success requires both.
-    # 276 ids ran serially in 8 min on the maintainer's box (2026-09-05,
-    # elspeth-d8749aeaa3); hosted runners are slower, so allow ~3x.
-    timeout-minutes: 30
+    # PR #212 selected 651 ids on a hosted runner and reached 53% when the
+    # previous 30-minute limit cancelled the job. Allow the full required
+    # serial suite to finish and report its result.
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
