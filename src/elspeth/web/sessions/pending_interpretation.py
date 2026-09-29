@@ -50,6 +50,10 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot
+from elspeth.web.sessions.interpretation_validation import (
+    SessionInterpretationValidationInputs,
+    validate_composition_state_with_interpretation_inputs,
+)
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateRecord,
@@ -71,11 +75,9 @@ from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 if TYPE_CHECKING:
     from elspeth.contracts.blobs import BlobRecord
-    from elspeth.web.catalog.protocol import CatalogService
-    from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.web.composer.state import CompositionState
     from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
 
 class _InterpretationHashDomainV2Payload(TypedDict):
@@ -1590,57 +1592,24 @@ class SessionRuntimePreflight(Protocol):
     ) -> ValidationResult: ...
 
 
-def _validate_patched_composition_state_for_policy(
-    state: CompositionState,
-    *,
-    profile_aware: bool,
-    plugin_snapshot: PluginAvailabilitySnapshot | None,
-    profile_registry: OperatorProfileRegistry | None,
-    catalog: CatalogService | None,
-) -> ValidationSummary:
-    """Validate a candidate without retaining its originating session service."""
-    if not profile_aware:
-        return state.validate()
-    if plugin_snapshot is None:
-        raise AuditIntegrityError("Profile-aware composition validation has no principal snapshot")
-    if profile_registry is None or catalog is None:
-        raise AuditIntegrityError("Profile-aware composition validation dependencies are unavailable")
-
-    from elspeth.web.plugin_policy.validation import validate_authored_composition_state
-
-    result = validate_authored_composition_state(
-        state,
-        snapshot=plugin_snapshot,
-        profile_registry=profile_registry,
-        catalog=catalog,
-    )
-    return result.validation
-
-
 @final
 class _SessionPendingInterpretationValidator:
-    """Exact validation-only capability for process-local, synchronous, handle-free dependencies."""
+    """Exact validation capability retaining closed profile facts and preflight evidence."""
 
     __slots__ = (
-        "__catalog",
         "__expected_anchor",
         "__expected_live",
         "__inline_blob_snapshot",
-        "__plugin_snapshot",
-        "__profile_aware",
-        "__profile_registry",
         "__runtime_preflight",
         "__session_id",
         "__user_id",
+        "__validation_inputs",
     )
 
     def __init__(
         self,
         *,
-        profile_aware: bool,
-        plugin_snapshot: PluginAvailabilitySnapshot | None,
-        profile_registry: OperatorProfileRegistry | None,
-        catalog: CatalogService | None,
+        validation_inputs: SessionInterpretationValidationInputs,
         runtime_preflight: SessionRuntimePreflight | None = None,
         inline_blob_snapshot: SessionInlineBlobSnapshot | None = None,
         expected_anchor: CompositionStateRecord | None = None,
@@ -1648,36 +1617,15 @@ class _SessionPendingInterpretationValidator:
         session_id: str,
         user_id: str | None,
     ) -> None:
-        from elspeth.web.catalog.service import CatalogServiceImpl
-        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
-        from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-
-        if type(profile_aware) is not bool:
-            raise TypeError("profile_aware must be an exact boolean")
-        for field_name, dependency, allowed_type in (
-            ("plugin_snapshot", plugin_snapshot, PluginAvailabilitySnapshot),
-            ("profile_registry", profile_registry, OperatorProfileRegistry),
-            ("catalog", catalog, CatalogServiceImpl),
-        ):
-            # Exact nominal typing is the whole guard (ADR-032): any other
-            # object, including one that merely wraps a runtime or authority
-            # handle, is refused here. The retired object-graph scanner that
-            # used to name the hidden handle was rejected by review (hidden
-            # carriers, pre-rejection traversal, unbounded work) and its
-            # replacement is the closed per-principal validation DTO.
-            if dependency is None or type(dependency) is allowed_type:
-                continue
-            raise TypeError(f"pending interpretation {field_name} must be the exact process-local {allowed_type.__name__}")
+        if type(validation_inputs) is not SessionInterpretationValidationInputs:
+            raise TypeError("pending interpretation validation_inputs must be exact SessionInterpretationValidationInputs")
         if type(session_id) is not str or not session_id:
             raise TypeError("pending interpretation session_id must be a nonblank exact string")
         if user_id is not None and type(user_id) is not str:
             raise TypeError("pending interpretation user_id must be an exact string or None")
         if runtime_preflight is not None and not callable(runtime_preflight):
             raise TypeError("pending interpretation runtime_preflight must be callable")
-        self.__profile_aware = profile_aware
-        self.__plugin_snapshot = plugin_snapshot
-        self.__profile_registry = profile_registry
-        self.__catalog = catalog
+        self.__validation_inputs = validation_inputs
         self.__runtime_preflight = runtime_preflight
         self.__inline_blob_snapshot = inline_blob_snapshot
         self.__expected_anchor = expected_anchor
@@ -1718,13 +1666,7 @@ class _SessionPendingInterpretationValidator:
                 validation_errors=None,
             )
         )
-        validation = _validate_patched_composition_state_for_policy(
-            candidate_state,
-            profile_aware=self.__profile_aware,
-            plugin_snapshot=self.__plugin_snapshot,
-            profile_registry=self.__profile_registry,
-            catalog=self.__catalog,
-        )
+        validation = validate_composition_state_with_interpretation_inputs(candidate_state, self.__validation_inputs).validation
         messages: tuple[str, ...] = tuple(error.message for error in validation.errors)
         is_valid = validation.is_valid
         # The persisted ``is_valid`` contract is the full runtime-preflight
@@ -1738,10 +1680,12 @@ class _SessionPendingInterpretationValidator:
                 if not inline_snapshot.assert_covers(InlinePreflightState.from_composition_state(candidate_state)):
                     raise AuditIntegrityError("pending interpretation candidate introduced an unprepared inline blob marker")
                 runtime = self.__runtime_preflight(
-                    candidate_state, self.__user_id, self.__session_id, self.__plugin_snapshot, inline_snapshot.content
+                    candidate_state, self.__user_id, self.__session_id, self.__validation_inputs.plugin_snapshot, inline_snapshot.content
                 )
             else:
-                runtime = self.__runtime_preflight(candidate_state, self.__user_id, self.__session_id, self.__plugin_snapshot)
+                runtime = self.__runtime_preflight(
+                    candidate_state, self.__user_id, self.__session_id, self.__validation_inputs.plugin_snapshot
+                )
             if not runtime.is_valid:
                 is_valid = False
                 messages = (*messages, *(error.message for error in runtime.errors))
