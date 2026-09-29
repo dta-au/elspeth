@@ -56,6 +56,7 @@ class CSSRecordsConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
     field: str = Field(min_length=1, max_length=128)
+    provenance_field: str | None = Field(default=None, min_length=1, max_length=128)
     selector: str = Field(min_length=1, max_length=512)
     columns: list[CSSRecordColumn] = Field(min_length=1, max_length=32)
     max_records: int = Field(default=200, ge=1, le=1000)
@@ -70,6 +71,13 @@ class CSSRecordsConfig(BaseModel):
             raise ValueError("records field must be nonempty and contain no surrounding whitespace or line breaks")
         return value
 
+    @field_validator("provenance_field")
+    @classmethod
+    def _validate_provenance_field_name(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or value != value.strip() or "\r" in value or "\n" in value):
+            raise ValueError("provenance_field must be nonempty and contain no surrounding whitespace or line breaks")
+        return value
+
     @field_validator("selector")
     @classmethod
     def _validate_selector(cls, value: str) -> str:
@@ -80,6 +88,8 @@ class CSSRecordsConfig(BaseModel):
         names = [column.field for column in self.columns]
         if len(names) != len(set(names)):
             raise ValueError("record column field names must be unique")
+        if self.provenance_field == self.field:
+            raise ValueError("provenance_field must differ from records field")
         return self
 
 

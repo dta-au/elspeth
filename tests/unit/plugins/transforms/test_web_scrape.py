@@ -1710,6 +1710,96 @@ def test_fixed_site_search_extracts_bounded_candidate_records(mock_ctx: PluginCo
 
 
 @respx.mock
+def test_structured_records_emit_separate_sanitized_provenance(mock_ctx: PluginContext) -> None:
+    respx.get(f"https://{_TEST_IP}:443/directory").mock(
+        return_value=httpx.Response(
+            200,
+            text='<main><a href="/one">Agency One</a><a href="/two">Agency Two</a></main>',
+            headers={"content-type": "text/html"},
+        )
+    )
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "candidate_sources",
+        "selector": "main",
+        "columns": [{"field": "links", "selector": "a", "attribute": "href", "multiple": "all", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    assert {"candidates", "candidate_sources"} <= transform.declared_output_fields
+    assert transform._output_schema_config is not None
+    assert {"candidates", "candidate_sources"} <= set(transform._output_schema_config.guaranteed_fields or ())
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"search_text": "Agency"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row is not None
+    emitted = result.row.to_dict()
+    assert emitted["candidates"] == [{"links": ["/one", "/two"]}]
+    assert emitted["candidate_sources"] == [
+        {
+            "links": {
+                "source_url": emitted["fetch_url_final"],
+                "record_selector": "main",
+                "selector": "a",
+                "attribute": "href",
+                "match_policy": "all",
+                "selected_count": 2,
+            }
+        }
+    ]
+    assert result.success_reason is not None
+    assert "candidate_sources" in result.success_reason["fields_added"]
+
+
+def test_structured_provenance_fingerprints_sensitive_final_url(mock_ctx: PluginContext) -> None:
+    options = _make_basic_transform_options()
+    options.pop("url_field")
+    options["url"] = "https://example.com/directory"
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "candidate_sources",
+        "selector": "main",
+        "columns": [{"field": "name", "selector": "a", "required": True}],
+    }
+    transform = WebScrapeTransform(options)
+    transform.on_start(mock_ctx)
+    response = httpx.Response(
+        200,
+        text="<main><a>Agency</a></main>",
+        headers={"content-type": "text/html"},
+        request=httpx.Request("GET", f"https://{_TEST_IP}:443/final"),
+    )
+    final_url = "https://example.com/final?access_token=secret-value"
+    call = mock_ctx.landscape.record_call.return_value
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()), patch.object(transform, "_fetch_url", return_value=(response, final_url, call)):
+        result = transform.process(make_pipeline_row({"search_text": "Agency"}), mock_ctx)
+
+    assert result.status == "success"
+    assert result.row is not None
+    emitted = result.row.to_dict()
+    assert "secret-value" not in repr(emitted)
+    assert emitted["candidate_sources"][0]["name"]["source_url"] == emitted["fetch_url_final"]
+
+
+def test_structured_provenance_field_rejects_output_collision() -> None:
+    options = _make_basic_transform_options()
+    options["records"] = {
+        "field": "candidates",
+        "provenance_field": "fetch_status",
+        "selector": "main",
+        "columns": [{"field": "name"}],
+    }
+    with pytest.raises(PluginConfigError, match="provenance_field"):
+        WebScrapeTransform(options)
+
+
+@respx.mock
 def test_search_candidate_limit_refuses_unreported_matches(mock_ctx: PluginContext) -> None:
     respx.get(f"https://{_TEST_IP}:443/directory").mock(
         return_value=httpx.Response(200, text="<main><li>One</li><li>Two</li></main>", headers={"content-type": "text/html"})
