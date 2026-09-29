@@ -37,14 +37,17 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.security.web import (
-    NetworkError as SSRFNetworkError,
-)
-from elspeth.core.security.web import (
+    HTTPOrigin,
     SSRFBlockedError,
     SSRFSafeRequest,
+    parse_http_origin,
+    validate_allowed_http_origin,
     validate_archived_ssrf_request,
     validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
+)
+from elspeth.core.security.web import (
+    NetworkError as SSRFNetworkError,
 )
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
@@ -188,6 +191,15 @@ class WebScrapeHTTPConfig(BaseModel):
         default="public_only",
         description="SSRF allowlist: 'public_only' (default), 'allow_private', or list of CIDR ranges",
     )
+    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _validate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        parsed = [parse_http_origin(value) for value in values]
+        if len(values) != len(set(parsed)):
+            raise ValueError("allowed_origins entries must be unique")
+        return values
 
     @field_validator("abuse_contact", "scraping_reason")
     @classmethod
@@ -311,6 +323,7 @@ class WebScrapeConfig(TransformDataConfig):
                 allowed_ranges = _parse_allowed_ranges(allowed_hosts)
             try:
                 validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
+                validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
                 raise ValueError(f"url: {exc}") from exc
         return self
@@ -627,7 +640,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d38c155493aecf52"
+    source_file_hash: str | None = "sha256:98106ac4c5446c6d"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -726,6 +739,7 @@ class WebScrapeTransform(BaseTransform):
         self._timeout = cfg.http.timeout
         self._max_body_bytes = cfg.http.max_body_bytes
         self._max_request_body_bytes = cfg.http.max_request_body_bytes
+        self._allowed_origins: tuple[HTTPOrigin, ...] = tuple(parse_http_origin(value) for value in cfg.http.allowed_origins)
 
         # Compute allowed_ranges from allowed_hosts config
         allowed_hosts = cfg.http.allowed_hosts
@@ -1037,6 +1051,7 @@ class WebScrapeTransform(BaseTransform):
                 raise FrameworkBugError("web_scrape has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
+            validate_allowed_http_origin(url, self._allowed_origins)
             if request_params:
                 try:
                     query_url = httpx.Request(self._method, url, params=request_params).url
@@ -1332,6 +1347,7 @@ class WebScrapeTransform(BaseTransform):
                     params=request_params or None,
                     follow_redirects=False,
                     allowed_ranges=self._allowed_ranges,
+                    allowed_origins=self._allowed_origins,
                 )
             else:
                 if request_params:
@@ -1342,6 +1358,7 @@ class WebScrapeTransform(BaseTransform):
                         params=request_params,
                         follow_redirects=True,
                         allowed_ranges=self._allowed_ranges,
+                        allowed_origins=self._allowed_origins,
                     )
                 else:
                     response, final_hostname_url, call = client.get_ssrf_safe(
@@ -1349,6 +1366,7 @@ class WebScrapeTransform(BaseTransform):
                         headers=headers,
                         follow_redirects=True,
                         allowed_ranges=self._allowed_ranges,
+                        allowed_origins=self._allowed_origins,
                     )
 
             # Check status code and raise appropriate errors

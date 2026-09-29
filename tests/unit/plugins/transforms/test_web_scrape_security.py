@@ -553,6 +553,28 @@ class TestAllowedHostsEndToEnd:
         assert result.status == "error"
         assert result.reason["error_type"] == "SSRFBlockedError"
 
+    def test_unapproved_row_origin_refused_before_dns(self, mock_ctx):
+        transform = WebScrapeTransform(
+            {
+                "schema": {"mode": "observed"},
+                "url_field": "url",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": {
+                    "abuse_contact": "ops@example.com",
+                    "scraping_reason": "test",
+                    "allowed_origins": ["https://example.gov.au"],
+                },
+            }
+        )
+        transform.on_start(mock_ctx)
+        with patch("socket.getaddrinfo") as resolve:
+            result = transform.process(make_pipeline_row({"url": "https://attacker.test/search?term=private"}), mock_ctx)
+        resolve.assert_not_called()
+        assert result.status == "error"
+        assert result.reason["cause"] == "origin_not_allowed"
+        assert "attacker" not in str(result.reason)
+
     def test_cloud_metadata_blocked_with_allow_private(self, allow_private_transform, mock_ctx):
         """Cloud metadata always blocked even with allow_private."""
         with patch("socket.getaddrinfo", _mock_getaddrinfo("169.254.169.254")):

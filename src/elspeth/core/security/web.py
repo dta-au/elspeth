@@ -34,6 +34,7 @@ from typing import Literal
 from elspeth.contracts.call_mode import ReplaySSRFRequest
 
 SSRFRefusalKind = Literal[
+    "origin_not_allowed",
     "malformed_url",
     "invalid_port",
     "missing_scheme",
@@ -354,6 +355,52 @@ def validate_configured_url_for_ssrf(
     if port == 0:
         raise SSRFBlockedError("Port 0 is not allowed", kind="port_zero")
     validate_literal_ip_for_ssrf(hostname, allowed_ranges=allowed_ranges)
+
+
+HTTPOrigin = tuple[str, str, int]
+
+
+def parse_http_origin(origin: str) -> HTTPOrigin:
+    """Parse a configured exact HTTP origin without resolving its hostname."""
+    if any(ord(char) < 33 or char == "\\" for char in origin):
+        raise ValueError("allowed_origins entries must not contain whitespace or backslashes")
+    try:
+        validate_url_scheme(origin)
+        parsed = _parse_url_for_validation(origin)
+        hostname = _validated_url_hostname(origin, parsed)
+        port = _validated_url_port(origin, parsed)
+    except (SSRFBlockedError, TypeError) as exc:
+        raise ValueError("allowed_origins entries must be HTTP(S) origins") from exc
+    if (
+        hostname is None
+        or port == 0
+        or "%" in parsed.netloc
+        or "?" in origin
+        or "#" in origin
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("allowed_origins entries must contain only scheme, hostname, and optional port")
+    return parsed.scheme.lower(), hostname.lower(), port or (443 if parsed.scheme.lower() == "https" else 80)
+
+
+def validate_allowed_http_origin(url: str, allowed_origins: Sequence[HTTPOrigin]) -> None:
+    """Refuse an unapproved destination before DNS or replay evidence is read."""
+    if not allowed_origins:
+        return
+    if any(ord(char) < 32 or char == "\\" for char in url):
+        raise SSRFBlockedError("URL contains an ambiguous HTTP origin", kind="origin_not_allowed")
+    validate_url_scheme(url)
+    parsed = _parse_url_for_validation(url)
+    hostname = _validated_url_hostname(url, parsed)
+    port = _validated_url_port(url, parsed)
+    if hostname is None or port == 0 or "%" in parsed.netloc:
+        raise SSRFBlockedError("URL has no valid HTTP origin", kind="origin_not_allowed")
+    origin = parsed.scheme.lower(), hostname.lower(), port or (443 if parsed.scheme.lower() == "https" else 80)
+    if origin not in allowed_origins:
+        raise SSRFBlockedError("HTTP origin is not allowed", kind="origin_not_allowed")
 
 
 @dataclass(frozen=True, slots=True)

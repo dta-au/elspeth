@@ -3,9 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+export PYTHONPATH="$ROOT/src:$ROOT/elspeth-lints/src${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON_BIN="${PYTHON_BIN:-.venv/bin/python}"
-ELSPETH_BIN="${ELSPETH_BIN:-.venv/bin/elspeth}"
+run_elspeth() {
+    "$PYTHON_BIN" -c 'from elspeth.cli import app; app()' "$@"
+}
 EXAMPLE=examples/fixed_web_search
 variant="${1:-directory}"
 case "$variant" in
@@ -56,7 +59,7 @@ start_server() {
 start_server
 
 set +e
-"$ELSPETH_BIN" run --settings "$SETTINGS" --execute \
+run_elspeth run --settings "$SETTINGS" --execute \
     > "$RUNS/pipeline.out" 2> "$RUNS/pipeline.err"
 pipeline_exit=$?
 set -e
@@ -106,7 +109,7 @@ PY
 
 stop_server
 set +e
-"$ELSPETH_BIN" run --settings "$RUNS/settings_replay.yaml" --execute \
+run_elspeth run --settings "$RUNS/settings_replay.yaml" --execute \
     > "$RUNS/replay.out" 2> "$RUNS/replay.err"
 replay_exit=$?
 set -e
@@ -118,7 +121,7 @@ fi
 
 start_server
 set +e
-"$ELSPETH_BIN" run --settings "$RUNS/settings_verify.yaml" --execute \
+run_elspeth run --settings "$RUNS/settings_verify.yaml" --execute \
     > "$RUNS/verify.out" 2> "$RUNS/verify.err"
 verify_exit=$?
 set -e

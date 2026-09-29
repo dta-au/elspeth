@@ -30,6 +30,8 @@ transforms:
         scraping_reason: Operator-approved public ABN Lookup search canary
         timeout: 20
         allowed_hosts: public_only
+        allowed_origins:
+          - https://abr.business.gov.au
       schema: {mode: observed}
 sinks:
   results:

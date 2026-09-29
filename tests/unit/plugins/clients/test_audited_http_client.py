@@ -1667,7 +1667,9 @@ class TestAuditedHTTPClientGet:
             )
 
         assert response.status_code == 200
-        assert final_url == "https://api.example.com/search?token=URL_SECRET&q=hello"
+        # httpx params replace a URL's existing query on the wire. The final
+        # logical URL must describe that request, including the mapped values.
+        assert final_url == "https://api.example.com/search?api_key=PARAM_SECRET&q=hello"
         ssrf_client.get.assert_called_once()
         assert ssrf_client.get.call_args[0][0] == "https://93.184.216.34:443/search?token=URL_SECRET&q=hello"
         assert ssrf_client.get.call_args[1]["params"] == {"api_key": "PARAM_SECRET", "q": "hello"}

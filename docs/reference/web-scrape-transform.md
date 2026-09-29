@@ -21,6 +21,7 @@ transforms:
         scraping_reason: "Compliance monitoring"
         timeout: 30
         allowed_hosts: public_only  # public_only | allow_private | CIDR list
+        allowed_origins: [https://example.gov.au]  # optional exact scheme, host, port
 
       strip_elements:
         - script
@@ -33,6 +34,13 @@ HTTP(S) address in each row; `url` fixes the absolute address in the node.
 The latter is useful when many rows search the same site. Both use the same
 request-time SSRF validation and IP pinning. A fixed URL is also checked at
 config time without DNS resolution. `blob_fetch` supports the same URL choice.
+
+Set `http.allowed_origins` to restrict the initial URL and every redirect to
+the listed HTTP(S) origins. Matching uses the scheme, hostname, and effective
+port (80 or 443 when omitted); subdomains and a switch from HTTPS to HTTP are
+different origins. An unapproved row URL is refused before DNS. This setting
+does not replace `http.allowed_hosts`: the resolved IP is still checked against
+that policy. `blob_fetch` accepts the same origin setting.
 
 For a public search endpoint, keep the destination in `url` and map each
 query parameter to a row field with `query_fields`:
@@ -49,6 +57,7 @@ transforms:
       http:
         abuse_contact: compliance@example.com
         scraping_reason: Approved public register search
+        allowed_origins: [https://abr.business.gov.au]
       schema: {mode: observed}
 ```
 
@@ -179,6 +188,7 @@ hardcodes the fix; the plugin owns it.
 
 - SSRF prevention (blocks private IPs, loopback, cloud metadata)
 - Configurable host policy via `http.allowed_hosts`
+- Optional exact destination and redirect policy via `http.allowed_origins`
 - Scheme whitelist (http/https only)
 - SSL certificate verification (always enabled)
 

@@ -23,14 +23,17 @@ from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
-from elspeth.core.security.web import NetworkError as SSRFNetworkError
 from elspeth.core.security.web import (
+    HTTPOrigin,
     SSRFBlockedError,
     SSRFSafeRequest,
+    parse_http_origin,
+    validate_allowed_http_origin,
     validate_archived_ssrf_request,
     validate_configured_url_for_ssrf,
     validate_url_for_ssrf,
 )
+from elspeth.core.security.web import NetworkError as SSRFNetworkError
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
@@ -93,6 +96,15 @@ class BlobFetchHTTPConfig(BaseModel):
         default="public_only",
         description="SSRF allowlist: 'public_only', 'allow_private', or explicit CIDR ranges.",
     )
+    allowed_origins: tuple[str, ...] = Field(default=(), description="Exact HTTP(S) origins permitted for initial requests and redirects.")
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def _validate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        parsed = [parse_http_origin(value) for value in values]
+        if len(values) != len(set(parsed)):
+            raise ValueError("allowed_origins entries must be unique")
+        return values
 
     @field_validator("abuse_contact", "fetch_reason")
     @classmethod
@@ -191,6 +203,7 @@ class BlobFetchConfig(TransformDataConfig):
                 allowed_ranges = _parse_allowed_ranges(allowed_hosts)
             try:
                 validate_configured_url_for_ssrf(self.url, allowed_ranges=allowed_ranges)
+                validate_allowed_http_origin(self.url, tuple(parse_http_origin(value) for value in self.http.allowed_origins))
             except SSRFBlockedError as exc:
                 raise ValueError(f"url: {exc}") from exc
         return self
@@ -319,7 +332,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9a98ca4a95aeecbd"
+    source_file_hash: str | None = "sha256:72d46ee06d8794da"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -381,6 +394,7 @@ class BlobFetch(BaseTransform):
         self._fetch_reason = cfg.http.fetch_reason
         self._timeout = cfg.http.timeout
         self._max_body_bytes = cfg.http.max_body_bytes
+        self._allowed_origins: tuple[HTTPOrigin, ...] = tuple(parse_http_origin(value) for value in cfg.http.allowed_origins)
 
         allowed_hosts = cfg.http.allowed_hosts
         if allowed_hosts == "public_only":
@@ -522,6 +536,7 @@ class BlobFetch(BaseTransform):
                 raise FrameworkBugError("blob_fetch has no configured URL source")
             if type(url) is not str:
                 raise TypeError("URL field must be a string")
+            validate_allowed_http_origin(url, self._allowed_origins)
             session = ctx.call_mode_session
             if session is not None and session.mode is RunMode.REPLAY:
                 archived = session.replay_ssrf_request(
@@ -681,6 +696,7 @@ class BlobFetch(BaseTransform):
                 headers=headers,
                 follow_redirects=True,
                 allowed_ranges=self._allowed_ranges,
+                allowed_origins=self._allowed_origins,
             )
             if response.status_code == 404:
                 raise NotFoundError("HTTP 404")

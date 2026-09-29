@@ -6,6 +6,11 @@ local government-style directory with the query key `q`; `settings_abn_page.yaml
 uses ABN Lookup's public results address with the query key `SearchText`. The
 plugin code is identical for both.
 
+`http.allowed_origins` restricts requests and redirects to exact scheme,
+hostname, and port. It is independent of `allowed_hosts`, which still validates
+the resolved IP address. Set the origins to the site you are approved to query;
+the ABN address is only an example.
+
 Run the three three-row local fixtures with
 `./examples/fixed_web_search/run_fixture.sh directory` and
 `./examples/fixed_web_search/run_fixture.sh registry`, then

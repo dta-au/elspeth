@@ -110,6 +110,7 @@ class BodyTooLargeError(WebScrapeError):
 # with one fixed sentence per kind.
 URL_POLICY_REFUSAL_TEXT: Mapping[SSRFRefusalKind | DNSFailureKind, str] = MappingProxyType(
     {
+        "origin_not_allowed": "the row's URL origin is not allowed",
         "malformed_url": "the row's URL is malformed",
         "invalid_port": "the row's URL has an invalid port",
         "missing_scheme": "the row's URL has no scheme (expected http:// or https://)",

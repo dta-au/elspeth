@@ -35,6 +35,8 @@ transforms:
         timeout: 5
         allowed_hosts:
           - 127.0.0.0/8
+        allowed_origins:
+          - http://127.0.0.1:8213
       schema: {mode: observed}
 sinks:
   results:

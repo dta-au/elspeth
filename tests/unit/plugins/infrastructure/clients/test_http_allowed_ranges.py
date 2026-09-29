@@ -25,7 +25,7 @@ import pytest
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
-from elspeth.core.security.web import SSRFSafeRequest
+from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest, parse_http_origin
 from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
@@ -276,6 +276,50 @@ class TestRedirectAllowedRangesThreading:
                 assert call_kwargs.kwargs.get("allowed_ranges") == allowed or (
                     len(call_kwargs.args) > 1 and call_kwargs.args[1] == allowed
                 ), f"validate_url_for_ssrf was called during redirect but allowed_ranges was not passed through. Call args: {call_kwargs}"
+        finally:
+            client.close()
+
+    def test_unapproved_redirect_is_audited_and_refused_before_dns(self, fake_execution, telemetry_sink) -> None:
+        from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
+
+        initial_request = SSRFSafeRequest(
+            original_url="https://example.gov.au/start",
+            resolved_ip="203.0.113.10",
+            host_header="example.gov.au",
+            port=443,
+            path="/start",
+            scheme="https",
+            bare_hostname="example.gov.au",
+        )
+        redirect_response = httpx.Response(
+            302,
+            headers={"location": "https://other.gov.au/search"},
+            request=httpx.Request("GET", "https://203.0.113.10:443/start"),
+        )
+        factory = FakeHTTPClientFactory([redirect_response])
+        client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
+            execution=fake_execution,
+            state_id="test-state",
+            run_id="test-run",
+            telemetry_emit=telemetry_sink,
+        )
+        try:
+            with (
+                patch("elspeth.plugins.infrastructure.clients.http.validate_url_for_ssrf") as dns_validate,
+                patch("httpx.Client", new=factory),
+                pytest.raises(SSRFBlockedError, match="origin") as exc,
+            ):
+                client.get_ssrf_safe(
+                    initial_request,
+                    follow_redirects=True,
+                    allowed_origins=(parse_http_origin("https://example.gov.au"),),
+                )
+            assert exc.value.kind == "origin_not_allowed"
+            dns_validate.assert_not_called()
+            assert len(factory.clients) == 1
+            assert [call.call_type.value for call in fake_execution.calls] == ["http_redirect", "http"]
+            assert all(call.status.value == "error" for call in fake_execution.calls)
         finally:
             client.close()
 

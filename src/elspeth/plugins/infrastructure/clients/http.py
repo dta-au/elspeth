@@ -41,7 +41,9 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
 from elspeth.core.canonical import stable_hash
 from elspeth.core.security.web import (
+    HTTPOrigin,
     SSRFSafeRequest,
+    validate_allowed_http_origin,
     validate_url_for_ssrf,
 )
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
@@ -509,6 +511,7 @@ class AuditedHTTPClient(AuditedClientBase):
         call_index: int,
         follow_redirects: bool,
         max_redirects: int,
+        allowed_origins: Sequence[HTTPOrigin],
     ) -> tuple[httpx.Response, str, Call]:
         session = self._call_mode_session
         if session is None or session.mode is not RunMode.REPLAY:
@@ -609,6 +612,7 @@ class AuditedHTTPClient(AuditedClientBase):
             archived_hop_url = hop_request["url"]
             if type(archived_hop_url) is not str:
                 raise AuditIntegrityError(f"SSRF-safe HTTP replay hop {hop_evidence.source_call_id} lacks logical URL")
+            validate_allowed_http_origin(archived_hop_url, allowed_origins)
             last_hop_url = archived_hop_url
             last_hop_transport_url = hop_url
             self._restore_replay_response(
@@ -650,6 +654,7 @@ class AuditedHTTPClient(AuditedClientBase):
         logical_url = transport["logical_url"]
         if type(logical_url) is not str:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} lacks logical URL")
+        validate_allowed_http_origin(logical_url, allowed_origins)
         if _fingerprint_url(logical_url) != logical_url:
             raise AuditIntegrityError(f"SSRF-safe HTTP replay call {evidence.source_call_id} has unsafe logical URL")
         expected_logical_url = str(httpx.Request(method, request.original_url, params=params).url)
@@ -1200,6 +1205,7 @@ class AuditedHTTPClient(AuditedClientBase):
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        allowed_origins: Sequence[HTTPOrigin] = (),
         verify_source_call_id: str | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """HTTP request with SSRF-safe IP pinning and redirect validation.
@@ -1243,6 +1249,7 @@ class AuditedHTTPClient(AuditedClientBase):
             encode_urlencoded_form(form)
             if any(key.casefold() == "content-type" for key in (headers or {})):
                 raise ValueError("form content type is controlled by AuditedHTTPClient")
+        validate_allowed_http_origin(request.original_url, allowed_origins)
         if self._semantic_managed_identity_verify:
             if not verify_source_call_id:
                 raise AuditIntegrityError("Managed identity verify requires a preflight source call")
@@ -1295,6 +1302,7 @@ class AuditedHTTPClient(AuditedClientBase):
                 call_index=call_index,
                 follow_redirects=follow_redirects,
                 max_redirects=max_redirects,
+                allowed_origins=allowed_origins,
             )
 
         if self._semantic_managed_identity_verify:
@@ -1349,6 +1357,7 @@ class AuditedHTTPClient(AuditedClientBase):
                     merged_headers,
                     original_url=logical_request_url,
                     allowed_ranges=allowed_ranges,
+                    allowed_origins=allowed_origins,
                     replay_hops=replay_hops,
                 )
 
@@ -1477,6 +1486,7 @@ class AuditedHTTPClient(AuditedClientBase):
         follow_redirects: bool = False,
         max_redirects: int = 10,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        allowed_origins: Sequence[HTTPOrigin] = (),
         verify_source_call_id: str | None = None,
     ) -> tuple[httpx.Response, str, Call]:
         """GET with SSRF-safe IP pinning and redirect validation.
@@ -1491,6 +1501,7 @@ class AuditedHTTPClient(AuditedClientBase):
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             allowed_ranges=allowed_ranges,
+            allowed_origins=allowed_origins,
             verify_source_call_id=verify_source_call_id,
         )
 
@@ -1503,6 +1514,7 @@ class AuditedHTTPClient(AuditedClientBase):
         original_url: str,
         *,
         allowed_ranges: Sequence[IPv4Network | IPv6Network] = (),
+        allowed_origins: Sequence[HTTPOrigin] = (),
         replay_hops: list[HTTPRedirectReplayHop] | None = None,
     ) -> tuple[httpx.Response, int, str]:
         """Follow HTTP redirects with SSRF validation at each hop.
@@ -1577,6 +1589,7 @@ class AuditedHTTPClient(AuditedClientBase):
 
             # CRITICAL: Validate the redirect target for SSRF
             try:
+                validate_allowed_http_origin(redirect_url, allowed_origins)
                 redirect_request = validate_url_for_ssrf(redirect_url, allowed_ranges=allowed_ranges)
             except contract_errors.TIER_1_ERRORS:
                 raise
