@@ -11,10 +11,24 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlsplit
 
+_ENTITY_MATCHES = {
+    "Riverdale Council": (("Riverdale Council", "RC-001"),),
+    "North Coast Trading": (
+        ("North Coast Trading Pty Ltd", "NCT-101"),
+        ("North Coast Trading Services", "NCT-102"),
+    ),
+}
+_ENTITY_DETAILS = {
+    "RC-001": ("Riverdale Council", "active"),
+    "NCT-101": ("North Coast Trading Pty Ltd", "active"),
+    "NCT-102": ("North Coast Trading Services", "inactive"),
+}
+
 
 class SearchHandler(BaseHTTPRequestHandler):
     access_log: Path
     wire_log: Path
+    server_port: int = 8213
 
     @staticmethod
     def _matches(query: str) -> list[str]:
@@ -28,6 +42,25 @@ class SearchHandler(BaseHTTPRequestHandler):
     def _directory_html(cls, query: str) -> bytes:
         entries = "".join(f"<li>{html.escape(match)}</li>" for match in cls._matches(query))
         return f"<main><h1>Results for {html.escape(query)}</h1><ul>{entries}</ul></main>".encode()
+
+    @classmethod
+    def _entity_search_html(cls, query: str) -> bytes:
+        entries = "".join(
+            f'<article class="candidate"><a href="http://127.0.0.1:{cls.server_port}/entity/{entity_id}">{html.escape(name)}</a></article>'
+            for name, entity_id in _ENTITY_MATCHES.get(query, ())
+        )
+        return f'<main class="entity-results"><h1>{html.escape(query)}</h1>{entries}</main>'.encode()
+
+    @classmethod
+    def _entity_detail_html(cls, entity_id: str) -> bytes:
+        name, status = _ENTITY_DETAILS[entity_id]
+        return (
+            '<main class="entity-detail">'
+            f'<h1 class="legal-name">{html.escape(name)}</h1>'
+            f'<p class="registry-id">{html.escape(entity_id)}</p>'
+            f'<p class="record-status">{html.escape(status)}</p>'
+            "</main>"
+        ).encode()
 
     def _send_html(self, body: bytes) -> None:
         self.send_response_only(200)
@@ -57,6 +90,14 @@ class SearchHandler(BaseHTTPRequestHandler):
                 )
                 body = f'<section class="results"><header>{html.escape(query)}</header>{entries}</section>'.encode()
             self._record_query(query)
+        elif parsed.path == "/entity-search":
+            query = parse_qs(parsed.query).get("name", [""])[0]
+            body = self._entity_search_html(query)
+            self._record_query(f"search:{query}")
+        elif parsed.path.startswith("/entity/") and parsed.path.removeprefix("/entity/") in _ENTITY_DETAILS:
+            entity_id = parsed.path.removeprefix("/entity/")
+            body = self._entity_detail_html(entity_id)
+            self._record_query(f"detail:{entity_id}")
         else:
             self.send_error(404)
             return
@@ -127,7 +168,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--access-log", type=Path, required=True)
     parser.add_argument("--wire-log", type=Path, required=True)
+    parser.add_argument("--port", type=int, default=8213)
     args = parser.parse_args()
     SearchHandler.access_log = args.access_log
     SearchHandler.wire_log = args.wire_log
-    HTTPServer(("127.0.0.1", 8213), SearchHandler).serve_forever()
+    SearchHandler.server_port = args.port
+    HTTPServer(("127.0.0.1", args.port), SearchHandler).serve_forever()

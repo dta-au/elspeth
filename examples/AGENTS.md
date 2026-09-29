@@ -182,6 +182,10 @@ rows, then offline replay and live verification. It refuses to overwrite an exis
 `settings_abn_page.yaml` targets the public ABN Lookup results page as a small
 live example; it is not part of the offline fixture check.
 
+`./examples/fixed_web_search/run_detail_fixture.sh` runs a separate loopback
+search-to-detail pipeline on port 8215. It checks zero, one, and multiple
+candidate outcomes, source-to-output lineage, offline replay, and live verify.
+
 ### Chroma RAG (embedded, no external server)
 
 ChromaDB runs embedded — no server setup needed, but requires `chromadb` package.

@@ -1,0 +1,201 @@
+# Generic public-register workflow: search, inspect every candidate, then classify.
+# The names and identifiers belong only to the loopback fixture.
+sources:
+  primary:
+    plugin: csv
+    on_success: searches
+    options:
+      path: examples/fixed_web_search/input_detail.csv
+      schema:
+        mode: fixed
+        fields:
+          - 'id: int'
+          - 'search_text: str'
+      on_validation_failure: discard
+
+transforms:
+  - name: search_page
+    plugin: web_scrape
+    input: searches
+    on_success: search_results
+    on_error: failures
+    options:
+      url: http://127.0.0.1:8215/entity-search
+      query_fields: {name: search_text}
+      content_field: search_html
+      fingerprint_field: search_fingerprint
+      format: raw
+      records:
+        field: candidates
+        selector: main.entity-results article.candidate
+        max_records: 10
+        columns:
+          - field: candidate_name
+            selector: a
+            required: true
+          - field: detail_url
+            selector: a
+            attribute: href
+            required: true
+      http:
+        abuse_contact: examples@example.com
+        scraping_reason: Local public-register search fixture
+        timeout: 5
+        allowed_hosts: [127.0.0.0/8]
+        allowed_origins: [http://127.0.0.1:8215]
+      schema: {mode: observed}
+
+  - name: count_candidates
+    plugin: value_transform
+    input: search_results
+    on_success: counted_searches
+    on_error: failures
+    options:
+      operations:
+        - target: candidate_count
+          expression: "len(row['candidates'])"
+      schema: {mode: observed}
+
+  - name: expand_candidates
+    plugin: json_explode
+    input: candidates_found
+    on_success: candidate_rows
+    on_error: failures
+    options:
+      array_field: candidates
+      output_field: candidate
+      include_index: true
+      schema: {mode: observed}
+
+  - name: prepare_detail_url
+    plugin: field_mapper
+    input: candidate_rows
+    on_success: detail_urls
+    on_error: failures
+    options:
+      select_only: true
+      mapping:
+        id: source_id
+        search_text: search_text
+        candidate_count: candidate_count
+        item_index: candidate_index
+        candidate.candidate_name: candidate_name
+        candidate.detail_url: detail_url
+        search_fingerprint: search_fingerprint
+      schema: {mode: observed}
+
+  - name: detail_page
+    plugin: web_scrape
+    input: detail_urls
+    on_success: detail_pages
+    on_error: failures
+    options:
+      url_field: detail_url
+      content_field: detail_html
+      fingerprint_field: detail_fingerprint
+      format: raw
+      records:
+        field: detail_records
+        selector: main.entity-detail
+        max_records: 1
+        columns:
+          - field: legal_name
+            selector: h1.legal-name
+            required: true
+          - field: registry_id
+            selector: .registry-id
+            required: true
+          - field: record_status
+            selector: .record-status
+            required: true
+      http:
+        abuse_contact: examples@example.com
+        scraping_reason: Local public-register detail fixture
+        timeout: 5
+        allowed_hosts: [127.0.0.0/8]
+        allowed_origins: [http://127.0.0.1:8215]
+      schema: {mode: observed}
+
+  - name: expand_detail_record
+    plugin: json_explode
+    input: detail_pages
+    on_success: extracted_details
+    on_error: failures
+    options:
+      array_field: detail_records
+      output_field: detail
+      include_index: false
+      schema: {mode: observed}
+
+  - name: project_detail_fields
+    plugin: field_mapper
+    input: extracted_details
+    on_success: classify_details
+    on_error: failures
+    options:
+      select_only: true
+      mapping:
+        source_id: source_id
+        search_text: search_text
+        candidate_count: candidate_count
+        candidate_index: candidate_index
+        candidate_name: candidate_name
+        detail_url: detail_url
+        search_fingerprint: search_fingerprint
+        detail_fingerprint: detail_fingerprint
+        fetch_url_final: detail_url_final
+        detail.legal_name: legal_name
+        detail.registry_id: registry_id
+        detail.record_status: record_status
+      schema: {mode: observed}
+
+gates:
+  - name: has_candidates
+    input: counted_searches
+    condition: "row['candidate_count'] == 0"
+    routes:
+      'true': no_results
+      'false': candidates_found
+  - name: classify_candidate_set
+    input: classify_details
+    condition: "row['candidate_count'] == 1"
+    routes:
+      'true': one_candidate
+      'false': ambiguous_candidates
+
+sinks:
+  one_candidate:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_detail/one_candidate.jsonl
+      schema: {mode: observed}
+      format: jsonl
+  ambiguous_candidates:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_detail/ambiguous_candidates.jsonl
+      schema: {mode: observed}
+      format: jsonl
+  no_results:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_detail/no_results.jsonl
+      schema: {mode: observed}
+      format: jsonl
+  failures:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/fixed_web_search/output_detail/failures.jsonl
+      schema: {mode: observed}
+      format: jsonl
+
+landscape:
+  url: sqlite:///examples/fixed_web_search/runs_detail/audit.db
+payload_store:
+  base_path: examples/fixed_web_search/runs_detail/payloads
+concurrency:
+  max_workers: 1

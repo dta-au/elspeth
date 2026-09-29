@@ -51,3 +51,28 @@ The live page may change its address or markup. This configuration fetches the
 HTML result page; it does not follow detail links or interpret ABN status. A
 batch validation workflow needs site-specific selectors and matching rules,
 rate limits, and restart handling before using the results as decisions.
+
+## Search, expand candidates, and inspect detail pages
+
+`settings_fixture_detail.yaml` is a generic public-register example. It sends
+each input name to a fixed search address, extracts bounded candidate names and
+absolute detail URLs, and computes the candidate count. A zero count goes to
+`no_results.jsonl`. Other searches expand one row per candidate, fetch each
+detail URL under an exact origin allowlist, and extract the legal name,
+registry ID, and record status. A one-candidate search goes to
+`one_candidate.jsonl`; multiple candidates go to
+`ambiguous_candidates.jsonl`, with **all** candidate details retained. The
+pipeline does not decide which ambiguous record matches the input, and neither
+a detail status nor a one-candidate result is an identity-validation decision.
+
+Run `./examples/fixed_web_search/run_detail_fixture.sh` for a fully local
+acceptance check. It uses its own server on port 8215 and refuses to overwrite
+existing `runs_detail/` or `output_detail/`. The runner checks three search
+requests, three detail requests, the three output classes, and the token-parent
+chain from each output back to one of the three source rows. It then replays
+all six calls without a server and verifies all six against the restarted
+fixture. The three example names and IDs are fictitious. This configuration
+expects absolute detail links in the search page. For a real site,
+replace the selectors, allowed origin, query key, source, contact address, and
+rate policy with the site's actual approved contract; keep the ambiguous and
+no-result branches as explicit review outcomes.
