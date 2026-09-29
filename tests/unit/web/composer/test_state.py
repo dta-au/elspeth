@@ -32,6 +32,61 @@ from elspeth.web.composer.yaml_generator import generate_yaml
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
+@pytest.mark.parametrize("auth", [{}, {"credential": "literal"}, {"credential": None}, {"credential": {"secret_ref": "WEB_TOKEN"}}])
+def test_web_scrape_auth_is_unavailable_during_authoring(auth: dict[str, object]) -> None:
+    state = CompositionState(
+        sources={"default": SourceSpec(plugin="csv", on_success="scrape", options={}, on_validation_failure="discard")},
+        nodes=(
+            NodeSpec.from_dict(
+                {
+                    "id": "scrape",
+                    "node_type": "transform",
+                    "plugin": "web_scrape",
+                    "input": "scrape",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": {"auth": auth},
+                }
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    errors = [error for error in state.validate().errors if error.error_code == "web_scrape_auth_unavailable"]
+    assert len(errors) == 1
+    assert errors[0].component == "node:scrape"
+    assert errors[0].severity == "high"
+    assert "response evidence" in errors[0].message
+    assert "literal" not in errors[0].message
+
+
+@pytest.mark.parametrize(("plugin", "options"), [("web_scrape", {}), ("web_scrape", {"auth": None}), ("passthrough", {"auth": {}})])
+def test_auth_refusal_does_not_reject_unauthenticated_or_other_plugins(plugin: str, options: dict[str, object]) -> None:
+    state = CompositionState(
+        sources={"default": SourceSpec(plugin="csv", on_success="scrape", options={}, on_validation_failure="discard")},
+        nodes=(
+            NodeSpec.from_dict(
+                {
+                    "id": "scrape",
+                    "node_type": "transform",
+                    "plugin": plugin,
+                    "input": "scrape",
+                    "on_success": "out",
+                    "on_error": "discard",
+                    "options": options,
+                }
+            ),
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    assert not any(error.error_code == "web_scrape_auth_unavailable" for error in state.validate().errors)
+
+
 class TestSourceSpec:
     def test_frozen(self) -> None:
         s = SourceSpec(plugin="csv", on_success="t1", options={}, on_validation_failure="discard")

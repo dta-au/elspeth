@@ -255,6 +255,11 @@
       "search_parts"
     ]
   },
+  "examples/fixed_web_search/settings_fixture_pagination.yaml": {
+    "transform:search_pages": [
+      "search_text"
+    ]
+  },
   "examples/fixed_web_search/settings_fixture_registry.yaml": {
     "transform:search_page": [
       "search_text"
