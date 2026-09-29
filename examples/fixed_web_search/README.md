@@ -71,8 +71,13 @@ existing `runs_detail/` or `output_detail/`. The runner checks three search
 requests, three detail requests, the three output classes, and the token-parent
 chain from each output back to one of the three source rows. It then replays
 all six calls without a server and verifies all six against the restarted
-fixture. The three example names and IDs are fictitious. This configuration
-expects absolute detail links in the search page. For a real site,
+fixture. The three example names and IDs are fictitious. Its search page emits
+relative detail links; `resolve_url: true` joins them to the actual final
+response URL and admits them under the declared origin policy before the row
+is persisted. Resolved candidate URLs and URL/error metadata are checked for
+sensitive query values; the fetched HTML remains exact audited response bytes
+and may contain site tokens. Sites with secret-bearing HTML need a separate
+classified response-evidence boundary. For a real site,
 replace the selectors, allowed origin, query key, source, contact address, and
 rate policy with the site's actual approved contract; keep the ambiguous and
 no-result branches as explicit review outcomes.

@@ -28,7 +28,6 @@ _ENTITY_DETAILS = {
 class SearchHandler(BaseHTTPRequestHandler):
     access_log: Path
     wire_log: Path
-    server_port: int = 8213
 
     @staticmethod
     def _matches(query: str) -> list[str]:
@@ -43,10 +42,10 @@ class SearchHandler(BaseHTTPRequestHandler):
         entries = "".join(f"<li>{html.escape(match)}</li>" for match in cls._matches(query))
         return f"<main><h1>Results for {html.escape(query)}</h1><ul>{entries}</ul></main>".encode()
 
-    @classmethod
-    def _entity_search_html(cls, query: str) -> bytes:
+    @staticmethod
+    def _entity_search_html(query: str) -> bytes:
         entries = "".join(
-            f'<article class="candidate"><a href="http://127.0.0.1:{cls.server_port}/entity/{entity_id}">{html.escape(name)}</a></article>'
+            f'<article class="candidate"><a href="/entity/{entity_id}">{html.escape(name)}</a></article>'
             for name, entity_id in _ENTITY_MATCHES.get(query, ())
         )
         return f'<main class="entity-results"><h1>{html.escape(query)}</h1>{entries}</main>'.encode()
@@ -172,5 +171,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     SearchHandler.access_log = args.access_log
     SearchHandler.wire_log = args.wire_log
-    SearchHandler.server_port = args.port
     HTTPServer(("127.0.0.1", args.port), SearchHandler).serve_forever()

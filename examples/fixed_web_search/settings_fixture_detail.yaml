@@ -36,6 +36,7 @@ transforms:
           - field: detail_url
             selector: a
             attribute: href
+            resolve_url: true
             required: true
       http:
         abuse_contact: examples@example.com

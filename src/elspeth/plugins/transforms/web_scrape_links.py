@@ -35,6 +35,8 @@ def resolve_discovered_href(
     The downstream row-URL transform resolves, checks, and pins the destination
     IP again immediately before dispatch. A configured exact origin is required
     so a page cannot emit links to arbitrary hosts in the meantime.
+    This only protects emitted href row values and URL metadata. The fetched
+    HTML remains exact audited response evidence and may contain page tokens.
     """
     if not allowed_origins:
         raise ValueError("resolved links require http.allowed_origins")
