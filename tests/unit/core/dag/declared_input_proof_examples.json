@@ -199,6 +199,67 @@
   "examples/explicit_routing/settings.yaml": {
     "transform:enrich": []
   },
+  "examples/fixed_web_search/settings_abn_page.yaml": {
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture.yaml": {
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_detail.yaml": {
+    "transform:count_candidates": [],
+    "transform:detail_page": [
+      "detail_url"
+    ],
+    "transform:expand_candidates": [
+      "candidates"
+    ],
+    "transform:expand_detail_record": [
+      "detail_records"
+    ],
+    "transform:prepare_detail_url": [
+      "candidate",
+      "candidate_count",
+      "id",
+      "item_index",
+      "search_fingerprint",
+      "search_text"
+    ],
+    "transform:project_detail_fields": [
+      "candidate_count",
+      "candidate_index",
+      "candidate_name",
+      "detail",
+      "detail_fingerprint",
+      "detail_url",
+      "fetch_url_final",
+      "search_fingerprint",
+      "search_text",
+      "source_id"
+    ],
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_form.yaml": {
+    "transform:search_page": [
+      "search_form"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_multipart.yaml": {
+    "transform:search_page": [
+      "fixture_id",
+      "search_parts"
+    ]
+  },
+  "examples/fixed_web_search/settings_fixture_registry.yaml": {
+    "transform:search_page": [
+      "search_text"
+    ]
+  },
   "examples/fork_coalesce/settings.yaml": {
     "transform:preprocess": []
   },

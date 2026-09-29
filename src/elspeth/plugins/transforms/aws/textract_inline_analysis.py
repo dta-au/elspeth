@@ -260,7 +260,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:74490c146392334b"
+    source_file_hash: str | None = "sha256:229d85c78907213d"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED
@@ -706,6 +706,10 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
                 if content_hash != _PROBE_DOCUMENT_SHA256:
                     raise PayloadNotFoundError(content_hash)
                 return _PROBE_DOCUMENT_BYTES
+
+            def retrieve_bounded(self, content_hash: str, *, max_bytes: int) -> bytes | None:
+                content = self.retrieve(content_hash)
+                return content if len(content) <= max_bytes else None
 
             def exists(self, content_hash: str) -> bool:
                 return content_hash == _PROBE_DOCUMENT_SHA256

@@ -78,8 +78,9 @@ KNOWN LIMITS, so nobody reads more assurance into this than it carries:
   that shape would be rejected for the wrong reason. The control mutation below
   is what keeps that honest: an option that cannot first be repointed at an
   ordinary arriving column is reported rather than counted as covered.
-* A scalar option can require another config mode. ``web_scrape.request_json_field``
-  is legal only for POST, so the mutation below enables POST for that option's
+* A scalar option can require another config mode. ``web_scrape``'s
+  ``request_json_field``, ``request_form_field`` and ``request_multipart_field``
+  are legal only for POST, so the mutation below enables POST for those options'
   control and candidate while leaving the ordinary GET probe intact.
 """
 
@@ -216,10 +217,13 @@ def _input_naming_options(cls: type[BaseTransform], probe: BaseTransform) -> dic
     return options
 
 
+_WEB_SCRAPE_POST_BODY_OPTIONS = frozenset({"request_json_field", "request_form_field", "request_multipart_field"})
+
+
 def _base_for_option(cls: type[BaseTransform], base: dict[str, Any], option: str) -> dict[str, Any]:
     """Keep mode-dependent options legal so the mutation isolates a field collision."""
     configured = copy.deepcopy(base)
-    if cls.name == "web_scrape" and option == "request_json_field":
+    if cls.name == "web_scrape" and option in _WEB_SCRAPE_POST_BODY_OPTIONS:
         configured["method"] = "POST"
     return configured
 
@@ -303,9 +307,9 @@ class TestInputOptionsDoNotNameCreatedFields:
         probe = WebScrapeTransform(WebScrapeTransform.probe_config())
         options = _input_naming_options(WebScrapeTransform, probe)
 
-        assert set(options) == {"url_field", "request_json_field"}
+        assert set(options) == {"url_field", *_WEB_SCRAPE_POST_BODY_OPTIONS}
         assert options["url_field"] not in probe.self_created_input_fields
-        assert options["request_json_field"] is None
+        assert all(options[option] is None for option in _WEB_SCRAPE_POST_BODY_OPTIONS)
         assert sorted(probe.self_created_input_fields)[0] in probe.declared_output_fields
 
     def test_llm_is_unswept_because_it_has_no_scalar_naming_option(self) -> None:
