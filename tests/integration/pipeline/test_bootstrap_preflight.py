@@ -329,12 +329,13 @@ class TestBootstrapProgrammaticExecution:
     def test_orchestrator_context_preserves_named_sources(self) -> None:
         """CLI PipelineConfig assembly carries plural source instances into runtime."""
         from elspeth.cli import _orchestrator_context
+        from tests.fixtures.plugins import ListSource
 
         mock_config = _make_bootstrap_config()
         mock_config.checkpoint.enabled = False
         mock_graph = _GraphStub()
-        first_source = object()
-        second_source = object()
+        first_source = ListSource([], name="orders", on_success="out")
+        second_source = ListSource([], name="refunds", on_success="out")
         mock_plugins = SimpleNamespace(
             transforms=[],
             aggregations={},
