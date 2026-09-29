@@ -9,6 +9,7 @@ author see one wording.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -16,10 +17,105 @@ from pydantic import ValidationError
 
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import (
+    CompositionState,
+    NodeSpec,
+    OutputSpec,
+    PipelineMetadata,
+    SourceSpec,
+    _validate_multi_query_generated_input_requirements,
+)
 from elspeth.web.composer.tools.generation import _CLOSED_VALIDATION_ERROR_CODES, explain_validation_code
 
 _CODE = "query_input_columns_undeclared"
+
+
+@pytest.mark.parametrize("list_form", [False, True])
+@pytest.mark.parametrize("consumer", ["required", "alias", "source_row", "schema", "image", "image_format"])
+def test_generated_input_conflict_has_same_stage_one_and_plugin_message(list_form: bool, consumer: str) -> None:
+    query = {"input_fields": {"text": "body"}, "template": "{{ row.text }}", "output_fields": [{"suffix": "answer", "type": "string"}]}
+    options = _options([], {"classify": query})
+    if consumer == "required":
+        options["required_input_fields"] = ["body", "classify_answer"]
+    elif consumer == "alias":
+        query["input_fields"] = {"text": "classify_answer"}
+    elif consumer == "source_row":
+        query["template"] = "{{ row.source_row.classify_answer }}"
+    elif consumer == "schema":
+        options["schema"]["required_fields"] = ["classify_answer"]
+    elif consumer == "image":
+        options["image_inputs"] = [{"field": "classify_answer", "format": "png"}]
+    else:
+        options["image_inputs"] = [{"field": "photo", "format_field": "classify_answer"}]
+    if list_form:
+        options["queries"] = [{"name": "classify", **query}]
+    result = _state(options).validate()
+    assert not result.is_valid
+    (entry,) = [entry for entry in result.errors if entry.error_code == "query_generated_fields_required"]
+    assert entry.component == "node:classify"
+    assert entry.severity == "high"
+    with pytest.raises(ValidationError) as exc:
+        LLMConfig.model_validate(options)
+    assert entry.message in str(exc.value)
+
+
+def test_generated_input_code_has_direct_guidance() -> None:
+    assert "query_generated_fields_required" in _CLOSED_VALIDATION_ERROR_CODES
+    guidance = explain_validation_code("query_generated_fields_required")
+    assert guidance is not None
+    explanation, fix = guidance
+    assert "generated" in explanation
+    assert "downstream" in fix
+    assert "distinct output names" in fix
+
+
+@pytest.mark.parametrize("queries", ["invalid", {"classify": {"input_fields": ["body"]}}, [{"input_fields": {"text": "body"}}]])
+def test_generated_guard_malformed_queries_are_plugin_option_rejections(queries: Any) -> None:
+    result = _state(_options([], queries)).validate()
+    assert not result.is_valid
+    assert any(entry.error_code == "plugin_options_invalid" for entry in result.errors)
+    assert not any(entry.error_code == "query_generated_fields_required" for entry in result.errors)
+
+
+def test_generated_guard_does_not_parse_other_plugins_queries_options() -> None:
+    node = replace(_state(_options([], "plugin-specific-query-shape")).nodes[0], plugin="passthrough")
+    assert _validate_multi_query_generated_input_requirements(node) == ()
+
+
+def test_generated_guard_mapping_key_overrides_redundant_name_like_plugin() -> None:
+    options = _options(["body"], {"classify": {"name": 123, "input_fields": {"text": "body"}, "template": "{{ row.text }}"}})
+    assert LLMConfig.model_validate(options).queries is not None
+    result = _state(options).validate()
+    assert result.is_valid, result.errors
+
+
+@pytest.mark.parametrize("field", ["classify_reply", "classify_reply_usage", "classify_reply_model"])
+def test_generated_guard_covers_custom_response_operational_fields(field: str) -> None:
+    options = _options(["body", field], {"classify": {"input_fields": {"text": "body"}, "template": "{{ row.text }}"}})
+    options["response_field"] = "reply"
+    result = _state(options).validate()
+    (entry,) = [entry for entry in result.errors if entry.error_code == "query_generated_fields_required"]
+    assert field in entry.message
+    assert entry.message in _plugin_message(options)
+
+
+@pytest.mark.parametrize("required", [["body", "title"], []])
+def test_generated_guard_accepts_two_upstream_only_queries_and_extra_presence(required: list[str]) -> None:
+    options = _options(
+        required,
+        {
+            name: {
+                "input_fields": {"answer": "body"},
+                "template": "{{ row.answer }}",
+                "output_fields": [{"suffix": "answer", "type": "string"}],
+            }
+            for name in ("good_colour_pair", "approximate_hex")
+        },
+    )
+    options.pop("prompt_template")
+    result = _state(options).validate()
+    assert result.is_valid, result.errors
+    assert LLMConfig.model_validate(options).required_input_fields == required
 
 
 def test_generated_input_conflict_reaches_stage_one_with_plugin_message() -> None:

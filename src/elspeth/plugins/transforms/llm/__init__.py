@@ -103,10 +103,21 @@ def _llm_created_output_fields(
     The one table of what an LLM transform writes and as which type: the
     transform stamps it (``LLMTransform.created_output_fields``) and
     ``LLMConfig`` checks the operator's authored types against it.
+
+    Operational values overwrite extracted values of the same name when
+    the row is assembled, so their declarations have the same precedence.
     """
+    operational_fields = tuple(
+        FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES
+    )
+    operational_names = {field.name for field in operational_fields}
     return (
-        *(FieldDefinition(f"{response_field}{suffix}", _SUFFIX_SCHEMA_TYPES[suffix]) for suffix in LLM_GUARANTEED_SUFFIXES),
-        *(FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value]) for field in output_fields),
+        *operational_fields,
+        *(
+            FieldDefinition(f"{prefix}{field.suffix}", _OUTPUT_FIELD_TYPE_TO_SCHEMA[field.type.value])
+            for field in output_fields
+            if f"{prefix}{field.suffix}" not in operational_names
+        ),
     )
 
 
