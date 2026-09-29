@@ -367,3 +367,29 @@ def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
 
     assert job["if"] == "github.event_name != 'pull_request'"
     assert job["env"]["OPENROUTER_API_KEY"] == "${{ secrets.OPENROUTER_API_KEY }}"
+
+
+@pytest.mark.parametrize("job_name", ["test", "integration"])
+def test_pytest_container_jobs_raise_the_open_file_limit(job_name: str) -> None:
+    """Docker 29 starts the runners' containers with a soft nofile of 1024, which
+    one xdist worker exhausted mid-suite (run 36526535297: `Too many open
+    files`, then 108 failed + 1661 errors on that worker alone)."""
+    job = _ci_workflow()["jobs"][job_name]
+
+    assert "--ulimit nofile=65536:524288" in job["container"]["options"]
+
+
+def test_test_job_reports_through_junit_not_verbose_log() -> None:
+    """The retrievable job log truncates around 71k lines, so the verbose
+    per-test listing hid the failure summary; the JUnit report is uploaded
+    whatever the outcome."""
+    test_job = _ci_workflow()["jobs"]["test"]
+
+    for step_name in ("Run tests with coverage", "Run tests without coverage"):
+        args = _pytest_args(_step_run(test_job, step_name))
+        assert "-v" not in args
+        assert "--junitxml=pytest-junit.xml" in args
+
+    upload = _step(test_job, "Upload JUnit report")
+    assert upload["if"] == "always()"
+    assert upload["with"]["path"] == "${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml"
