@@ -363,6 +363,36 @@ class TestPurgeResultValidation:
 
 
 class TestFindExpiredPayloadRefs:
+    @pytest.mark.parametrize("version", [True, 1.0, "1", 2])
+    def test_invalid_snapshot_version_refuses_discovery_and_deletion(self, db: LandscapeDB, tmp_path: Path, version: object) -> None:
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        manager = PurgeManager(db, store)
+        now = datetime(2026, 2, 8, tzinfo=UTC)
+        child_ref = store.store(b"sealed source rows")
+        metadata = {"source_snapshot_ref": child_ref, "source_snapshot_version": version}
+        metadata_ref = store.store(json.dumps(metadata).encode())
+        with db.write_connection() as conn:
+            _create_run(conn, "invalid-snapshot", status=RunStatus.COMPLETED, completed_at=now - timedelta(days=40))
+            _create_node(conn, "invalid-snapshot", "source-invalid")
+            conn.execute(
+                operations_table.insert().values(
+                    operation_id="invalid-snapshot-op",
+                    run_id="invalid-snapshot",
+                    node_id="source-invalid",
+                    operation_type="source_load",
+                    started_at=now,
+                    status="completed",
+                    output_data_ref=metadata_ref,
+                    output_data_hash=stable_hash(metadata),
+                )
+            )
+        with pytest.raises(AuditIntegrityError, match="metadata is malformed"):
+            manager.find_expired_payload_refs(retention_days=30, as_of=now)
+        with pytest.raises(AuditIntegrityError, match="metadata is malformed"):
+            manager.purge_payloads([child_ref, metadata_ref])
+        assert store.exists(child_ref)
+        assert store.exists(metadata_ref)
+
     def test_source_snapshot_child_is_protected_by_active_run_and_purged_with_metadata(
         self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

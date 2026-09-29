@@ -129,6 +129,7 @@ class PurgeManager:
             child = metadata["source_snapshot_ref"]
             if (
                 set(metadata) != {"source_snapshot_ref", "source_snapshot_version"}
+                or type(metadata["source_snapshot_version"]) is not int
                 or metadata["source_snapshot_version"] != 1
                 or type(child) is not str
                 or re.fullmatch(r"[a-f0-9]{64}", child) is None
