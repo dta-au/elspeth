@@ -891,6 +891,23 @@ jobs:
             --ignore-vuln CVE-2026-45833 \
             --progress-spinner=off
 
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "24"
+
+      # Audits the locked npm trees straight from the lockfiles (no install).
+      # The frontend lockfile is what the release image compiles into its
+      # static assets; the root lockfile is test tooling (Playwright, Azurite).
+      # Any advisory at any severity fails the job, as pip-audit does above.
+      - name: Audit frontend npm dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}/src/elspeth/web/frontend
+        run: npm audit --package-lock-only --audit-level=low
+
+      - name: Audit root npm tooling dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: npm audit --package-lock-only --audit-level=low
+
       - name: Check Python dependency licenses
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
