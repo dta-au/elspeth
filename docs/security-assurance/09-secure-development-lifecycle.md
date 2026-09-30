@@ -2,7 +2,7 @@
 
 **Status:** product process baseline complete; independent assessment and
 deployment change control open · **Reviewed against:** `release/0.8.1` @
-`49c184508` (2026-09-30) · **Owner:** ELSPETH maintainer
+`004c0eee0` (2026-09-30) · **Owner:** ELSPETH maintainer
 
 Shows how code is written, reviewed, tested and gated before it reaches a
 release. For each gate it records what the gate checks, where it runs, and
@@ -84,7 +84,7 @@ Measured from the repository ruleset `main` (id 12348893, enforcement
 | Automated code review | Copilot code review requested on each push to a pull request (advisory, not a required check) |
 | Bypass actors | None; the ruleset reports `current_user_can_bypass: never` for an admin account |
 
-`CI Success` is an aggregate job. It fails unless every one of nine CI jobs
+`CI Success` is an aggregate job. It fails unless every one of ten CI job IDs
 succeeded (§ 2.1), so one required check covers all of them and a renamed job
 cannot silently drop out of protection [EV-604].
 
@@ -110,11 +110,12 @@ corresponding governance and repository-setting risks are handled through the
 - **Repository Actions settings** (measured): SHA pinning of actions is
   required; the default workflow token is read-only; workflows cannot approve
   pull requests [EV-602].
-- **Pinned actions.** All 88 `uses:` references in `.github/workflows/` are
-  pinned to a full 40-character commit SHA. Instrument:
-  `git grep -hE '^\s*-?\s*uses:' -- .github/workflows | wc -l` (88) against the
-  same pattern requiring `@[0-9a-f]{40}` (88); a mutated line
-  `uses: actions/checkout@v4` does not match [EV-605].
+- **Pinned actions.** Recursive YAML parsing found 98 `uses:` references in
+  nine workflow files. All 98 are third-party actions pinned to a full
+  40-character commit SHA, representing 18 distinct actions; there are no
+  local or `docker://` references. Before use, the classifier accepted a
+  40-character SHA, rejected a tag and a short SHA, and classified local and
+  `docker://` samples outside the third-party count [EV-605].
 - **Pinned tool downloads.** actionlint, Terraform and Bicep are downloaded by
   fixed version and checked against a SHA-256 before use. Python dependencies
   install with `uv sync --frozen` (the lockfile), frontend dependencies with
@@ -168,9 +169,16 @@ these jobs reports `success` [EV-604]:
 | `Host-runner unit (docker CLI, non-root filesystem)` | Tests that need a Docker CLI or a non-root user; required skips become failures |
 | `State-engine catalog and selector validation` | Proof catalogues, plugin lifecycle matrix and documentation links |
 | `Azure Container Apps Bicep bundle` | Compiles every Bicep template and parameter file; compiled-template contract test |
-| `Dependency and License Audit` | `pip-audit`, `npm audit` on both lockfiles, and licence check |
+| `Dependency and License Audit` | Strict `pip-audit` and GPL/AGPL refusal for the separately locked root and gateway Python graphs; `npm audit` on both npm lockfiles |
+| `Gateway (locked tests and image)` | Frozen gateway tests and conformance; real-image build; zero High/Critical Trivy admission; exact revision and UID/GID; read-only external conformance |
 | `Frontend E2E (Playwright)` | Browser journeys against a real backend and Chromium |
 | `Frontend unit (vitest + typecheck)` | TypeScript type check and vitest |
+
+A source check at `004c0eee0` proves that the aggregate names all ten job IDs,
+including the gateway job. This local commit has no GitHub CI run, so the
+successful execution of that job and a refreshed live-ruleset observation
+remain release evidence to capture; the required check name itself remains
+`CI Success`.
 
 A skipped or cancelled job counts as a failure. The `Integration Tests` job
 (tests that may call a live model) runs only on pushes to protected
@@ -199,9 +207,10 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | Live-provider integration tests | Integration tests with a model API key | CI `Integration Tests`, push only | No — runs after merge; gates image publication (§ 6.2) | as above [EV-604] [EV-617] [EV-625] |
 | Frontend unit and types | `tsc` over two projects; 238 vitest files | CI `Frontend unit` | Yes (`CI Success`) | as above [EV-604] [EV-620] |
 | Frontend end-to-end | Playwright browser journeys | CI `Frontend E2E` | Yes (`CI Success`) | as above [EV-604] [EV-620] |
-| Dependency audit (`pip-audit`) | Known vulnerabilities in the locked Python dependency set, `--strict`, with each ignored advisory justified in the workflow | CI `Dependency and License Audit` | Yes (`CI Success`) | as above; detail in [10](10-vulnerability-and-supply-chain.md) [EV-604] [EV-707] |
+| Dependency audit (`pip-audit`) | Known vulnerabilities in the separately locked root and standalone gateway Python graphs, `--strict`, with each root exception justified in the workflow | CI `Dependency and License Audit` | Yes (`CI Success`) | as above; detail in [10](10-vulnerability-and-supply-chain.md) [EV-604] [EV-707] |
 | Dependency audit (`npm audit`) | Known vulnerabilities in the frontend and root npm lockfiles, any severity | CI `Dependency and License Audit` | Yes (`CI Success`) | as above; detail in [10](10-vulnerability-and-supply-chain.md) [EV-604] [EV-707] [EV-720] |
-| Licence check | Fails on GPL or AGPL Python dependencies | CI `Dependency and License Audit` | Yes (`CI Success`) | as above [EV-604] [EV-707] |
+| Licence check | Fails on GPL or AGPL dependencies in both locked Python graphs and retains both reports | CI `Dependency and License Audit` | Yes (`CI Success`) | as above [EV-604] [EV-707] |
+| Assembled gateway image qualification | Frozen tests and conformance; built-image High/Critical Trivy refusal, exact-revision and fixed UID/GID checks, and read-only external conformance | CI `Gateway (locked tests and image)` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml), `tests/unit/cicd/test_gateway_supply_chain.py` [EV-604] [EV-617] [EV-722] |
 | CodeQL | Python, `security-extended` query suite; tests and lint fixtures excluded; also weekly on schedule | CI `Analyze Python`, push, pull request and Monday schedule | Yes (`CodeQL`) | [codeql.yaml](../../.github/workflows/codeql.yaml), [codeql-config.yml](../../.github/codeql/codeql-config.yml) [EV-612] |
 | Composer redaction gate | A change to the redaction snapshot is classified as weakening or strengthening; the matching label, and a rationale for a weakening, are required | Pull request (also re-runs on label and description edits) | Yes (`redaction-gate`) | [composer-redaction-gate.yml](../../.github/workflows/composer-redaction-gate.yml), [policy guide](../guides/redaction-policy-changes.md) [EV-613] |
 | Telemetry backfill trailer | Every commit touching a telemetry cohort directory carries its attribution trailer | Pre-commit (`commit-msg` stage); pull request | Yes (`Check cohort-attribution trailers on PR commits`) | [enforce-telemetry-backfill-trailer.yaml](../../.github/workflows/enforce-telemetry-backfill-trailer.yaml) [EV-614] |
@@ -210,7 +219,7 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | Secret scanner | Credential-shaped strings in staged content ([07 § 4.4](07-secrets-and-key-management.md#44-source-control)) | Pre-commit, every commit | Blocks the local commit; track residual source-control risk in [15](15-risk-register.md) | `scripts/git-hooks/pre-commit-secret-scan.sh` [EV-606] |
 | File hygiene hooks | Trailing whitespace, final newline, YAML and TOML syntax, files over 1,000 KB, merge-conflict markers, debug statements | Pre-commit | Local only | [.pre-commit-config.yaml](../../.pre-commit-config.yaml) [EV-606] |
 | Mutation testing | Whether tests kill injected faults in `core/canonical.py` and `core/landscape/` | Weekly schedule and manual | No — advisory by design; scores are not thresholds ([GOVERNANCE.md](../../GOVERNANCE.md#maintainer-continuity)) | [mutation-testing.yaml](../../.github/workflows/mutation-testing.yaml) [EV-615] |
-| Dependabot version updates | Weekly grouped update pull requests for `uv`, both `npm` trees, GitHub Actions and Docker | Monday schedule | Not a gate; its pull requests pass the gates above | [dependabot.yml](../../.github/dependabot.yml) [EV-616] |
+| Dependabot version updates | Seven weekly update entries: both `uv` trees, both `npm` trees, GitHub Actions and both Docker contexts | Monday schedule | Not a gate; its pull requests pass the gates above | [dependabot.yml](../../.github/dependabot.yml) [EV-616] |
 | Release required-checks verification | The image commit has successful checks for every context the `main` ruleset requires | `build-push.yaml`, before any build | Blocks image publication (§ 6.2) | `scripts/cicd/check_release_required_checks.py` [EV-625] |
 
 ### 2.3 `elspeth-lints` rule families
@@ -283,6 +292,7 @@ editing YAML without a test failing [EV-617]:
 |---|---|
 | `tests/unit/test_ci_workflow_xdist.py` | Concurrency policy shared by the three push workflows; additional judge-workflow check name; CodeQL suites not filtered by severity; integration job fails closed; no workflow references the operator HMAC key |
 | `tests/unit/test_build_push_release_checks.py` | Required-check verification before build; OCI revision label bound to the image commit; tags promoted only after smoke tests; Dockerfile inputs and runtime contract |
+| `tests/unit/cicd/test_gateway_supply_chain.py` | Gateway lock freshness and a stale-metadata negative control; exact dependency-audit exceptions; CI aggregation; image qualification; exact-digest gateway publication, evidence and promotion contracts |
 | `tests/unit/elspeth_lints/test_meta_ci_never_signs.py` | CI never signs judge metadata |
 | `tests/unit/cicd/` | Trust-tier ratchet, state-engine CI selection, live-provider workflow |
 | `tests/unit/web/composer/test_label_gate_direction.py` | The four label and direction combinations of the redaction gate, through the real scripts |
@@ -450,8 +460,12 @@ Limits an assessor should weigh:
   (`python:3.13-slim@sha256:…`), the `uv` binary image and the distroless
   runtime (`gcr.io/distroless/python3-debian13:debug-nonroot@sha256:…`)
   [EV-627].
-- **Locked dependencies:** `uv.lock` and the frontend `package-lock.json`
-  [EV-704] [EV-706].
+- **Locked dependencies:** the root `uv.lock`, the separate `gateway/uv.lock`
+  and the frontend `package-lock.json` [EV-704] [EV-706].
+- **Gateway build inputs pinned and frozen:** its Python 3.12 Alpine builder
+  and runtime and its `uv` source are pinned by digest. Separate build and
+  runtime environments consume `gateway/uv.lock` with `--frozen`; the exact
+  local wheel is installed with `--no-deps` [EV-722].
 - **A reviewed trust root** (the AWS RDS CA bundle) is baked into the image
   and checked against a committed SHA-256 at build and smoke time [EV-627].
 - Base-image and dependency patching are covered in
@@ -479,16 +493,24 @@ failed check stops the job [EV-625].
 The workflow then performs the following sequence [EV-626]:
 
 1. A lean PostgreSQL image is built and tested before any registry login.
-2. The multi-architecture image (`linux/amd64`, `linux/arm64`) is built and
-   pushed as `sha-<commit>`, with the OCI `revision` label set to the commit.
+2. The main multi-architecture image (`linux/amd64`, `linux/arm64`) is built
+   and pushed as `sha-<commit>`, with the OCI `revision` label set to the
+   commit. When GHCR is selected, the workflow also builds the separately
+   named in-tree reference gateway for both platforms and binds it to the same
+   source commit.
 3. When both registries are selected, ACR receives a digest-preserving copy
    of the GHCR image, and the workflow asserts the two digests are equal.
-4. Each pushed digest is signed (§ 6.3).
-5. The smoke-test job pulls the image by digest and checks the non-root
+4. Each main-image digest is signed (§ 6.3). The exact gateway digest is
+   scanned per platform, signed and verified under the workflow identity.
+5. The smoke-test job pulls the main image by digest and checks the non-root
    runtime identity, data directories, database drivers and trust root, runs
-   the CLI, and runs example pipelines whose outputs it checks [EV-712].
-6. For a tag, the release job promotes the smoke-tested digest to the tag
-   name and creates the GitHub release [EV-626].
+   the CLI, and runs example pipelines whose outputs it checks [EV-712]. When
+   a gateway digest exists, the job also checks its source revision, runtime
+   identity, UID/GID 65532, read-only execution and health.
+6. For a tag, the release job promotes the qualified main-image digests and
+   the exact GHCR gateway digest to their tag names, then creates the GitHub
+   release [EV-626]. The ACR copy/build branches apply only to the main image;
+   the reference gateway publication contract is GHCR-only.
 
 ### 6.3 Signing, provenance and SBOM
 
@@ -500,6 +522,13 @@ The workflow then performs the following sequence [EV-626]:
   `sbom: true`, so BuildKit attaches a provenance attestation and an SBOM
   attestation to the image index. SBOM content is covered in
   [10](10-vulnerability-and-supply-chain.md) [EV-626].
+- **Reference gateway evidence.** The GHCR gateway build requests maximum
+  provenance and an SPDX SBOM, retrieves both from the exact output digest,
+  scans its amd64 and arm64 platform images with a zero High/Critical
+  threshold, verifies its keyless signature, and retains those five evidence
+  files for 90 days [EV-709] [EV-722]. These are source-enforced workflow
+  contracts. A successful GitHub run remains required to prove that a
+  particular gateway digest and its evidence exist in the registry.
 
 ### 6.4 How a deployer verifies an image
 
@@ -513,6 +542,16 @@ cosign verify \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   --certificate-identity "https://github.com/dta-au/elspeth/.github/workflows/build-push.yaml@refs/tags/<tag>" \
   "ghcr.io/dta-au/elspeth@sha256:<digest>"
+```
+
+The separately named reference gateway uses the same issuer and workflow
+identity policy:
+
+```bash
+cosign verify \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  --certificate-identity "https://github.com/dta-au/elspeth/.github/workflows/build-push.yaml@refs/tags/<tag>" \
+  "ghcr.io/dta-au/elspeth-llm-gateway@sha256:<digest>"
 ```
 
 For an image built after CI on `main`, the identity ends in
@@ -533,5 +572,10 @@ another registry does not copy its signature unless that copy was signed too.
 | Output of `cosign verify` with the exact certificate identity | DEPLOYMENT-TODO: |
 | `build-push.yaml` run that produced the digest, and its required-check verification step | DEPLOYMENT-TODO: |
 | OCI revision label matches the assessed commit | DEPLOYMENT-TODO: |
+| Reference gateway exact GHCR digest and publication run | DEPLOYMENT-TODO: first successful GitHub publication run |
+| Reference gateway SPDX SBOM and maximum-provenance files, bound to the source commit and digest | DEPLOYMENT-TODO: |
+| Reference gateway amd64 and arm64 Trivy results at zero High/Critical | DEPLOYMENT-TODO: |
+| Reference gateway Cosign verification output and workflow identity | DEPLOYMENT-TODO: |
+| Reference gateway exact-digest read-only smoke result | DEPLOYMENT-TODO: |
 | Who accepted the release for deployment, and when | DEPLOYMENT-TODO: |
 | Gap between the deployed commit and the commit this pack was reviewed at | DEPLOYMENT-TODO: |
