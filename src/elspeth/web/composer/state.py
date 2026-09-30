@@ -7122,6 +7122,17 @@ class CompositionState:
         errors: list[ValidationEntry] = []
         _err = ValidationEntry  # local alias for brevity
         invalid_row_union_branch_nodes: set[str] = set()
+        runtime_lineage_cache: dict[tuple[str, str], tuple[bool, tuple[NodeSpec, ...]]] = {}
+
+        def runtime_connection_lineage(origin: str, target: str) -> tuple[bool, tuple[NodeSpec, ...]]:
+            """Resolve one lineage query at most once during this validation walk."""
+            cache_key = (origin, target)
+            cached = runtime_lineage_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            resolved = _runtime_connection_lineage(origin, target, self.sources, self.nodes)
+            runtime_lineage_cache[cache_key] = resolved
+            return resolved
 
         # 1. Source exists
         if not self.sources:
@@ -8046,7 +8057,7 @@ class CompositionState:
                     coalesce_branch_connections = _coalesce_branch_connections(node.branches)
                     coalesce_branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
                     for branch_alias, branch_connection in zip(coalesce_branch_aliases, coalesce_branch_connections, strict=True):
-                        is_downstream, lineage = _runtime_connection_lineage(branch_alias, branch_connection, self.sources, self.nodes)
+                        is_downstream, lineage = runtime_connection_lineage(branch_alias, branch_connection)
                         if not is_downstream:
                             continue
                         for ancestor in lineage:
@@ -8120,12 +8131,7 @@ class CompositionState:
                     branch_lineages: list[tuple[str, tuple[NodeSpec, ...]]] = []
                     lineage_is_valid = True
                     for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
-                        is_downstream, lineage = _runtime_connection_lineage(
-                            branch_alias,
-                            branch_connection,
-                            self.sources,
-                            self.nodes,
-                        )
+                        is_downstream, lineage = runtime_connection_lineage(branch_alias, branch_connection)
                         if is_downstream:
                             branch_lineages.append((branch_alias, lineage))
                             continue
