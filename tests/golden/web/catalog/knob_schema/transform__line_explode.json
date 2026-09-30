@@ -70,6 +70,16 @@
         "nullable": false,
         "required": false,
         "tier": "common"
+      },
+      {
+        "default": 67108864,
+        "description": "Maximum estimated serialized size of all rows emitted for one input row",
+        "kind": "number-int",
+        "label": "Max Output Bytes",
+        "name": "max_output_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
       }
     ]
   },

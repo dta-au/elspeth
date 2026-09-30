@@ -522,6 +522,7 @@ TransformErrorCategory = Literal[
     "validation_failed",
     "invalid_input",
     "too_many_lines",  # Line-expanding transform input exceeds configured max_lines
+    "output_too_large",  # Line-expanding transform's estimated aggregate output exceeds configured max_output_bytes
     "blob_not_found",
     "blob_too_large",
     "decode_failed",
@@ -820,6 +821,8 @@ class TransformErrorReason(TypedDict):
     declared_by: NotRequired[Literal["operator", "plugin", "upstream"]]  # Who declared the violated type (ADR-050 D6)
     line_count: NotRequired[int]  # Observed lines before rejecting line-expanding input
     max_lines: NotRequired[int]  # Configured line-expansion limit
+    estimated_output_bytes: NotRequired[int]  # Estimated serialized bytes a line expansion would emit
+    max_output_bytes: NotRequired[int]  # Configured aggregate line-expansion output limit
 
     # Contract violation context
     violation_type: NotRequired[str]

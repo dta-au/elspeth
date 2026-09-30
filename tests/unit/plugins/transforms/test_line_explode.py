@@ -120,6 +120,36 @@ def test_line_explode_rejects_more_than_default_max_lines(ctx: PluginContext) ->
     assert not result.retryable
 
 
+def test_line_explode_rejects_aggregate_output_before_copying(ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.plugins.transforms import line_explode as line_explode_module
+    from elspeth.plugins.transforms.line_explode import LineExplode, LineExplodeConfig
+
+    assert "max_output_bytes" in LineExplodeConfig.model_fields
+
+    transform = LineExplode(
+        {
+            "schema": DYNAMIC_SCHEMA,
+            "source_field": "html",
+            "output_field": "html_line",
+            "max_output_bytes": 200,
+        }
+    )
+
+    def fail_if_called(value: object) -> object:
+        pytest.fail(f"deepcopy must not run after the aggregate output limit is exceeded: {value!r}")
+
+    monkeypatch.setattr(line_explode_module.copy, "deepcopy", fail_if_called)
+    result = transform.process(make_pipeline_row({"html": "a\nb\nc", "retained": list(range(20))}), ctx)
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "output_too_large"
+    assert result.reason["estimated_output_bytes"] > result.reason["max_output_bytes"]
+    assert result.reason["max_output_bytes"] == 200
+    assert result.reason["line_count"] == 3
+    assert not result.retryable
+
+
 def test_line_explode_can_omit_index(ctx: PluginContext) -> None:
     from elspeth.plugins.transforms.line_explode import LineExplode
 
