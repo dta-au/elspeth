@@ -28,10 +28,18 @@ jobs:
   mutation-test:
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 60  # Mutation testing is slow
+    env:
+      CI_CHECKOUT_PATH: mutation-${{ github.run_id }}-${{ github.run_attempt }}-canonical
+      UV_CACHE_DIR: ${{ github.workspace }}/mutation-${{ github.run_id }}-${{ github.run_attempt }}-canonical/.uv-cache
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -91,16 +99,24 @@ jobs:
         with:
           name: mutation-results
           path: |
-            .mutmut-cache/
+            ${{ env.CI_CHECKOUT_PATH }}/.mutmut-cache/
           retention-days: 30
 
   mutation-test-landscape:
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 120  # Landscape has more code
+    env:
+      CI_CHECKOUT_PATH: mutation-${{ github.run_id }}-${{ github.run_attempt }}-landscape
+      UV_CACHE_DIR: ${{ github.workspace }}/mutation-${{ github.run_id }}-${{ github.run_attempt }}-landscape/.uv-cache
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
@@ -143,5 +159,5 @@ jobs:
         with:
           name: mutation-results-landscape
           path: |
-            .mutmut-cache/
+            ${{ env.CI_CHECKOUT_PATH }}/.mutmut-cache/
           retention-days: 30

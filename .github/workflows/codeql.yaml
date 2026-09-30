@@ -29,17 +29,26 @@ permissions:
 jobs:
   analyze:
     name: Analyze Python
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-codeql
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@78ed0c7291d93e40c51b085850dc669a4c3ab73b
         with:
           languages: python
           queries: security-extended
-          config-file: ./.github/codeql/codeql-config.yml
+          source-root: ${{ env.CI_CHECKOUT_PATH }}
+          config-file: ./${{ env.CI_CHECKOUT_PATH }}/.github/codeql/codeql-config.yml
+          # Bound shared-host use: four runner services share this machine.
+          threads: 2
+          ram: 4096
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@78ed0c7291d93e40c51b085850dc669a4c3ab73b

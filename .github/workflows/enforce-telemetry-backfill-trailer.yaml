@@ -19,11 +19,19 @@ on:
 jobs:
   check:
     name: Check cohort-attribution trailers on PR commits
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-telemetry-backfill
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout PR head with full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
           fetch-depth: 0   # full history so merge-base resolves correctly
 
       - name: Determine merge base against PR target

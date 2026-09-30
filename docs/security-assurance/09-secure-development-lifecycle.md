@@ -96,11 +96,16 @@ corresponding governance and repository-setting risks are handled through the
 
 ### 1.4 CI execution boundary
 
-- **Public-repository guardrail.** Pull-request workflows run code from
-  unmerged branches, so every pull-request job runs on a GitHub-hosted runner.
-  Only push, tag, schedule and manual events use the project's self-hosted
-  `trusted` runner (`runs-on` expression in each workflow). GitHub does not
-  pass repository secrets to workflows triggered from forks [EV-604].
+- **Local runner admission.** Automated CI, release, website and mutation
+  jobs use the project's self-hosted `nyx-ci, trusted` pool. Manual
+  live-provider acceptance retains specialized self-hosted cloud runners
+  to prove cloud execution topology. Pull requests from repository branches
+  run locally; fork pull requests skip checkout jobs and fail the required aggregate
+  checks. GitHub must require approval for all outside contributors because
+  a fork can remove its workflow's YAML admission condition. Maintainers
+  review fork code and workflow changes before admitting them onto a
+  repository branch. GitHub does not pass repository secrets to workflows
+  triggered from forks [EV-604].
 - **Least privilege.** Workflows declare `permissions:`; most jobs hold
   `contents: read` only. Write scopes are limited to the jobs that need them
   (`security-events: write` for CodeQL, `packages: write` and `id-token: write`
