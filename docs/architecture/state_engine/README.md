@@ -27,9 +27,10 @@ under three one-host deployment profiles, and PostgreSQL 16 as the required
 first-class backend for the maintained AWS single-leader Landscape deployment.
 Multi-replica scheduling remains outside the claim.
 
-Compiler handoff rule: a future `CompiledPipeline` binds the catalog ID and
-digest recorded in the current dated `assessment.json` and may execute only
-when runtime assembly reports a compatible state-engine contract.
+The [application API design](../../specs/application-api-design.md) owns the
+future compiler boundary. Runtime admission binds the actual engine/runtime
+contracts and execution inputs; a dated assessment records evidence at one
+baseline, not a portable execution permit or runtime contract identity.
 
 Do not reuse historical denominators. The v1 68-leg result and the v2 73-leg
 2,040-cell result answer different contracts than v3's 7,010 executable cells.
@@ -49,8 +50,8 @@ Use this order when documents disagree:
 6. GitHub Issues owns live work status, assignment, priority, and dependencies.
 7. Older dated assessments preserve only their baseline-bound conclusions.
 
-No other document is canonical for current state-engine status. In particular,
-`docs/architecture/token-scheduler-state-engine.md` is a deprecated pointer.
+No other document is canonical for current state-engine status. The deprecated
+`token-scheduler-state-engine.md` pointer has been moved to `docs-archive/`.
 
 ## Start here
 
@@ -81,8 +82,8 @@ docs/architecture/state_engine/
 ├── assessment-framework.md
 ├── proof-catalog/
 │   ├── README.md
-│   ├── v1/catalog.json         # frozen historical contract
-│   ├── v2/catalog.json         # frozen historical contract
+│   ├── v1/catalog.json         # historical contract retained as executable fixture
+│   ├── v2/catalog.json         # historical contract retained as executable fixture
 │   └── v3/                     # current contract, schemas, and selector manifest
 ├── templates/
 │   ├── assessment-readme.md

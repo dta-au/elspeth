@@ -11,8 +11,8 @@ is required before any onboarding commitment.
 **Planning basis:** a maintainer work-package assessment dated 3 September
 2026. The source assessment is not published in a repository clone; see
 [project control](docs/project-control/README.md) for access information.
-The [web API seam design, 8 September 2026](docs/specs/2026-09-08-application-api-seam-design.md)
-and the compiler specifications linked below supplement that assessment.
+The [application API design](docs/specs/application-api-design.md) consolidates
+the web split, API seam and compiler direction and supplements that assessment.
 Multi-replica implementation remediation also draws on the
 [0.8.0 changelog](CHANGELOG.md#080---2026-09-07-unified-lineage-and-production-hardening)
 and the
@@ -52,9 +52,10 @@ Their placement among extensions is indicative; the maintainer must decide
 whether to bring them forward. Contributor setup work can also start earlier,
 while shared-maintainer operation depends on release and security controls.
 
-The web API seam can proceed independently of the compiler seam. Its initial
-contract work precedes handing browser development to another team; placing it
-among extensions does not require it to wait for the earlier stages.
+The API seam can proceed independently of the compiler seam. Harden the
+application contract and producer, then require the retained reference UI to
+conform. ARGO and an agentic chassis consume the same admitted contract.
+Placing this work among extensions does not require it to wait for earlier stages.
 
 ## Main work packages
 
@@ -97,23 +98,18 @@ acceptance.
 | Package | Main scope and intended outcome | Dependency or decision |
 | --- | --- | --- |
 | **C.1 Contract and integration hardening** | Align what components produce, what other components accept and what documentation teaches. Replace duplicated or loosely typed definitions with shared contracts and checks. | Coordinate persisted sharing, failure-code, audit-snapshot and node-type contracts with the identity cutover, before durable use. Sequence remaining Composer work against A.2 and A.3. |
-| **C.2 Compiler seam** | Establish the backend boundary between authoring and execution. Compile YAML and Composer definitions into the same pipeline bundle, carrying secret references rather than values, and verify it before execution. | The maintainer must decide whether and when to schedule it. Separate initial compilation and execution from the broader persisted-artefact work. Initial hash checks establish integrity, not operator signing authority. |
-| **C.3 Web API seam** | Publish a versioned application programming interface (API) so users can bring their own web layer or other client. Provide a tracked OpenAPI contract, generated client types, compatibility negotiation, response fixtures and documented progress channels. Keep authoring, validation, access control and graph interpretation in the backend. | Can proceed independently of C.2. Establish the contract before a browser-development handoff. Initial delivery supports one contract version; independent releases and separate-origin hosting require later decisions and evidence. |
+| **C.2 Compiler seam** | Refine shared definition normalization, server-owned admitted execution inputs and runtime assembly behind the API. Build on current execution envelopes, exact bindings, approval and recovery; distinguish definition, audit-config and instantiated topology identities. | Independent of first API/reference-client delivery. Initial direction rebuilds and verifies the graph; portable bundles are deferred. Self-supplied hashes confer neither artifact authenticity nor execution permission. |
+| **C.3 Application API seam** | Harden one versioned contract for the retained reference UI, ARGO and an agentic chassis. Publish HTTP/stream schemas, errors, negotiation and semantic fixtures; make the producer and reference UI conform. Retain server validation, policy, custody, execution and audit authority. | Can proceed independently of C.2. Reference conformance is mandatory, not inferred from current behavior. Machine identity/delegation and harness effect controls precede relevant alternate-head admission. Independent releases/origins need additional evidence. |
 | **C.4 Composer wires remediation** | Connect each advertised tool setting to its validation model, handler behaviour, redaction rules, planner guidance and user-facing proposal. Repair settings that are dropped or hidden, misleading change summaries and inconsistent response fields. | Derive checks from source, prove they detect deliberate faults, and verify results with live Composer trials. Coordinate with A.2 and A.3. This package gives the Composer wires campaign its own scope within the broader C.1 hardening work; count that work here only. |
 
-The [web API seam design](docs/specs/2026-09-08-application-api-seam-design.md)
-defines the boundary between clients and the backend. It enables a replacement
-web interface to use documented application services without depending on
-internal Python modules. Contract fixtures let client developers test without
-a running backend. Building a replacement client is outside this package.
-
-The [compiler architecture](docs/specs/2026-04-15-compiled-pipeline-architecture-design.md)
-and [initial compiler seam sketch](docs/specs/2026-08-20-compiler-facade-mvp-sketch.md)
-define the boundary inside the backend. Initial delivery checks configuration
-integrity before creating plugins, then checks graph integrity before execution.
-It retains execution from settings; signing authority and cross-host portability
-are outside that initial scope. The compiler consumes and checks what the
-planner authored; it does not author pipeline structure.
+The [application API design](docs/specs/application-api-design.md) is the single
+future-facing specification for C.2/C.3 and web ownership. The API defines the
+boundary; the current UI remains the reference implementation and must be
+migrated to it, rather than define it through incidental internal assumptions.
+Contract fixtures support offline clients; producer/consumer and lifecycle
+checks establish conformance. ARGO-specific requirements remain to be supplied.
+The agentic head uses normal admitted, auditable plugin execution, not a raw
+plugin escape path. Neither requires portable compiled artifacts for first use.
 
 ### D. Assurance and release readiness
 

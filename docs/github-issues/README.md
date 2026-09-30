@@ -73,7 +73,7 @@ product defects, and they mean nothing to an outside contributor. They remain in
 > itself. It does not cover a vulnerability. An unfixed vulnerability belongs in a
 > **private GitHub security advisory**, where the developers who must fix it can see it
 > and the world cannot, and becomes a public issue once it is fixed. See
-> `docs/reviews/2026-09-23-single-developer-assumptions.md` F-01–F-04 and F-41.
+> [the historical single-developer audit](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-23-single-developer-assumptions.md) F-01–F-04 and F-41.
 
 **Work awaiting a decision** — items held pending an operator call, labelled
 `wait:decision`. They migrate once decided, not before.

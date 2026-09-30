@@ -5,7 +5,7 @@ project-control reporting for ELSPETH are set by the maintainer's
 organisation, not decided by this project; this README is the repository's
 pointer to them, and this folder is the only authority for what they are.
 (They were previously described in
-[ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
+[ADR-024](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
 retired 2026-09-13 as not being an architecture decision. For the project's
 own single-maintainer assurance posture — approval counts, required gates,
 the two-maintainer step-up trigger — see

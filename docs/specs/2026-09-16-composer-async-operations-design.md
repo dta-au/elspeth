@@ -1,7 +1,7 @@
 # Composer async operations
 
 - **Status:** Revised design for implementation planning. This replaces the
-  rejected 2026-09-16 draft; the [review](2026-09-16-composer-async-operations-review.md)
+  rejected 2026-09-16 draft; the [review](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/specs/2026-09-16-composer-async-operations-review.md)
   remains a historical review of that draft.
 - **Scope (2026-09-28):** freeform is the only composer. Guided was removed
   from the product in `7001600fe` (2026-09-28). The cutover covers
