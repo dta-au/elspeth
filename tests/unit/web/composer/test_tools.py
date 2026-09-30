@@ -17726,6 +17726,51 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
         assert result.data["preview_is_valid"] is False
 
+    def test_observed_csv_declared_input_proof_is_request_bounded(self) -> None:
+        """Wide schemas stop at a request-wide work/result bound and fail closed."""
+        from sqlalchemy import update
+
+        from elspeth.web.blobs.service import content_hash as _content_hash
+        from elspeth.web.sessions.models import blobs_table
+
+        field_names = tuple(f"field_{index}" for index in range(300))
+        csv_content = (",".join(field_names) + "\n" + ",".join("1" for _ in field_names) + "\n").encode()
+        self.csv_storage_path.write_bytes(csv_content)
+        with self.engine.begin() as conn:
+            conn.execute(
+                update(blobs_table)
+                .where(blobs_table.c.id == self.csv_blob_id)
+                .values(size_bytes=len(csv_content), content_hash=_content_hash(csv_content))
+            )
+
+        state = self._state_with_csv_source(schema_mode="observed").with_node(
+            self._plain_transform(
+                "wide_consumer",
+                plugin="passthrough",
+                input_connection="rows",
+                on_success="out",
+                options={"schema": {"mode": "flexible", "fields": [f"{name}: int" for name in field_names]}},
+            )
+        )
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        mismatches = [item for item in diagnostics if item["code"] == "declared_input_type_mismatch_against_source_schema"]
+        budget_failures = [item for item in diagnostics if item["code"] == "source_inspection_failed"]
+        assert len(mismatches) == 16
+        assert len(budget_failures) == 1
+        assert budget_failures[0]["evidence_locator"]["max_declared_input_type_checks"] == 256
+        assert budget_failures[0]["evidence_locator"]["max_declared_input_type_diagnostics"] == 16
+        assert result.data["preview_is_valid"] is False
+
     def test_observed_csv_str_input_declaration_does_not_block(self) -> None:
         """str/any declarations match what an observed CSV actually delivers."""
         state = self._state_with_csv_source(schema_mode="observed").with_node(
