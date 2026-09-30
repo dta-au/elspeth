@@ -230,11 +230,17 @@ def _make_post_transform(*, format: str = "raw", max_request_body_bytes: int = 1
     ],
 )
 def test_web_scrape_auth_header_builder_and_audit_fingerprint(
-    scheme: str, credential: str, header_name: str | None, expected_name: str, expected_value: str
+    scheme: str,
+    credential: str,
+    header_name: str | None,
+    expected_name: str,
+    expected_value: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers
     from elspeth.plugins.transforms.web_scrape_auth import WebScrapeAuthConfig
 
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
     config = WebScrapeAuthConfig(scheme=scheme, origin="https://example.com", credential=credential, header_name=header_name)
     name, value = config.header()
     assert (name, value) == (expected_name, expected_value)

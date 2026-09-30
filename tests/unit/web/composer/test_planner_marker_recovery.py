@@ -163,7 +163,11 @@ async def test_successful_sibling_breaks_consecutive_argument_rejections(tmp_pat
         completion=completion,
         recorder=recorder,
         budget=_budget(max_total_provider_calls=12),
-        model_overrides={"tool_contract_dialect": ToolContractDialect.OPENAI_STRICT, "max_discovery_turns": 10},
+        model_overrides={
+            "tool_contract_dialect": ToolContractDialect.OPENAI_STRICT,
+            "max_discovery_turns": 10,
+            "timeout_seconds": 60.0,
+        },
     )
 
     assert [invocation.status.value for invocation in recorder.invocations[:8]] == [
