@@ -169,7 +169,7 @@ webui = [
     # Web UX -- LLM Composer MVP
     "fastapi>=0.136,<1",
     "uvicorn[standard]>=0.46,<1",
-    "PyJWT[crypto]>=2.12,<3",
+    "PyJWT[crypto]>=2.14,<3",
     "python-multipart>=0.0.27",
     "websockets>=14.2,<15",
     "httpx>=0.28,<1",
@@ -244,7 +244,7 @@ all = [
     # webui dependencies
     "fastapi>=0.136,<1",
     "uvicorn[standard]>=0.46,<1",
-    "PyJWT[crypto]>=2.12,<3",
+    "PyJWT[crypto]>=2.14,<3",
     "python-multipart>=0.0.27",
     "websockets>=14.2,<15",
     "httpx>=0.28,<1",
@@ -273,6 +273,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/elspeth"]
+
+[tool.uv]
+# Security floors for packages also pulled in through SDK dependencies.
+constraint-dependencies = [
+    "oauthlib>=4,<5",
+    "PyJWT>=2.14,<3",
+]
 
 [tool.uv.sources]
 elspeth-lints = { path = "elspeth-lints", editable = true }

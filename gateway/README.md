@@ -115,8 +115,9 @@ auth) are also available on the same port.
 ## Running the tests
 
 ```bash
-cd gateway
-../.venv/bin/python -m pytest tests conformance -q
+uv sync --project gateway --frozen --extra test --no-default-groups
+uv run --project gateway --frozen --extra test --no-default-groups \
+  pytest gateway/tests gateway/conformance -q
 ```
 
 `tests/` is the gateway's own unit/integration suite. `conformance/` is the
@@ -199,11 +200,13 @@ validate its own targets does not qualify.
 
 ## The container image
 
-`gateway/Dockerfile` is a multi-stage build:
+`gateway/Dockerfile` is a multi-stage, frozen build:
 
-- **builder** — installs this package (and its dependencies) into an
-  isolated venv at `/venv` via `pip install /build`.
-- **final** — `FROM` the same digest-pinned `python:3.12-slim` base,
+- **builder** — copies `gateway/pyproject.toml` and `gateway/uv.lock`, takes
+  `uv` from an immutable image digest, installs the locked build group into a
+  separate build venv, builds the wheel without isolation, then installs only
+  the frozen runtime graph and that exact wheel into `/venv`.
+- **final** — `FROM` the same digest-pinned `python:3.12-alpine` base,
   copies `/venv` only (no `pip install`, no `ADD`, in this stage), runs as
   the fixed non-root UID/GID `65532:65532`, and starts with an absolute,
   shell-free entrypoint:
@@ -228,6 +231,22 @@ docker build \
   --build-arg GATEWAY_REVISION="$(git rev-parse HEAD)" \
   gateway/ -t elspeth-llm-gateway:dev
 ```
+
+The lock is a standalone gateway lock; root `uv.lock` does not govern this
+image. Ordinary setup, tests, audits, and Docker builds are frozen and never
+refresh it. A maintainer intentionally updates it from the repository root:
+
+```bash
+scripts/update-gateway-lock.sh --upgrade
+uv lock --check --project gateway
+uv export --project gateway --frozen --all-extras --all-groups \
+  --no-emit-project --format requirements-txt >/tmp/gateway-requirements.txt
+```
+
+Dependabot opens separate weekly updates for the gateway's uv lock and pinned
+Docker inputs. Those changes run the required gateway dependency audit, licence
+check, tests, image build, High/Critical image scan, read-only runtime smoke,
+and image-qualification conformance lane before `CI Success` can pass.
 
 The image is read-only-rootfs compatible: it never writes anything outside
 `/tmp` (and `PYTHONDONTWRITEBYTECODE=1` stops it from ever trying to write
