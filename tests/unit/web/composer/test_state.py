@@ -10857,6 +10857,43 @@ class TestCompositionStateRowUnion:
 
         assert result.is_valid, result.errors
 
+    def test_repeated_row_union_mappings_reuse_lineage_queries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.web.composer import state as state_module
+
+        state = self._state()
+        original_lineage = state_module._runtime_connection_lineage
+        lineage_queries: list[tuple[str, str]] = []
+
+        def recording_lineage(
+            origin: str,
+            target: str,
+            sources: dict[str, SourceSpec],
+            nodes: tuple[NodeSpec, ...],
+        ) -> tuple[bool, tuple[NodeSpec, ...]]:
+            lineage_queries.append((origin, target))
+            return original_lineage(origin, target, sources, nodes)
+
+        monkeypatch.setattr(state_module, "_runtime_connection_lineage", recording_lineage)
+        repeated_unions = tuple(
+            replace(
+                self._row_union(),
+                id=f"variant_union_{index}",
+                on_success=f"union_out_{index}",
+            )
+            for index in range(20)
+        )
+        state = replace(
+            state,
+            nodes=tuple(node for node in state.nodes if node.node_type != "row_union") + repeated_unions,
+        )
+
+        state.validate()
+
+        assert lineage_queries == [
+            ("control_branch", "control_done"),
+            ("treatment_branch", "treatment_done"),
+        ]
+
     @pytest.mark.parametrize("output_mode", [None, "transform"])
     def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:
         state = self._state()
