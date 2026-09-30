@@ -1,5 +1,7 @@
 # Pre-publication security plan review
 
+**Review owner:** DTA Cloud Engineering
+
 Reviewed for `release/0.8.1` against baseline `ee04378f8`. Four independent readers
 checked source reality, architecture, test quality and downstream effects. The
 original brief required changes; the corrected plan addresses these findings.

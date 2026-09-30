@@ -1,10 +1,10 @@
 # 05 — Statement of applicability
 
 **Status:** deployment template complete — control selection and assessment
-unpopulated · **ISM release:** see § 1 Deployment record · **Reviewed
-against:** `release/0.8.1` @
-`eee4bb9419265e69ac13012a1c5fe421d6ba7240` (2026-10-01) · **Owner:**
-ELSPETH maintainer
+unpopulated · **ISM release:** see § 1 Deployment record · **Product source
+reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:** DTA Cloud
+Engineering
 
 This template records the complete control population selected for an
 ELSPETH installation, the applicability and implementation decision for each

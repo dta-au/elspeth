@@ -1,8 +1,10 @@
 # 14 — Security testing
 
 **Status:** product testing baseline and findings follow-up method complete;
-independent penetration testing record open · **Reviewed against:** `release/0.8.1`
-@ `eee4bb941` (2026-10-01) · **Owner:** ELSPETH maintainer
+independent penetration testing record open · **Product source reviewed
+against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:** DTA Cloud
+Engineering
 
 Records the security testing carried out, who did it, what was in scope and
 what was found. Separate internal review from independent testing — an
@@ -17,7 +19,7 @@ assessor weighs them differently.
 
 | Date | Type | Performed by | Independent? | Scope | Release tested | Outcome summary | Report location |
 |---|---|---|---|---|---|---|---|
-| 2026-09-23 | Scoped internal plan and implementation security review | ELSPETH maintainer with four independent AI review lanes | No — separate agent contexts, not organisational independence | Judge-metadata secret custody and signature verification; sentinel identity binding; affected export, persistence and historical projections; related regression and policy gates | `release/0.8.1`; baseline `ee04378f8`, with repaired line reviewed through `a6803f2e4` | Required changes were implemented and independently re-read. Focused and PostgreSQL checks passed and the controlled lint comparison added no findings. The frozen broad gate remained a failed run reconciled by bounded repairs, and authoritative operator signature verification was not performed; the record makes both limits explicit | [Pre-publication security plan review](../reviews/2026-09-23-pre-publication-security-review.md) [EV-623] |
+| 2026-09-23 | Scoped internal plan and implementation security review | DTA Cloud Engineering with four independent AI review lanes | No — separate agent contexts, not organisational independence | Judge-metadata secret custody and signature verification; sentinel identity binding; affected export, persistence and historical projections; related regression and policy gates | `release/0.8.1`; baseline `ee04378f8`, with repaired line reviewed through `a6803f2e4` | Required changes were implemented and independently re-read. Focused and PostgreSQL checks passed and the controlled lint comparison added no findings. The frozen broad gate remained a failed run reconciled by bounded repairs, and authoritative operator signature verification was not performed; the record makes both limits explicit | [Pre-publication security plan review](../reviews/2026-09-23-pre-publication-security-review.md) [EV-623] |
 
 ## 2. Continuous testing
 
@@ -27,9 +29,9 @@ The security-relevant layers are:
 
 | Layer | Product signal | Enforcement |
 |---|---|---|
-| Static source analysis | CodeQL scans Python with the `security-extended` query suite on pushes, pull requests and a weekly schedule. Ruff, strict mypy, contract checks and the 24-rule `elspeth-lints` registry add project-specific integrity checks [EV-608] [EV-612] | CodeQL and the `CI Success` aggregate block merge to `main` under the measured ruleset |
+| Static source analysis | CodeQL scans Python with the `security-extended` query suite on protected-branch pushes, same-repository pull requests and a weekly schedule; fork pull requests skip the job. Ruff, strict mypy, contract checks and the 24-rule `elspeth-lints` registry add project-specific integrity checks [EV-608] [EV-612] | CodeQL and the `CI Success` aggregate block merge to `main` under the measured ruleset |
 | Dependency and licence analysis | `pip-audit --strict` separately checks the frozen root and gateway Python graphs; `npm audit` checks both npm lockfiles at every severity; the licence job rejects GPL and AGPL dependencies in both Python graphs [EV-707] [EV-720] [EV-722] | The dependency-and-licence job feeds required `CI Success`; documented exceptions follow [10 § 2](10-vulnerability-and-supply-chain.md#2-triage-and-remediation-targets). A separate required gateway lane scans the assembled image and runs it read-only through external conformance |
-| Python behaviour | The default selection exercises unit, integration, property, invariant and end-to-end behaviour on Python 3.12 and 3.13. A separate required serial suite tests schema, SQL and contention against PostgreSQL [EV-618] [EV-619] | 59,486 default items and 652 PostgreSQL-marked items were collected at the reviewed commit; both lanes feed `CI Success` |
+| Python behaviour | The default selection exercises unit, integration, property, invariant and end-to-end behaviour on Python 3.12 and 3.13. A separate required serial suite tests schema, SQL and contention against PostgreSQL [EV-618] [EV-619] | 61,039 default items and 660 PostgreSQL-marked items were collected at the reviewed commit; the sharded default lanes, combined coverage lane and serial PostgreSQL lane feed `CI Success` |
 | Browser and frontend behaviour | Vitest plus TypeScript type checking cover frontend components; Playwright runs browser journeys against a real backend and Chromium [EV-620] | Both frontend jobs feed `CI Success` |
 | Security policy and release integrity | Redaction-direction governance, telemetry attribution, trust-tier analysis, the local secret scanner, additional advisory judge lint and quality signals, required-check verification, image smoke tests, keyless image signing, provenance and SBOM generation cover policy and release seams. The gateway workflow-source contract adds exact-digest amd64/arm64 scans, attestation retrieval, signature verification and read-only smoke testing | [09 § 2.2](09-secure-development-lifecycle.md#22-gate-table) states which signals block a local commit, merge or publication and which remain advisory |
 
@@ -82,7 +84,7 @@ finding-closure purposes.
 1. **Receive sensitive findings privately.** Use the channels and handling
    rules in [SECURITY.md](../../SECURITY.md); do not publish exploit details,
    secrets, personal data or proof-of-compromise material in an issue.
-2. **Triage and contain.** The ELSPETH maintainer assigns the highest credible
+2. **Triage and contain.** DTA Cloud Engineering assigns the highest credible
    impact and applies the release-blocking and remediation policy in
    [10 § 2](10-vulnerability-and-supply-chain.md#2-triage-and-remediation-targets).
    Preserve affected evidence and withdraw or disable an unsafe artifact when

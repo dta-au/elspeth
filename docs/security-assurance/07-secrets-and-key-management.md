@@ -1,9 +1,9 @@
 # 07 — Secrets and key management
 
 **Status:** product control baseline complete; deployment storage, custody and
-rotation records open · **Reviewed against:** `release/0.8.1` candidate @
-`cb20ed2e2` (2026-09-30) ·
-**Owner:** ELSPETH maintainer
+rotation records open · **Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 Describes which secrets and keys ELSPETH uses, how they reach the
 application, the boundaries of the controls that keep managed secret values
@@ -144,8 +144,8 @@ below. Repeat provider, cloud and CI rows once per distinct credential.
 | Each cloud data or service credential, including static IAM credentials if used | DEPLOYMENT-TODO: repeat as needed |
 | Each sink database credential | DEPLOYMENT-TODO: repeat as needed |
 | Each optional LLM-gateway credential | DEPLOYMENT-TODO: repeat as needed |
-| Judge metadata HMAC key (§ 5.1) | DEPLOYMENT-TODO: |
-| Each CI secret class referenced by an enabled workflow (§ 5.2) | DEPLOYMENT-TODO: repeat as needed |
+| If the organisation maintains a fork: its judge metadata signing key (§ 5.5) | DEPLOYMENT-TODO: or not applicable |
+| Each secret used by deployment-owned CI (§ 5.5) | DEPLOYMENT-TODO: repeat as needed, or not applicable |
 | `user_secrets_enabled` decision and protection/backup of stored per-user secrets | DEPLOYMENT-TODO: |
 
 Short-lived session JWTs, sealed SSO transaction cookies, one-time SSO
@@ -438,7 +438,7 @@ its key-strength and generation controls in § 7.1.
 
 Server-side secret scanning and push protection are repository-hosting
 controls and cannot be established from this tree. Before each release, the
-ELSPETH maintainer verifies their live state in the hosting service and
+DTA Cloud Engineering verifies their live state in the hosting service and
 records the date, repository, verifier, enabled features and any exception in
 the repository administration record. That record is product operations
 evidence, not a deployment/server fact and must not contain secret values.
@@ -468,7 +468,7 @@ them; verification is an operator step in a trusted context [EV-221].
 ### 5.2 CI secrets
 
 Secret names referenced by `.github/workflows/*` at
-`49c1845085d36811b120ef1c540048463e32aabc` (names only) [EV-223]:
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (names only) [EV-223]:
 
 | Workflow | Trigger | Secrets referenced | Use |
 |---|---|---|---|
@@ -482,14 +482,15 @@ No checked-in workflow references or injects the judge metadata HMAC key
 (§ 5.1), a production web secret key, a share-link key, a fingerprint key or
 a deployment database credential. The workflow files prove only which secret
 names they reference; they do not prove which repository, organisation or
-environment secrets exist in the hosting service. The live inventory and
-event/fork exposure policy are therefore explicit Deployment record items
-[EV-223].
+environment secrets exist in the hosting service. Section 5.4 records the
+ELSPETH project's dated live inventory evidence. A deploying organisation
+records only secrets and CI it operates itself [EV-223] [EV-228].
 
-### 5.3 Custody review procedure
+### 5.3 Deployment custody review procedure
 
-Use this procedure for each scheduled custody review and after a material
-change to a secret store, CI environment or deployment identity:
+The deploying organisation uses this procedure for each scheduled review and
+after a material change to its secret store, CI environment or deployment
+identity:
 
 1. Enumerate human and machine principals that can read secret values,
    create or rotate versions, change access policy, administer CI secrets or
@@ -499,30 +500,74 @@ change to a secret store, CI environment or deployment identity:
    principal that cannot read a value may still be able to grant itself read
    access through policy administration, so record and review both powers.
 3. Re-confirm the separation decisions: image builders versus production-key
-   holders; runtime versus schema-owner database access; and operator-only
-   judge-key custody versus key-free CI and agent tooling.
+   holders and runtime versus schema-owner database access.
 4. Remove stale principals and narrow over-broad scopes. Rotate a secret when
    access cannot be shown to have remained within the approved population.
 5. Exercise break-glass access without exposing values in the exercise
    record. Verify that use is logged, reviewed and followed by revocation or
    credential rotation as the deployment policy requires.
 6. Record the reviewer, date, live source queried, changes, exceptions and
-   evidence location in the controlled repository. Route suspected exposure
-   to the compromise procedure in § 6.2.
+   evidence location in the controlled deployment copy. Route suspected
+   exposure to the compromise procedure in § 6.2.
 
-### 5.4 Deployment record
+### 5.4 ELSPETH project-operations custody record
+
+The pre-publication custody review queried GitHub on 2026-09-23. After the
+operator removed the judge-metadata HMAC key from repository Actions secrets,
+the repository-scoped inventory contained `AWS_DEPLOY_ROLE_ARN`, `AWS_REGION`
+and `OPENROUTER_API_KEY`. The effective organisation-secret query returned
+zero inherited secrets, and the `copilot` and `github-pages` environments each
+returned zero secrets. No checked-in workflow references the judge key. The
+review did not establish runner-local custody [EV-221] [EV-228].
+
+That runner gap was reviewed on 2026-10-01. The four ordinary CI runners use
+the dedicated `actions-runner` account. Their runner directories are restricted
+to that account at mode `0700`; `.credentials`, `.credentials_rsaparams`,
+`.env` and `.path` are mode `0600`. The persistent runner environment names
+contained only `LANG`, the service units define no additional environment, and
+no checked-in workflow references the judge key. Systemd drop-ins set a
+restrictive umask, remove service capabilities and prevent privilege gain.
+This establishes the configured persistent environment and file custody; it
+does not claim that a running job cannot read material deliberately supplied
+to that job under the runner account. DTA Cloud Engineering owns host access,
+with the named human roster retained in the controlled project-administration
+record [EV-723].
+
+Project release authority and HMAC custody sit with DTA Cloud Engineering,
+acting as the project signing operator. The key's exact storage location and
+value are deliberately excluded from the public repository. The supported
+signing workflow passes the key only to the project operator's trusted
+`sign-bundle` or `rekey` process; CI and agent tools remain key-free (§ 5.1).
+
+For a project custody review, DTA Cloud Engineering re-enumerates repository,
+organisation and environment secret grants; confirms that no workflow, CI job
+or key-free agent tool receives the judge key; checks the project operator's
+custody and revocation path; and applies the
+[self-hosted runner custody runbook](../runbooks/self-hosted-runner-hardening.md).
+This is dated
+project-operations evidence. It is refreshed before a release that relies on
+the custody claim. An installer does not fill in or attest to ELSPETH's
+upstream GitHub administration.
+
+### 5.5 Deployment record
+
+Complete this record for the deployment's own runtime secrets and for any
+fork, local build or release automation operated by the deploying
+organisation. When the deployment consumes official ELSPETH artifacts without
+running project CI, mark the downstream-CI rows not applicable and cite the
+verified artifact evidence from
+[09 § 6](09-secure-development-lifecycle.md#6-build-and-release-integrity).
 
 | Item | Value |
 |---|---|
-| Who holds the judge metadata HMAC key, and where | DEPLOYMENT-TODO: |
-| Confirmation that no repository or organisation Actions secret holds the judge key (the handoff notes that removing a workflow reference does not revoke a secret) | DEPLOYMENT-TODO: |
-| Live inventory of repository, organisation and environment secrets; owning scope and enabled workflows for each | DEPLOYMENT-TODO: controlled copy only |
-| Which workflow events may receive each CI secret, including fork and external-contributor policy | DEPLOYMENT-TODO: |
+| If the organisation maintains a fork with its own signed tier-model metadata: who holds that fork's signing key and where | DEPLOYMENT-TODO: or not applicable |
+| If the organisation runs its own CI: live inventory of repository, organisation and environment secrets; owning scope and enabled workflows for each | DEPLOYMENT-TODO: controlled copy only, or not applicable |
+| Which events may receive secrets in deployment-owned CI, including fork and external-contributor policy | DEPLOYMENT-TODO: or not applicable |
 | Who can read production secrets in the secret store | DEPLOYMENT-TODO: |
 | Who can change them | DEPLOYMENT-TODO: |
 | Who can grant or change secret-store access, and how that authority is reviewed | DEPLOYMENT-TODO: |
 | Separation between those who build the image and those who hold production keys | DEPLOYMENT-TODO: |
-| CI secrets: owner, scope (repository or environment) and rotation | DEPLOYMENT-TODO: |
+| Deployment-owned CI secrets: owner, scope and rotation | DEPLOYMENT-TODO: or not applicable |
 | Break-glass access to secrets | DEPLOYMENT-TODO: |
 | Break-glass use logging, review and credential revocation after use | DEPLOYMENT-TODO: |
 
@@ -624,8 +669,8 @@ once the authenticating key itself is compromised [EV-226] [EV-316].
 | Landscape passphrase | DEPLOYMENT-TODO: | Follow the datastore recovery decision; there is no in-product re-key | DEPLOYMENT-TODO: |
 | Database credentials | DEPLOYMENT-TODO: | Revoke at the database, replace in the store, restart and verify both runtime and schema-owner paths separately | DEPLOYMENT-TODO: |
 | Provider and cloud credentials | DEPLOYMENT-TODO: | Revoke at the provider, rotate, restart and review provider usage logs and Landscape call records | DEPLOYMENT-TODO: |
-| Judge metadata HMAC key | DEPLOYMENT-TODO: | Run `elspeth-lints rekey` by the operator using the [handoff procedure](../judge-signature-handoff.md) | DEPLOYMENT-TODO: |
-| Each CI secret | DEPLOYMENT-TODO: | Revoke at its issuer, replace at the narrowest environment/repository scope and inspect affected workflow runs | DEPLOYMENT-TODO: |
+| Signing key for a deployment-maintained fork, if any | DEPLOYMENT-TODO: or not applicable | Run `elspeth-lints rekey` by the fork's operator using the [handoff procedure](../judge-signature-handoff.md) | DEPLOYMENT-TODO: or not applicable |
+| Each deployment-owned CI secret | DEPLOYMENT-TODO: or not applicable | Revoke at its issuer, replace at the narrowest environment/repository scope and inspect affected workflow runs | DEPLOYMENT-TODO: or not applicable |
 
 ## 7. Controlled risk references
 

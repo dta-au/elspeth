@@ -2,8 +2,9 @@
 
 **Status:** generic product records, controls and response guidance complete;
 deployment records remain open ·
-**Reviewed against:** `release/0.8.1` @ `352430f4f659704d50efffc5dfca967ae9b73ebb`
-(2026-09-30) · **Owner:** ELSPETH maintainer
+**Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:** DTA Cloud
+Engineering
 
 Describes what ELSPETH records, how the record is protected from tampering,
 how long it is kept, and how security events are detected.
@@ -338,7 +339,7 @@ The shipped writers store the exact string exposed as
 deletion cascades the row, while durable-history soft archive retains it and
 there is no independent expiry or purge. The reverse-proxy trust, necessity
 and literal-address retention decision are recorded in
-[12 § 4.2](12-privacy-impact-assessment.md#42-audit-access-network-address-policy)
+[12 § 4.2](12-privacy-impact-assessment.md#42-deployment-record--audit-access-network-address-policy)
 [EV-813].
 
 Record deployment-specific residual-risk acceptance in

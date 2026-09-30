@@ -1,8 +1,9 @@
 # 09 — Secure development lifecycle
 
 **Status:** product process baseline complete; independent assessment and
-deployment change control open · **Reviewed against:** `release/0.8.1` @
-`004c0eee0` (2026-09-30) · **Owner:** ELSPETH maintainer
+deployment change control open · **Product source reviewed against:**
+`release/0.8.1` @ `487ac85a377f135e012bb206e3769cd65f6fadb8`
+(2026-10-01) · **Owner:** DTA Cloud Engineering
 
 Shows how code is written, reviewed, tested and gated before it reaches a
 release. For each gate it records what the gate checks, where it runs, and
@@ -44,17 +45,22 @@ Existing material:
 | `v*` tags | Pushing a version tag is the operator action that publishes a release image (§ 6.2) [EV-625] [EV-626] |
 | `dependabot/*` | Automated dependency-update branches, opened as pull requests (§ 2.2) [EV-616] |
 
-CI, CodeQL and an additional judge lint and quality workflow run on every push
-and pull request to `main`, `master`, `RC*` and `release/**`. The judge
-workflow is advisory by design and is not part of the standard enforcement
-package. The redaction gate and the commit-trailer gate run on pull requests
-to the same branches [EV-604] [EV-611] [EV-612] [EV-613] [EV-614].
+CI, CodeQL and an additional judge lint and quality workflow are triggered by
+pushes and pull requests to `main`, `master`, `RC*` and `release/**`. CI and
+CodeQL checkout and analysis jobs run for protected-branch pushes and
+same-repository pull requests; fork pull requests skip those jobs and fail the
+applicable aggregate. The judge workflow is advisory by design and is not part
+of the standard enforcement package. The redaction gate and the commit-trailer
+gate run on pull requests to the same branches [EV-604] [EV-611] [EV-612]
+[EV-613] [EV-614].
 
 ### 1.2 Who may change code
 
 - The repository `dta-au/elspeth` is public and owned by a GitHub
-  organisation. Named accounts hold read, write or admin roles; who holds
-  them is a **Deployment record** item (§ 1.6).
+  organisation. Project governance assigns release authority to DTA Cloud
+  Engineering (§ 1.6). The mutable GitHub permission roster is
+  reviewed as project administration evidence; it is not delegated to an
+  installer as a deployment fact.
 - ELSPETH runs in **single-maintainer mode**
   ([GOVERNANCE.md § Maintainer continuity](../../GOVERNANCE.md#maintainer-continuity)).
   The required number of approving human reviews is zero, because
@@ -65,7 +71,7 @@ to the same branches [EV-604] [EV-611] [EV-612] [EV-613] [EV-614].
   maintainer takes part: one required approval, stale-review dismissal,
   last-push approval, required conversation resolution and an ownership map
   for security-sensitive paths [EV-603].
-- Release authority sits with the repository maintainer. GOVERNANCE.md
+- Release authority sits with DTA Cloud Engineering. GOVERNANCE.md
   requires the approver, date, branch or tag, commit, evidence links and
   exceptions to be recorded for a public release [EV-603].
 
@@ -84,7 +90,7 @@ Measured from the repository ruleset `main` (id 12348893, enforcement
 | Automated code review | Copilot code review requested on each push to a pull request (advisory, not a required check) |
 | Bypass actors | None; the ruleset reports `current_user_can_bypass: never` for an admin account |
 
-`CI Success` is an aggregate job. It fails unless every one of ten CI job IDs
+`CI Success` is an aggregate job. It fails unless every one of eleven CI job IDs
 succeeded (§ 2.1), so one required check covers all of them and a renamed job
 cannot silently drop out of protection [EV-604].
 
@@ -106,7 +112,9 @@ corresponding governance and repository-setting risks are handled through the
   a fork can remove its workflow's YAML admission condition. Maintainers
   review fork code and workflow changes before admitting them onto a
   repository branch. GitHub does not pass repository secrets to workflows
-  triggered from forks [EV-604].
+  triggered from forks. Project policy requires approval for all outside
+  contributors; the authenticated repository setting measured on 2026-10-01
+  is `all_external_contributors` [EV-604] [EV-714].
 - **Least privilege.** Workflows declare `permissions:`; most jobs hold
   `contents: read` only. Write scopes are limited to the jobs that need them
   (`security-events: write` for CodeQL, `packages: write` and `id-token: write`
@@ -115,9 +123,9 @@ corresponding governance and repository-setting risks are handled through the
 - **Repository Actions settings** (measured): SHA pinning of actions is
   required; the default workflow token is read-only; workflows cannot approve
   pull requests [EV-602].
-- **Pinned actions.** Recursive YAML parsing found 98 `uses:` references in
-  nine workflow files. All 98 are third-party actions pinned to a full
-  40-character commit SHA, representing 18 distinct actions; there are no
+- **Pinned actions.** Recursive YAML parsing found 102 `uses:` references in
+  nine workflow files. All 102 are third-party actions pinned to a full
+  40-character commit SHA, representing 19 distinct actions; there are no
   local or `docker://` references. Before use, the classifier accepted a
   40-character SHA, rejected a tag and a short SHA, and classified local and
   `docker://` samples outside the third-party count [EV-605].
@@ -148,16 +156,30 @@ requests [EV-601] [EV-602] [EV-612].
 Re-run these for the release being assessed; repository settings can change
 without a commit.
 
-### 1.6 Deployment record — change control
+### 1.6 ELSPETH project-operations authority
+
+| Item | ELSPETH project baseline |
+|---|---|
+| Governance mode | Single-maintainer mode; no claim of independent human approval [EV-603] |
+| Public-release decision authority | DTA Cloud Engineering; approval record includes approver, date, ref, commit, evidence and exceptions [EV-603] |
+| `main` ruleset bypass | No bypass actors; measured ruleset reported `current_user_can_bypass: never` for an admin account on 2026-09-30 [EV-601] |
+| Version-tag publication authority | Governance authorises DTA Cloud Engineering. Technically, a `v*` push can trigger the release workflow for any GitHub actor allowed to create that ref; publication still fails unless the target commit has all live `main` required checks [EV-603] [EV-625] |
+| Permission-roster custody | DTA Cloud Engineering holds the GitHub administration record and reviews admin/write access and tag authority. The reviewed public evidence establishes one release-authority role but does not establish a current hosted-permission count; the pack therefore makes no stronger roster claim and does not ask an installer to supply it |
+
+### 1.7 Deployment record — change control
+
+The upstream project facts are fixed in §§ 1.2–1.6. Record only the deploying
+organisation's release-acceptance process and any source fork or build system
+that it operates.
 
 | Item | Value |
 |---|---|
 | Release and commit assessed; CI run for that commit | DEPLOYMENT-TODO: |
-| Accounts holding admin and write roles on the repository, and who reviews that list | DEPLOYMENT-TODO: |
-| Who may push version tags and publish images | DEPLOYMENT-TODO: |
+| If a fork or local build is used: accounts holding admin/write roles and who reviews them | DEPLOYMENT-TODO: or not applicable |
+| If a fork or local release workflow is used: who may create release tags and publish artifacts | DEPLOYMENT-TODO: or not applicable |
 | Whether the deploying agency requires independent human review before a release is deployed, and who performs it | DEPLOYMENT-TODO: |
 | Change approval for deploying a new release (change board, ticket, approver) | DEPLOYMENT-TODO: |
-| Date the settings in § 1.3–§ 1.4 were last re-measured | DEPLOYMENT-TODO: |
+| Date and evidence on which the organisation re-checked or accepted the upstream settings in §§ 1.3–1.4 | DEPLOYMENT-TODO: |
 
 ## 2. Automated gates
 
@@ -169,7 +191,8 @@ these jobs reports `success` [EV-604]:
 | Job | Content |
 |---|---|
 | `Static analysis` | actionlint, ruff, mypy, contract checks, elspeth-lints rules (§ 2.3) |
-| `Test (Python 3.12)`, `Test (Python 3.13)` | Default pytest selection; coverage floors on 3.13 |
+| `Test (Python 3.12, shard 0–3)`, `Test (Python 3.13, shard 0–3)` | Four deterministic shards per interpreter over the default pytest selection; 3.13 shards emit coverage data |
+| `Combined coverage` | Requires all test shards, proves the four 3.13 manifests form one complete non-overlapping population, combines coverage and enforces every coverage floor |
 | `Testcontainer (PostgreSQL contention proofs)` | `pytest tests/ -m testcontainer -n 0` against real PostgreSQL |
 | `Host-runner unit (docker CLI, non-root filesystem)` | Tests that need a Docker CLI or a non-root user; required skips become failures |
 | `State-engine catalog and selector validation` | Proof catalogues, plugin lifecycle matrix and documentation links |
@@ -179,10 +202,10 @@ these jobs reports `success` [EV-604]:
 | `Frontend E2E (Playwright)` | Browser journeys against a real backend and Chromium |
 | `Frontend unit (vitest + typecheck)` | TypeScript type check and vitest |
 
-A source check at `004c0eee0` proves that the aggregate names all ten job IDs,
-including the gateway job. This local commit has no GitHub CI run, so the
-successful execution of that job and a refreshed live-ruleset observation
-remain release evidence to capture; the required check name itself remains
+A source check at `487ac85a3` proves that the aggregate names all eleven job IDs,
+including the gateway job. No GitHub CI run for this commit was examined, so
+successful execution and a refreshed live-ruleset observation remain release
+evidence to capture; the required check name itself remains
 `CI Success`.
 
 A skipped or cancelled job counts as a failure. The `Integration Tests` job
@@ -207,8 +230,8 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | `elspeth-lints` rules | Project-specific invariants (§ 2.3) | Pre-commit (per rule, on trigger paths); CI `Static analysis` | Yes (`CI Success`), except `trust_tier.tier_model` (§ 2.4) | [ADR-023](../architecture/adr/023-custom-python-ci-analyzer.md) [EV-606] [EV-608] [EV-610] |
 | Lint migration parity | Shadow-mode comparison of migrated lint rules | CI `Static analysis` | Yes (`CI Success`) | `scripts/cicd/parity_harness.py` [EV-604] |
 | Python tests (default selection) | Unit, integration, property, invariant and end-to-end tests (§ 3), on Python 3.12 and 3.13 | CI `Test` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml) [EV-604] [EV-618] |
-| Coverage floors | Branch-enabled coverage ≥ 85 % overall; `core/landscape` ≥ 92 %, `core/canonical.py` ≥ 99 %, `engine/orchestrator` ≥ 90 %, `contracts` ≥ 62 % | CI `Test (Python 3.13)` | Yes (`CI Success`) | as above [EV-621] |
-| PostgreSQL testcontainer suite | Schema, SQL, locking and deployment acceptance against real PostgreSQL (652 tests, § 3.2) | CI `Testcontainer` | Yes (`CI Success`) | as above [EV-604] [EV-619] |
+| Coverage floors | Branch-enabled coverage ≥ 85 % overall; `core/landscape` ≥ 92 %, `core/canonical.py` ≥ 99 %, `engine/orchestrator` ≥ 90 %, `contracts` ≥ 62 % | CI `Combined coverage`, after all four Python 3.13 shards | Yes (`CI Success`) | as above [EV-621] |
+| PostgreSQL testcontainer suite | Schema, SQL, locking and deployment acceptance against real PostgreSQL (660 tests, § 3.2) | CI `Testcontainer` | Yes (`CI Success`) | as above [EV-604] [EV-619] |
 | Live-provider integration tests | Integration tests with a model API key | CI `Integration Tests`, push only | No — runs after merge; gates image publication (§ 6.2) | as above [EV-604] [EV-617] [EV-625] |
 | Frontend unit and types | `tsc` over two projects; 238 vitest files | CI `Frontend unit` | Yes (`CI Success`) | as above [EV-604] [EV-620] |
 | Frontend end-to-end | Playwright browser journeys | CI `Frontend E2E` | Yes (`CI Success`) | as above [EV-604] [EV-620] |
@@ -216,7 +239,7 @@ on `main` (§ 1.3). Pre-commit hooks run on the contributor's machine once
 | Dependency audit (`npm audit`) | Known vulnerabilities in the frontend and root npm lockfiles, any severity | CI `Dependency and License Audit` | Yes (`CI Success`) | as above; detail in [10](10-vulnerability-and-supply-chain.md) [EV-604] [EV-707] [EV-720] |
 | Licence check | Fails on GPL or AGPL dependencies in both locked Python graphs and retains both reports | CI `Dependency and License Audit` | Yes (`CI Success`) | as above [EV-604] [EV-707] |
 | Assembled gateway image qualification | Frozen tests and conformance; built-image High/Critical Trivy refusal, exact-revision and fixed UID/GID checks, and read-only external conformance | CI `Gateway (locked tests and image)` | Yes (`CI Success`) | [ci.yaml](../../.github/workflows/ci.yaml), `tests/unit/cicd/test_gateway_supply_chain.py` [EV-604] [EV-617] [EV-722] |
-| CodeQL | Python, `security-extended` query suite; tests and lint fixtures excluded; also weekly on schedule | CI `Analyze Python`, push, pull request and Monday schedule | Yes (`CodeQL`) | [codeql.yaml](../../.github/workflows/codeql.yaml), [codeql-config.yml](../../.github/codeql/codeql-config.yml) [EV-612] |
+| CodeQL | Python, `security-extended` query suite; tests and lint fixtures excluded; also weekly on schedule | CI `Analyze Python`, protected-branch push, same-repository pull request and Monday schedule; fork pull requests skip the job | Yes (`CodeQL`) | [codeql.yaml](../../.github/workflows/codeql.yaml), [codeql-config.yml](../../.github/codeql/codeql-config.yml) [EV-612] |
 | Composer redaction gate | A change to the redaction snapshot is classified as weakening or strengthening; the matching label, and a rationale for a weakening, are required | Pull request (also re-runs on label and description edits) | Yes (`redaction-gate`) | [composer-redaction-gate.yml](../../.github/workflows/composer-redaction-gate.yml), [policy guide](../guides/redaction-policy-changes.md) [EV-613] |
 | Telemetry backfill trailer | Every commit touching a telemetry cohort directory carries its attribution trailer | Pre-commit (`commit-msg` stage); pull request | Yes (`Check cohort-attribution trailers on PR commits`) | [enforce-telemetry-backfill-trailer.yaml](../../.github/workflows/enforce-telemetry-backfill-trailer.yaml) [EV-614] |
 | Additional judge lint and quality diagnostics | Rolling 30-day operator-override signal for judged suppressions; judge-quality corpus signal against a live model (trusted pushes only) | Push and pull request | No — advisory by design and outside the standard enforcement package | [enforce-allowlist-judge-gates.yaml](../../.github/workflows/enforce-allowlist-judge-gates.yaml) [EV-611] |
@@ -306,25 +329,25 @@ editing YAML without a test failing [EV-617]:
 
 ### 3.1 Python tests by tier
 
-Measured at `49c184508`. File counts filter `git ls-files tests/<tier>` for
+Measured at `487ac85a3`. File counts filter `git ls-files tests/<tier>` for
 `test_*.py`, which includes files directly under each tier as well as nested
 files; the unit result was controlled against
-`find tests/unit -name 'test_*.py'` (1,700 both ways). Item counts come from
+`find tests/unit -name 'test_*.py'` (1,736 both ways). Item counts come from
 `pytest tests/ --collect-only -q -n 0` (exit 0), counting collected node ids
 by top-level directory [EV-618].
 
 | Tier | Directory | Test files | Items in default selection |
 |---|---|---|---|
-| Unit | `tests/unit` | 1,700 | 53,991 |
-| Integration | `tests/integration` | 238 | 3,399 |
+| Unit | `tests/unit` | 1,736 | 55,518 |
+| Integration | `tests/integration` | 241 | 3,425 |
 | Property-based (Hypothesis) | `tests/property` | 74 | 1,154 |
 | Invariants | `tests/invariants` | 20 | 676 |
 | End-to-end | `tests/e2e` | 40 | 223 |
 | Fixture self-tests | `tests/fixtures` | 2 | 40 |
 | Gateway runtime | `tests/gateway_runtime` | 1 | 3 |
-| PostgreSQL testcontainer | `tests/testcontainer` | 87 | 0 (deselected) |
+| PostgreSQL testcontainer | `tests/testcontainer` | 88 | 0 (deselected) |
 | Performance | `tests/performance` | 18 | 0 (deselected) |
-| **Total** | | **2,180** | **59,486** of 60,280 collected |
+| **Total** | | **2,220** | **61,039** of 61,841 collected |
 
 Hypothesis is imported by 112 files under `tests/`, 75 of them under
 `tests/property` (`git grep -l 'from hypothesis\|import hypothesis'`).
@@ -338,16 +361,18 @@ separate CI job (§ 2.1) or with `pytest tests/ -m testcontainer -n 0`.
 
 | Marker | Tests (whole tree) | Where they run |
 |---|---|---|
-| `testcontainer` | 652 | CI `Testcontainer` job, required |
+| `testcontainer` | 660 | CI `Testcontainer` job, required |
 | `live_provider` | 56 | Operator-gated (`--run-live-provider`) and the manual `state-engine-live-provider.yml` workflow; no automatic CI job |
 | `performance` | 51 | On demand |
 | `slow` | 37 | On demand |
 | `stress` | 30 | On demand (needs the ChaosLLM server) |
 
-Counts are from `pytest tests/ --collect-only -q -n 0 -m <marker>`. Markers
-overlap; 794 distinct tests are deselected in total. `--strict-markers` and
-`--strict-config` are set, so an unknown marker or setting fails collection
-[EV-619].
+Counts are from one controlled collection that enumerated every collected
+item's markers before applying the default expression. The same collection
+computed the 802-item distinct union; marker populations overlap. A separate
+default `pytest tests/ --collect-only -q -n 0` collection confirmed 802
+deselected items. `--strict-markers` and `--strict-config` are set, so an
+unknown marker or setting fails collection [EV-619].
 
 ### 3.3 Frontend tests
 
@@ -382,16 +407,16 @@ invariants that no latency or cost argument overrides
 
 ### 4.2 Review records
 
-Review records are kept under [docs/reviews/](../reviews/): 36 review entry
-points dated 2026-09-20 to 2026-09-28 at `49c184508` (35 top-level records
-plus the release web-review README) [EV-623]. Those most relevant to security:
+Review records are kept under [docs/reviews/](../reviews/): 39 top-level review
+records dated 2026-09-20 to 2026-09-30 at `487ac85a3`, with 80 nested
+supporting records [EV-623]. Those most relevant to security:
 
 | Date | Review | Method |
 |---|---|---|
 | 2026-09-23 | [Pre-publication security plan review](../reviews/2026-09-23-pre-publication-security-review.md) | Four independent readers (source reality, architecture, test quality, downstream effects); read-only GitHub secret and ruleset inventory |
 | 2026-09-23 | [Web tier review, 48-hour window](../reviews/2026-09-23-release-0.8.1-web-review/README.md) | Diff review of 133 commits in 39 bundles and 9 seams; every finding sent to an independent refuter, high findings to a second |
 | 2026-09-23 | [Identity / SSO programme completion adjudication](../reviews/2026-09-23-identity-sso-completion.md) | Completion check of the identity programme |
-| 2026-09-23 | [Single-developer assumptions audit](../reviews/2026-09-23-single-developer-assumptions.md) and [in agent tooling](../reviews/2026-09-23-single-developer-tooling-assumptions.md) | Where the project depends on one person |
+| 2026-09-23 | [Single-developer assumptions audit](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-23-single-developer-assumptions.md) and [in agent tooling](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-23-single-developer-tooling-assumptions.md) | Historical reports preserved in `docs-archive/`; open findings retain their own disposition |
 | 2026-09-27 | [Composer provider failure boundary gap analysis](../reviews/2026-09-27-composer-provider-boundary-gap.md) | Boundary analysis |
 | 2026-09-28 | [Gateway boundary implementation review](../reviews/2026-09-28-gateway-boundaries-implementation-review.md) | Implementation review |
 
@@ -422,7 +447,7 @@ adversarial review tooling [EV-624].
 
 | Item | Value |
 |---|---|
-| Independent (non-maintainer) code or design review performed for this release, by whom, scope | DEPLOYMENT-TODO: |
+| Additional independent code or design review commissioned or accepted by the deploying organisation, including assessor and scope | DEPLOYMENT-TODO: or not applicable; upstream project reviews are recorded in § 4.2 |
 | Penetration test ([14](14-security-testing.md)) | DEPLOYMENT-TODO: |
 | Review findings accepted as residual risk, and by whom ([15](15-risk-register.md)) | DEPLOYMENT-TODO: |
 
@@ -436,7 +461,7 @@ independent human review and testing ([14](14-security-testing.md)).
 
 | Failure mode | Controls |
 |---|---|
-| Code that looks right but is wrong | Strict mypy; 59,486 default tests plus 652 PostgreSQL tests; property-based tests; coverage floors; CodeQL (§ 2.2, § 3) [EV-612] [EV-618] [EV-619] [EV-621] |
+| Code that looks right but is wrong | Strict mypy; 61,039 default tests plus 660 PostgreSQL tests; property-based tests; coverage floors; CodeQL (§ 2.2, § 3) [EV-612] [EV-618] [EV-619] [EV-621] |
 | Defensive code that hides errors instead of surfacing them | Trust-tier model with judge-reviewed, operator-signed exceptions (§ 2.4); masquerade gate on attribute probes; `validation_theatre` rule; [ADR-032 validate by trust domain](../architecture/adr/032-validate-by-trust-domain.md) [EV-609] [EV-610] |
 | A change that is green locally but breaks a whole-tree property | Whole-tree gates pin exact site sets, output bytes and plugin source hashes ([CONTRIBUTING.md](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)) |
 | Tests that pass for the wrong reason | Red-team agent charter (§ 4.3); anti-inert gate design (§ 2.3); positive and negative controls required for every measurement (§ 3.4) [EV-609] [EV-622] [EV-624] |
@@ -577,7 +602,7 @@ another registry does not copy its signature unless that copy was signed too.
 | Output of `cosign verify` with the exact certificate identity | DEPLOYMENT-TODO: |
 | `build-push.yaml` run that produced the digest, and its required-check verification step | DEPLOYMENT-TODO: |
 | OCI revision label matches the assessed commit | DEPLOYMENT-TODO: |
-| Reference gateway exact GHCR digest and publication run | DEPLOYMENT-TODO: first successful GitHub publication run |
+| Reference gateway use decision; if used, exact GHCR digest and the publication run that produced it | DEPLOYMENT-TODO: or not applicable |
 | Reference gateway SPDX SBOM and maximum-provenance files, bound to the source commit and digest | DEPLOYMENT-TODO: |
 | Reference gateway amd64 and arm64 Trivy results at zero High/Critical | DEPLOYMENT-TODO: |
 | Reference gateway Cosign verification output and workflow identity | DEPLOYMENT-TODO: |

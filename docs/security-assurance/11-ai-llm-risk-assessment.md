@@ -1,8 +1,9 @@
 # 11 — AI / LLM risk assessment
 
 **Status:** reusable product assessment complete; deployment record open ·
-**Reviewed against:** `release/0.8.1` @ `49c184508` (2026-09-30) ·
-**Owner:** ELSPETH maintainer
+**Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 ELSPETH uses language models in the Web Composer and in pipeline plugins. It
 also integrates with managed prompt-shield, content-safety and retrieval

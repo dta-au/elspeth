@@ -1,8 +1,9 @@
 # 13 — Incident response and continuity
 
 **Status:** generic response and continuity method complete; deployment records
-open · **Reviewed against:** `release/0.8.1` @ `eee4bb941` (2026-10-01) ·
-**Owner:** ELSPETH maintainer
+open · **Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 This document defines the reusable security-incident and continuity method for
 ELSPETH. Each deploying organisation completes the labelled **Deployment

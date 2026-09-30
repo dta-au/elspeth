@@ -1,8 +1,9 @@
 # 06 — Identity and access
 
 **Status:** product control baseline complete; deployment records open ·
-**Reviewed against:** `release/0.8.1` @ `352430f4f659704d50efffc5dfca967ae9b73ebb`
-(2026-09-30) · **Owner:** ELSPETH maintainer
+**Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:** DTA Cloud
+Engineering
 
 Describes how users are identified, authenticated and authorised, and how
 their access is granted, reviewed and removed. It covers the web application.

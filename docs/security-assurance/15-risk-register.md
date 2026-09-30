@@ -1,9 +1,9 @@
 # 15 — Risk register
 
 **Status:** public schema complete — populated register held in the controlled
-deployment copy · **Reviewed against:** `release/0.8.1` candidate @
-`eee4bb941` (2026-10-01) · **Owner:**
-ELSPETH maintainer
+deployment copy · **Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:**
+DTA Cloud Engineering
 
 > **Do not populate this file in the public repository.** Open risks,
 > exposure conditions, likelihood, treatment detail and acceptance decisions

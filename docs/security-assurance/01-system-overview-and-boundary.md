@@ -1,9 +1,9 @@
 # 01 — System overview and boundary
 
 **Status:** product baseline complete; Deployment record required ·
-**Reviewed against:** `release/0.8.1` @
-`49c1845085d36811b120ef1c540048463e32aabc` (2026-09-30) ·
-**Owner:** ELSPETH maintainer
+**Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 This document fixes the public product boundary inherited by the rest of the
 assurance pack. It describes ELSPETH source, release artefacts and shipped
