@@ -637,12 +637,25 @@ class LLMConfig(TransformDataConfig):
         from elspeth.plugins.sources.field_normalization import describe_undeclared_row_fields, undeclared_row_fields
 
         env = create_sandboxed_environment()
+        unbound_top_level_cache: dict[str, tuple[str, ...]] = {}
+        row_fields_cache: dict[str, frozenset[str]] = {}
 
-        def unbound_top_level(template: str) -> list[str]:
+        def unbound_top_level(template: str) -> tuple[str, ...]:
             # Field validators already compile-checked both template slots,
             # so parse cannot fail here; no TemplateSyntaxError handling.
-            names = find_runtime_unbound_variables(env.parse(template))
-            return sorted(names - _PROMPT_CONTEXT_NAMES - _PROMPT_GLOBAL_NAMES)
+            cached = unbound_top_level_cache.get(template)
+            if cached is None:
+                names = find_runtime_unbound_variables(env.parse(template))
+                cached = tuple(sorted(names - _PROMPT_CONTEXT_NAMES - _PROMPT_GLOBAL_NAMES))
+                unbound_top_level_cache[template] = cached
+            return cached
+
+        def row_fields(template: str) -> frozenset[str]:
+            cached = row_fields_cache.get(template)
+            if cached is None:
+                cached = extract_jinja2_field_usage(template).fields
+                row_fields_cache[template] = cached
+            return cached
 
         if self.queries is None:
             unbound = unbound_top_level(self.prompt_template)
@@ -657,7 +670,7 @@ class LLMConfig(TransformDataConfig):
                 )
             if self.required_input_fields:
                 undeclared = undeclared_row_fields(
-                    extract_jinja2_field_usage(self.prompt_template).fields,
+                    row_fields(self.prompt_template),
                     self.required_input_fields,
                 )
                 if undeclared:
@@ -697,7 +710,7 @@ class LLMConfig(TransformDataConfig):
                 node_template_specs.append(spec.name)
 
             bound = frozenset(spec.input_fields)
-            unbound_fields = sorted(extract_jinja2_field_usage(template).fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+            unbound_fields = sorted(row_fields(template) - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
             if unbound_fields:
                 fields = ", ".join(f"'{name}'" for name in unbound_fields)
                 bound_names = ", ".join(f"'{name}'" for name in sorted(bound))

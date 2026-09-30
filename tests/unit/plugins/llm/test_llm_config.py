@@ -2261,6 +2261,30 @@ class TestTemplateVariableBindings:
         message = str(exc_info.value)
         assert "'broken_query'" in message
 
+    def test_shared_node_template_is_extracted_once_for_binding_checks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Fallback queries must not multiply parsing cost by the shared template size."""
+        from elspeth.core import templates
+
+        template = "Assess this long shared prompt: {{ row.input_1 }}"
+        original_extract = templates.extract_jinja2_field_usage
+        shared_template_calls = 0
+
+        def counting_extract(candidate: str) -> Any:
+            nonlocal shared_template_calls
+            if candidate == template:
+                shared_template_calls += 1
+            return original_extract(candidate)
+
+        monkeypatch.setattr(templates, "extract_jinja2_field_usage", counting_extract)
+        queries = {f"query_{index}": {"input_fields": {"input_1": f"column_{index}"}} for index in range(100)}
+
+        config = self._multi(queries, template=template)
+
+        assert config.queries is not None
+        # The dynamic-access validator performs one independent extraction;
+        # the binding validator must add only one, regardless of query count.
+        assert shared_template_calls == 2
+
     def test_from_dict_wraps_binding_error_as_plugin_config_error(self) -> None:
         """The web/probe path must see the redacted-safe §5.3 category, not a
         bare ValueError escaping as a 500."""
