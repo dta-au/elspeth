@@ -326,19 +326,7 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
 def test_audit_readiness_reads_do_not_consume_the_composer_rate_limit(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
-    """Reads are unguarded — the shared per-user bucket is for writes.
-
-    These GETs previously shared the composer message bucket (added in
-    d1fbdf3fc as a phase-2 review blocker, mirroring sibling routes).
-    In deployment that bucket is sized for LLM-backed compose calls
-    (10/min), and the tutorial's endgame polls audit-readiness enough
-    to starve the tutorial-completion PATCH into a 429. Policy per
-    preferences/routes.py: "Read GET is intentionally unguarded —
-    idempotent, safe to spam, no write amplification."
-
-    limit=1 makes the assertion sharp: if either route consumed or
-    checked the bucket, the second request would 429.
-    """
+    """Audit reads never consume the bucket reserved for LLM-backed calls."""
     client, session_id = audit_readiness_client_with_state
 
     for suffix in ("", "/explain"):
@@ -347,6 +335,22 @@ def test_audit_readiness_reads_do_not_consume_the_composer_rate_limit(
         assert first_response.status_code == 200
         response = client.get(f"/api/sessions/{session_id}/audit-readiness{suffix}")
         assert response.status_code == 200
+
+
+def test_snapshot_uses_dedicated_per_user_rate_limit(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    """Repeated expensive snapshots are bounded without charging composer calls."""
+    client, session_id = audit_readiness_client_with_state
+    client.app.state.audit_readiness_rate_limiter = ComposerRateLimiter(limit=1)
+
+    first_response = client.get(f"/api/sessions/{session_id}/audit-readiness")
+    assert first_response.status_code == 200
+
+    response = client.get(f"/api/sessions/{session_id}/audit-readiness")
+    assert response.status_code == 429
+    assert response.json()["detail"]["error_type"] == "rate_limited"
+    assert int(response.headers["Retry-After"]) >= 1
 
 
 # --- P4-A-3 (elspeth-bf52d495a2): a page load's two reads share the session ---

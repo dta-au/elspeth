@@ -336,6 +336,16 @@ class WebSettings(BaseModel):
     )
     composer_runtime_preflight_timeout_seconds: float = Field(default=5.0, gt=0)
     composer_rate_limit_per_minute: int = Field(..., ge=1)
+    audit_readiness_rate_limit_per_minute: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Per-user per-minute budget for audit-readiness snapshots. "
+            "Snapshots run canonical pipeline validation, so this separate "
+            "bucket protects shared worker capacity without consuming the "
+            "LLM-backed composer-call budget."
+        ),
+    )
     write_rate_limit_per_minute: int = Field(
         default=60,
         ge=1,

@@ -1659,6 +1659,14 @@ def _create_app(
         limit=settings.composer_rate_limit_per_minute,
     )
 
+    # --- Audit-readiness rate limiter (per-process in-memory) ---
+    # Snapshot reads run canonical validation in the shared worker pool. Keep
+    # their per-user budget separate from LLM calls while preventing one user
+    # from monopolising that process-wide capacity.
+    app.state.audit_readiness_rate_limiter = ComposerRateLimiter(
+        limit=settings.audit_readiness_rate_limit_per_minute,
+    )
+
     # --- Write rate limiter (per-process in-memory) ---
     # Cheap authenticated DB writes get their own bucket so tutorial
     # preference bursts never compete with the LLM-call budget above.
