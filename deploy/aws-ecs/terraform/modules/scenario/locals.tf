@@ -131,7 +131,10 @@ locals {
     "sink:text",
     "transform:aws_bedrock_content_safety",
     "transform:aws_bedrock_prompt_shield",
-    "transform:aws_textract_document_analysis",
+    # Async Textract is deliberately not a shipped web default. Its author-
+    # controlled polling and result-retention limits can monopolize the web
+    # service's shared execution worker. Operators can still use the packaged
+    # transform from trusted batch/CLI pipelines.
     "transform:field_mapper",
     # line_explode and report_assemble are the REMEDIES the sinks' own guidance
     # names: text says route multiline values through line_explode, document

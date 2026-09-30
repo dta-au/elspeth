@@ -68,7 +68,7 @@ alarm_actions               = []
 #   "source:aws_s3", "source:csv", "source:json", "source:text",
 #   "sink:aws_s3", "sink:csv", "sink:json", "sink:text",
 #   "transform:aws_bedrock_content_safety", "transform:aws_bedrock_prompt_shield",
-#   "transform:aws_textract_document_analysis", "transform:field_mapper",
+#   "transform:field_mapper",
 #   "transform:llm", "transform:passthrough", "transform:web_scrape",
 # ]
 # plugin_preferences = {

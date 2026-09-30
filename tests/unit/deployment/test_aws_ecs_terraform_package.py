@@ -687,7 +687,7 @@ def test_package_contains_only_the_supported_source_and_operator_inputs() -> Non
     assert "!*.tfbackend.example" in ignored
 
 
-def test_scenario_web_plugin_allowlist_exposes_textract_to_composer() -> None:
+def test_scenario_web_plugin_allowlist_does_not_expose_textract_to_composer() -> None:
     locals_text = _text("modules/scenario/locals.tf")
     allowlist_match = re.search(
         r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\]",
@@ -696,7 +696,7 @@ def test_scenario_web_plugin_allowlist_exposes_textract_to_composer() -> None:
     )
 
     assert allowlist_match is not None
-    assert '"transform:aws_textract_document_analysis"' in allowlist_match.group("body")
+    assert '"transform:aws_textract_document_analysis"' not in allowlist_match.group("body")
 
 
 def test_scenario_allowlist_keeps_the_s3_source_authorization_the_web_surface_declines() -> None:

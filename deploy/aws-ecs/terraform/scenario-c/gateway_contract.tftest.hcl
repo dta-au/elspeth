@@ -62,7 +62,6 @@ variables {
     "sink:document",
     "sink:json",
     "sink:text",
-    "transform:aws_textract_document_analysis",
     "transform:field_mapper",
     "transform:line_explode",
     "transform:llm",
