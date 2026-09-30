@@ -89,3 +89,9 @@ nine real Azurite blob source and sink tests passed with exit 0; Moment Timezone
 UTC conversion and Sequelize import checks also passed. Python source and the
 frontend dependency tree are unchanged. Remote required checks on the final
 published commit remain the acceptance boundary.
+
+## Incremental planner steering-test review
+
+**GO; no actionable findings.** Astra reviewed the single-test change in [test_pipeline_planner.py](../../tests/unit/web/composer/test_pipeline_planner.py) against `b6bffe3d4`. A scoped loop clock isolates turn-count steering from host scheduling without changing the production planner, shared five-second budget, provider parsing, or discovery execution. The original before/after pressure-notice assertions remain intact; new assertions verify the returned proposal, two provider calls with audited ordinals, and the `list_sources` discovery invocation. Independent source inspection confirmed that the dedicated sync-phase deadline/cancellation, slow-provider timeout, and multiturn deadline tests remain unchanged.
+
+The implementation lane's controlled six-second preflight advance failed the original test before provider entry and passed the repaired test on Python 3.12 and 3.13. Removing the notice still failed at the preserved pressure-count assertion after the new path assertions passed. Both complete affected-file runs exited 0 with 289 tests passed each; applicable whole-tree checks exited 0 with 253 passed, and Ruff/format/trust-boundary checks passed. Astra inspected the controls and evidence and independently verified the final diff and file identity. Remote CI on the integrated commit remains required.

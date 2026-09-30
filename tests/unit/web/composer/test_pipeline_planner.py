@@ -5052,8 +5052,20 @@ async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
         _response(("list_sources", {})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
+    recorder = BufferingRecorder()
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
 
-    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+    # This tests turn-count steering through the real planner and provider
+    # parser. Host scheduling must not consume its unrelated wall-clock budget;
+    # the deadline tests above separately exercise timeout enforcement.
+    with patch.object(loop, "time", lambda: clock_origin):
+        proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert len(completion.requests) == 2
+    assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
 
     # max_discovery_turns defaults to 3: after the first discovery turn two
     # remain, which is exactly when the budget-pressure steering must land.
