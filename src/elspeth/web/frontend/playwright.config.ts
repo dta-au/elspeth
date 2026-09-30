@@ -33,16 +33,23 @@ const E2E_DATA_DIR = process.env.PLAYWRIGHT_E2E_DATA_DIR
   ? resolve(process.env.PLAYWRIGHT_E2E_DATA_DIR)
   : resolve(HERE, ".e2e-data", E2E_RUN_ID);
 const STORAGE_STATE_PATH = resolve(HERE, "tests", "e2e", ".auth", "user.json");
+const ROLE_ADMIN_USERNAME = "e2e-role-admin";
+const ROLE_ADMIN_PASSWORD = "pw-admin-placeholder"; // secret-scan: allow-this-line
 
 process.env.PLAYWRIGHT_E2E_DATA_DIR = E2E_DATA_DIR;
 process.env.PLAYWRIGHT_FRONTEND_BASE_URL = FRONTEND_URL;
 process.env.PLAYWRIGHT_BACKEND_BASE_URL = BACKEND_BASE_URL;
 process.env.PLAYWRIGHT_FRONTEND_PORT = String(FRONTEND_PORT);
 process.env.PLAYWRIGHT_BACKEND_PORT = String(BACKEND_PORT);
+process.env.PLAYWRIGHT_ROLE_ADMIN_USERNAME = ROLE_ADMIN_USERNAME;
+process.env.PLAYWRIGHT_ROLE_ADMIN_PASSWORD = ROLE_ADMIN_PASSWORD;
 
 const isCI = !!process.env.CI;
 
 const composerSettingsEnv: Record<string, string> = {
+  PLAYWRIGHT_E2E_DATA_DIR: E2E_DATA_DIR,
+  PLAYWRIGHT_ROLE_ADMIN_USERNAME: ROLE_ADMIN_USERNAME,
+  PLAYWRIGHT_ROLE_ADMIN_PASSWORD: ROLE_ADMIN_PASSWORD,
   ELSPETH_WEB__data_dir: E2E_DATA_DIR,
   ELSPETH_WEB__registration_mode: "open",
   ELSPETH_WEB__auth_provider: "local",
@@ -165,6 +172,11 @@ export default defineConfig({
   webServer: [
     {
       command:
+        'uv run elspeth composer users add "$PLAYWRIGHT_ROLE_ADMIN_USERNAME" ' +
+        '--password "$PLAYWRIGHT_ROLE_ADMIN_PASSWORD" --display-name "E2E Role Administrator" ' +
+        '--data-dir "$PLAYWRIGHT_E2E_DATA_DIR" && ' +
+        'uv run elspeth composer users bootstrap-admin local "$PLAYWRIGHT_ROLE_ADMIN_USERNAME" ' +
+        '--note "Playwright workload-role bootstrap" --data-dir "$PLAYWRIGHT_E2E_DATA_DIR" && ' +
         "npm --prefix src/elspeth/web/frontend run build && " +
         "uv run --extra webui python -m uvicorn elspeth.web.app:create_app --factory " +
         `--host 127.0.0.1 --port ${BACKEND_PORT}`,
