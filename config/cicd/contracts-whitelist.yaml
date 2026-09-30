@@ -21,6 +21,10 @@ allowed_external_types:
   - "core/dag/group_bindings:GroupBindingRegistry"
   # Plugin bundle type shared between runtime construction, CLI, and web preflight
   - "plugins/infrastructure/runtime_factory:PluginBundle"
+  # Application loading carries plugin-owned archived operational models into
+  # runtime construction. These DTOs are not consumed by the engine layer.
+  - "plugins/infrastructure/power_automate_nonlive:PowerAutomateArchive"
+  - "plugins/infrastructure/power_automate_nonlive:PowerAutomateNonliveConstruction"
   # The identity-retirement outcome and the Landscape auth recorder cross from
   # web/ into the CLI: `composer users remove` audits its retirement to the
   # same Landscape row the web app writes, through the same recorder. Neither
@@ -134,6 +138,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/sinks/csv_sink.py:CSVSink.write:rows (list)"
   - "src/elspeth/plugins/sinks/csv_sink.py:CSVSink._get_field_names_and_display:row"
   - "src/elspeth/plugins/sinks/json_sink.py:JSONSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.write:rows (list)"
   - "src/elspeth/plugins/infrastructure/display_headers.py:apply_display_headers:rows (list)"
   - "src/elspeth/plugins/infrastructure/display_headers.py:apply_display_headers:return (list)"
 
@@ -164,6 +169,9 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/infrastructure/base.py:BaseTransform.__init__:config"
   - "src/elspeth/plugins/infrastructure/base.py:BaseSink.__init__:config"
   - "src/elspeth/plugins/infrastructure/base.py:BaseSource.__init__:config"
+  - "src/elspeth/plugins/sources/power_automate.py:PowerAutomateSource.__init__:config"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.__init__:config"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink._initialize:config"
   # config_base.py:PluginConfig.from_dict:config — removed: config param now typed 'object'
 
   # Base classes - get_config_model dispatchers (config is user YAML, Tier 3 boundary)
@@ -225,6 +233,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/infrastructure/base.py:BaseSink.probe_config:return"
   - "src/elspeth/plugins/sinks/text_sink.py:TextSink.probe_config:return"
   - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.probe_config:return"
+  - "src/elspeth/plugins/sinks/power_automate.py:PowerAutomateSink.probe_config:return"
 
   # Plugin implementations - config input
   - "src/elspeth/plugins/sinks/chroma_sink.py:ChromaSink.__init__:config"
@@ -350,7 +359,7 @@ allowed_dict_patterns:
   - "src/elspeth/engine/orchestrator/types.py:AggregationFlushResult.to_dict:return"
 
   # JSON parsing - object_pairs_hook must return dict (json.loads contract)
-  - "src/elspeth/plugins/infrastructure/clients/json_utils.py:_reject_duplicate_keys:return"
+  - "src/elspeth/contracts/json_parser.py:_reject_duplicate_keys:return"
 
   # Plugin schema emission - model_json_schema() / Pydantic TypeAdapter output
   # is a standard JSON Schema dict. Base implementations on BaseSource,

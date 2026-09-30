@@ -196,6 +196,7 @@ class AzureSearchProfileSettings(BaseModel):
 @dataclass(frozen=True, slots=True)
 class RuntimeWebPluginConfig:
     plugin_allowlist: tuple[str, ...]
+    power_automate_allowed_origins: tuple[str, ...]
     plugin_preferences: tuple[tuple[PluginCapability, tuple[str, ...]], ...]
     plugin_control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
     llm_profiles: tuple[tuple[str, RuntimeLLMProfile], ...] = field(repr=False)
@@ -216,6 +217,7 @@ class RuntimeWebPluginConfig:
     def from_settings(cls, settings: WebSettings) -> RuntimeWebPluginConfig:
         return cls(
             plugin_allowlist=tuple(settings.plugin_allowlist),
+            power_automate_allowed_origins=tuple(settings.power_automate_allowed_origins),
             plugin_preferences=tuple(
                 (capability, tuple(plugin_ids))
                 for capability, plugin_ids in sorted(settings.plugin_preferences.items(), key=lambda item: item[0].value)

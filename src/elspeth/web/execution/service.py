@@ -472,6 +472,7 @@ def _build_web_plugin_policy_evidence(
         plugin_code_identities=tuple(sorted(identities)),
         binding_generation_fingerprint=snapshot.binding_generation_fingerprint,
         decision_codes=("policy_allowed",),
+        power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
     )
 
 
@@ -3022,6 +3023,10 @@ class ExecutionServiceImpl:
                 )
             if raw_eligibility_config is None:
                 raise TypeError("Pipeline YAML must produce a mapping before sink effect eligibility")
+            if "run_mode" in raw_eligibility_config and raw_eligibility_config["run_mode"] != "live":
+                raise ValueError("Web execution does not support nonlive run invocation")
+            if "replay_from" in raw_eligibility_config and raw_eligibility_config["replay_from"] is not None:
+                raise ValueError("Web execution does not support nonlive run invocation")
             from elspeth.web.execution.export_marking import operator_marked_config_dict
 
             effective_eligibility_config = operator_marked_config_dict(raw_eligibility_config, self._settings)
@@ -3498,6 +3503,7 @@ class ExecutionServiceImpl:
                 graph=graph,
                 sink_effect_modes=execution_sink_modes,
                 sink_effect_admission=sink_effect_admission,
+                sink_effect_bindings=bundle.sink_effect_bindings,
             )
             if isinstance(pipeline_config, PipelineConfig) and audit_safe_config is not None:
                 pipeline_config = replace(

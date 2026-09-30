@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionDecision
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
@@ -66,6 +67,7 @@ class WebPluginPolicyEvidence:
     binding_generation_fingerprint: str
     decision_codes: tuple[str, ...]
     admission_decision: ChargeableAdmissionDecision | None = None
+    power_automate_allowed_origins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.admission_decision is not None and not isinstance(self.admission_decision, ChargeableAdmissionDecision):
@@ -75,6 +77,26 @@ class WebPluginPolicyEvidence:
         _require_sha256("policy_hash", self.policy_hash)
         _require_sha256("snapshot_hash", self.snapshot_hash)
         _require_sha256("binding_generation_fingerprint", self.binding_generation_fingerprint)
+
+        _require_canonical("power_automate_allowed_origins", self.power_automate_allowed_origins)
+        for origin in self.power_automate_allowed_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.port is not None
+                or "*" in parsed.netloc
+            ):
+                raise ValueError("power_automate_allowed_origins must contain normalized HTTPS443 origins")
+            host = parsed.hostname
+            authority = f"[{host}]" if ":" in host else host
+            if origin != f"https://{authority}":
+                raise ValueError("power_automate_allowed_origins must contain normalized HTTPS443 origins")
 
         _require_canonical("authorized_plugin_ids", self.authorized_plugin_ids)
         _require_canonical("available_plugin_ids", self.available_plugin_ids)

@@ -88,6 +88,9 @@ class RunLifecycleReadRepository:
     def get_run_source_lifecycle_records(self, run_id: str) -> dict[str, RunSourceLifecycleRecord]:
         return self._repo.get_run_source_lifecycle_records(run_id)
 
+    def get_run_source_config_hashes(self, run_id: str) -> dict[str, str]:
+        return self._repo.get_run_source_config_hashes(run_id)
+
     def get_source_field_resolution(self, run_id: str) -> dict[str, str] | None:
         return self._repo.get_source_field_resolution(run_id)
 

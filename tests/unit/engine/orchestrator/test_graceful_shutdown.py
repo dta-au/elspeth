@@ -385,7 +385,7 @@ class TestCheckpointInterruptedProgress:
             orchestrator._checkpoints._checkpoint_config = _checkpoint_config(enabled=False)
 
             sink = _SinkSlice()
-            config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={"output": "write"})
+            config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={"output": "write"}, sink_effect_bindings={})
 
             processor = _BarrierScalarsProcessor(BarrierScalars(aggregation={}, coalesce={}))
             from elspeth.contracts.coordination import CoordinationToken

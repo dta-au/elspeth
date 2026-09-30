@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from ipaddress import ip_address
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -17,13 +18,16 @@ from elspeth.contracts.call_mode import (
     SourceCallParentIdentity,
     VerificationDecision,
 )
-from elspeth.contracts.enums import CallStatus, CallType, RunMode
+from elspeth.contracts.enums import CallStatus, CallType, NodeType, RunMode
 from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape.row_data import CallDataState
+from elspeth.engine.orchestrator.source_read_verification import canonical_source_read_response, source_read_verification_policy
 
 if TYPE_CHECKING:
+    from elspeth.contracts import SourceProtocol
     from elspeth.contracts.audit import Call
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.core.landscape.factory import RecorderFactory
@@ -139,6 +143,7 @@ class AuditedCallModeSession:
         self._mi_verify_admissions: set[tuple[CallType, str | None, str | None, int]] = set()
         self._mi_preflights: dict[tuple[str | None, str | None, str], str] = {}
         self._operation_mi_preflights: dict[tuple[str, str], str] = {}
+        self._source_read_scopes: dict[str, int] = {}
         self._required = self._preflight_source_calls()
 
     @property
@@ -148,6 +153,89 @@ class AuditedCallModeSession:
     @property
     def source_run_id(self) -> str:
         return self._source_run_id
+
+    def _require_source_policy_operation(self, operation_id: str, *, run_id: str, node_id: str | None = None) -> None:
+        operation = self._factory.execution.get_operation(operation_id)
+        if operation is None or operation.run_id != run_id or operation.operation_type != "source_load":
+            raise AuditIntegrityError("Canonical source read policy operation identity differs")
+        if node_id is not None and operation.node_id != node_id:
+            raise AuditIntegrityError("Canonical source read policy node identity differs")
+        node = self._factory.data_flow.get_node(operation.node_id, run_id)
+        if node is None or node.node_type is not NodeType.SOURCE or node.plugin_name != "power_automate":
+            raise AuditIntegrityError("Canonical source read policy requires a reviewed source node")
+        if operation.input_data_ref is None or operation.input_data_hash is None or self._factory.payload_store is None:
+            raise AuditIntegrityError("Canonical source read policy operation evidence is unavailable")
+        content = self._factory.payload_store.retrieve_bounded(operation.input_data_ref, max_bytes=4096)
+        if content is None:
+            raise AuditIntegrityError("Canonical source read policy operation evidence is unavailable")
+        try:
+            metadata, error = parse_json_strict(content.decode("utf-8"))
+            if error is not None:
+                raise ValueError("invalid metadata")
+            metadata_hash = stable_hash(metadata)
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise AuditIntegrityError("Canonical source read policy operation evidence is invalid") from None
+        if (
+            type(metadata) is not dict
+            or metadata_hash != operation.input_data_hash
+            or metadata.get("source_plugin") != "power_automate"
+            or metadata.get("source_read_verification_policy") != "power-automate-canonical-json-v1"
+        ):
+            raise AuditIntegrityError("Canonical source read policy operation evidence differs")
+
+    @contextmanager
+    def source_read_scope(self, *, source: SourceProtocol, current_operation_id: str) -> Iterator[None]:
+        """Bind the fixed response policy to this reviewed source and operation."""
+        if self._mode is not RunMode.VERIFY or source_read_verification_policy(source) is None:
+            raise AuditIntegrityError("Canonical source verification requires the reviewed builtin source in verify mode")
+        if source.node_id is None:
+            raise AuditIntegrityError("Canonical source node identity is unassigned")
+        self._require_source_policy_operation(current_operation_id, run_id=self._current_run_id, node_id=source.node_id)
+        if current_operation_id in self._source_read_scopes:
+            raise AuditIntegrityError("Canonical source read policy scope is already active")
+        bound = source.config["max_response_body_bytes"] if "max_response_body_bytes" in source.config else 4194304
+        if type(bound) is not int or bound <= 0:
+            raise AuditIntegrityError("Canonical source read policy response bound is invalid")
+        calls = self._factory.execution.list_source_calls_for_current_parent(
+            source_run_id=self._source_run_id,
+            call_type=CallType.HTTP,
+            current_state_id=None,
+            current_operation_id=current_operation_id,
+        )
+        if not calls:
+            raise AuditIntegrityError("Canonical source read policy has no archived source reads")
+        for call in calls:
+            if call.operation_id is None or call.state_id is not None or call.call_id not in self._required:
+                raise AuditIntegrityError("Canonical source read policy call parent differs")
+            self._require_source_policy_operation(call.operation_id, run_id=self._source_run_id)
+            request = self._factory.execution.get_call_request_data(call.call_id)
+            if request.state is not CallDataState.AVAILABLE or request.data is None or not self._is_source_read(request.data):
+                raise AuditIntegrityError("Canonical source read policy requires exact source reads")
+            response = self._factory.execution.get_call_response_data(call.call_id)
+            if response.state is not CallDataState.AVAILABLE:
+                raise AuditIntegrityError("Invalid canonical source response archive")
+            canonical_source_read_response(response.data, max_body_bytes=bound)
+        self._source_read_scopes[current_operation_id] = bound
+        try:
+            yield
+            if {call.call_id for call in calls} - self._consumed:
+                raise AuditIntegrityError("Canonical verification has unconsumed source reads")
+            if self._failed_decisions:
+                raise VerificationMismatchError("Canonical source read results differ from audited run")
+        finally:
+            del self._source_read_scopes[current_operation_id]
+
+    @staticmethod
+    def _is_source_read(request: Mapping[str, Any]) -> bool:
+        body = request["json"] if "json" in request else None
+        return (
+            request["method"] == "POST"
+            and isinstance(body, Mapping)
+            and body.get("protocol") == "elspeth.power-automate.v1"
+            and body.get("operation") == "read"
+            and "hop_number" not in request
+            and "redirect_from" not in request
+        )
 
     def _preflight_source_calls(self) -> frozenset[str]:
         """Reject incomplete call archives before any plugin lifecycle hook."""
@@ -675,7 +763,21 @@ class AuditedCallModeSession:
                 )
                 recorded_comparison = _verification_response(call_type, recorded_response, chat_completion_request=chat_completion_request)
                 live_comparison = _verification_response(call_type, live_response_data, chat_completion_request=chat_completion_request)
-                if stable_hash(recorded_comparison) != stable_hash(live_comparison):
+                canonical_read = (
+                    call_type is CallType.HTTP
+                    and current_state_id is None
+                    and current_operation_id in self._source_read_scopes
+                    and self._is_source_read(request_data)
+                )
+                if canonical_read:
+                    assert current_operation_id is not None
+                    bound = self._source_read_scopes[current_operation_id]
+                    recorded_comparison = canonical_source_read_response(recorded_response, max_body_bytes=bound)
+                    try:
+                        live_comparison = canonical_source_read_response(live_response_data, max_body_bytes=bound)
+                    except AuditIntegrityError:
+                        differences["canonical_response"] = "invalid_evidence"
+                if "canonical_response" not in differences and stable_hash(recorded_comparison) != stable_hash(live_comparison):
                     differences["response_hash"] = {
                         "source": stable_hash(recorded_comparison),
                         "current": stable_hash(live_comparison),

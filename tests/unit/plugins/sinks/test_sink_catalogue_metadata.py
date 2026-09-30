@@ -30,6 +30,7 @@ EXPECTED_SINK_TAGS = {
     "dataverse": ("dataverse", "odata", "crm", "upsert"),
     "document": ("document", "file", "multiline", "single-value"),
     "json": ("json", "jsonl", "file", "structured"),
+    "power_automate": ("power-automate", "http", "flow", "recoverable"),
     "text": ("text", "file", "line-oriented", "single-field"),
 }
 EXPECTED_SINK_NAMES = set(EXPECTED_SINK_TAGS)
@@ -128,6 +129,13 @@ def _assert_plugin_specific_example_contract(reference: BuiltinReference) -> Non
         assert options["collision_policy"] == "auto_increment"
         assert cast(Mapping[str, Any], options["schema"])["mode"] == "observed"
         _assert_relative_output_path(options["path"])
+    elif name == "power_automate":
+        assert options["auth"] == {"method": "managed_identity", "client_id": "example-user-assigned-client"}
+        assert options["allowed_origin"] == "https://flow-endpoint.example.org"
+        assert options["fields"] == ["record_id", "result"]
+        schema = cast(Mapping[str, Any], options["schema"])
+        assert schema == {"mode": "flexible", "fields": ["record_id: str", "result: str"]}
+        assert "trigger_url_secret" not in options
     elif name == "text":
         assert options["field"] == "line_text"
         schema = cast(Mapping[str, Any], options["schema"])

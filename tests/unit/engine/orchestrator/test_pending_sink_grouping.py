@@ -14,7 +14,7 @@ These tests verify:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import groupby
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -46,6 +46,7 @@ class _SinkFake:
 class _PipelineConfigFake:
     sinks: dict[str, _SinkFake]
     sink_effect_modes: dict[str, str]
+    sink_effect_bindings: dict[str, object] = field(default_factory=dict)
 
 
 def _recorder_factory_fake() -> _RecorderFactoryFake:

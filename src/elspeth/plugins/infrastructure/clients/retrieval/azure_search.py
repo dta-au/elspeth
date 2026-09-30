@@ -477,7 +477,7 @@ class AzureSearchProvider:
             if status_code >= 400:
                 raise RetrievalError(f"Azure AI Search client error: HTTP {status_code}", retryable=False, status_code=status_code)
 
-            from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
+            from elspeth.contracts.json_parser import parse_json_strict
 
             parsed, error = parse_json_strict(response.text)
             if error is not None:

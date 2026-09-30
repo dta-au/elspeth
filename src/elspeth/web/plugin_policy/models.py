@@ -92,6 +92,7 @@ class WebPluginPolicy:
     preferences: tuple[tuple[PluginCapability, tuple[PluginId, ...]], ...]
     control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
     plugin_code_identities: tuple[tuple[PluginId, str, str], ...]
+    power_automate_allowed_origins: tuple[str, ...]
     policy_hash: str
 
     @classmethod
@@ -104,10 +105,12 @@ class WebPluginPolicy:
         control_modes: tuple[tuple[PluginCapability, ControlMode], ...],
         plugin_code_identities: tuple[tuple[PluginId, str, str], ...],
         schema_version: int = 1,
+        power_automate_allowed_origins: tuple[str, ...] = (),
     ) -> WebPluginPolicy:
         authorized = required | configured_optional
         canonical = {
             "schema_version": schema_version,
+            "power_automate_allowed_origins": sorted(power_automate_allowed_origins),
             "required": sorted(map(str, required)),
             "configured_optional": sorted(map(str, configured_optional)),
             "authorized": sorted(map(str, authorized)),
@@ -126,6 +129,7 @@ class WebPluginPolicy:
             preferences=preferences,
             control_modes=control_modes,
             plugin_code_identities=tuple(sorted(plugin_code_identities, key=lambda item: item[0])),
+            power_automate_allowed_origins=tuple(sorted(power_automate_allowed_origins)),
             policy_hash=_canonical_hash(canonical),
         )
 
@@ -140,6 +144,7 @@ class PluginAvailabilitySnapshot:
     usable_profile_aliases: tuple[tuple[PluginId, tuple[str, ...]], ...]
     selected_profile_aliases: tuple[tuple[PluginId, str | None], ...]
     control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
+    power_automate_allowed_origins: tuple[str, ...]
     binding_generation_fingerprint: str
     authority: PluginSnapshotAuthority
     snapshot_hash: str
@@ -194,9 +199,11 @@ class PluginAvailabilitySnapshot:
         binding_generation_fingerprint: str,
         control_modes: tuple[tuple[PluginCapability, ControlMode], ...] = (),
         authority: PluginSnapshotAuthority = PluginSnapshotAuthority.RESTRICTED,
+        power_automate_allowed_origins: tuple[str, ...] = (),
     ) -> PluginAvailabilitySnapshot:
         canonical = {
             "policy_hash": policy_hash,
+            "power_automate_allowed_origins": sorted(power_automate_allowed_origins),
             "principal_scope": principal_scope,
             "available": sorted(map(str, available)),
             "unavailable": [(str(item.plugin_id), item.reason.value) for item in sorted(unavailable)],
@@ -216,6 +223,7 @@ class PluginAvailabilitySnapshot:
             usable_profile_aliases=usable_profile_aliases,
             selected_profile_aliases=selected_profile_aliases,
             control_modes=control_modes,
+            power_automate_allowed_origins=tuple(sorted(power_automate_allowed_origins)),
             binding_generation_fingerprint=binding_generation_fingerprint,
             authority=authority,
             snapshot_hash=_canonical_hash(canonical),

@@ -24,6 +24,13 @@ from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearch
 from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode, ChromaSearchMode
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
+from elspeth.plugins.infrastructure.power_automate import (
+    PowerAutomateManagedIdentityAuth,
+    PowerAutomateSASAuth,
+    PowerAutomateServicePrincipalAuth,
+    PowerAutomateSinkConfig,
+    PowerAutomateSourceConfig,
+)
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSinkConfig
 from elspeth.plugins.sinks.chroma_sink import ChromaSinkConfig
@@ -41,8 +48,8 @@ from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig, RetrievalP
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 UNCLASSIFIED = "UNCLASSIFIED"
-EXPECTED_COUNTS = {"source": 9, "transform": 39, "sink": 9}
-EXPECTED_VARIANT_COUNT = 77
+EXPECTED_COUNTS = {"source": 10, "transform": 39, "sink": 10}
+EXPECTED_VARIANT_COUNT = 83
 ALLOWED_PB_BOUNDARIES = frozenset({"PB-01", "PB-02", "PB-04", "PB-06", "PB-07", "PB-09"})
 ALLOWED_LOCAL_FIXTURES = frozenset({"hermetic", "provider-contract-fake", "real-process-http"})
 ALLOWED_RELEASE_LANES = frozenset({"local", "live-aws", "live-azure", "live-chroma", "live-dataverse", "live-provider"})
@@ -179,10 +186,16 @@ def _variant_map() -> dict[str, tuple[str, ...]]:
     if set(retrieval_providers) != {"chroma"}:
         raise ValueError("RAG provider Literal drifted from its owned registry contract")
     dataverse_modes = _owned_literal_values(DataverseAuthConfig, "method")
+    power_automate_modes = tuple(
+        value
+        for model in (PowerAutomateSASAuth, PowerAutomateServicePrincipalAuth, PowerAutomateManagedIdentityAuth)
+        for value in _owned_literal_values(model, "method")
+    )
     return {
         "source:azure_blob": tuple(get_args(AzureAuthMethod)),
         "source:dataverse": dataverse_modes,
         "source:llm": tuple(source_llm),
+        "source:power_automate": power_automate_modes,
         "transform:aws_textract_document_analysis": tuple(get_args(TextractAuthMode)),
         "transform:aws_textract_inline_analysis": tuple(get_args(TextractAuthMode)),
         "transform:azure_ai_search": tuple(mode.replace("_", "-") for mode in get_args(AzureSearchAuthMode)),
@@ -191,6 +204,7 @@ def _variant_map() -> dict[str, tuple[str, ...]]:
         "sink:azure_blob": tuple(get_args(AzureAuthMethod)),
         "sink:chroma_sink": tuple(get_args(ChromaConnectionMode)),
         "sink:dataverse": dataverse_modes,
+        "sink:power_automate": power_automate_modes,
     }
 
 
@@ -253,6 +267,21 @@ def _textract_auth(mode: str) -> dict[str, object]:
     if mode == "secret_refs":
         return {"auth_mode": mode, "aws_access_key_id": "matrix-access", "aws_secret_access_key": "matrix-secret"}
     raise ValueError(f"unsupported Textract auth mode {mode!r}")
+
+
+def _power_automate_options(mode: str) -> dict[str, object]:
+    options: dict[str, object] = {"allowed_origin": "https://matrix.flow.example.org"}
+    if mode == "sas_url":
+        options["auth"] = {"method": mode, "trigger_url_secret": "https://matrix.flow.example.org/invoke?sig=matrix-signature"}
+    elif mode == "service_principal":
+        options["auth"] = {"method": mode, "tenant_id": "matrix-tenant", "client_id": "matrix-client", "client_secret": "matrix-secret"}
+        options["trigger_url"] = "https://matrix.flow.example.org/invoke"
+    elif mode == "managed_identity":
+        options["auth"] = {"method": mode, "client_id": "matrix-user-assigned-client"}
+        options["trigger_url"] = "https://matrix.flow.example.org/invoke"
+    else:
+        raise ValueError(f"unsupported Power Automate auth mode {mode!r}")
+    return options
 
 
 def _find_declaring_plugin_nodes(value: object, *, plugin_name: str) -> list[Mapping[str, Any]]:
@@ -328,6 +357,18 @@ def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> set[tu
     validated_subjects: set[tuple[str, str]] = set()
     schema = {"mode": "observed"}
     with plugin_preflight_mode(True):
+        for mode in variants["source:power_automate"]:
+            PowerAutomateSourceConfig.from_dict({**_power_automate_options(mode), "schema": schema, "on_validation_failure": "discard"})
+            validated_subjects.add(("source:power_automate", mode))
+        for mode in variants["sink:power_automate"]:
+            PowerAutomateSinkConfig.from_dict(
+                {
+                    **_power_automate_options(mode),
+                    "fields": ["result"],
+                    "schema": {"mode": "flexible", "fields": ["result: str"]},
+                }
+            )
+            validated_subjects.add(("sink:power_automate", mode))
         for mode in variants["source:azure_blob"]:
             AzureBlobSourceConfig.from_dict(
                 {

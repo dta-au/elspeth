@@ -276,13 +276,15 @@ class Orchestrator:
         Raises:
             OrchestrationInvariantError: If graph or payload_store is not provided
         """
-        resolve_runtime_run_mode(config, settings)
+        runtime_mode = resolve_runtime_run_mode(config, settings)
 
         require_sink_effect_admission(
             config.sinks,
             configured_modes=config.sink_effect_modes,
             required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
             admission=config.sink_effect_admission,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=runtime_mode.mode,
         )
         return self._run_lifecycle.run(
             config,
@@ -382,6 +384,8 @@ class Orchestrator:
             configured_modes=config.sink_effect_modes,
             required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
             admission=config.sink_effect_admission,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=resolve_runtime_run_mode(config, settings).mode,
         )
         return self._resume_coordinator.resume(
             resume_point,

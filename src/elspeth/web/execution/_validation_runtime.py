@@ -191,9 +191,13 @@ def load_runtime_settings(
     pipeline_yaml = materialized.pipeline_yaml
     authored = materialized.authored
     try:
+        config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
+        if "run_mode" in config_dict and (type(config_dict["run_mode"]) is not str or config_dict["run_mode"] != "live"):
+            raise ValueError("Web execution does not support nonlive run invocation")
+        if "replay_from" in config_dict and config_dict["replay_from"] is not None:
+            raise ValueError("Web execution does not support nonlive run invocation")
         settings_config: dict[str, object] | None = None
         if secret_service is not None and user_id is not None and authored.all_secret_refs:
-            config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
             resolved_dict, _resolutions = resolve_secret_refs(
                 config_dict,
                 secret_service,
@@ -202,11 +206,10 @@ def load_runtime_settings(
             )
             settings_config = resolved_dict
         elif secret_service is None and "secret_ref" in pipeline_yaml:
-            config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
             settings_config = redact_secret_refs_for_validation(config_dict)
 
         if operator_settings is not None:
-            authored_config = settings_config if settings_config is not None else _load_yaml_mapping(load_yaml, pipeline_yaml)
+            authored_config = settings_config if settings_config is not None else config_dict
             marked_config = operator_marked_config_dict(authored_config, operator_settings)
             if marked_config is not authored_config or settings_config is not None:
                 settings_config = marked_config

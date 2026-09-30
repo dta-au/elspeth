@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from elspeth.contracts.enums import CallStatus, CallType, RunMode
 from elspeth.contracts.freeze import deep_freeze
+
+if TYPE_CHECKING:
+    from elspeth.contracts import SourceProtocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +108,10 @@ class CallModeSession(Protocol):
 
     @property
     def source_run_id(self) -> str: ...
+
+    def source_read_scope(self, *, source: SourceProtocol, current_operation_id: str) -> AbstractContextManager[None]:
+        """Admit a reviewed source-load response policy for one operation only."""
+        ...
 
     def replay_call(
         self,

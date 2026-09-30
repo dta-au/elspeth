@@ -36,6 +36,7 @@ from elspeth.contracts.errors import (
     VerificationMismatchError,
     WriteLockHeldError,
 )
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint.recovery import NonResumableRunError
@@ -53,11 +54,13 @@ if TYPE_CHECKING:
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.run_result import RunResult
+    from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
     from elspeth.core.config import SecretsConfig
     from elspeth.core.landscape import LandscapeDB
     from elspeth.core.rate_limit import RateLimitRegistry
     from elspeth.engine import Orchestrator, PipelineConfig
     from elspeth.engine.orchestrator import RowPlugin
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateNonliveConstruction
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
     from elspeth.telemetry import TelemetryManager
     from elspeth.web.auth.audit import AuthAuditRecorder
@@ -197,6 +200,8 @@ def verify_delivered_audit_export(
 def _preflight_follower_sink_effects(
     sinks: Mapping[str, SinkProtocol],
     configured_modes: Mapping[str, str],
+    *,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
 ) -> object:
     """Fail closed over resolved follower sinks before any startup work."""
     from elspeth.contracts.sink_effects import SinkEffectInputKind
@@ -206,6 +211,7 @@ def _preflight_follower_sink_effects(
         sinks,
         configured_modes=configured_modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=runtime_bindings,
     )
 
 
@@ -218,6 +224,7 @@ def _start_follower_plugin_lifecycle(
     ctx: PluginContext,
     started_transforms: list[RowPlugin] | None = None,
     started_sinks: dict[str, SinkProtocol] | None = None,
+    runtime_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
 ) -> None:
     """Consume admission and optionally record successfully-started plugins."""
     from elspeth.contracts.sink_effects import SinkEffectInputKind
@@ -228,6 +235,8 @@ def _start_follower_plugin_lifecycle(
         configured_modes=configured_modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
         admission=admission,
+        runtime_bindings=runtime_bindings,
+        run_mode=ctx.run_mode,
     )
     for transform in transforms:
         transform.on_start(ctx)
@@ -243,6 +252,7 @@ def _instantiate_plugins_for_runtime_preflight(
     settings: ElspethSettings,
     *,
     purpose: object | None = None,
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None,
 ) -> PluginBundle:
     """Construct runtime plugins under the constructor-safe preflight posture."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
@@ -251,6 +261,13 @@ def _instantiate_plugins_for_runtime_preflight(
     resolved_purpose = SinkEffectExecutionPurpose.FRESH if purpose is None else purpose
     if not isinstance(resolved_purpose, SinkEffectExecutionPurpose):
         raise TypeError("Runtime preflight purpose must be exact SinkEffectExecutionPurpose")
+    if power_automate_nonlive is not None:
+        return instantiate_plugins_from_config(
+            settings,
+            preflight_mode=True,
+            sink_effect_purpose=resolved_purpose,
+            power_automate_nonlive=power_automate_nonlive,
+        )
     return instantiate_plugins_from_config(
         settings,
         preflight_mode=True,
@@ -699,7 +716,7 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
     )
     try:
         admit_source_run(db, RuntimeRunMode(mode, replay_from))
-        from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
+        from elspeth.contracts.json_parser import parse_json_strict
 
         source = RecorderFactory.read_only(db).run_lifecycle.get_run(replay_from)
         if source is None:
@@ -707,6 +724,16 @@ def _admit_raw_cli_nonlive_run(settings_path: Path) -> tuple[RunMode, frozenset[
         source_settings, parse_error = parse_json_strict(source.settings_json)
         if parse_error is not None or type(source_settings) is not dict:
             raise ValueError(f"Replay/verify source run {replay_from!r} has invalid settings_json")
+        from elspeth.plugins.infrastructure.power_automate_nonlive import (
+            admit_power_automate_archive,
+            has_power_automate_components,
+            project_power_automate_nonlive,
+        )
+
+        if has_power_automate_components(raw_config) or has_power_automate_components(source_settings):
+            archive = admit_power_automate_archive(RecorderFactory.read_only(db), replay_from)
+            project_power_automate_nonlive(raw_config, archive)
+            source_settings = archive
     finally:
         db.close()
     return mode, requested_plugins, source_settings
@@ -918,6 +945,14 @@ def _load_settings_with_secrets(
     run_mode = _raw_run_mode_before_secrets(raw_config)
     if run_mode is not RunMode.LIVE and secrets_config.source == "keyvault":
         raise ValueError("Replay/verify cannot fetch Key Vault secrets")
+    from elspeth.config_loading import load_nonlive_settings
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive, has_power_automate_components
+
+    if type(source_settings) is PowerAutomateArchive:
+        loaded = load_nonlive_settings(settings_path, archive=source_settings)
+        return loaded.settings, []
+    if run_mode is not RunMode.LIVE and has_power_automate_components(raw_config):
+        raise ValueError("Power Automate nonlive loading requires admitted archive context")
 
     # Phase 2: Load secrets from Key Vault if configured
     # Returns resolution records for later audit recording
@@ -928,6 +963,28 @@ def _load_settings_with_secrets(
     config = load_settings(settings_path, source_settings=source_settings)
 
     return config, secret_resolutions
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedCLISettings:
+    settings: ElspethSettings
+    secret_resolutions: tuple[SecretResolutionInput, ...]
+    power_automate_nonlive: PowerAutomateNonliveConstruction | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "secret_resolutions")
+
+
+def _load_runtime_settings_with_secrets(settings_path: Path, *, source_settings: object | None = None) -> LoadedCLISettings:
+    """Carry explicit offline construction authority beside ordinary settings."""
+    from elspeth.config_loading import load_nonlive_settings
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive
+
+    if type(source_settings) is PowerAutomateArchive:
+        loaded = load_nonlive_settings(settings_path, archive=source_settings)
+        return LoadedCLISettings(loaded.settings, (), loaded.power_automate_nonlive)
+    config, resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+    return LoadedCLISettings(config, tuple(resolutions))
 
 
 def _execution_sinks_for_graph(
@@ -971,6 +1028,8 @@ def _preflight_execution_sinks(
         sinks,
         configured_modes=modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=bindings,
+        run_mode=config.run_mode,
     )
     return sinks, modes, admission
 
@@ -999,7 +1058,7 @@ def _configure_execution_sinks_for_resume(execution_sinks: Mapping[str, SinkProt
             raise typer.Exit(1) from None
 
 
-def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object) -> None:
+def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object, source_settings: object | None = None) -> None:
     """Run adapter-class eligibility before secrets or other startup work."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
     from elspeth.plugins.infrastructure.runtime_factory import (
@@ -1010,6 +1069,17 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
     if not isinstance(purpose, SinkEffectExecutionPurpose):
         raise TypeError("Raw sink effect preflight purpose must be exact SinkEffectExecutionPurpose")
     raw_config = _load_raw_yaml(settings_path)
+    from elspeth.plugins.infrastructure.power_automate_nonlive import (
+        PowerAutomateArchive,
+        has_power_automate_components,
+        project_power_automate_nonlive,
+    )
+
+    projected_nonlive = type(source_settings) is PowerAutomateArchive
+    if type(source_settings) is PowerAutomateArchive:
+        raw_config, _ = project_power_automate_nonlive(raw_config, source_settings)
+    elif has_power_automate_components(raw_config) and _raw_run_mode_before_secrets(raw_config) is not RunMode.LIVE:
+        raise ValueError("Power Automate nonlive preflight requires admitted archive context")
     # Supported ${VAR} expansion must complete before configuration-dependent
     # mode/URL/dialect resolution (elspeth-19f2382cf4). Key Vault-mapped
     # variables are only populated by the later secret-loading phase, so sinks
@@ -1019,7 +1089,7 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
     validate_sink_effect_eligibility_from_raw_config(
         raw_config,
         purpose=purpose,
-        expand_env_placeholders=True,
+        expand_env_placeholders=not projected_nonlive,
         deferrable_env_vars=deferrable_env_vars,
     )
     if purpose is SinkEffectExecutionPurpose.FRESH:
@@ -1028,7 +1098,7 @@ def _preflight_raw_settings_sink_effects(settings_path: Path, *, purpose: object
             validate_sink_effect_eligibility_from_raw_config(
                 raw_config,
                 purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
-                expand_env_placeholders=True,
+                expand_env_placeholders=not projected_nonlive,
                 deferrable_env_vars=deferrable_env_vars,
             )
 
@@ -1088,8 +1158,9 @@ def run(
         if execute and not dry_run:
             from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
-            _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-        config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+            _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH, source_settings=source_settings)
+        loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+        config, secret_resolutions = loaded_settings.settings, list(loaded_settings.secret_resolutions)
         _require_marked_export(config)
     except FileNotFoundError:
         typer.echo(f"Error: Settings file not found: {settings}", err=True)
@@ -1126,7 +1197,10 @@ def run(
 
     # Instantiate plugins before graph construction
     try:
-        plugins = _instantiate_plugins_for_runtime_preflight(config)
+        if loaded_settings.power_automate_nonlive is None:
+            plugins = _instantiate_plugins_for_runtime_preflight(config)
+        else:
+            plugins = _instantiate_plugins_for_runtime_preflight(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
     except contract_errors.TIER_1_ERRORS:
         raise  # Tier 1 errors must crash with full traceback, not Exit(1)
     except Exception as e:
@@ -1757,6 +1831,8 @@ def _orchestrator_context(
         transforms.append(transform)
 
     # Build PipelineConfig
+    from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+
     pipeline_config = _PipelineConfig(
         sources=plugins.sources,
         transforms=transforms,
@@ -1767,6 +1843,7 @@ def _orchestrator_context(
         coalesce_settings=(list(config.coalesce) if config.coalesce else []),
         sink_effect_modes=effective_sink_effect_modes,
         sink_effect_admission=sink_effect_admission,
+        sink_effect_bindings=execution_sink_bindings_for_runtime(config, plugins.sink_effect_bindings),
         escalation_fixpoint_bound=graph.escalation_fixpoint_bound,
     )
 
@@ -1967,12 +2044,16 @@ def _bootstrap_and_run_impl(settings_path: Path, *, source_settings: object | No
     from elspeth.plugins.infrastructure.probe_factory import build_collection_probes
     from elspeth.plugins.infrastructure.runtime_factory import make_sink_factory
 
-    _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH)
-    config, secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+    _preflight_raw_settings_sink_effects(settings_path, purpose=SinkEffectExecutionPurpose.FRESH, source_settings=source_settings)
+    loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+    config, secret_resolutions = loaded_settings.settings, list(loaded_settings.secret_resolutions)
     _require_marked_export(config)
     _admit_cli_nonlive_run(config)
 
-    plugins = _instantiate_plugins_for_runtime_preflight(config)
+    if loaded_settings.power_automate_nonlive is None:
+        plugins = _instantiate_plugins_for_runtime_preflight(config)
+    else:
+        plugins = _instantiate_plugins_for_runtime_preflight(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
     execution_sinks, execution_sink_modes, sink_effect_admission = _preflight_execution_sinks(config, plugins)
 
     graph = ExecutionGraph.from_plugin_instances(
@@ -2125,7 +2206,8 @@ def validate(
     try:
         mode, requested_plugins, source_settings = _admit_raw_cli_nonlive_run(settings_path)
         _install_nonlive_plugin_scope(mode, requested_plugins)
-        config, _secret_resolutions = _load_settings_with_secrets(settings_path, source_settings=source_settings)
+        loaded_settings = _load_runtime_settings_with_secrets(settings_path, source_settings=source_settings)
+        config, _secret_resolutions = loaded_settings.settings, loaded_settings.secret_resolutions
         _admit_cli_nonlive_run(config)
     except (YamlParserError, YamlScannerError) as e:
         # YAML syntax errors from Dynaconf/ruamel (malformed YAML) - show helpful message
@@ -2199,7 +2281,10 @@ def validate(
 
     # Instantiate plugins BEFORE graph construction
     try:
-        plugins = instantiate_plugins_from_config(config)
+        if loaded_settings.power_automate_nonlive is None:
+            plugins = instantiate_plugins_from_config(config)
+        else:
+            plugins = instantiate_plugins_from_config(config, power_automate_nonlive=loaded_settings.power_automate_nonlive)
     except ValueError as e:
         # Plugin configuration errors (e.g., invalid schema for sink type)
         error_msg = str(e)
@@ -4608,6 +4693,9 @@ def join(
             agg_transform.node_id = node_id
             follower_transforms.append(agg_transform)
 
+        from elspeth.engine.orchestrator.preflight import execution_sink_bindings_for_runtime
+
+        execution_sink_bindings = execution_sink_bindings_for_runtime(settings_config, plugins.sink_effect_bindings)
         pipeline_config = PipelineConfig(
             config=resolve_config(settings_config),
             sources=plugins.sources,
@@ -4618,6 +4706,7 @@ def join(
             coalesce_settings=(list(settings_config.coalesce) if settings_config.coalesce else []),
             sink_effect_modes=execution_sink_modes,
             sink_effect_admission=sink_effect_admission,
+            sink_effect_bindings=execution_sink_bindings,
             escalation_fixpoint_bound=execution_graph.escalation_fixpoint_bound,
         )
 
@@ -4661,6 +4750,7 @@ def join(
                 ctx=ctx,
                 started_transforms=started_follower_transforms,
                 started_sinks=started_follower_sinks,
+                runtime_bindings=execution_sink_bindings,
             )
 
             follower_run_entered = True

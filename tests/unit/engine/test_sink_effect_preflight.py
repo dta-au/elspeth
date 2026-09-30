@@ -20,7 +20,7 @@ from elspeth.cli import (
     _preflight_follower_sink_effects,
     _start_follower_plugin_lifecycle,
 )
-from elspeth.contracts import CallType
+from elspeth.contracts import CallType, RunMode
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.sink_effects import (
@@ -597,6 +597,8 @@ def test_module_private_receipt_parts_cannot_forge_or_replace_authority() -> Non
             {"legacy": LegacyObservableSink()},
             configured_modes={"legacy": "write"},
             required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            runtime_bindings={},
+            run_mode=RunMode.LIVE,
         )
 
     forged = object.__new__(type(admission))
@@ -686,7 +688,7 @@ def test_follower_consumes_exact_receipt_before_any_plugin_lifecycle(mutation: s
             sinks=sinks,  # type: ignore[arg-type]
             configured_modes=modes,
             admission=admission,
-            ctx=object(),  # type: ignore[arg-type]
+            ctx=SimpleNamespace(run_mode=RunMode.LIVE),  # type: ignore[arg-type]
         )
 
     assert sink.on_start_calls == 0
@@ -712,7 +714,7 @@ def test_follower_consumes_unchanged_receipt_without_duplicate_validation(monkey
         sinks=sinks,  # type: ignore[arg-type]
         configured_modes=modes,
         admission=admission,
-        ctx=object(),  # type: ignore[arg-type]
+        ctx=SimpleNamespace(run_mode=RunMode.LIVE),  # type: ignore[arg-type]
     )
 
     assert sink.on_start_calls == 1
@@ -799,7 +801,7 @@ def test_direct_orchestrator_entry_rejects_before_fresh_or_resume_coordinator(op
     orchestrator = object.__new__(Orchestrator)
     orchestrator._run_lifecycle = MagicMock(spec=["run"])
     orchestrator._resume_coordinator = MagicMock(spec=["resume"])
-    config = SimpleNamespace(config={}, sinks={"output": sink}, sink_effect_modes={}, sink_effect_admission=None)
+    config = SimpleNamespace(config={}, sinks={"output": sink}, sink_effect_modes={}, sink_effect_admission=None, sink_effect_bindings={})
 
     with pytest.raises(SinkEffectCapabilityError, match="effect protocol"):
         if operation == "run":
@@ -845,6 +847,7 @@ def test_follower_rejection_never_calls_join_run(monkeypatch: pytest.MonkeyPatch
     settings = SimpleNamespace(
         sinks={"output": SimpleNamespace(options={})},
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
+        run_mode=RunMode.LIVE,
     )
     monkeypatch.setattr("elspeth.cli._instantiate_plugins_for_runtime_preflight", lambda _settings, **_kwargs: plugins)
 
@@ -1143,6 +1146,7 @@ def test_real_runtime_factory_carries_adapter_resolved_mode_with_exact_sink(
             )
         },
         landscape=SimpleNamespace(export=SimpleNamespace(enabled=False, sink=None)),
+        run_mode=RunMode.LIVE,
     )
 
     bundle = instantiate_plugins_from_config(settings, preflight_mode=True)  # type: ignore[arg-type]

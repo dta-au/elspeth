@@ -35,6 +35,7 @@ def test_follower_preflight_passes_explicit_pipeline_members_kind() -> None:
         sinks,
         configured_modes={"output": "write"},
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=None,
     )
 
 

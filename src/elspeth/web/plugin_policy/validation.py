@@ -12,6 +12,8 @@ from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditI
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, TextractProfiledAuditIdentity
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
+from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.plugins.infrastructure.power_automate import PowerAutomateProtocolError, normalize_allowed_origin
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
@@ -188,6 +190,11 @@ def validate_plugin_policy(
         )
 
     if not snapshot.is_trained_operator:
+        findings.extend(
+            finding
+            for component in components
+            if (finding := _power_automate_origin_finding(component, snapshot.power_automate_allowed_origins)) is not None
+        )
         findings.extend(finding for component in components if (finding := _s3_source_endpoint_override_finding(component)) is not None)
         alias_inventory = frozenset(alias for _plugin_id, aliases in snapshot.usable_profile_aliases for alias in aliases)
         findings.extend(
@@ -231,6 +238,35 @@ def validate_plugin_policy(
         findings=tuple(findings),
         profiled_s3_audit_identities=profiled_s3_audit_identities,
         profiled_textract_audit_identities=profiled_textract_audit_identities,
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="web-authored Power Automate allowed_origin option in a component's untrusted options",
+    source_param="component",
+    suppresses=("R5",),
+    invariant="returns a value-free origin denial for missing, malformed or unapproved authored origins; never resolves credentials",
+)
+def _power_automate_origin_finding(component: _Component, approved_origins: tuple[str, ...]) -> PluginPolicyFinding | None:
+    if component.plugin_id not in (PluginId("source", "power_automate"), PluginId("sink", "power_automate")):
+        return None
+    authored_origin = component.options["allowed_origin"] if "allowed_origin" in component.options else None
+    normalized_origin: str | None = None
+    if type(authored_origin) is str:
+        try:
+            normalized_origin = normalize_allowed_origin(authored_origin)
+        except PowerAutomateProtocolError:
+            normalized_origin = None
+    if normalized_origin in approved_origins:
+        return None
+    return PluginPolicyFinding(
+        stage="operator_profile_options",
+        component_id=component.component_id,
+        component_type=component.component_type,
+        error_code="power_automate_origin_not_allowed",
+        message="Power Automate requires an operator-approved HTTPS443 destination origin.",
+        suggestion="Set allowed_origin to an operator-approved origin and authorize credential wiring separately.",
     )
 
 

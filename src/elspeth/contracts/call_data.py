@@ -22,6 +22,8 @@ format stability.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import math
@@ -34,6 +36,7 @@ from typing import Any, Literal, Protocol, cast, get_args, runtime_checkable
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
+from elspeth.contracts.http_policy import HTTP_FAILURE_CODES, HTTPFailureCode
 from elspeth.contracts.payload_store import IntegrityError
 from elspeth.contracts.token_usage import TokenUsage
 
@@ -633,6 +636,38 @@ class HTTPResponseTransport:
 
 
 @dataclass(frozen=True, slots=True)
+class HTTPDecodedBodyEvidence:
+    """Exact bounded decoded bytes, independent of URL/header replay safety."""
+
+    body_b64: str
+    decoded_size: int
+    complete: bool
+    incomplete_reason: HTTPFailureCode | None = None
+
+    def __post_init__(self) -> None:
+        _require_str(self.body_b64, "HTTPDecodedBodyEvidence.body_b64")
+        require_int(self.decoded_size, "HTTPDecodedBodyEvidence.decoded_size", min_value=0)
+        if type(self.complete) is not bool:
+            raise TypeError("HTTPDecodedBodyEvidence.complete must be bool")
+        if self.complete and self.incomplete_reason is not None:
+            raise ValueError("Complete decoded evidence cannot have an incomplete reason")
+        if not self.complete and self.incomplete_reason not in HTTP_FAILURE_CODES:
+            raise ValueError("Incomplete decoded evidence requires a closed reason")
+        try:
+            decoded = base64.b64decode(self.body_b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("Decoded evidence has invalid base64") from None
+        if len(decoded) != self.decoded_size or base64.b64encode(decoded).decode("ascii") != self.body_b64:
+            raise ValueError("Decoded evidence has inconsistent bytes")
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"body_b64": self.body_b64, "decoded_size": self.decoded_size, "complete": self.complete}
+        if self.incomplete_reason is not None:
+            result["incomplete_reason"] = self.incomplete_reason
+        return result
+
+
+@dataclass(frozen=True, slots=True)
 class HTTPCallResponse:
     """Audit record for an HTTP response.
 
@@ -646,6 +681,7 @@ class HTTPCallResponse:
     body: Mapping[str, Any] | tuple[Any, ...] | str | None = None
     redirect_count: int = 0
     transport: HTTPResponseTransport | None = None
+    decoded_body: HTTPDecodedBodyEvidence | None = None
 
     def __post_init__(self) -> None:
         _require_http_status_code(self.status_code, "status_code")
@@ -659,6 +695,8 @@ class HTTPCallResponse:
             )
         if self.transport is not None and not isinstance(self.transport, HTTPResponseTransport):
             raise TypeError("HTTPCallResponse.transport must be HTTPResponseTransport")
+        if self.decoded_body is not None and not isinstance(self.decoded_body, HTTPDecodedBodyEvidence):
+            raise TypeError("HTTPCallResponse.decoded_body must be HTTPDecodedBodyEvidence")
         freeze_fields(self, "headers", "body")
 
     def to_dict(self) -> dict[str, Any]:
@@ -681,6 +719,8 @@ class HTTPCallResponse:
             d["redirect_count"] = self.redirect_count
         if self.transport is not None:
             d["transport"] = self.transport.to_dict()
+        if self.decoded_body is not None:
+            d["decoded_body"] = self.decoded_body.to_dict()
         return d
 
 

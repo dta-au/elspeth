@@ -1,6 +1,6 @@
 # Power Automate Sources and Sinks Implementation Plan
 
-> **Implementation handoff:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task by task, with failing behavior tests before production changes. This is a plan; plugin implementation and tenant writes require a separate execution instruction.
+> **Implementation handoff:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement this plan task by task, with failing behavior tests before production changes. Implementation and local merge are authorized. Per the operator instruction on 2026-10-01, this feature has no live-tenant acceptance step or opt-in live tests.
 
 **Goal:** Add a `power_automate` source that reads rows from an HTTP-triggered flow and a `power_automate` sink that publishes rows through an HTTP-triggered flow, with auditable completion, offline replay, live source verification, and safe interrupted-write recovery.
 
@@ -10,9 +10,9 @@
 
 **Revision base:** Inspected `release/0.8.1` at `d724cf75494f87665c76c47b73c0b8ab35fd47cf` on 2026-10-01. The earlier design was locally merged at `17a1b83dba3406d0e980f448c83e03095ac7558a`. Branch placement does not select a feature release. Confirm the implementation target before code or release-note changes.
 
-**Confirmed scope:** HTTP-triggered flows for both source and sink. This document fixes the v1 implementation decisions below. Tenant availability, licensing, credentials, and throughput still need the explicit acceptance task; no live acceptance is claimed.
+**Confirmed scope:** HTTP-triggered flows for both source and sink, targeting `release/0.8.1`. Verify functionality through deterministic transport/authentication tests, durable flow emulation, process-death recovery and the repository gates. Tenant availability, licensing and throughput are operating prerequisites documented for users, not implementation acceptance gates.
 
-**Prerequisites:** Read [CONTRIBUTING.md](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit). Use a dedicated implementation worktree, its own environment, and both source roots in `PYTHONPATH`. Provision disposable test flows only when tenant work is authorized. Use an inspectable target that satisfies the remote contract below.
+**Prerequisites:** Read [CONTRIBUTING.md](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit). Use a dedicated implementation worktree, its own environment, and both source roots in `PYTHONPATH`. Test recovery against a durable emulator satisfying the remote contract below. Document the inspectable/idempotent target users must provide.
 
 ## Scope and behavior
 
@@ -42,7 +42,7 @@ Ordinary resume never restarts pagination. Add `snapshot_for_resume: bool = Fals
 
 ## Configuration contract
 
-This is the complete example to ship in `examples/power_automate/settings.yaml`. The hostname is a placeholder: use the exact origin of the current saved trigger URL. The fixed source schema guarantees selected sink fields.
+This configuration matches `examples/power_automate/settings.yaml`. The hostname is a placeholder: use the exact origin of the current saved trigger URL. The fixed source schema guarantees selected sink fields.
 
 ```yaml
 sources:
@@ -53,10 +53,9 @@ sources:
       on_validation_failure: quarantine
       auth:
         method: sas_url
-        trigger_url_secret: "${POWER_AUTOMATE_READ_URL}"
-      allowed_origin: https://flow-endpoint.example.org
+        trigger_url_secret: "${POWER_AUTOMATE_READ_TRIGGER_URL}"
+      allowed_origin: https://flows.example.test
       query: {dataset: approved_records}
-      snapshot_id: snapshot-42
       snapshot_for_resume: true
       page_size: 100
       max_pages: 1000
@@ -72,8 +71,8 @@ sinks:
     options:
       auth:
         method: sas_url
-        trigger_url_secret: "${POWER_AUTOMATE_WRITE_URL}"
-      allowed_origin: https://flow-endpoint.example.org
+        trigger_url_secret: "${POWER_AUTOMATE_WRITE_TRIGGER_URL}"
+      allowed_origin: https://flows.example.test
       fields: [record_id, result]
       timeout_seconds: 90
       max_request_body_bytes: 1048576
@@ -83,11 +82,12 @@ sinks:
     plugin: json
     on_write_failure: discard
     options:
-      path: output/quarantine.jsonl
+      path: examples/power_automate/output/quarantine.jsonl
       format: jsonl
+      mode: append
       schema: {mode: observed}
 landscape:
-  url: sqlite:///runs/landscape.db
+  url: sqlite:///examples/power_automate/runs/landscape.db
 ```
 
 | Field / decision | Exact v1 behavior |
@@ -113,7 +113,7 @@ Require the existing HMAC fingerprint key for secret-bearing live configs, even 
 
 ## Closed flow protocol
 
-This is an ELSPETH integration protocol for flow authors, not a built-in Power Automate API. Use `protocol: "elspeth.power-automate.v1"`. Require HTTP 200 and `application/json` media type, allow optional charset, reject redirects, duplicate JSON keys, nonfinite numbers, excess depth and unknown envelope fields. Parse to frozen owned DTOs. Retain complete bounded decoded response bytes and filtered/fingerprinted request/response metadata in the payload store through the explicit evidence seam below. This does not promise raw unsafe headers or reconstructable signed-URL transport. Diagnostics contain no raw cursor, URL query, row values, response body, or remote exception message.
+This is an ELSPETH integration protocol for flow authors, not a built-in Power Automate API. Use `protocol: "elspeth.power-automate.v1"`. Require HTTP 200 and `application/json` media type, allow optional charset, reject redirects, duplicate JSON keys, nonfinite numbers, excess depth and unknown envelope fields. Wire values must fit the RFC 8785 canonical audit domain: integer literals within ±9007199254740991 and Unicode without lone surrogates. Represent larger identifiers as strings; never silently coerce numbers. Unsupported canonical values refuse the whole response with a closed `invalid_json` code before yielding rows, while complete bounded decoded evidence remains audited. JSON schemas describe envelope/data shapes; the wire codec additionally checks these representation constraints. Parse to frozen owned DTOs. Retain complete bounded decoded response bytes and filtered/fingerprinted request/response metadata in the payload store through the explicit evidence seam below. This does not promise raw unsafe headers or reconstructable signed-URL transport. Diagnostics contain no raw cursor, URL query, row values, response body, or remote exception message.
 
 ### Read
 
@@ -199,16 +199,18 @@ Sink logical target is `power-automate://<normalized-origin-host>/binding/<stabl
 
 `BaseSource`/`BaseSink` otherwise retain raw configs. Live safe initialization above is mandatory for direct archived node equality in `source_replay.py`. Never feed archived `_fingerprint` fields to live auth validators or invent placeholder credentials.
 
-Create these nominal L3 types in `plugins/infrastructure/power_automate.py`:
+Create these nominal L3 types in `plugins/infrastructure/power_automate_nonlive.py`:
 
 - `ArchivedPowerAutomateOptions`: component type/name, source run ID, exact safe audit options/hash and parsed frozen runtime spec, including strict archived auth variants.
-- `DeferredPowerAutomateCredential`: exact CLI `${ENV_NAME}` or existing authorized web secret locator plus expected archived fingerprint; no plaintext/SDK in the DTO. Resolution checks HMAC identity before egress.
+- `DeferredPowerAutomateCredential`: exact CLI `${ENV_NAME}` plus expected archived fingerprint; no plaintext/SDK in the DTO. Resolution checks HMAC identity before egress.
 - `PowerAutomateNonliveConstruction`: resolved mode/source-run ID and named admitted source/sink options; deferred credentials for VERIFY sources only.
 - `LoadedNonliveSettings`: application result pairing settings with the construction DTO; no dynamic settings attributes.
 
 Normal constructors and `from_archived_options(options, *, credential=None)` classmethods share a private owned initializer. REPLAY resolver is absent; VERIFY sink resolver/factory is absent. `instantiate_plugins_from_config(..., power_automate_nonlive=None)` requires this context in PA nonlive paths and exact reviewed builtin identity. DTO presence does not bypass engine run/config/node admission.
 
-Modify loading before `_expand_env_vars`, before raw sink preflight and before secret-store/SDK work. `_admit_raw_cli_nonlive_run` and equivalent web admission first verify completed archive settings hash/version/node hashes and raw literal mode/run identity. Capture exact locators without resolving, reject literals/default-bearing env expressions/forged fingerprint input. Compare every noncredential option, query, schema, routes and bound with admitted archive, normalizing ordinary defaults consistently; retain the exact archived safe dictionary for durable graph identity. Project only credential-bearing PA fields to their admitted safe counterparts. Run raw nonlive sink preflight against projected settings without env expansion. A common `load_nonlive_settings_from_config_dict` performs this projection for file/dict/YAML/web entry points and returns explicit construction context. Preserve other plugins' existing loader behavior and nonlive restrictions, including CLI Key Vault refusal.
+Modify loading before `_expand_env_vars`, before raw sink preflight and before secret-store/SDK work. `_admit_raw_cli_nonlive_run` first verifies completed archive settings hash/version/node hashes and raw literal mode/run identity. Capture exact locators without resolving, reject literals/default-bearing env expressions/forged fingerprint input. Compare every noncredential option, query, schema, routes and bound with admitted archive, normalizing ordinary defaults consistently; retain the exact archived safe dictionary for durable graph identity. Project only credential-bearing PA fields to their admitted safe counterparts. Run raw nonlive sink preflight against projected settings without env expansion. A common `load_nonlive_settings_from_config_dict` performs this projection for supported file/dict/YAML entry points and returns explicit construction context. Preserve other plugins' existing loader behavior and nonlive restrictions, including CLI Key Vault refusal.
+
+Web Composer currently refuses `run_mode` and `replay_from` invocation fields. Preserve that boundary, including private worker refusal before raw preflight or secret resolution. Both Power Automate plugins participate in ordinary Web LIVE execution; this feature adds no public Web nonlive API or deferred web secret locator.
 
 REPLAY may choose a different unused locator but cannot change safe identity/nonsecret config. VERIFY resolves source locator lazily and demands original credential fingerprint. Nonsecret execution inputs must be literal or follow existing admitted template rules; this work does not make arbitrary env-dependent configs offline-safe.
 
@@ -216,7 +218,7 @@ REPLAY may choose a different unused locator but cannot change safe identity/non
 
 Keep the call-mode session attached: source-load HTTP calls are required in VERIFY and `assert_complete` enforces consumption. Setting it to None bypasses admission and cannot pass completion safely.
 
-Add L0 `contracts/source_read_verification.py`: closed enum `SourceReadHTTPVerificationPolicy.CANONICAL_JSON_PAGE` and nominal `CanonicalJSONSourceReadCapability`, implemented initially only by the reviewed PA source. `prepare_verified_sources` registers the policy on the actual source-load operation before load and unregisters in finally through new `CallModeSession.register_source_read_http_verification` / `unregister_source_read_http_verification` methods. Require VERIFY, actual SOURCE node, operation type source_load, no row state; refuse arbitrary plugin/config comparators.
+Add L0 `contracts/source_read_verification.py`: closed enum `SourceReadVerificationPolicy.POWER_AUTOMATE_CANONICAL_JSON_V1` and nominal `CanonicalJSONSourceReadCapability`, implemented initially only by the reviewed PA source. L3 runtime composition assigns the closed policy only to the exact reviewed builtin. `prepare_verified_sources` registers the policy on the actual source-load operation before load and unregisters in finally through new `CallModeSession.register_source_read_http_verification` / `unregister_source_read_http_verification` methods. Require VERIFY, actual SOURCE node, operation type source_load, no row state; refuse arbitrary plugin/config comparators.
 
 `AuditedCallModeSession.verify_call` applies this policy only to HTTP POST with exact protocol and `operation=read`, no redirects. Compare status, `application/json` media type, redirect count and **entire strictly parsed canonical JSON body from complete decoded-body evidence**, including raw rows, snapshot and cursor. Ignore volatile HTTP response headers, JSON key order/whitespace and raw byte-size differences for this explicit source policy; preserve bounded decoded bytes and safe metadata. Existing strict transform/other-source response comparison is unchanged. Existing ordered rows/contracts/quarantines/discards verification still runs before downstream startup. Missing calls or changed request/data still fail. Persist the fixed policy name in the source-load operation input metadata, alongside `source_plugin`; do not add metadata to the differences dictionary that determines `is_match` or create a new SQL verdict column.
 
@@ -346,7 +348,7 @@ Also pass that impostor through real preflight and assert its precise refusal; t
 
 **RED:** `test_nonlive_projects_credentials_before_env_expansion`, `test_archive_hash_and_nonsecret_changes_fail_before_secrets`, `test_raw_sink_preflight_never_resolves_nonlive_secrets`, `test_live_safe_options_equal_archived_node_options`, `test_raw_secret_override_is_refused_for_durable_power_automate`, `test_verify_defers_source_credentials_and_omits_sink_credentials`. Use secret resolver/SDK/DNS/HTTP tripwires and assert no invocation, not merely absent HTTP responses.
 
-**Implement:** typed archive/resolver/construction/loading result, early archive hash/version/node integrity checks, exact locator capture, safe projection and effective-option comparison described above. Raw live auth and archived auth have separate parsers. Carry explicit nonlive context through all file/dict/YAML/web factory callers. Keep runtime factory exact builtin dispatch and later source run admission checks. Adapt `_load_settings_with_secrets`, `_admit_raw_cli_nonlive_run`, `_raw_run_mode_before_secrets`, raw sink preflight in that order. No Key Vault relaxation, forged fingerprint acceptance, default-placeholder secrets or dynamic settings attributes.
+**Implement:** typed archive/resolver/construction/loading result, early archive hash/version/node integrity checks, exact locator capture, safe projection and effective-option comparison described above. Raw live auth and archived auth have separate parsers. Carry explicit nonlive context through supported file/dict/YAML factory callers; refuse unsupported Web nonlive invocation before secrets. Keep runtime factory exact builtin dispatch and later source run admission checks. Adapt `_load_settings_with_secrets`, `_admit_raw_cli_nonlive_run`, `_raw_run_mode_before_secrets`, raw sink preflight in that order. No Key Vault relaxation, forged fingerprint acceptance, default-placeholder secrets or dynamic settings attributes.
 
 **GREEN command:** `plan_pytest task04 tests/unit/cli/test_run_mode_admission.py tests/unit/core/test_config_loading_layering.py tests/unit/core/test_secrets_config.py tests/unit/plugins/infrastructure/test_runtime_factory.py tests/unit/engine/orchestrator/test_source_replay.py`
 
@@ -434,19 +436,19 @@ Also pass that impostor through real preflight and assert its precise refusal; t
 
 ### Task 11 — Ship reference flows, examples and operator guidance
 
-**Create:** `docs/reference/power-automate.md`, `examples/power_automate/settings.yaml`, `README.md`; opt-in `tests/integration/plugins/test_power_automate_live.py`. Register dedicated live marker in `pyproject.toml` and ensure normal CI does not execute tenant traffic.
+**Create:** `docs/reference/power-automate.md`, `examples/power_automate/settings.yaml`, `README.md`. Provide credential-free emulator instructions; no live-tenant test module or marker.
 
-**RED / document checks:** parse the shipped YAML with actual settings/schema/plugin constructors; compare JSON-schema accepted/rejected fixtures to parsers; validate example references and run it against the emulator. A fake URL/config probe must make zero external calls. A live test without opt-in and explicit tenant fixtures skips before secret lookup.
+**RED / document checks:** parse the shipped YAML with actual settings/schema/plugin constructors; compare JSON-schema accepted/rejected fixtures to parsers; validate example references and run it against the emulator. A fake URL/config probe must make zero external calls. All automated tests use controlled transport/auth fixtures and make no tenant calls.
 
 **Implement guide:** exact designer steps for separate read and status/write flows; request JSON schemas; operation switch and unknown-operation rejection; stable snapshot/page ordering; read-only status; atomic keyed target create/read-back; sticky rejection; Response placement after all claimed effects. Use a standard Dataverse reference table with unique alternate key on delivery ID and bound payload/hash/outcome/receipt/original-flow-run columns. Choose Web API `PATCH` at the alternate-key URL with `If-None-Match: *` (create only), or a proven duplicate-key create path; ordinary upsert can update an existing row and is not the primitive. Duplicate/precondition-failure performs authoritative read-back and returns the **original stored receipt and flow-run ID**, never the duplicate invocation's run ID. Insert complete delivery data/outcome/receipt atomically in that immutable row; response/bookkeeping loss recovers from it. Status has zero mutations and only reports safe absence under the keyed-create contract. Publish the allowed business-target rejection rule and its sticky durable storage; a conflicting delivery hash is unknown. Prove concurrency/late-request/receipt-loss behavior in Task 12. The reference target stores one immutable delivery record as the demonstrated business effect; arbitrary follow-on actions require separate safety proof.
 
-Cover SAS and allowed SP/user-assigned MI setup, exact public audience/scope and allowed-principal object ID, existing secret wiring, operator approved origins, current trigger URL copy/rotation, fingerprint-key custody, configured rotation refusal for old-run resume/verify, snapshot/receipt retention, 64-MiB snapshot restriction, response caps/timeouts/unknown recovery, no retry guarantee, quota/DLP/license prerequisites. Include executable credential-free emulator instructions and precise opt-in tenant commands. Do not check in live IDs/connections/URLs or fake flow-export packages claiming importability.
+Cover SAS and allowed SP/user-assigned MI setup, exact public audience/scope and allowed-principal object ID, existing secret wiring, operator approved origins, current trigger URL copy/rotation, fingerprint-key custody, configured rotation refusal for old-run resume/verify, snapshot/receipt retention, 64-MiB snapshot restriction, response caps/timeouts/unknown recovery, no retry guarantee, quota/DLP/license prerequisites. Include executable credential-free emulator instructions. Do not check in live IDs/connections/URLs or fake flow-export packages claiming importability.
 
-**GREEN command:** `plan_pytest task11 tests/integration/plugins/test_power_automate_pipeline.py tests/integration/plugins/test_power_automate_live.py tests/unit/plugins/test_catalog_reference_content.py`
+**GREEN command:** `plan_pytest task11 tests/integration/plugins/test_power_automate_pipeline.py tests/unit/plugins/test_catalog_reference_content.py`
 
-**Done / commit:** examples match runtime parsers, remote branches are buildable and documented, live tests cannot run accidentally. `docs: document Power Automate source and sink operation`.
+**Done / commit:** examples match runtime parsers, remote branches are buildable and documented, emulator instructions run without tenant credentials. `docs: document Power Automate source and sink operation`.
 
-### Task 12 — Run integration gates and real-tenant acceptance
+### Task 12 — Run integration gates and deterministic acceptance
 
 **Files:** final task touches fixes only where a measured failure points; no generic cleanup. Use `scripts/full-suite-gate.sh`, current `.github/workflows/ci.yaml`, `.claude/lanes/power-automate-implementation/` for ignored logs. Confirm test-capacity ownership/load; one broad suite at a time.
 
@@ -473,9 +475,9 @@ printf 'keyless_exit=%s\n' "$lint_result"
 
 Standing findings may keep that diagnostic nonzero; inspect touched findings and compare complete sets, never claim signed clearance. Operator-held-key signing is separate, after actual code churn settles; no agent key or hand-edited signatures.
 
-**Tenant acceptance:** only on authorized disposable flows/data. Gate SAS, SP and user-assigned MI separately; unallowed principal must be refused. Read multipage/empty/retained snapshot; publish and independently inspect exact durable target; duplicate same ID concurrently; changed-hash conflict; intentionally lose response and reconcile; terminate around target/receipt bookkeeping; prove sticky rejection and expired/pending unknown. Verify matching/changed snapshots, bearer renewal, offline replay, same-run configured rotation refusal and fresh-run adoption of current URL. Count requests/actions from target, flow history and Landscape; no mock-derived claim of live correctness. Do not enable a claimed auth mode/recoverability guarantee until its live proof passes. Document regional feature availability/DLP/license/connector limits actually observed.
+**Deterministic acceptance:** gate SAS, SP and user-assigned MI separately with fake credentials and inspected transport requests; unallowed origin/principal changes must be refused under the configured contract. Read multipage/empty/retained snapshot; publish and independently inspect the durable emulator target; duplicate same ID concurrently; changed-hash conflict; intentionally lose response and reconcile; terminate around target/receipt bookkeeping; prove sticky rejection and expired/pending unknown. Verify matching/changed snapshots, bearer renewal, offline replay, same-run configured rotation refusal and fresh-run adoption of the current URL. Count requests/actions from the durable target and Landscape. These proofs cover the connector contract and engine behavior; do not label them tenant acceptance. Document regional feature availability/DLP/license/connector limits as operating requirements.
 
-**Done / commit:** required frozen local gates pass; diagnostics reviewed with stated limits; each advertised tenant mode has measured acceptance. Only then integrate reviewed implementation into the confirmed local target using branch-safety. Local merge, push, hosted CI, signing and deployment are separate statuses/actions. `test: complete Power Automate integration acceptance` if tracked test repairs result; no empty ceremony commit.
+**Done / commit:** required frozen local gates pass; diagnostics reviewed with stated limits; every mode and recovery contract has deterministic acceptance evidence. Only then integrate reviewed implementation into `release/0.8.1` using branch-safety. Local merge, push, hosted CI, signing and deployment are separate statuses/actions. `test: complete Power Automate integration acceptance` if tracked test repairs result; no empty ceremony commit.
 
 ## Inventory checklist coupled to Tasks 6 and 7
 
@@ -486,21 +488,21 @@ Read the entire CONTRIBUTING new-plugin checklist at execution time. These curre
 - `tests/unit/web/catalog/test_service.py`, `test_knob_schema_golden.py`; generate `tests/golden/web/catalog/knob_schema/source__power_automate.json` and `sink__power_automate.json` from the catalog service schema cache as described by the existing golden test.
 - `config/cicd/contracts-whitelist.yaml`: constructor and hermetic probe entries. Use MI config with explicit fake client ID, no key/network/SDK needed. No lint exemptions for production parsing.
 - `scripts/state_engine_plugin_matrix.py`, `tests/golden/state_engine/plugin_lifecycle_matrix.json`, `tests/unit/plugins/test_state_engine_plugin_matrix.py`; v2/v3 proof catalogs under `docs/architecture/state_engine/proof-catalog/`. `render-skeleton <golden>` intentionally yields UNCLASSIFIED entries/nonzero until demonstrated fields are populated; `check <golden>` must then exit 0. Do not use a nonexistent `--write` option.
-- `scripts/cicd/plugin_hash.py` after final formatting; update plugin hash entries through its actual CLI. Regenerate soft-mapping census with `.venv/bin/python -m scripts.check_contracts --write-census` only when scanned sites change. Review dynamic-attribute/import/wire/symbol inventories and regenerate touched fingerprints via documented producers in the same change; no aliases/padding/suppressions.
+- `scripts/cicd/plugin_hash.py` after final formatting; compute plugin hash entries through its shared producer API. Regenerate soft-mapping census with `.venv/bin/python -m scripts.check_contracts --write-census` only when scanned sites change. Review dynamic-attribute/import/wire/symbol inventories and regenerate touched fingerprints via documented producers in the same change; no aliases/padding/suppressions.
 
 ## Completion and remaining deployment inputs
 
 The implementation is complete only when both ordinary authoring surfaces, bounded source accounting, exact sink receipts, source snapshot recovery, offline replay, scoped live verification, secret-leak controls, operator-origin admission, lifecycle inventories and required gates all match the task proofs. The reference target's status/dedup contract is a prerequisite for recoverability; a generic trigger acknowledgement or standalone receipt table is insufficient.
 
-The implementer must obtain the actual release target, test-tenant access, approved endpoint origins, allowed principal IDs, current callback URLs and target retention window during setup/tenant acceptance. Those are deployment inputs, not unresolved code-design choices. This planning task provisions none of them.
+The local integration target is `release/0.8.1`. Approved endpoint origins, allowed principal IDs, callback URLs and target retention are user deployment inputs documented in the guide. Implementation requires no tenant access and provisions no external flows.
 
 ## Primary platform references
 
-Checked on 2026-10-01; recheck at implementation and live acceptance.
+Checked on 2026-10-01; recheck when platform APIs change.
 
 - [Microsoft: OAuth authentication for HTTP request triggers](https://learn.microsoft.com/en-us/power-automate/oauth-authentication): principal admission, exact public audience and regional availability.
 - [Microsoft: flow limits and configuration](https://learn.microsoft.com/en-us/power-automate/limits-and-config): inbound response ceiling and actions continuing after Response; local 90/110-second limits are implementation choices.
 - [Microsoft: troubleshooting trigger URL changes](https://learn.microsoft.com/en-us/troubleshoot/power-platform/power-automate/flow-run-issues/triggers-troubleshoot): current designer URLs and scale-unit segments; copy rather than synthesize URLs.
-- [Microsoft: client credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow): resource-specific `/.default` scope; actual Power Automate token acceptance remains a tenant proof.
+- [Microsoft: client credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow): resource-specific `/.default` scope; allowed principals and trigger authentication are tenant operating configuration.
 - [Microsoft: Dataverse upsert behavior](https://learn.microsoft.com/en-us/power-apps/developer/data-platform/use-upsert-insert-update-record): existing-key update and create-only `If-None-Match` behavior for the reference target.
 - [HTTPCore: public network backend interfaces](https://www.encode.io/httpcore/network-backends/), [connection pool configuration](https://www.encode.io/httpcore/connection-pools/): public transport composition seam for per-operation remaining-budget deadlines.

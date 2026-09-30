@@ -5,10 +5,13 @@ those with plugin declarations before any environment expansion can turn
 operator placeholders into output data.
 """
 
+from __future__ import annotations
+
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, get_args, get_origin
+from typing import TYPE_CHECKING, Any, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel
@@ -29,6 +32,85 @@ from elspeth.core.config import (
 )
 
 _EXACT_ENV_SECRET = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}\Z")
+
+if TYPE_CHECKING:
+    from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive, PowerAutomateNonliveConstruction
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedNonliveSettings:
+    settings: ElspethSettings
+    power_automate_nonlive: PowerAutomateNonliveConstruction
+
+
+def _admit_power_automate_effective_settings(settings: ElspethSettings, archive: PowerAutomateArchive) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.core.canonical import stable_hash
+    from elspeth.core.config import resolve_config
+    from elspeth.plugins.infrastructure.power_automate_nonlive import admit_archived_invocation_settings
+
+    source = deep_thaw(archive.settings)
+    current = resolve_config(settings)
+    # resolve_config persists every owned settings field, including defaults.
+    # Check that shape before removing the intentional invocation differences;
+    # missing archived fields are corruption, not implicit authoring defaults.
+    if set(source) != set(current):
+        raise AuditIntegrityError("power_automate_archive_settings_invalid")
+    admit_archived_invocation_settings(source)
+    source_concurrency = source["concurrency"]
+    current_concurrency = current["concurrency"]
+    if type(source_concurrency) is not dict or set(source_concurrency) != set(current_concurrency):
+        raise AuditIntegrityError("power_automate_archive_settings_invalid")
+    source_worker_limit = source_concurrency["max_workers"]
+    if type(source_worker_limit) is not int or source_worker_limit < 1:
+        raise AuditIntegrityError("power_automate_archive_settings_invalid")
+    for field in ("run_mode", "replay_from"):
+        del source[field]
+        del current[field]
+    if current_concurrency["max_workers"] == 1:
+        del source_concurrency["max_workers"]
+        del current_concurrency["max_workers"]
+    if stable_hash(source) != stable_hash(current):
+        raise ValueError("power_automate_execution_settings_differ")
+
+
+def load_nonlive_settings_from_config_dict(
+    config_dict: Mapping[str, object],
+    *,
+    archive: PowerAutomateArchive,
+    expand_env_vars: bool = False,
+) -> LoadedNonliveSettings:
+    from elspeth.plugins.infrastructure.power_automate_nonlive import project_power_automate_nonlive
+
+    _, context = project_power_automate_nonlive(_lowercase_schema_keys(dict(config_dict)), archive)
+    settings = load_settings_from_config_dict(config_dict, expand_env_vars=expand_env_vars, power_automate_archive=archive)
+    _admit_power_automate_effective_settings(settings, archive)
+    return LoadedNonliveSettings(settings, context)
+
+
+def load_nonlive_settings(config_path: Path, *, archive: PowerAutomateArchive) -> LoadedNonliveSettings:
+    from elspeth.plugins.infrastructure.power_automate_nonlive import project_power_automate_nonlive
+
+    raw = load_bounded_pipeline_yaml(config_path.read_text())
+    if not isinstance(raw, Mapping):
+        raise ValueError("Configuration must be a mapping")
+    _, context = project_power_automate_nonlive(_lowercase_schema_keys(dict(raw)), archive)
+    settings = load_settings(config_path, source_settings=archive.settings, power_automate_archive=archive)
+    _admit_power_automate_effective_settings(settings, archive)
+    return LoadedNonliveSettings(settings, context)
+
+
+def load_nonlive_settings_from_yaml_string(
+    yaml_str: str,
+    *,
+    archive: PowerAutomateArchive,
+    expand_env_vars: bool = False,
+) -> LoadedNonliveSettings:
+    raw = load_bounded_pipeline_yaml(yaml_str)
+    if not isinstance(raw, Mapping):
+        raise ValueError("Configuration must be a mapping")
+    return load_nonlive_settings_from_config_dict(raw, archive=archive, expand_env_vars=expand_env_vars)
 
 
 @trust_boundary(
@@ -265,6 +347,7 @@ def load_settings(
     config_path: Path,
     *,
     source_settings: object | None = None,
+    power_automate_archive: PowerAutomateArchive | None = None,
 ) -> ElspethSettings:
     """Load settings from YAML file with environment variable overrides.
 
@@ -326,6 +409,12 @@ def load_settings(
 
     # Filter Dynaconf internals (now safe — all non-known keys are Dynaconf's)
     raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
+    from elspeth.plugins.infrastructure.power_automate_nonlive import has_power_automate_components, project_power_automate_nonlive
+
+    if power_automate_archive is not None:
+        raw_config, _ = project_power_automate_nonlive(raw_config, power_automate_archive)
+    elif has_power_automate_components(raw_config) and raw_config.get("run_mode", RunMode.LIVE) != RunMode.LIVE:
+        raise ValueError("Power Automate nonlive loading requires admitted archive context")
     _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
     _reject_web_scrape_auth_literal(raw_config)
 
@@ -350,10 +439,18 @@ def load_settings(
             source_settings=source_settings,
         )
 
-    return ElspethSettings(**raw_config)
+    settings = ElspethSettings(**raw_config)
+    if power_automate_archive is not None:
+        _admit_power_automate_effective_settings(settings, power_automate_archive)
+    return settings
 
 
-def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_env_vars: bool = False) -> ElspethSettings:
+def load_settings_from_config_dict(
+    config_dict: Mapping[str, object],
+    *,
+    expand_env_vars: bool = False,
+    power_automate_archive: PowerAutomateArchive | None = None,
+) -> ElspethSettings:
     """Load settings from an already parsed in-memory config dict.
 
     This is the common post-parse path for web execution and validation.
@@ -385,6 +482,12 @@ def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_
         raise ValueError(f"Unknown configuration keys: {unknown_keys}. Valid top-level keys: {sorted(known_fields)}")
 
     raw_config = {k: v for k, v in raw_config.items() if k in known_fields}
+    from elspeth.plugins.infrastructure.power_automate_nonlive import has_power_automate_components, project_power_automate_nonlive
+
+    if power_automate_archive is not None:
+        raw_config, _ = project_power_automate_nonlive(raw_config, power_automate_archive)
+    elif has_power_automate_components(raw_config) and raw_config.get("run_mode", RunMode.LIVE) != RunMode.LIVE:
+        raise ValueError("Power Automate nonlive loading requires admitted archive context")
     _reject_file_backed_template_options_for_in_memory_loader(raw_config)
     _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config)
     if expand_env_vars:
@@ -398,7 +501,10 @@ def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_
     raw_config = _lower_llm_profile_nodes(raw_config, materialize=expand_env_vars)
     if expand_env_vars:
         raw_config = _expand_env_vars(raw_config)
-    return ElspethSettings(**raw_config)
+    settings = ElspethSettings(**raw_config)
+    if power_automate_archive is not None:
+        _admit_power_automate_effective_settings(settings, power_automate_archive)
+    return settings
 
 
 @trust_boundary(
@@ -413,7 +519,12 @@ def load_settings_from_config_dict(config_dict: Mapping[str, object], *, expand_
     test_ref="tests/unit/core/test_config.py::TestLoadSettingsFromYamlStringBoundary::test_non_mapping_yaml_document_raises",
     test_fingerprint="c7191a8e2aa172c5b106dc0133d7999b2b56178482b5e6a695b88b20a0e3ff8b",
 )
-def load_settings_from_yaml_string(yaml_content: str, *, expand_env_vars: bool = False) -> ElspethSettings:
+def load_settings_from_yaml_string(
+    yaml_content: str,
+    *,
+    expand_env_vars: bool = False,
+    power_automate_archive: PowerAutomateArchive | None = None,
+) -> ElspethSettings:
     """Load settings from a YAML string without touching disk.
 
     This is used by the web execution service to load pipeline configs
@@ -440,4 +551,4 @@ def load_settings_from_yaml_string(yaml_content: str, *, expand_env_vars: bool =
     config_dict = load_bounded_pipeline_yaml(yaml_content)
     if not isinstance(config_dict, dict):
         raise ValueError(f"Configuration must be a YAML mapping (key: value), not {type(config_dict).__name__}")
-    return load_settings_from_config_dict(config_dict, expand_env_vars=expand_env_vars)
+    return load_settings_from_config_dict(config_dict, expand_env_vars=expand_env_vars, power_automate_archive=power_automate_archive)

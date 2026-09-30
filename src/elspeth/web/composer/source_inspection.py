@@ -35,8 +35,8 @@ from pydantic import JsonValue
 
 from elspeth.contracts.blobs import BlobContentMissingError, BlobIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.sources.field_normalization import resolve_field_names
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.response_contracts import SelectedResponseContract

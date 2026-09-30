@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
+from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
 from pydantic import ValidationError
@@ -49,6 +50,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.safe_validation_errors import safe_validation_error_text
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.sink_effect_http import HTTPSinkEffectCapability, SinkEffectHTTPEnvironment, SinkEffectHTTPPostFactory
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
     SinkEffectAttemptState,
@@ -58,6 +60,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPipelineMembersInput,
     SinkEffectReservationRequest,
     SinkEffectRole,
+    SinkEffectRuntimeBinding,
 )
 from elspeth.core.canonical import canonical_json as pipeline_canonical_json
 from elspeth.core.clock import Clock
@@ -164,6 +167,7 @@ class SinkExecutor:
         shutdown_event: threading.Event | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
         make_shutdown_error: Callable[[], BaseException] | None = None,
+        sink_effect_bindings: Mapping[str, SinkEffectRuntimeBinding] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -195,6 +199,25 @@ class SinkExecutor:
         self._shutdown_event = shutdown_event
         self._check_coordination_latch = check_coordination_latch
         self._make_shutdown_error = make_shutdown_error
+        self._sink_effect_bindings = MappingProxyType(dict(sink_effect_bindings or {}))
+
+    def _http_factory_for_sink(self, sink_name: str, sink: SinkProtocol, ctx: PluginContext) -> SinkEffectHTTPPostFactory | None:
+        binding = self._sink_effect_bindings.get(sink_name)
+        if binding is not None and (binding.sink is not sink or binding.sink_name != sink_name):
+            raise OrchestrationInvariantError("sink HTTP binding does not match the current sink")
+        factory = None if binding is None else binding.http_post_factory
+        if ctx.run_mode is not RunMode.LIVE:
+            if factory is not None:
+                raise OrchestrationInvariantError("nonlive sink cannot carry HTTP authority")
+            return None
+        if isinstance(sink, HTTPSinkEffectCapability):
+            if not isinstance(factory, SinkEffectHTTPPostFactory):
+                raise OrchestrationInvariantError("HTTP sink requires its admitted nominal HTTP factory")
+            if factory.safe_config_fingerprint != stable_hash(sink.config):
+                raise OrchestrationInvariantError("sink HTTP factory safe configuration changed")
+        elif factory is not None:
+            raise OrchestrationInvariantError("non-HTTP sink cannot carry HTTP authority")
+        return factory
 
     def _require_coordination_token(self) -> CoordinationToken:
         """The leader token every fenced sink-effect verb requires (ADR-048)."""
@@ -832,6 +855,7 @@ class SinkExecutor:
             if ctx.replay_from is None:
                 raise OrchestrationInvariantError("replay sink execution requires a source run")
             effect_adapter = VirtualReplaySinkEffect(factory=self._factory, source_run_id=ctx.replay_from, sink_node_id=sink_node_id)
+        http_factory = self._http_factory_for_sink(sink_name, sink, ctx)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -841,6 +865,12 @@ class SinkExecutor:
             shutdown_event=self._shutdown_event,
             check_coordination_latch=self._check_coordination_latch,
             make_shutdown_error=self._make_shutdown_error,
+            http_post_factory=http_factory,
+            http_environment=(
+                SinkEffectHTTPEnvironment(telemetry_emit=ctx.telemetry_emit, rate_limit_registry=ctx.rate_limit_registry)
+                if http_factory is not None
+                else None
+            ),
         ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
@@ -1190,6 +1220,7 @@ class SinkExecutor:
             effect_adapter = VirtualReplaySinkEffect(
                 factory=self._factory, source_run_id=ctx.replay_from, sink_node_id=failsink_node_id, role=SinkEffectRole.FAILSINK
             )
+        http_factory = self._http_factory_for_sink(failsink_name, failsink, ctx)
         result = SinkEffectCoordinator(
             factory=self._factory,
             worker_id=self._worker_id,
@@ -1199,6 +1230,12 @@ class SinkExecutor:
             shutdown_event=self._shutdown_event,
             check_coordination_latch=self._check_coordination_latch,
             make_shutdown_error=self._make_shutdown_error,
+            http_post_factory=http_factory,
+            http_environment=(
+                SinkEffectHTTPEnvironment(telemetry_emit=ctx.telemetry_emit, rate_limit_registry=ctx.rate_limit_registry)
+                if http_factory is not None
+                else None
+            ),
         ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,

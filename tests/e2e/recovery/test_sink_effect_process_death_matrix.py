@@ -613,3 +613,11 @@ def test_single_process_profile_covers_complete_sink_effect_process_death_matrix
             seam_value,
             observe_profile=lambda db: _observe_single_process_profile(db, reporter),
         )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
+@pytest.mark.parametrize("seam_value", ["before_effect", "remote_commit", "after_finalize_before_response"])
+def test_power_automate_process_death_reconciles_original_delivery(tmp_path: Path, seam_value: str) -> None:
+    from tests.integration.pipeline.test_power_automate_effect_recovery import exercise_power_automate_process_death
+
+    exercise_power_automate_process_death(tmp_path, seam_value)

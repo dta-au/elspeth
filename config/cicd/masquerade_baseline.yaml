@@ -277,6 +277,19 @@ entries:
     OpenAI-compatible SDK usage detail objects. TokenUsage.from_dict validates the
     extracted counters as nonnegative integers excluding bool and converts missing
     or malformed values to None. Only owned TokenUsage escapes; SDK objects do not.
+- path: src/elspeth/plugins/infrastructure/clients/power_automate.py
+  qualname: _admit_power_automate_token
+  kind: getattr
+  occurrences: 1
+  probe_shapes:
+  - 7762e4797552c2b20d94831b3311a603068b1fddf8301be93b822532884ddc00
+  classification: external-parse
+  justification: ADR-032 foreign Azure credential admission reads the token field
+    once with a missing-value sentinel, accepts only a nonempty ASCII string without
+    controls or whitespace, and constructs the frozen owned _AdmittedPowerAutomateToken.
+    SDK objects do not escape. Tests accept both real Azure AccessToken and dynamic
+    Pydantic external values, and reject missing or malformed token values without
+    secret-bearing diagnostics.
 - path: src/elspeth/plugins/infrastructure/templates.py
   qualname: TemplateRow.__getattr__
   kind: dunder_getattr
@@ -1375,8 +1388,8 @@ entries:
   - bf0d01e03719bbca8c09adacfeed220c9cc7493f98f174f4e5293cd582b82080
   classification: reflection-owned-table
   justification: Test-harness writer factory dispatches a fixed literal method name
-    to the owned SessionServiceImpl base. The two-argument lookup raises on an
-    absent method; no external or masquerader-controlled object is accepted.
+    to the owned SessionServiceImpl base. The two-argument lookup raises on an absent
+    method; no external or masquerader-controlled object is accepted.
 - path: tests/unit/web/sessions/session_test_authority.py
   qualname: FencedSessionServiceHarness._run_writer._wrapped
   kind: getattr
@@ -1385,8 +1398,8 @@ entries:
   - bf0d01e03719bbca8c09adacfeed220c9cc7493f98f174f4e5293cd582b82080
   classification: reflection-owned-table
   justification: Test-harness run-writer factory dispatches a fixed literal method
-    name to the owned SessionServiceImpl base. The two-argument lookup raises
-    on an absent method; no external or masquerader-controlled object is accepted.
+    name to the owned SessionServiceImpl base. The two-argument lookup raises on an
+    absent method; no external or masquerader-controlled object is accepted.
 - path: tests/unit/web/sessions/test_archive_quarantine.py
   qualname: _inject_helper_fault_once
   kind: getattr

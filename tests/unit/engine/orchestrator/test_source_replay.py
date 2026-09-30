@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -13,9 +13,17 @@ import pytest
 
 from elspeth.contracts import PluginSchema, SourceRow
 from elspeth.contracts.audit import NodeStateFailed, ValidationErrorRecord
+from elspeth.contracts.contract_records import ValidationErrorWithContract
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import NodeStateStatus, NodeType, RunMode, TerminalPath
-from elspeth.contracts.errors import AuditIntegrityError, VerificationMismatchError
+from elspeth.contracts.errors import (
+    AuditIntegrityError,
+    ContractViolation,
+    ExtraFieldViolation,
+    MissingFieldViolation,
+    TypeMismatchViolation,
+    VerificationMismatchError,
+)
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
@@ -24,7 +32,7 @@ from elspeth.core.landscape.data_flow.serialization import canonical_or_recorded
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import RowDataResult, RowDataState
 from elspeth.engine.orchestrator.source_iteration import SourceIterationDriver
-from elspeth.engine.orchestrator.source_replay import _verified_rows, prepare_audited_sources, prepare_verified_sources
+from elspeth.engine.orchestrator.source_replay import _verified_rows, prepare_audited_sources, prepare_verified_sources, replay_source_rows
 
 
 class _ReplaySchema(PluginSchema):
@@ -192,6 +200,21 @@ def _failed_source_state() -> NodeStateFailed:
     )
 
 
+def _validation_record(original: object, *, destination: str = "quarantine", error_id: str = "error-old") -> ValidationErrorRecord:
+    return ValidationErrorRecord(
+        error_id=error_id,
+        run_id="previous-run",
+        node_id="source-old",
+        row_id="row-1" if destination != "discard" else None,
+        row_hash=stable_hash(original),
+        row_data_json=json.dumps(original, separators=(",", ":")),
+        error="bad value",
+        schema_mode="observed",
+        destination=destination,
+        created_at=datetime.now(UTC),
+    )
+
+
 def test_replay_reconstructs_quarantined_row() -> None:
     factory, source, row = _source_audit(payload={"_raw": "bad"})
     row.source_data_hash = stable_hash({"_raw": "bad"})
@@ -200,7 +223,8 @@ def test_replay_reconstructs_quarantined_row() -> None:
     factory.data_flow.get_token_outcomes_for_row.return_value = [
         SimpleNamespace(path=TerminalPath.QUARANTINED_AT_SOURCE, token_id="source-token", sink_name="quarantine")
     ]
-    factory.data_flow.get_validation_errors_for_row.return_value = [SimpleNamespace(row_data_json='"bad"')]
+    factory.data_flow.get_validation_errors_for_run.return_value = [_validation_record("bad")]
+    factory.data_flow.get_validation_errors_for_row.return_value = [_validation_record("bad")]
 
     plan = prepare_audited_sources(factory, "previous-run", {"primary": source})
 
@@ -210,6 +234,158 @@ def test_replay_reconstructs_quarantined_row() -> None:
     assert item.quarantine_error == "bad value"
     assert item.quarantine_destination == "quarantine"
     source.load.assert_not_called()
+
+
+@pytest.mark.parametrize("original", [None, ["bad"], [{"key": ["nested"]}], {"_raw": ["bad"]}])
+def test_replay_reconstructs_original_json_quarantine_shape(original: object) -> None:
+    stored = original if type(original) is dict else {"_raw": original}
+    factory, source, _row = _source_audit(payload=stored)
+    factory.query.get_tokens.return_value = [SimpleNamespace(token_id="source-token")]
+    factory.query.get_node_states_for_token.return_value = [_failed_source_state()]
+    factory.data_flow.get_token_outcomes_for_row.return_value = [
+        SimpleNamespace(path=TerminalPath.QUARANTINED_AT_SOURCE, token_id="source-token", sink_name="quarantine")
+    ]
+    factory.data_flow.get_validation_errors_for_run.return_value = [_validation_record(original)]
+    factory.data_flow.get_validation_errors_for_row.return_value = [_validation_record(original)]
+
+    item = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"].rows[0]
+
+    assert item.row == original
+    assert type(item.row) is type(original)
+    assert item.source_row_index == 5
+    assert item.is_quarantined
+    source.load.assert_not_called()
+
+
+@pytest.mark.parametrize("original", [None, ["bad"], {"_raw": ["bad"]}])
+def test_replay_restores_complete_validation_ledger_with_new_error_ids(original: object) -> None:
+    stored = original if type(original) is dict else {"_raw": original}
+    factory, source, _row = _source_audit(payload=stored)
+    factory.query.get_tokens.return_value = [SimpleNamespace(token_id="source-token")]
+    factory.query.get_node_states_for_token.return_value = [_failed_source_state()]
+    factory.data_flow.get_token_outcomes_for_row.return_value = [
+        SimpleNamespace(path=TerminalPath.QUARANTINED_AT_SOURCE, token_id="source-token", sink_name="quarantine")
+    ]
+    errors = [_validation_record({"value": "discard"}, destination="discard", error_id="discard-old"), _validation_record(original)]
+    factory.data_flow.get_validation_errors_for_run.return_value = errors
+    factory.data_flow.get_validation_errors_for_row.return_value = [errors[1]]
+    audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    token = CoordinationToken(run_id="replay-run", worker_id="worker:replay-run:test", leader_epoch=1)
+    ctx = PluginContext(run_id="replay-run", config={}, node_id="source-new", landscape=factory.data_flow, coordination_token=token)
+    factory.data_flow.record_validation_error.side_effect = ["discard-new", "quarantine-new"]
+
+    restored = tuple(replay_source_rows(audited, ctx))
+
+    assert len(restored) == 1
+    assert restored[0].row == original
+    assert type(restored[0].row) is type(original)
+    assert restored[0].validation_error_id == "quarantine-new"
+    assert restored[0].source_row_index == 5
+    calls = factory.data_flow.record_validation_error.call_args_list
+    assert len(calls) == 2
+    assert [call.kwargs["destination"] for call in calls] == ["discard", "quarantine"]
+    assert [call.kwargs["row_data"] for call in calls] == [{"value": "discard"}, original]
+    assert all(call.kwargs["node_id"] == "source-new" for call in calls)
+    assert ctx.pop_pending_quarantine_validation_error_id(original) is None
+
+
+@pytest.mark.parametrize(
+    "corruption,reason",
+    [
+        ({"run_id": "foreign"}, "foreign run"),
+        ({"row_id": None}, "payload or linkage"),
+        ({"row_id": "missing-row"}, "ambiguous _raw"),
+        ({"destination": "other-sink"}, "decision disagrees"),
+        ({"error": "different error"}, "decision disagrees"),
+        ({"row_hash": "f" * 64}, "payload hash mismatch"),
+    ],
+)
+def test_replay_refuses_corrupt_quarantine_validation_ledger(corruption: dict[str, object], reason: str) -> None:
+    factory, source, _row = _source_audit(payload={"_raw": None})
+    factory.query.get_tokens.return_value = [SimpleNamespace(token_id="source-token")]
+    factory.query.get_node_states_for_token.return_value = [_failed_source_state()]
+    factory.data_flow.get_token_outcomes_for_row.return_value = [
+        SimpleNamespace(path=TerminalPath.QUARANTINED_AT_SOURCE, token_id="source-token", sink_name="quarantine")
+    ]
+    factory.data_flow.get_validation_errors_for_run.return_value = [replace(_validation_record(None), **corruption)]
+
+    with pytest.raises(AuditIntegrityError, match=reason):
+        prepare_audited_sources(factory, "previous-run", {"primary": source})
+
+    source.load.assert_not_called()
+
+
+def test_replay_refuses_duplicate_validation_error_identity() -> None:
+    factory, source, _row = _source_audit()
+    error = _validation_record(None, destination="discard")
+    factory.data_flow.get_validation_errors_for_run.return_value = [error, error]
+
+    with pytest.raises(AuditIntegrityError, match="duplicate"):
+        prepare_audited_sources(factory, "previous-run", {"primary": source})
+
+
+def test_replay_refuses_orphan_quarantine_validation_error() -> None:
+    factory, source, _row = _source_audit()
+    factory.data_flow.get_validation_errors_for_run.return_value = [replace(_validation_record(None), row_id="missing-row")]
+
+    with pytest.raises(AuditIntegrityError, match="missing rows"):
+        prepare_audited_sources(factory, "previous-run", {"primary": source})
+
+
+def test_replay_preserves_distinct_links_for_identical_quarantine_payloads() -> None:
+    factory, source, first = _source_audit(payload={"_raw": ["bad"]})
+    second = SimpleNamespace(**{**vars(first), "row_id": "row-2", "source_row_index": 6})
+    factory.query.iter_rows_for_run.return_value = [[first, second]]
+    errors = [_validation_record(["bad"]), replace(_validation_record(["bad"]), error_id="second-old", row_id="row-2")]
+    factory.data_flow.get_validation_errors_for_run.return_value = errors
+    with patch("elspeth.engine.orchestrator.source_replay._quarantine_details", return_value=("bad value", "quarantine")):
+        audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    token = CoordinationToken(run_id="replay-run", worker_id="worker:replay-run:test", leader_epoch=1)
+    ctx = PluginContext(run_id="replay-run", config={}, node_id="source-new", landscape=factory.data_flow, coordination_token=token)
+    factory.data_flow.record_validation_error.side_effect = ["first-new", "second-new"]
+
+    restored = tuple(replay_source_rows(audited, ctx))
+
+    assert [row.validation_error_id for row in restored] == ["first-new", "second-new"]
+    assert [row.source_row_index for row in restored] == [5, 6]
+    assert ctx.pop_pending_quarantine_validation_error_id(["bad"]) is None
+
+
+@pytest.mark.parametrize(
+    "violation,original",
+    [
+        (MissingFieldViolation(normalized_name="value", original_name="Value"), {}),
+        (ExtraFieldViolation(normalized_name="value", original_name="Value"), {"value": "bad"}),
+        (
+            TypeMismatchViolation(normalized_name="value", original_name="Value", expected_type=int, actual_type=str, actual_value="bad"),
+            {"value": "bad"},
+        ),
+        (
+            TypeMismatchViolation(
+                normalized_name="value", original_name="Value", expected_type=int, actual_type=list, actual_value=["bad"]
+            ),
+            {"value": ["bad"]},
+        ),
+    ],
+)
+def test_replay_preserves_owned_structured_quarantine_decisions(violation: ContractViolation, original: dict[str, object]) -> None:
+    details = ValidationErrorWithContract.from_violation(violation)
+    factory, source, _row = _source_audit(payload=original)
+    error = replace(_validation_record(original), **asdict(details))
+    factory.data_flow.get_validation_errors_for_run.return_value = [error]
+    with patch("elspeth.engine.orchestrator.source_replay._quarantine_details", return_value=("bad value", "quarantine")):
+        audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+    token = CoordinationToken(run_id="replay-run", worker_id="worker:replay-run:test", leader_epoch=1)
+    ctx = PluginContext(run_id="replay-run", config={}, node_id="source-new", landscape=factory.data_flow, coordination_token=token)
+    factory.data_flow.record_validation_error.return_value = "quarantine-new"
+
+    restored = tuple(replay_source_rows(audited, ctx))
+
+    recorded = factory.data_flow.record_validation_error.call_args.kwargs["contract_violation"]
+    assert type(recorded) is type(violation)
+    assert ValidationErrorWithContract.from_violation(recorded) == details
+    assert restored[0].validation_error_id == "quarantine-new"
+    assert restored[0].row == original
 
 
 def test_replay_refuses_failed_source_state_without_quarantine_outcome() -> None:
@@ -297,8 +473,8 @@ def test_verify_late_source_drift_refuses_complete_preload() -> None:
     factory, source, _row = _source_audit()
     audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
     assert audited.schema_contract is not None
-    first = SimpleNamespace(name="first", node_id="source-1")
-    second = SimpleNamespace(name="second", node_id="source-2")
+    first = SimpleNamespace(name="first", node_id="source-1", config={})
+    second = SimpleNamespace(name="second", node_id="source-2", config={})
     first.load = MagicMock(spec=_bound_source_load, return_value=iter(audited.rows))
     second.load = MagicMock(
         spec=_bound_source_load, return_value=iter([SourceRow.valid({"value": 999}, contract=audited.schema_contract, source_row_index=5)])
@@ -336,7 +512,7 @@ def test_verify_late_source_drift_refuses_complete_preload() -> None:
 def test_verify_materializes_all_sources_once_with_source_operation_identity() -> None:
     factory, first, _row = _source_audit()
     audited_first = prepare_audited_sources(factory, "previous-run", {"primary": first})["primary"]
-    second = SimpleNamespace(node_id="source-2", name="rows-2")
+    second = SimpleNamespace(node_id="source-2", name="rows-2", config={})
     first.node_id = "source-1"
     observed_operations: list[str] = []
 
@@ -381,8 +557,9 @@ def test_verify_materializes_all_sources_once_with_source_operation_identity() -
     assert ctx.operation_id is None
 
 
+@pytest.mark.parametrize("destination", ["discard", "quarantine"])
 @pytest.mark.parametrize("move_discard", [False, True], ids=["unchanged", "moved-to-other-source"])
-def test_verify_binds_identical_discard_decisions_to_their_source(move_discard: bool) -> None:
+def test_verify_binds_identical_validation_decisions_to_their_source(move_discard: bool, destination: str) -> None:
     factory, source, _row = _source_audit()
     audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
     discard = ValidationErrorRecord(
@@ -393,11 +570,15 @@ def test_verify_binds_identical_discard_decisions_to_their_source(move_discard: 
         row_data_json='{"value":"bad"}',
         error="invalid",
         schema_mode="fixed",
-        destination="discard",
+        destination=destination,
         created_at=datetime.now(UTC),
     )
-    first = SimpleNamespace(name="first", node_id="source-1", load=MagicMock(spec=_bound_source_load, return_value=iter(audited.rows)))
-    second = SimpleNamespace(name="second", node_id="source-2", load=MagicMock(spec=_bound_source_load, return_value=iter(audited.rows)))
+    first = SimpleNamespace(
+        name="first", node_id="source-1", config={}, load=MagicMock(spec=_bound_source_load, return_value=iter(audited.rows))
+    )
+    second = SimpleNamespace(
+        name="second", node_id="source-2", config={}, load=MagicMock(spec=_bound_source_load, return_value=iter(audited.rows))
+    )
     factory.data_flow.get_validation_errors_for_run.return_value = [
         replace(discard, run_id="verify-run", node_id="source-1"),
         replace(discard, run_id="verify-run", node_id="source-1" if move_discard else "source-2"),
@@ -410,7 +591,7 @@ def test_verify_binds_identical_discard_decisions_to_their_source(move_discard: 
         call_mode_session=SimpleNamespace(mode=RunMode.VERIFY),
     )
     token = CoordinationToken(run_id="verify-run", worker_id="worker:verify-run:test", leader_epoch=1)
-    expected = pytest.raises(VerificationMismatchError, match="validation discards differ") if move_discard else nullcontext()
+    expected = pytest.raises(VerificationMismatchError, match="validation decisions differ") if move_discard else nullcontext()
     with (
         patch(
             "elspeth.engine.orchestrator.source_replay.track_operation",
@@ -424,8 +605,8 @@ def test_verify_binds_identical_discard_decisions_to_their_source(move_discard: 
             factory,
             "verify-run",
             {
-                "first": replace(audited, name="first", validation_discards=(discard,)),
-                "second": replace(audited, name="second", validation_discards=(discard,)),
+                "first": replace(audited, name="first", validation_errors=(discard,)),
+                "second": replace(audited, name="second", validation_errors=(discard,)),
             },
             {"first": first, "second": second},
             ctx,

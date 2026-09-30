@@ -24,7 +24,7 @@ from elspeth.engine.orchestrator.source_replay import _verified_rows, prepare_au
 from tests.fixtures.factories import make_context
 from tests.unit.engine.orchestrator.test_call_mode_session import _CURRENT_TOKEN, _factory
 from tests.unit.engine.orchestrator.test_run_modes import _pipeline, _settings
-from tests.unit.engine.orchestrator.test_source_replay import _bound_source_load, _failed_source_state, _source_audit
+from tests.unit.engine.orchestrator.test_source_replay import _bound_source_load, _failed_source_state, _source_audit, _validation_record
 
 _PARENT = {"current_state_id": "current-state", "current_operation_id": None}
 _REQUEST = {"method": "GET", "url": "https://example.org/"}
@@ -566,7 +566,7 @@ def test_quarantine_replay_requires_one_bound_original_payload_and_destination(c
     factory.query.get_tokens.return_value = [SimpleNamespace(token_id="source-token")]
     factory.query.get_node_states_for_token.return_value = [failed]
     factory.data_flow.get_token_outcomes_for_row.return_value = [outcome]
-    factory.data_flow.get_validation_errors_for_row.return_value = [SimpleNamespace(row_data_json='"bad"')]
+    factory.data_flow.get_validation_errors_for_run.return_value = [replace(_validation_record("bad"), run_id="source-run")]
     if corruption == "duplicate-state":
         factory.query.get_node_states_for_token.return_value = [failed, failed]
     elif corruption == "missing-error":
@@ -582,9 +582,9 @@ def test_quarantine_replay_requires_one_bound_original_payload_and_destination(c
     elif corruption == "hash-drift":
         row.source_data_hash = "0" * 64
     elif corruption == "missing-original":
-        factory.data_flow.get_validation_errors_for_row.return_value = []
+        factory.data_flow.get_validation_errors_for_run.return_value = []
     elif corruption == "wrong-original":
-        factory.data_flow.get_validation_errors_for_row.return_value = [SimpleNamespace(row_data_json='"different"')]
+        factory.data_flow.get_validation_errors_for_run.return_value = [replace(_validation_record("different"), run_id="source-run")]
     with pytest.raises(AuditIntegrityError, match=reason):
         prepare_audited_sources(factory, "source-run", {"primary": source})
     source.load.assert_not_called()
@@ -597,7 +597,7 @@ def test_quarantine_replay_preserves_real_raw_dict_instead_of_unwrapping_it() ->
     factory.data_flow.get_token_outcomes_for_row.return_value = [
         SimpleNamespace(path=TerminalPath.QUARANTINED_AT_SOURCE, token_id="source-token", sink_name="quarantine")
     ]
-    factory.data_flow.get_validation_errors_for_row.return_value = [SimpleNamespace(row_data_json='{"_raw":"bad"}')]
+    factory.data_flow.get_validation_errors_for_run.return_value = [replace(_validation_record({"_raw": "bad"}), run_id="source-run")]
     snapshot = prepare_audited_sources(factory, "source-run", {"primary": source})["primary"]
     assert snapshot.rows[0].row == {"_raw": "bad"}
     assert snapshot.rows[0].quarantine_destination == "quarantine"

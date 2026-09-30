@@ -27,11 +27,11 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, LimiterProtocol, TransformContext
 from elspeth.contracts.errors import CapacityError, FrameworkBugError, PluginRetryableError, is_capacity_error
 from elspeth.contracts.events import TelemetryEvent
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config

@@ -203,6 +203,7 @@ class SinkFlushCoordinator:
             shutdown_event=ctx.shutdown_event,
             check_coordination_latch=check_coordination_latch,
             make_shutdown_error=_shutdown_during_sink_effect_wait,
+            sink_effect_bindings=config.sink_effect_bindings,
         )
         step = sink_step
         total_diversions = DiversionCounts()
