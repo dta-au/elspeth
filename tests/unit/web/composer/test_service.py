@@ -66,6 +66,7 @@ from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import _registry as tool_registry
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -556,6 +557,34 @@ def test_freeform_planner_context_present_but_invalid_authorship_marker_crashes(
 
 
 class TestComposerTextOnlyResponse:
+    @pytest.mark.asyncio
+    async def test_state_credentials_are_refused_before_prompt_serialization_or_provider(self) -> None:
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="output",
+                options={"path": "input.csv", "password": "low-entropy-secret"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        with (
+            patch("elspeth.web.composer.service.build_messages") as build,
+            patch.object(service._provider_gateway, "_call_llm", new_callable=AsyncMock) as provider,
+            pytest.raises(CredentialMaterialRefused) as caught,
+        ):
+            await service.compose("Review this pipeline", [], state, session_id=session_id)
+
+        assert caught.value.surface == "composer_state_before_provider"
+        build.assert_not_called()
+        provider.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_non_build_text_only_returns_immediately(self) -> None:
         """Non-build text-only replies still terminate without mutation."""

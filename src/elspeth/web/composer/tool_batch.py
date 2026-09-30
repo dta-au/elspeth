@@ -155,6 +155,11 @@ from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
+from elspeth.web.credential_guard import (
+    require_no_credential_material,
+    require_no_credential_material_in_llm_metadata,
+    require_no_credential_material_in_tool_wire,
+)
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -270,6 +275,10 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
             raise AuditIntegrityError("Composer tool batch is missing a provider tool-call ID")
         if type(call_id) is not str:
             raise AuditIntegrityError("Composer tool batch contains a non-string provider tool-call ID")
+        require_no_credential_material(
+            {"tool_call_id": call_id},
+            surface="composer_provider_response",
+        )
         if not call_id.strip():
             raise AuditIntegrityError("Composer tool batch contains a blank provider tool-call ID")
         if len(call_id) > PROVIDER_TOOL_CALL_ID_MAX_LENGTH:
@@ -282,6 +291,10 @@ def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
         function_arguments = getattr(function, "arguments", _MISSING_TOOL_CALL_FIELD)
         if type(function_name) is not str or type(function_arguments) is not str:
             raise AuditIntegrityError("Composer tool batch contains malformed provider function metadata")
+        require_no_credential_material(
+            {"tool_name": function_name},
+            surface="composer_provider_response",
+        )
         if not function_name.strip():
             raise AuditIntegrityError("Composer tool batch contains blank provider function name")
 
@@ -812,6 +825,29 @@ async def run_tool_batch(
     raw_assistant_content = assistant_message.content
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
+    # Scan the complete response metadata before progress, history, audit,
+    # proposal, blob, or state effects. Internal adapters can supply an
+    # already-admitted completion without passing through ProviderGateway, so
+    # this common owner must cover prose, identifiers, reasoning, and mixed
+    # batches all-or-nothing as well.
+    require_no_credential_material_in_llm_metadata(
+        content=raw_assistant_content,
+        tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+        reasoning_content=completion.provider_metadata.reasoning_content,
+        reasoning_details=completion.provider_metadata.reasoning_details,
+        thinking_blocks=completion.provider_metadata.thinking_blocks,
+        model_returned=completion.provider_metadata.model_returned,
+        provider_request_id=completion.provider_metadata.provider_request_id,
+        finish_reason=completion.provider_metadata.finish_reason,
+        provider_served=completion.provider_metadata.provider_served,
+        surface="composer_tool_batch",
+    )
+    for tool_call in assistant_tool_calls:
+        require_no_credential_material_in_tool_wire(
+            tool_call.function.name,
+            tool_call.function.arguments,
+            surface="composer_tool_wire",
+        )
     provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
     if (
         turn_sessions_service is not None

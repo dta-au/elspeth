@@ -225,6 +225,7 @@ def _bedrock_receipt_projection(
             temperature=None,
             seed=None,
             response=response,
+            credential_surface="aws_ecs_bedrock_response",
         )
     except Exception:
         raise AcceptanceCheckError("bedrock_metadata") from None

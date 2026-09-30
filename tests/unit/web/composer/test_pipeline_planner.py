@@ -100,6 +100,7 @@ from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_sc
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -115,7 +116,7 @@ from elspeth.web.plugin_policy.models import (
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, composition_proposals_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.identities import ensure_test_identity
@@ -3806,6 +3807,27 @@ def test_planner_rejects_invalid_provider_tool_call_ids(call_id: str) -> None:
     assert caught.value.code == "MALFORMED_RESPONSE"
 
 
+@pytest.mark.parametrize("field", ["call_id", "function_name"])
+def test_planner_rejects_credential_shaped_tool_call_metadata_before_admission(field: str) -> None:
+    credential = "ghp_" + "a" * 36
+    call_id = credential if field == "call_id" else "call-1"
+    name = credential if field == "function_name" else "get_pipeline_state"
+    response = _response_with_call_id(call_id, name, {})
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        _parse_response_tool_calls(
+            response,
+            max_tool_calls=3,
+            dialect=ToolContractDialect.NONE,
+            sent_tool_names=frozenset({"get_pipeline_state"}),
+        )
+
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert caught.value.to_payload()["surface"] == "composer_planner_response"
+    assert credential not in str(caught.value)
+    assert credential not in canonical_json(caught.value.to_payload())
+
+
 @pytest.mark.parametrize("name", ["", " ", "\u2003"])
 def test_planner_rejects_blank_provider_tool_names(name: str) -> None:
     response = _Response(
@@ -4329,6 +4351,207 @@ async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n
         content=content,
         user_id="planner-user",
     )
+
+
+@pytest.mark.asyncio
+async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch_or_persistence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    engine, origin = await _session_context()
+    credential = "ghp_" + "a" * 36
+    mixed_response = _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(
+                            id="call-clean",
+                            function=_Function(
+                                name="get_plugin_schema",
+                                arguments=json.dumps({"plugin_type": "source", "name": "csv"}),
+                            ),
+                        ),
+                        _ToolCall(
+                            id=credential,
+                            function=_Function(name="get_pipeline_state", arguments="{}"),
+                        ),
+                    ],
+                )
+            )
+        ],
+        usage=_planner_usage(),
+    )
+    completion = _ScriptedCompletion(
+        mixed_response,
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    state = _empty_state()
+    state_before = state.to_dict()
+    schemas_marked: list[tuple[str, str]] = []
+    finalized_candidates: list[object] = []
+
+    def mark_schema_loaded(plugin_type: str, plugin_name: str) -> None:
+        schemas_marked.append((plugin_type, plugin_name))
+
+    def finalize_candidate(candidate: object) -> object:
+        finalized_candidates.append(candidate)
+        return candidate
+
+    with engine.begin() as conn:
+        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            originating_message=origin,
+            custody_config=PlannerCustodyConfig(
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                max_storage_per_session=1_000_000,
+                secret_service=None,
+                runtime_preflight=None,
+            ),
+            current_state=state,
+            mark_schema_loaded=mark_schema_loaded,
+            candidate_finalizer=finalize_candidate,
+        )
+
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert credential not in str(caught.value)
+    assert len(completion.requests) == 1
+    assert credential not in canonical_json(completion.requests)
+    assert recorder.invocations == ()
+    assert schemas_marked == []
+    assert finalized_candidates == []
+    assert state.to_dict() == state_before
+    assert credential not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+    assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credential_field",
+    ["model_returned", "provider_request_id", "finish_reason", "combined_reasoning"],
+)
+async def test_planner_provider_metadata_refusal_is_atomic_before_audit_history_or_persistence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    credential_field: str,
+) -> None:
+    engine, origin = await _session_context()
+    credential = "ghp_" + "a" * 36
+    response = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    if credential_field == "model_returned":
+        response.model = credential
+    elif credential_field == "provider_request_id":
+        response.id = credential
+    elif credential_field == "finish_reason":
+        response.choices[0].__dict__["finish_reason"] = credential
+    else:
+        response.model = credential
+        response.choices[0].message.__dict__["reasoning_content"] = credential
+    completion = _ScriptedCompletion(
+        response,
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    state = _empty_state()
+    state_before = state.to_dict()
+    schemas_marked: list[tuple[str, str]] = []
+    finalized_candidates: list[object] = []
+
+    def mark_schema_loaded(plugin_type: str, plugin_name: str) -> None:
+        schemas_marked.append((plugin_type, plugin_name))
+
+    def finalize_candidate(candidate: object) -> object:
+        finalized_candidates.append(candidate)
+        return candidate
+
+    with engine.begin() as conn:
+        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            originating_message=origin,
+            custody_config=PlannerCustodyConfig(
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                max_storage_per_session=1_000_000,
+                secret_service=None,
+                runtime_preflight=None,
+            ),
+            current_state=state,
+            mark_schema_loaded=mark_schema_loaded,
+            candidate_finalizer=finalize_candidate,
+        )
+
+    assert caught.value.surface == "composer_planner_response"
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert credential not in repr(caught.value.to_payload())
+    assert len(completion.requests) == 1
+    assert credential not in canonical_json(completion.requests)
+    assert recorder.invocations == ()
+    assert schemas_marked == []
+    assert finalized_candidates == []
+    assert state.to_dict() == state_before
+    assert len(recorder.llm_calls) == 1
+    refused_call = recorder.llm_calls[0]
+    assert refused_call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+    assert refused_call.error_message == "credential_material_rejected"
+    assert refused_call.model_returned is None
+    assert refused_call.provider_request_id is None
+    assert refused_call.finish_reason is None
+    assert credential not in canonical_json([refused_call.to_dict()])
+    assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
+async def test_planner_provider_metadata_ordinary_controls_are_retained(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    response = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    response.model = "provider/planner-v2"
+    response.id = "ordinary-request-id"
+    response.choices[0].__dict__["finish_reason"] = "provider-stop"
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+    )
+
+    assert isinstance(result.proposal, PipelineProposal)
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    call = recorder.llm_calls[0]
+    assert call.status is ComposerLLMCallStatus.SUCCESS
+    assert call.model_returned == "provider/planner-v2"
+    assert call.provider_request_id == "ordinary-request-id"
+    assert call.finish_reason == "provider-stop"
 
 
 @pytest.mark.asyncio

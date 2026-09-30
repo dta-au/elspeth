@@ -23,6 +23,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 
 
@@ -468,6 +469,41 @@ class TestDispatchTool:
             scratch_dir,
         )
         assert result["success"] is True
+
+    def test_session_tool_arguments_use_the_shared_credential_guard(self, scratch_dir: Path) -> None:
+        candidate = "sk-" + "a" * 24
+        session_manager, session_checkout_ref = _session_authority(scratch_dir)
+
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            _dispatch_tool(
+                "new_session",
+                {"name": candidate},
+                _empty_state(),
+                _mock_catalog(),
+                scratch_dir,
+                session_manager=session_manager,
+                session_checkout_ref=session_checkout_ref,
+            )
+
+        assert caught.value.surface == "composer_mcp_tool_arguments"
+        assert candidate not in repr(caught.value.to_payload())
+
+    def test_legacy_state_is_refused_before_mcp_disclosure(self, scratch_dir: Path) -> None:
+        candidate = "sk-" + "b" * 24
+        contaminated = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(name=candidate),
+            version=1,
+        )
+
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            _dispatch_tool("list_sources", {}, contaminated, _mock_catalog(), scratch_dir)
+
+        assert caught.value.surface == "composer_mcp_state"
+        assert candidate not in repr(caught.value.to_payload())
 
     def test_set_source_path_without_session_identity_fails_closed(self, scratch_dir: Path) -> None:
         # set_source is promoted to a type-driven manifest entry

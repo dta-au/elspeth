@@ -108,6 +108,7 @@ from elspeth.web.coordination.approval_authority import (
 from elspeth.web.coordination.contracts import RecoveryRequiredReason, SessionOperationFenceLost
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding
 from elspeth.web.execution.accounting import load_run_accounting_from_db
@@ -1215,6 +1216,14 @@ class ExecutionServiceImpl:
         if record.session_id != session_id:
             raise StateAccessError(str(state_id))
         authored = state_from_record(record)
+        env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id)) if self._secret_service is not None else frozenset()
+        )
+        require_no_credential_material_in_state(
+            authored,
+            surface="composer_approval_state",
+            env_ref_names=env_ref_names,
+        )
         semantic_errors, _, semantic_contracts = validate_semantic_contracts(authored)
         if semantic_errors:
             raise SemanticContractViolationError(entries=semantic_errors, contracts=semantic_contracts)
@@ -1726,6 +1735,16 @@ class ExecutionServiceImpl:
         # Bridge CompositionStateRecord → CompositionState for generate_yaml().
         # The record stores raw dicts; generate_yaml() needs the typed domain object.
         authored_state = state_from_record(state_record)
+        credential_env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id))
+            if self._secret_service is not None and user_id is not None
+            else frozenset()
+        )
+        require_no_credential_material_in_state(
+            authored_state,
+            surface="composer_execution_state",
+            env_ref_names=credential_env_ref_names,
+        )
         try:
             completion_gates = parse_completion_gates(state_record.composer_meta)
         except ValueError as exc:
@@ -2748,6 +2767,16 @@ class ExecutionServiceImpl:
         ``completion_ready`` accordingly. ``None`` — no record at hand, or no
         envelope ever written — leaves the recompute untouched.
         """
+        env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id))
+            if self._secret_service is not None and user_id is not None
+            else frozenset()
+        )
+        require_no_credential_material_in_state(
+            state,
+            surface="composer_validation_state",
+            env_ref_names=env_ref_names,
+        )
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
         return await self._authoritative_state_preflight(
             state,

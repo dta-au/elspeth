@@ -14633,6 +14633,26 @@ class TestSendMessageTranscriptSnapshot:
     """
 
     @pytest.mark.asyncio
+    async def test_credential_material_is_refused_before_message_persistence_or_provider(self, tmp_path) -> None:
+        app, service = _make_app(tmp_path)
+        composer = _make_composer_mock(response_text="must not run")
+        app.state.composer_service = composer
+        session = await service.create_session("alice", "Credential refusal", "local")
+        candidate = "sk-" + "a" * 24
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                f"/api/sessions/{session.id}/messages",
+                json={"content": f"Please use {candidate}", "client_request_id": str(uuid.uuid4())},
+            )
+
+        assert response.status_code == 422
+        assert response.json()["detail"]["error_type"] == "credential_material_rejected"
+        assert candidate not in response.text
+        assert await service.get_messages(session.id, limit=None) == []
+        assert composer.compose.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_competing_compose_lease_returns_409_without_persisting_user_message(self, tmp_path) -> None:
         app, service = _make_app(tmp_path)
         app.state.composer_service = _make_composer_mock(response_text="must not run")

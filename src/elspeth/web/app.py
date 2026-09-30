@@ -41,6 +41,7 @@ from elspeth.contracts import RunStatus
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionPolicy
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
+from elspeth.contracts.credential_material import scrub_credential_material
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import (
     FingerprintKeyMissingError,
@@ -113,6 +114,7 @@ from elspeth.web.coordination.review_authority import RepositoryReviewAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.coordination.workflow_scope_reader import RepositoryWorkflowScopeReader
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
@@ -1358,6 +1360,17 @@ def _create_app(
 
     register_session_operation_exception_handlers(app)
 
+    @app.exception_handler(CredentialMaterialRefused)
+    async def _credential_material_refused_handler(
+        request: Request,
+        exc: CredentialMaterialRefused,
+    ) -> JSONResponse:
+        """Render only fixed, value-free classifier evidence."""
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.to_payload(), "request_id": _correlation_id(request)},
+        )
+
     @app.exception_handler(AuditIntegrityError)
     async def _audit_integrity_error_handler(request: Request, exc: AuditIntegrityError) -> JSONResponse:
         # ~40 raise sites produce byte-identical fail-closed 500s through
@@ -2205,7 +2218,9 @@ def _create_app(
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
-        safe_errors = [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
+        safe_errors = scrub_credential_material(
+            [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
+        )
         request_id = _request_id(request)
         # Operational correlation only: never project the validation errors,
         # request body, URL, identity, or exception into this event. Even the

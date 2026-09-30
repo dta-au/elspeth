@@ -10,6 +10,7 @@ from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerAdmissionRefused, ComposerResult
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
 from elspeth.web.sessions.protocol import MessageIngressAccepted, MessageIngressConflict, MessageIngressFresh
 from elspeth.web.sessions.titles import is_default_session_title
@@ -153,6 +154,10 @@ def register_message_routes(router: APIRouter) -> None:
         7. Persist the assistant response message with post-compose state_id.
         8. Return the assistant message and (optionally) the new state.
         """
+        try:
+            require_no_credential_material(body.content, surface="web_message_ingress")
+        except CredentialMaterialRefused as exc:
+            raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
         # 0. Rate limit check — before any work
         await rate_limiter.check(user.user_id)
 
@@ -865,6 +870,8 @@ def register_message_routes(router: APIRouter) -> None:
                             reason="admission_refused",
                         ),
                     )
+                    if isinstance(exc, CredentialMaterialRefused):
+                        raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
                     raise HTTPException(
                         status_code=403,
                         detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},

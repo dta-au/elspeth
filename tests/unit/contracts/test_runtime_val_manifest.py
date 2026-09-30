@@ -11,8 +11,8 @@ from typing import Annotated, ClassVar, Literal, Optional, TypedDict, Union
 import pytest
 import typing_extensions
 
+import elspeth.contracts.credential_material as credential_material_module
 import elspeth.contracts.schema_contract as schema_contract_module
-import elspeth.contracts.secret_scrub as secret_scrub_module
 import elspeth.engine.executors.declared_output_fields as declared_output_fields_module
 from elspeth.contracts.declaration_contracts import (
     AggregateDeclarationContractViolation,
@@ -1496,17 +1496,17 @@ def test_manifest_records_live_tier_1_nested_code_helper_drift(_isolate_runtime_
         for entry in baseline["tier_1_errors"]
         if entry["class_name"] == "DeclaredOutputFieldsViolation" and entry["class_module"] == DeclaredOutputFieldsViolation.__module__
     )
-    original_code = secret_scrub_module._parsed_http_url_contains_sensitive_parts.__code__
+    original_code = credential_material_module._classify_http_url.__code__
 
     def replacement(value: str) -> bool:
         del value
         return False
 
-    secret_scrub_module._parsed_http_url_contains_sensitive_parts.__code__ = replacement.__code__
+    credential_material_module._classify_http_url.__code__ = replacement.__code__
     try:
         mutated = build_runtime_val_manifest()
     finally:
-        secret_scrub_module._parsed_http_url_contains_sensitive_parts.__code__ = original_code
+        credential_material_module._classify_http_url.__code__ = original_code
 
     mutated_entry = next(
         entry

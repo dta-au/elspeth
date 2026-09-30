@@ -145,6 +145,11 @@ from elspeth.web.composer.tools.sources import (
     _source_component_id,
 )
 from elspeth.web.composer.tools.state_responses import PIPELINE_STATE_RESPONSE_CONTRACT
+from elspeth.web.credential_guard import (
+    CREDENTIAL_REFUSAL_DETAIL,
+    CredentialMaterialRefused,
+    require_no_credential_material_in_state,
+)
 from elspeth.web.interpretation_state import (
     BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -2274,8 +2279,24 @@ def _execute_get_pipeline_state(
     Otherwise returns the full state: source, all nodes with options, all
     outputs with options, edges, and metadata.
     """
-    del context  # unused; signature uniformity with the other handlers.
     validated = _validate_mutation_arguments(GetPipelineStateArgumentsModel, args, "get_pipeline_state arguments")
+    env_ref_names = (
+        frozenset(item.name for item in context.secret_service.list_refs(context.user_id))
+        if context.secret_service is not None and context.user_id is not None
+        else frozenset()
+    )
+    try:
+        require_no_credential_material_in_state(
+            state,
+            surface="composer_pipeline_state_disclosure",
+            env_ref_names=env_ref_names,
+        )
+    except CredentialMaterialRefused:
+        return _failure_result(
+            state,
+            CREDENTIAL_REFUSAL_DETAIL,
+            error_code="credential_material_rejected",
+        )
     component = validated.component
     data: Any
 

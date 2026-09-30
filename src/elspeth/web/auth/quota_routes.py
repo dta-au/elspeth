@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import MAX_AUTH_AUDIT_TEXT_LENGTH, AuthAuditWriter
@@ -22,6 +22,7 @@ from elspeth.web.coordination.quota_policy_authority import (
     QuotaTargetNotFound,
     RepositoryQuotaPolicyAuthority,
 )
+from elspeth.web.validation import reject_credential_material
 
 
 class IdentityQuotaView(BaseModel):
@@ -44,12 +45,22 @@ class SetQuotaBody(BaseModel):
     on_behalf_of: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     console_request_id: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
 
+    @model_validator(mode="after")
+    def _reject_credential_material(self) -> SetQuotaBody:
+        reject_credential_material(self.model_dump(mode="json"))
+        return self
+
 
 class RevokeQuotaBody(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     on_behalf_of: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     console_request_id: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
+
+    @model_validator(mode="after")
+    def _reject_credential_material(self) -> RevokeQuotaBody:
+        reject_credential_material(self.model_dump(mode="json"))
+        return self
 
 
 def _authority(request: Request) -> RepositoryQuotaPolicyAuthority:

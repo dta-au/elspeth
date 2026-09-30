@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import insert, update
+from sqlalchemy import insert, select, update
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -19,7 +19,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.library_authority import RepositoryLibraryAuthority
-from elspeth.web.sessions.models import identities_table, identity_roles_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table, library_entries_table
 from elspeth.web.sessions.protocol import SessionNotFoundError, SessionRecord
 from elspeth.web.sessions.routes.workflow.library import create_library_router
 from tests.fixtures.identities import ensure_test_identity
@@ -132,6 +132,22 @@ def test_publish_curate_and_browse_hides_source_session(library_client: tuple[Sy
     assert browse[0]["payload_digest"] == published["payload_digest"]
     assert events == ["published", "accepted"]
     assert [call["entry_compartment_id"] for call in client.app.state.library_audit_calls] == ["test-compartment"] * 2
+
+
+def test_credential_title_refuses_before_library_persistence_or_audit(
+    library_client: tuple[SyncASGITestClient, _Actor, list[str]],
+) -> None:
+    client, _actor, events = library_client
+    session_id = _seed_session_with_state(client, user_id="alice")
+    candidate = "sk-" + "a" * 24
+
+    response = client.post(f"/api/sessions/{session_id}/library/publish", json={"title": candidate})
+
+    assert response.status_code == 422
+    assert events == []
+    assert client.app.state.library_audit_calls == []
+    with client.app.state.session_engine.connect() as conn:
+        assert conn.execute(select(library_entries_table.c.entry_id)).all() == []
 
 
 def test_rejection_blocks_fork_and_requires_note(library_client: tuple[SyncASGITestClient, _Actor, list[str]]) -> None:

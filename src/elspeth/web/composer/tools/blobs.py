@@ -97,6 +97,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
+from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.execution._validation_materialization import is_llm_authored_prompt_surface_binding, llm_prompt_surface_field
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, reconcile_authoritative_reviews
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
@@ -110,6 +111,24 @@ class BlobIdArgumentsModel(BaseModel):
     blob_id: str
 
     model_config = ConfigDict(extra="forbid")
+
+
+def _credential_safe_blob_discovery_result(
+    state: CompositionState,
+    payload: Any,
+    *,
+    surface: str,
+) -> ToolResult:
+    """Return a fixed tool refusal when legacy blob output is unsafe."""
+    try:
+        require_no_credential_material(payload, surface=surface)
+    except CredentialMaterialRefused:
+        return _failure_result(
+            state,
+            CREDENTIAL_REFUSAL_DETAIL,
+            error_code="credential_material_rejected",
+        )
+    return _discovery_result(state, payload)
 
 
 class WireBlobInlineRefArgumentsModel(BaseModel):
@@ -555,7 +574,7 @@ def _handle_list_blobs(
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     blobs = _sync_list_blobs(session_engine, session_id)
-    return _discovery_result(state, blobs)
+    return _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata")
 
 
 _LIST_BLOBS_DECLARATION = ToolDeclaration(
@@ -587,7 +606,11 @@ def _handle_list_composer_blobs(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    return _discovery_result(state, {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)})
+    return _credential_safe_blob_discovery_result(
+        state,
+        {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)},
+        surface="composer_blob_metadata",
+    )
 
 
 _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
@@ -628,7 +651,7 @@ def _handle_get_blob_metadata(
         "content_hash": blob["content_hash"],
         "status": blob["status"],
     }
-    return _discovery_result(state, safe_blob)
+    return _credential_safe_blob_discovery_result(state, safe_blob, surface="composer_blob_metadata")
 
 
 _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
@@ -2013,7 +2036,7 @@ def _execute_get_blob_content(
         "created_by": blob["created_by"],
         "creation_modality": blob["creation_modality"],
     }
-    return _discovery_result(state, payload)
+    return _credential_safe_blob_discovery_result(state, payload, surface="composer_blob_content")
 
 
 _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(

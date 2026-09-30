@@ -67,6 +67,7 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
+from elspeth.web.credential_guard import require_no_credential_material_for_tool, require_no_credential_material_in_state
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
@@ -378,6 +379,8 @@ def _dispatch_tool(
     The result dict always has ``success``, ``state`` (serialized
     CompositionState), and may include ``data``.
     """
+    require_no_credential_material_for_tool(tool_name, arguments, surface="composer_mcp_tool_arguments")
+    require_no_credential_material_in_state(state, surface="composer_mcp_state")
     if tool_name in _SESSION_TOOL_NAMES:
         require_arguments_conform_to_schema(tool_name, _SESSION_TOOL_VALIDATOR_BY_NAME[tool_name], arguments)
         if session_manager is None or session_checkout_ref is None:

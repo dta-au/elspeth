@@ -11,7 +11,7 @@ from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
@@ -47,6 +47,7 @@ from elspeth.web.execution.errors import (
 from elspeth.web.execution.protocol import StateAccessError
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _verify_session_ownership
+from elspeth.web.validation import reject_credential_material
 
 
 class ApprovalBindingCompiler(Protocol):
@@ -67,12 +68,26 @@ class ApprovalRequestBody(BaseModel):
     approver_identity_id: str = Field(min_length=1, max_length=64)
     note: str | None = Field(default=None, max_length=MAX_APPROVAL_NOTE_BYTES)
 
+    @field_validator("note")
+    @classmethod
+    def _reject_credential_note(cls, value: str | None) -> str | None:
+        if value is not None:
+            reject_credential_material(value)
+        return value
+
 
 class ApprovalDecisionBody(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     decision: Literal["approved", "rejected"]
     note: str | None = Field(default=None, max_length=MAX_APPROVAL_NOTE_BYTES)
+
+    @field_validator("note")
+    @classmethod
+    def _reject_credential_note(cls, value: str | None) -> str | None:
+        if value is not None:
+            reject_credential_material(value)
+        return value
 
 
 class ApprovalView(BaseModel):

@@ -8,9 +8,28 @@ Tests for:
 """
 
 import dataclasses
+from collections import OrderedDict, UserDict
 from collections.abc import Mapping
+from typing import NamedTuple
 
 import pytest
+
+
+class _ExecutionAuditDetails(NamedTuple):
+    ordinary: str
+    candidate: str
+
+
+class _ExecutionString(str):
+    pass
+
+
+class _ExecutionList(list[object]):
+    pass
+
+
+class _ExecutionSet(set[object]):
+    pass
 
 
 class TestExecutionError:
@@ -109,6 +128,81 @@ class TestExecutionError:
         assert error.context["safe"] == "operator diagnostic"
         assert secret not in repr(error.context)
         assert secret not in str(error.to_dict())
+
+    @pytest.mark.parametrize("mapping_type", [OrderedDict, UserDict])
+    @pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+    def test_execution_error_scrubs_mapping_subclass_context(
+        self,
+        mapping_type: type[Mapping[str, object]],
+        nested: bool,
+    ) -> None:
+        from elspeth.contracts import ExecutionError
+
+        secret = "ghp_" + "a" * 36
+        external = mapping_type({"password": "low-entropy-secret", "ordinary": secret, "safe": "stable"})
+        context: Mapping[str, object] = {"nested": external, "outer": "stable"} if nested else external
+
+        error = ExecutionError(
+            exception="ordinary",
+            exception_type="RuntimeError",
+            context=context,
+        )
+        audit = error.to_dict()
+        scrubbed_context = audit["context"]
+        if nested:
+            assert scrubbed_context["outer"] == "stable"
+            scrubbed_context = scrubbed_context["nested"]
+
+        assert scrubbed_context == {
+            "password": "<redacted-secret>",
+            "ordinary": "<redacted-secret>",
+            "safe": "stable",
+        }
+        assert external["password"] == "low-entropy-secret"
+        assert secret not in repr(audit)
+
+    @pytest.mark.parametrize("container_kind", ["namedtuple", "list", "set", "str"])
+    @pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+    def test_execution_error_scrubs_legacy_container_subclasses_like_exact_parents(
+        self,
+        container_kind: str,
+        nested: bool,
+    ) -> None:
+        from elspeth.contracts import ExecutionError
+
+        secret = "ghp_" + "a" * 36
+        if container_kind == "namedtuple":
+            external: object = _ExecutionAuditDetails("stable", secret)
+            exact_parent: object = ("stable", secret)
+        elif container_kind == "list":
+            external = _ExecutionList(["stable", secret])
+            exact_parent = ["stable", secret]
+        elif container_kind == "set":
+            external = _ExecutionSet({"stable", secret})
+            exact_parent = {"stable", secret}
+        else:
+            external = _ExecutionString(secret)
+            exact_parent = secret
+        subclass_context = OrderedDict({"value": external, "outer": "stable"})
+        parent_context = {"value": exact_parent, "outer": "stable"}
+        if nested:
+            subclass_context = OrderedDict({"nested": subclass_context, "root": "stable"})
+            parent_context = {"nested": parent_context, "root": "stable"}
+
+        subclass_audit = ExecutionError(
+            exception="ordinary",
+            exception_type="RuntimeError",
+            context=subclass_context,
+        ).to_dict()
+        parent_audit = ExecutionError(
+            exception="ordinary",
+            exception_type="RuntimeError",
+            context=parent_context,
+        ).to_dict()
+
+        assert subclass_audit == parent_audit
+        assert secret not in repr(subclass_audit)
+        assert "stable" in repr(subclass_audit)
 
     def test_execution_error_traceback_redacts_only_secret_lines(self) -> None:
         """Traceback scrubbing preserves safe frame diagnostics around a secret line."""

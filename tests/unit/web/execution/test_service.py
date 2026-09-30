@@ -9160,7 +9160,7 @@ class TestSinkPathRestriction:
             {
                 "name": "db_sink",
                 "plugin": "database",
-                "options": {"connection_string": "sqlite:///out.db"},
+                "options": {},
                 "on_write_failure": "discard",
             }
         ]
@@ -9519,7 +9519,6 @@ class TestTransformProviderConfigPathRestriction:
         options: dict[str, Any] = {
             "provider": "openrouter",
             "model": model,
-            "api_key": "test-key",
             "prompt_template": prompt_template,
             "schema": {"mode": "observed"},
             "required_input_fields": [],
@@ -9565,7 +9564,6 @@ class TestTransformProviderConfigPathRestriction:
         pooled_options: dict[str, Any] = {
             "provider": "openrouter",
             "model": model,
-            "api_key": "test-key",
             "prompt_template": prompt_template,
             "schema": {"mode": "observed"},
             "required_input_fields": [],

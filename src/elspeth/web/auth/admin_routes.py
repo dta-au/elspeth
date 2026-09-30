@@ -15,7 +15,7 @@ import secrets
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
@@ -30,7 +30,7 @@ from elspeth.web.coordination.identity_authority import (
     LastActiveAdminProtected,
     RepositoryIdentityAuthority,
 )
-from elspeth.web.validation import has_visible_content
+from elspeth.web.validation import has_visible_content, reject_credential_material
 
 _slog = structlog.get_logger(__name__)
 
@@ -48,6 +48,11 @@ class CreateUserRequest(BaseModel):
     username: str = Field(max_length=AUTH_AUDIT_PRINCIPAL_MAX_LENGTH)
     display_name: str
     email: str | None = None
+
+    @model_validator(mode="after")
+    def _reject_credential_material(self) -> CreateUserRequest:
+        reject_credential_material(self.model_dump(mode="json"))
+        return self
 
     @field_validator("username", "display_name")
     @classmethod
@@ -80,6 +85,11 @@ class DeleteUserRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     reason: str = Field(min_length=1, max_length=LOCAL_DELETION_REASON_MAX_LENGTH)
+
+    @model_validator(mode="after")
+    def _reject_credential_material(self) -> DeleteUserRequest:
+        reject_credential_material(self.model_dump(mode="json"))
+        return self
 
     @field_validator("reason")
     @classmethod

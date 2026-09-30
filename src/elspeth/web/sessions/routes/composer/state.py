@@ -37,6 +37,7 @@ from elspeth.web.coordination.composer_progress_authority import (
     ComposerProgressSessionUnavailable,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.interpretation_state import InterpretationReviewSite, parse_interpretation_requirements
 from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS, allowed_source_directories, managed_blob_directory, resolve_data_path
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
@@ -888,6 +889,13 @@ async def seed_state_from_runtime_yaml(
                 imported_state = composition_state_from_runtime_yaml(body.yaml)
             except RuntimeYamlImportError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            secret_service = request.app.state.scoped_secret_resolver
+            env_ref_names = frozenset(item.name for item in secret_service.list_refs(str(user.user_id)))
+            require_no_credential_material_in_state(
+                imported_state,
+                surface="composer_yaml_import",
+                env_ref_names=env_ref_names,
+            )
             _reject_imported_plugin_policy(imported_state, catalog, plugin_snapshot)
             imported_state = await _state_with_imported_source_blobs(
                 imported_state,
@@ -908,7 +916,7 @@ async def seed_state_from_runtime_yaml(
             )
             _reject_fabricated_secret_literals(
                 imported_state,
-                secret_service=request.app.state.scoped_secret_resolver,
+                secret_service=secret_service,
                 user_id=str(user.user_id),
             )
             _reject_malformed_interpretation_requirements(imported_state)

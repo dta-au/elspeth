@@ -92,6 +92,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
     ToolKind,
 )
+from elspeth.web.credential_guard import CREDENTIAL_REFUSAL_DETAIL, CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.interpretation_state import (
     SOURCE_AUTHORING_KEY,
     SourceAuthoringMetadata,
@@ -1781,7 +1782,16 @@ def _execute_inspect_source(
         content_hash=blob["content_hash"],
         total_size_bytes=blob["size_bytes"],
     )
-    return _discovery_result(state, facts_to_dict(facts))
+    facts_payload = facts_to_dict(facts)
+    try:
+        require_no_credential_material(facts_payload, surface="composer_source_inspection")
+    except CredentialMaterialRefused:
+        return _failure_result(
+            state,
+            CREDENTIAL_REFUSAL_DETAIL,
+            error_code="credential_material_rejected",
+        )
+    return _discovery_result(state, facts_payload)
 
 
 _INSPECT_SOURCE_DECLARATION = ToolDeclaration(

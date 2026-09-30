@@ -21,6 +21,14 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from pydantic_core import PydanticCustomError
+
+from elspeth.contracts.credential_material import (
+    CREDENTIAL_PATTERN_SPECS,
+    CREDENTIAL_REFUSAL_DETAIL,
+    find_credential_material,
+)
+
 # Major Unicode categories that produce visible glyphs.  A string composed
 # entirely of characters outside these categories (whitespace, control chars,
 # zero-width joiners, format chars, etc.) is "invisible" and rejected.
@@ -91,37 +99,12 @@ def is_reserved_server_secret_name(name: str) -> bool:
 # pattern is an oversight.
 
 
-# Credential-shape rejection patterns.  Documented in Phase 5b backend spec
-# lines 2073-2082.  Each entry's name is used in unit-test diagnostics and
-# in any future telemetry signal.
-#
-# NOTE on the JWT pattern: the contiguous match (`{4,}\.{4,}\.{4,}` with no
-# whitespace in the character class) is deliberately strict.  Benign prose
-# with periods ("appealing, well-organized, and easy to use.") contains
-# whitespace around each period and therefore cannot match (F-32 negative
-# test).  A weaker pattern that allowed whitespace inside the segments
-# would produce false positives on every multi-sentence amendment.
-_CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("bearer_token", re.compile(r"Bearer\s+[A-Za-z0-9._\-]{20,}")),
-    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{36}")),
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{40,}")),
-    # OpenAI keys (including ``sk-proj-`` and similar prefixes).  The
-    # Anthropic pattern is matched first so the more specific prefix wins
-    # — that ordering matters only for telemetry-name attribution; both
-    # patterns trigger rejection regardless.
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{40,}")),
-    (
-        "jwt",
-        re.compile(r"\b[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\.[A-Za-z0-9_\-]{4,}\b"),
-    ),
-    ("ssn", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
-)
-
 # Credit-card-shaped pattern.  Matched separately so the LUHN check can be
 # applied before flagging (avoids false positives on date-like strings of
 # the form ``2024-01-02-1234``).
 _CREDIT_CARD_RE: re.Pattern[str] = re.compile(r"\b(\d{4})[\s-](\d{4})[\s-](\d{4})[\s-](\d{4})\b")
+_SSN_RE: re.Pattern[str] = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_CREDENTIAL_REJECTION_MESSAGE = "That looks like a credential — please re-enter without secrets."
 
 
 def _luhn_check(digits: str) -> bool:
@@ -153,7 +136,10 @@ _PII_WARNING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-_CREDENTIAL_REJECTION_MESSAGE = "That looks like a credential — please re-enter without secrets."
+def reject_credential_material(value: object) -> None:
+    """Reject a bounded control value with the shared fixed Pydantic error."""
+    if find_credential_material(value) is not None:
+        raise PydanticCustomError("credential_material_rejected", CREDENTIAL_REFUSAL_DETAIL)
 
 
 def reject_credential_shaped_content(value: str) -> None:
@@ -174,14 +160,12 @@ def reject_credential_shaped_content(value: str) -> None:
     false positives on date-like strings.  All other patterns are
     structural matches.
     """
-    for _name, pattern in _CREDENTIAL_PATTERNS:
-        if pattern.search(value):
-            raise ValueError(_CREDENTIAL_REJECTION_MESSAGE)
+    reject_credential_material(value)
+    if _SSN_RE.search(value) is not None:
+        raise ValueError(_CREDENTIAL_REJECTION_MESSAGE)
     cc_match = _CREDIT_CARD_RE.search(value)
-    if cc_match is not None:
-        digits = "".join(cc_match.groups())
-        if _luhn_check(digits):
-            raise ValueError(_CREDENTIAL_REJECTION_MESSAGE)
+    if cc_match is not None and _luhn_check("".join(cc_match.groups())):
+        raise ValueError(_CREDENTIAL_REJECTION_MESSAGE)
 
 
 def _redact_sensitive_content(value: str) -> str:
@@ -193,7 +177,7 @@ def _redact_sensitive_content(value: str) -> str:
     """
 
     redacted = value
-    for name, pattern in _CREDENTIAL_PATTERNS:
+    for name, pattern in CREDENTIAL_PATTERN_SPECS:
         redacted = pattern.sub(f"<redacted-sensitive:{name}>", redacted)
 
     def _card_replacement(match: re.Match[str]) -> str:

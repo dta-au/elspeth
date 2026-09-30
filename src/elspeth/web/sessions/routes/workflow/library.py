@@ -7,13 +7,14 @@ from typing import Annotated, Literal, NotRequired, Protocol, TypedDict
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter
 from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.library_authority import (
@@ -38,11 +39,13 @@ from elspeth.web.coordination.library_authority import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.protocol import SessionRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _verify_session_ownership
 from elspeth.web.sessions.routes.composer.state import ImportStateYamlRequest, LibraryForkMetaUpdates
 from elspeth.web.sessions.schemas import CompositionStateResponse
+from elspeth.web.validation import reject_credential_material
 
 LibraryView = Literal["accepted", "queue", "mine"]
 LibraryAction = Literal["accepted", "rejected", "deprecated", "recalled"]
@@ -73,6 +76,12 @@ class PublishLibraryEntryRequest(BaseModel):
 
     title: str = Field(min_length=1, max_length=MAX_LIBRARY_TITLE_LENGTH)
 
+    @field_validator("title")
+    @classmethod
+    def _reject_credential_title(cls, value: str) -> str:
+        reject_credential_material(value)
+        return value
+
 
 class CurateLibraryEntryRequest(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -80,6 +89,13 @@ class CurateLibraryEntryRequest(BaseModel):
     # The authority returns the named library_note_too_long refusal. A
     # Pydantic maximum here would turn that documented 409 into a 422.
     note: str | None = None
+
+    @field_validator("note")
+    @classmethod
+    def _reject_credential_note(cls, value: str | None) -> str | None:
+        if value is not None:
+            reject_credential_material(value)
+        return value
 
 
 class LibraryEntryView(BaseModel):
@@ -327,6 +343,15 @@ def create_library_router() -> APIRouter:
             if state_record is None:
                 raise HTTPException(status_code=404, detail="No composition state exists")
             state = state_from_record(state_record)
+            secret_service = request.app.state.scoped_secret_resolver
+            env_ref_names = (
+                frozenset(item.name for item in secret_service.list_refs(user.user_id)) if secret_service is not None else frozenset()
+            )
+            require_no_credential_material_in_state(
+                state,
+                surface="composer_library_publication_state",
+                env_ref_names=env_ref_names,
+            )
             try:
                 entry = await run_sync_in_worker(
                     _authority(request).publish,
@@ -428,6 +453,16 @@ def create_library_router() -> APIRouter:
             )
         except LibraryAuthorityRefusal as exc:
             raise _refused(exc) from exc
+        source_state = composition_state_from_runtime_yaml(source.payload_yaml)
+        secret_service = request.app.state.scoped_secret_resolver
+        env_ref_names = (
+            frozenset(item.name for item in secret_service.list_refs(user.user_id)) if secret_service is not None else frozenset()
+        )
+        require_no_credential_material_in_state(
+            source_state,
+            surface="composer_library_fork_state",
+            env_ref_names=env_ref_names,
+        )
         # The app supplies the ordinary YAML importer as a typed seam. Resolve
         # it before creating a session, so incomplete wiring cannot strand one.
         try:
