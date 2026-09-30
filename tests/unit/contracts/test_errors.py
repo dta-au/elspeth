@@ -8,6 +8,7 @@ Tests for:
 """
 
 import dataclasses
+from collections import OrderedDict, UserDict
 from collections.abc import Mapping
 
 import pytest
@@ -109,6 +110,38 @@ class TestExecutionError:
         assert error.context["safe"] == "operator diagnostic"
         assert secret not in repr(error.context)
         assert secret not in str(error.to_dict())
+
+    @pytest.mark.parametrize("mapping_type", [OrderedDict, UserDict])
+    @pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+    def test_execution_error_scrubs_mapping_subclass_context(
+        self,
+        mapping_type: type[Mapping[str, object]],
+        nested: bool,
+    ) -> None:
+        from elspeth.contracts import ExecutionError
+
+        secret = "ghp_" + "a" * 36
+        external = mapping_type({"password": "low-entropy-secret", "ordinary": secret, "safe": "stable"})
+        context: Mapping[str, object] = {"nested": external, "outer": "stable"} if nested else external
+
+        error = ExecutionError(
+            exception="ordinary",
+            exception_type="RuntimeError",
+            context=context,
+        )
+        audit = error.to_dict()
+        scrubbed_context = audit["context"]
+        if nested:
+            assert scrubbed_context["outer"] == "stable"
+            scrubbed_context = scrubbed_context["nested"]
+
+        assert scrubbed_context == {
+            "password": "<redacted-secret>",
+            "ordinary": "<redacted-secret>",
+            "safe": "stable",
+        }
+        assert external["password"] == "low-entropy-secret"
+        assert secret not in repr(audit)
 
     def test_execution_error_traceback_redacts_only_secret_lines(self) -> None:
         """Traceback scrubbing preserves safe frame diagnostics around a secret line."""

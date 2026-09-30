@@ -1597,6 +1597,10 @@ def _parse_response_tool_calls(
         raw_arguments = _provider_field(function, "arguments")
         if not is_valid_provider_replay_tool_call_id(call_id) or type(name) is not str or not name.strip():
             raise PipelinePlannerError("planner tool call metadata is malformed", code="MALFORMED_RESPONSE")
+        require_no_credential_material(
+            {"tool_call_id": call_id, "tool_name": name},
+            surface="composer_planner_response",
+        )
         if call_id in seen_call_ids:
             raise PipelinePlannerError("planner response contains duplicate tool call ids", code="MALFORMED_RESPONSE")
         seen_call_ids.add(call_id)

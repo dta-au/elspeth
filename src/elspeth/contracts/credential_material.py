@@ -10,12 +10,13 @@ general-purpose DLP system.
 from __future__ import annotations
 
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final, Literal
 from urllib.parse import ParseResult, parse_qs, urlparse
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
 CREDENTIAL_DETECTOR_VERSION: Final[str] = "1"
@@ -103,7 +104,7 @@ CREDENTIAL_PATTERN_SPECS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
             r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|session[_-]?token|"
             r"auth[_-]?token|id[_-]?token|bearer[_-]?token|client[_-]?secret|"
             r"private[_-]?key|secret[_-]?key|connection[_-]?string|authorization|"
-            r"password|passwd|pwd|credentials?)[\"']?[ \t]*[:=][ \t]*['\"]?"
+            r"password|passwd|pwd|credentials?)[\"']?\s*[:=]\s*['\"]?"
             r"(?!\$\{[A-Za-z_][A-Za-z0-9_]*\}(?:['\"]?(?:\s|[,;)}\]]|$)))"
             r"[^'\"\s,;(){}\[\]]+",
             re.IGNORECASE,
@@ -363,7 +364,61 @@ def scrub_credential_material(value: Any, *, parent_key: str | None = None) -> A
     through unchanged; every recognized credential-bearing value becomes one
     fixed sentinel, avoiding partial disclosure through preserved structure.
     """
-    return _scrub(value, parent_key=parent_key, active_ids=set(), depth=0, nodes=[0])
+    try:
+        return _scrub(value, parent_key=parent_key, active_ids=set(), depth=0, nodes=[0])
+    except Exception:
+        # This is the final audit-persistence backstop for hostile external
+        # containers. Never preserve a value from a traversal that did not
+        # complete, and never include exception text in the replacement.
+        return REDACTED_CREDENTIAL_TEXT
+
+
+@trust_boundary(
+    tier=3,
+    source="an arbitrary audit value whose concrete mapping implementation is external",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="returns the value only when it implements Mapping; otherwise returns None without coercion",
+    non_raising=True,
+)
+def _mapping_for_audit_scrub(value: Any) -> Mapping[Any, Any] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _scrub_mapping(
+    value: Mapping[Any, Any],
+    *,
+    active_ids: set[int],
+    depth: int,
+    nodes: list[int],
+) -> Any:
+    object_id = id(value)
+    if object_id in active_ids:
+        return REDACTED_CREDENTIAL_TEXT
+    active_ids.add(object_id)
+    try:
+        if len(value) > 512:
+            return REDACTED_CREDENTIAL_TEXT
+        result: dict[Any, Any] = {}
+        for item_index, (key, child) in enumerate(value.items()):
+            if item_index >= 512:
+                return REDACTED_CREDENTIAL_TEXT
+            scrubbed_key = REDACTED_CREDENTIAL_TEXT if type(key) is str and _classify_string(key) is not None else key
+            result[scrubbed_key] = _scrub(
+                child,
+                parent_key=key if type(key) is str else None,
+                active_ids=active_ids,
+                depth=depth + 1,
+                nodes=nodes,
+            )
+        return result
+    except Exception:
+        # A custom Mapping can fail from len(), iteration, item access, or
+        # key hashing. Partial output is unsafe because the unread remainder
+        # may contain credentials, so redact the whole mapping value.
+        return REDACTED_CREDENTIAL_TEXT
+    finally:
+        active_ids.remove(object_id)
 
 
 def _scrub(
@@ -379,25 +434,9 @@ def _scrub(
         return REDACTED_CREDENTIAL_TEXT
     if parent_key is not None and is_secret_field(parent_key):
         return REDACTED_CREDENTIAL_TEXT
-    if type(value) in (dict, MappingProxyType):
-        object_id = id(value)
-        if object_id in active_ids or len(value) > 512:
-            return REDACTED_CREDENTIAL_TEXT
-        active_ids.add(object_id)
-        try:
-            result: dict[Any, Any] = {}
-            for key, child in value.items():
-                scrubbed_key = REDACTED_CREDENTIAL_TEXT if type(key) is str and _classify_string(key) is not None else key
-                result[scrubbed_key] = _scrub(
-                    child,
-                    parent_key=key if type(key) is str else None,
-                    active_ids=active_ids,
-                    depth=depth + 1,
-                    nodes=nodes,
-                )
-            return result
-        finally:
-            active_ids.remove(object_id)
+    mapping = _mapping_for_audit_scrub(value)
+    if mapping is not None:
+        return _scrub_mapping(mapping, active_ids=active_ids, depth=depth, nodes=nodes)
     if type(value) is str:
         return REDACTED_CREDENTIAL_TEXT if _classify_string(value) is not None else value
     if type(value) in (list, tuple):

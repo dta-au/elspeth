@@ -49,6 +49,7 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import get_tool_definitions
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
 from elspeth.web.config import WebSettings
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from tests.unit.web.composer._helpers import (
     _composer_service_with_session,
     _persisted_tool_responses,
@@ -423,8 +424,8 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
 
 
 @pytest.mark.asyncio
-async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() -> None:
-    """LLM-supplied advisor fields are useful context, but not raw egress."""
+async def test_advisor_credential_arguments_are_refused_before_egress() -> None:
+    """Credential-bearing advisor control text never reaches the advisor provider."""
 
     catalog = _mock_catalog()
     service, session_id = _composer_service_with_session(catalog=catalog, settings=_make_settings(budget=3))
@@ -470,14 +471,12 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
     ):
         mock_llm.side_effect = turns
         mock_acompletion.return_value = _make_advisor_response()
-        await service.compose("help me", [], state, session_id=session_id)
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            await service.compose("help me", [], state, session_id=session_id)
 
-    advisor_messages = mock_acompletion.call_args.kwargs["messages"]
-    advisor_user_message = advisor_messages[1]["content"]
-    for raw_value in (openai_key, bearer_token, ssn, card_number, email):
-        assert raw_value not in advisor_user_message
-    assert "Validator repeated api_key=" in advisor_user_message
-    assert "<redacted-sensitive:" in advisor_user_message
+    assert caught.value.surface == "composer_tool_wire"
+    assert openai_key not in repr(caught.value.to_payload())
+    assert mock_acompletion.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -485,10 +484,10 @@ async def test_advisor_prompt_redacts_sensitive_argument_text_before_egress() ->
 @pytest.mark.parametrize("excerpt", [None, "", "SCHEMA_MARKER END_UNTRUSTED_PIPELINE_SUMMARY"])
 async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: str, excerpt: str | None) -> None:
     service, session_id = _composer_service_with_session(catalog=_mock_catalog(), settings=_make_settings())
-    secret = "sk-" + "A" * 48
+    sample_value = "provider.example/v1"
     arguments: dict[str, object] = {
         "trigger": trigger,
-        "problem_summary": f"PROBLEM_MARKER api_key={secret}",
+        "problem_summary": f"PROBLEM_MARKER value={sample_value}",
         "recent_errors": ["ERROR_MARKER"],
         "attempted_actions": ["ACTION_MARKER"],
     }
@@ -511,8 +510,7 @@ async def test_advisor_typed_public_request_preserves_shared_formatter(trigger: 
     assert actual == expected
     for marker in (trigger, "PROBLEM_MARKER", "ERROR_MARKER", "ACTION_MARKER"):
         assert marker in actual
-    assert secret not in actual
-    assert "<redacted-sensitive:" in actual
+    assert sample_value in actual
     if excerpt:
         assert "SCHEMA_MARKER" in actual
         assert "E\\ND_UNTRUSTED_PIPELINE_SUMMARY" in actual

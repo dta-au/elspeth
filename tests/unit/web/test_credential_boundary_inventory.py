@@ -325,15 +325,18 @@ _PROVIDER_CALL_DISPOSITIONS = {
 }
 _PROVIDER_GUARD_OWNERS = {
     "src/elspeth/web/composer/advisor_checkpoint.py:AdvisorCheckpointOwner._call_advisor_with_audit._litellm_acompletion": (
-        ("AdvisorCheckpointOwner._call_advisor_with_audit", "require_no_credential_material"),
+        ("AdvisorCheckpointOwner._call_advisor_with_audit", "_require_no_credential_material_in_completion_fields"),
     ),
     "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model.completion": (
+        ("_parse_response_tool_calls", "require_no_credential_material"),
         ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
         ("_plan_pipeline_inner", "require_no_credential_material"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": (
         ("ProviderGateway._call_llm", "require_no_credential_material_in_tool_wire"),
-        ("ProviderGateway._call_llm", "require_no_credential_material"),
+        ("ProviderGateway._call_llm", "_require_no_credential_material_in_completion"),
+        ("ProviderGateway._call_llm_with_audit", "_require_no_credential_material_in_completion"),
+        ("_require_no_credential_material_in_completion_fields", "require_no_credential_material"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": (
         ("ProviderGateway._call_text_llm", "require_no_credential_material"),
@@ -465,16 +468,20 @@ async def call_provider():
 
 def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None:
     owners = {
-        "src/elspeth/web/composer/tools/_dispatch.py": "require_no_credential_material_for_tool",
-        "src/elspeth/web/composer/tool_batch.py": "require_no_credential_material_in_tool_wire",
-        "src/elspeth/composer_mcp/server.py": "require_no_credential_material_for_tool",
+        "src/elspeth/web/composer/tools/_dispatch.py": ("require_no_credential_material_for_tool",),
+        "src/elspeth/web/composer/tool_batch.py": (
+            "require_no_credential_material",
+            "require_no_credential_material_in_tool_wire",
+        ),
+        "src/elspeth/composer_mcp/server.py": ("require_no_credential_material_for_tool",),
     }
 
-    for relative, required_call in owners.items():
+    for relative, required_calls in owners.items():
         source = (ROOT / relative).read_text(encoding="utf-8")
-        assert any(required_call in calls for calls in _scoped_calls(source).values())
-        mutant = source.replace(required_call, "removed_credential_guard")
-        assert all(required_call not in calls for calls in _scoped_calls(mutant).values())
+        for required_call in required_calls:
+            assert any(required_call in calls for calls in _scoped_calls(source).values())
+            mutant = source.replace(required_call, "removed_credential_guard")
+            assert all(required_call not in calls for calls in _scoped_calls(mutant).values())
 
 
 _STATE_GUARD_DISPOSITIONS = {

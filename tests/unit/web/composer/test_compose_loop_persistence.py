@@ -290,6 +290,162 @@ async def test_mixed_internal_tool_batch_refuses_atomically_before_any_handler_o
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credential_field",
+    [
+        "content",
+        "tool_call_id",
+        "tool_name",
+        "reasoning_content",
+        "reasoning_details",
+        "thinking_blocks",
+        "model_returned",
+        "provider_request_id",
+        "finish_reason",
+    ],
+)
+async def test_internal_completion_control_metadata_refuses_atomically_before_any_effect(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    credential_field: str,
+) -> None:
+    candidate = "ghp_" + "a" * 36
+    completion = _admit_composer_llm_completion(
+        _tool_batch_response(
+            (
+                "call_clean_blob",
+                "create_blob",
+                {"filename": "must-not-exist.txt", "mime_type": "text/plain", "content": "ordinary"},
+            ),
+            ("call_clean_metadata", "set_metadata", {"patch": {"description": "ordinary"}}),
+        )
+    )
+    if credential_field == "content":
+        completion = replace(completion, message=replace(completion.message, content=candidate))
+    elif credential_field in {"tool_call_id", "tool_name"}:
+        calls = list(completion.tool_batch.calls)
+        contaminated = calls[1]
+        if credential_field == "tool_call_id":
+            contaminated = replace(contaminated, id=candidate)
+        else:
+            contaminated = replace(contaminated, function=replace(contaminated.function, name=candidate))
+        calls[1] = contaminated
+        completion = replace(
+            completion,
+            tool_batch=replace(
+                completion.tool_batch,
+                calls=tuple(calls),
+                call_ids=frozenset(call.id for call in calls),
+            ),
+        )
+    else:
+        metadata_value: object = candidate
+        if credential_field == "reasoning_details":
+            metadata_value = {"detail": candidate}
+        elif credential_field == "thinking_blocks":
+            metadata_value = [{"thinking": candidate}]
+        completion = replace(
+            completion,
+            provider_metadata=replace(completion.provider_metadata, **{credential_field: metadata_value}),
+        )
+
+    async def _internal_completion(_messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+        return completion
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert sessions_service is not None
+    before_messages = await sessions_service.get_messages(UUID(result_session_id))
+    before_state = await sessions_service.get_current_state(UUID(result_session_id))
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_internal_completion,
+            session_id=result_session_id,
+        )
+
+    assert caught.value.surface == "composer_provider_response"
+    assert candidate not in repr(caught.value.to_payload())
+    llm_calls = caught.value.__dict__["llm_calls"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0].status.value == "malformed_response"
+    assert llm_calls[0].error_message == "credential_material_rejected"
+    assert candidate not in canonical_json([call.to_dict() for call in llm_calls])
+    assert handler_calls == []
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    assert await sessions_service.get_current_state(UUID(result_session_id)) == before_state
+    after_messages = await sessions_service.get_messages(UUID(result_session_id))
+    assert after_messages == before_messages
+    assert candidate not in repr(after_messages)
+    with cast(Any, sessions_service)._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).all()
+            == []
+        )
+        assert conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all() == []
+        assert (
+            conn.execute(
+                select(chat_messages_table.c.id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+            ).all()
+            == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_internal_no_tool_completion_is_refused_before_audit_or_history(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    candidate = "ghp_" + "a" * 36
+    completion = _text_response("ordinary")
+    completion = replace(completion, message=replace(completion.message, content=candidate))
+
+    async def _internal_completion(_messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+        return completion
+
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert sessions_service is not None
+    before_messages = await sessions_service.get_messages(UUID(result_session_id))
+    before_state = await sessions_service.get_current_state(UUID(result_session_id))
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_internal_completion,
+            session_id=result_session_id,
+        )
+
+    assert caught.value.surface == "composer_provider_response"
+    llm_calls = caught.value.__dict__["llm_calls"]
+    assert len(llm_calls) == 1
+    assert llm_calls[0].status.value == "malformed_response"
+    assert llm_calls[0].error_message == "credential_material_rejected"
+    assert candidate not in canonical_json([call.to_dict() for call in llm_calls])
+    assert await sessions_service.get_current_state(UUID(result_session_id)) == before_state
+    assert await sessions_service.get_messages(UUID(result_session_id)) == before_messages
+    with cast(Any, sessions_service)._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(chat_messages_table.c.id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+            ).all()
+            == []
+        )
+
+
 def _interpretation_review_node() -> dict[str, Any]:
     """Return a persisted LLM node with one unresolved vague-term slot."""
     state = CompositionState(

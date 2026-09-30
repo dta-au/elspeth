@@ -197,6 +197,16 @@ def test_serialized_json_credential_assignment_is_recognized_as_text() -> None:
     assert finding.category == "token_shape"
 
 
+def test_credential_assignment_cannot_hide_value_across_line_breaks() -> None:
+    split_assignment = "RuntimeError: Authorization:\nBearer opaque-token"
+
+    finding = find_credential_material(split_assignment)
+
+    assert finding is not None
+    assert finding.category == "token_shape"
+    assert split_assignment not in repr(finding)
+
+
 def test_json_escapes_are_scanned_after_the_owner_decodes_them() -> None:
     decoded = json.loads(r'{"ordinary":"sk\u002dproj\u002d' + "a" * 24 + r'"}')
 

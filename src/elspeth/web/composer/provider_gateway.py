@@ -33,7 +33,11 @@ from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import admit_provider_attempt, quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
-from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_tool_wire
+from elspeth.web.credential_guard import (
+    CredentialMaterialRefused,
+    require_no_credential_material,
+    require_no_credential_material_in_tool_wire,
+)
 
 _COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
 
@@ -107,6 +111,12 @@ def _capture_composer_llm_completion_fields(
         message=None if message is missing else message,
         pricing_model=pricing_model,
     )
+    _require_no_credential_material_in_completion_fields(
+        content=None,
+        tool_calls=(),
+        provider_metadata=provider_metadata,
+        surface="composer_provider_response",
+    )
     if choices is missing or not isinstance(choices, list | tuple):
         raise _MalformedLLMResponseError(
             "LLM returned malformed choices — cannot continue composition",
@@ -128,6 +138,12 @@ def _capture_composer_llm_completion_fields(
             "LLM message content is neither absent nor a string",
             provider_metadata=provider_metadata,
         )
+    _require_no_credential_material_in_completion_fields(
+        content=content,
+        tool_calls=(),
+        provider_metadata=provider_metadata,
+        surface="composer_provider_response",
+    )
     tool_calls = getattr(message, "tool_calls", missing)
     if tool_calls is missing or (tool_calls is not None and not isinstance(tool_calls, list | tuple)):
         raise _MalformedLLMResponseError(
@@ -178,6 +194,43 @@ def _admit_captured_composer_llm_completion(
         message=message,
         tool_batch=admitted_batch,
         provider_metadata=provider_metadata,
+    )
+
+
+def _require_no_credential_material_in_completion(
+    completion: _AdmittedLLMCompletion,
+    *,
+    surface: str,
+) -> None:
+    """Reject all persisted or replayed text metadata in an owned completion."""
+    _require_no_credential_material_in_completion_fields(
+        content=completion.message.content,
+        tool_calls=tuple((call.id, call.function.name) for call in completion.tool_batch.calls),
+        provider_metadata=completion.provider_metadata,
+        surface=surface,
+    )
+
+
+def _require_no_credential_material_in_completion_fields(
+    *,
+    content: str | None,
+    tool_calls: Sequence[tuple[str, str]],
+    provider_metadata: _AdmittedLLMProviderMetadata,
+    surface: str,
+) -> None:
+    """Guard the normalized provider fields that can be audited or replayed."""
+    require_no_credential_material(
+        {
+            "content": content,
+            "tool_calls": [{"id": call_id, "name": name} for call_id, name in tool_calls],
+            "reasoning_content": provider_metadata.reasoning_content,
+            "reasoning_details": provider_metadata.reasoning_details,
+            "thinking_blocks": provider_metadata.thinking_blocks,
+            "model_returned": provider_metadata.model_returned,
+            "provider_request_id": provider_metadata.provider_request_id,
+            "finish_reason": provider_metadata.finish_reason,
+        },
+        surface=surface,
     )
 
 
@@ -420,14 +473,8 @@ class ProviderGateway:
                 call.function.arguments,
                 surface="composer_provider_response",
             )
-        require_no_credential_material(
-            {
-                "content": completion.message.content,
-                "tool_calls": [{"id": call.id, "name": call.function.name} for call in completion.tool_batch.calls],
-                "reasoning_content": completion.provider_metadata.reasoning_content,
-                "reasoning_details": completion.provider_metadata.reasoning_details,
-                "thinking_blocks": completion.provider_metadata.thinking_blocks,
-            },
+        _require_no_credential_material_in_completion(
+            completion,
             surface="composer_provider_response",
         )
         return completion
@@ -471,6 +518,9 @@ class ProviderGateway:
                 "reasoning_content": response_metadata.reasoning_content,
                 "reasoning_details": response_metadata.reasoning_details,
                 "thinking_blocks": response_metadata.thinking_blocks,
+                "model_returned": response_metadata.model_returned,
+                "provider_request_id": response_metadata.provider_request_id,
+                "finish_reason": response_metadata.finish_reason,
             },
             surface="composer_provider_response",
         )
@@ -498,6 +548,10 @@ class ProviderGateway:
         error_message: str | None = None
         try:
             completion = await asyncio.wait_for(self._call_llm(messages, tools), timeout=timeout)
+            _require_no_credential_material_in_completion(
+                completion,
+                surface="composer_provider_response",
+            )
             response_metadata = completion.provider_metadata
             if not tools and (completion.tool_batch.calls or not (completion.message.content or "").strip()):
                 raise _MalformedLLMResponseError(
@@ -536,6 +590,12 @@ class ProviderGateway:
             status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
             error_class = type(cause).__name__ if cause is not None else type(exc).__name__
             error_message = error_class
+            attach_llm_calls(exc, recorder)
+            raise
+        except CredentialMaterialRefused as exc:
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            error_class = type(exc).__name__
+            error_message = "credential_material_rejected"
             attach_llm_calls(exc, recorder)
             raise
         except Exception as exc:
@@ -578,29 +638,38 @@ class ProviderGateway:
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
-        response: Any | None = None
         response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
         try:
             provider_response = await asyncio.wait_for(self._call_text_llm(messages), timeout=timeout)
-            response = provider_response
+            choice = provider_response.choices[0] if provider_response.choices else None
+            message = choice.message if choice is not None else None
+            admitted_metadata = admit_llm_provider_metadata(
+                provider_response,
+                choice=choice,
+                message=message,
+                pricing_model=self._settings.composer_pricing_model or self._model,
+            )
             try:
                 content = provider_response.choices[0].message.content
             except (AttributeError, IndexError, TypeError):
                 raise _MalformedLLMResponseError(
                     "LLM returned a malformed diagnostics explanation",
-                    provider_metadata=admit_llm_provider_metadata(
-                        response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
-                    ),
+                    provider_metadata=admitted_metadata,
                 ) from None
+            _require_no_credential_material_in_completion_fields(
+                content=content if type(content) is str else None,
+                tool_calls=(),
+                provider_metadata=admitted_metadata,
+                surface="composer_provider_response",
+            )
             if type(content) is not str or not content.strip():
                 raise _MalformedLLMResponseError(
                     "LLM returned an empty diagnostics explanation",
-                    provider_metadata=admit_llm_provider_metadata(
-                        response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
-                    ),
+                    provider_metadata=admitted_metadata,
                 )
+            response_metadata = admitted_metadata
             status = ComposerLLMCallStatus.SUCCESS
             return content.strip()
         except TimeoutError:
@@ -635,6 +704,12 @@ class ProviderGateway:
             error_message = error_class
             attach_llm_calls(exc, recorder)
             raise
+        except CredentialMaterialRefused as exc:
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            error_class = type(exc).__name__
+            error_message = "credential_material_rejected"
+            attach_llm_calls(exc, recorder)
+            raise
         except Exception as exc:
             status = ComposerLLMCallStatus.API_ERROR
             error_class = type(exc).__name__
@@ -654,7 +729,6 @@ class ProviderGateway:
                         started_ns=started_ns,
                         temperature=self._settings.composer_temperature,
                         seed=self._settings.composer_seed,
-                        response=response,
                         response_metadata=response_metadata,
                         error_class=error_class,
                         error_message=error_message,

@@ -15,11 +15,15 @@ if TYPE_CHECKING:
 
 # Stable public sentinel retained for audit readers.
 REDACTED_SECRET_TEXT: Final[str] = REDACTED_CREDENTIAL_TEXT
+_CREDENTIAL_SCRUB_FAILURE: Final[dict[str, str]] = {"_redaction_status": "credential_scrub_failure"}
 
 
 def scrub_payload_for_audit(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return a deep-copied credential-redacted audit payload."""
-    return cast(dict[str, Any], scrub_credential_material(payload))
+    scrubbed = scrub_credential_material(payload)
+    if type(scrubbed) is dict:
+        return cast(dict[str, Any], scrubbed)
+    return dict(_CREDENTIAL_SCRUB_FAILURE)
 
 
 def scrub_text_for_audit(text: str) -> str:

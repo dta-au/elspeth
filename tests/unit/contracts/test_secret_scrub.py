@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict, UserDict
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType
+from typing import Any
 
 import pytest
 
@@ -12,9 +16,176 @@ from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_f
 REDACTED = "<redacted-secret>"
 
 
+class _ExplodingIterationMapping(Mapping[str, Any]):
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("ghp_" + "a" * 36)
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, key: str) -> Any:
+        raise AssertionError(f"unexpected item access: {key}")
+
+
+class _ExplodingAccessMapping(Mapping[str, Any]):
+    def __iter__(self) -> Iterator[str]:
+        yield "ordinary"
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, key: str) -> Any:
+        raise RuntimeError("sk-" + "a" * 24)
+
+
+class _ExplodingLengthMapping(Mapping[str, Any]):
+    def __iter__(self) -> Iterator[str]:
+        yield "ordinary"
+
+    def __len__(self) -> int:
+        raise RuntimeError("ghp_" + "a" * 36)
+
+    def __getitem__(self, key: str) -> Any:
+        return "ordinary"
+
+
+class _LateExplodingMapping(Mapping[str, Any]):
+    def __iter__(self) -> Iterator[str]:
+        yield "safe"
+        yield "unreadable"
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "safe":
+            return "stable"
+        raise RuntimeError("sk-" + "a" * 24)
+
+
+class _LengthLyingMapping(Mapping[str, Any]):
+    def __iter__(self) -> Iterator[str]:
+        index = 0
+        while True:
+            yield str(index)
+            index += 1
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, key: str) -> Any:
+        return key
+
+
 def test_plain_values_pass_through() -> None:
     p = {"field": "name", "count": 3, "flag": True}
     assert scrub_payload_for_audit(p) == {"field": "name", "count": 3, "flag": True}
+
+
+@pytest.mark.parametrize("mapping_type", [OrderedDict, UserDict])
+def test_mapping_subclasses_preserve_ordinary_values_and_scrub_credentials(mapping_type: type[Mapping[str, Any]]) -> None:
+    token = "ghp_" + "a" * 36
+    payload = mapping_type(
+        {
+            "ordinary": "stable",
+            "password": "low-entropy-secret",
+            "token_value": token,
+        }
+    )
+
+    scrubbed = scrub_payload_for_audit(payload)
+
+    assert scrubbed == {
+        "ordinary": "stable",
+        "password": REDACTED,
+        "token_value": REDACTED,
+    }
+    assert payload["password"] == "low-entropy-secret"
+
+
+def test_nested_mapping_subclasses_scrub_secret_keys_values_and_credential_shaped_keys() -> None:
+    token = "ghp_" + "a" * 36
+    payload = {
+        "ordered": OrderedDict([("api_key", "literal"), ("ordinary", token)]),
+        "user": UserDict({token: "ordinary", "stable": "value"}),
+    }
+
+    scrubbed = scrub_payload_for_audit(payload)
+
+    assert scrubbed == {
+        "ordered": {"api_key": REDACTED, "ordinary": REDACTED},
+        "user": {REDACTED: "ordinary", "stable": "value"},
+    }
+
+
+def test_mapping_subclass_cycle_and_width_limit_are_redacted_without_mutating_input() -> None:
+    cyclic: UserDict[str, Any] = UserDict()
+    cyclic["self"] = cyclic
+    at_width_limit = UserDict({str(index): index for index in range(512)})
+    oversized = UserDict({str(index): index for index in range(513)})
+    payload = {"cycle": cyclic, "oversized": oversized, "ordinary": "stable"}
+
+    scrubbed = scrub_payload_for_audit(payload)
+
+    assert scrubbed == {"cycle": {"self": REDACTED}, "oversized": REDACTED, "ordinary": "stable"}
+    assert len(scrub_payload_for_audit(at_width_limit)) == 512
+    assert scrub_payload_for_audit(oversized) == {"_redaction_status": "credential_scrub_failure"}
+    assert cyclic["self"] is cyclic
+    assert len(oversized) == 513
+
+
+def test_mapping_subclass_depth_and_node_limits_remain_bounded() -> None:
+    at_depth_limit: object = "leaf"
+    beyond_depth_limit: object = "leaf"
+    for _ in range(32):
+        at_depth_limit = UserDict({"next": at_depth_limit})
+    for _ in range(33):
+        beyond_depth_limit = UserDict({"next": beyond_depth_limit})
+
+    at_limit_scrubbed = scrub_payload_for_audit(at_depth_limit)
+    beyond_limit_scrubbed = scrub_payload_for_audit(beyond_depth_limit)
+    at_limit_leaf: object = at_limit_scrubbed
+    beyond_limit_leaf: object = beyond_limit_scrubbed
+    for _ in range(32):
+        assert isinstance(at_limit_leaf, dict)
+        at_limit_leaf = at_limit_leaf["next"]
+    for _ in range(33):
+        assert isinstance(beyond_limit_leaf, dict)
+        beyond_limit_leaf = beyond_limit_leaf["next"]
+
+    assert at_limit_leaf == "leaf"
+    assert beyond_limit_leaf == REDACTED
+
+    node_heavy = UserDict({str(branch): UserDict({str(index): index for index in range(512)}) for branch in range(9)})
+    node_scrubbed = scrub_payload_for_audit(node_heavy)
+    assert any(branch == REDACTED or (type(branch) is dict and REDACTED in branch.values()) for branch in node_scrubbed.values())
+    assert len(node_heavy) == 9
+
+
+def test_mapping_observed_width_is_bounded_when_length_lies() -> None:
+    scrubbed = scrub_payload_for_audit({"unbounded": _LengthLyingMapping(), "ordinary": "stable"})
+
+    assert scrubbed == {"unbounded": REDACTED, "ordinary": "stable"}
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        _ExplodingIterationMapping(),
+        _ExplodingAccessMapping(),
+        _ExplodingLengthMapping(),
+        _LateExplodingMapping(),
+        MappingProxyType(_ExplodingAccessMapping()),
+    ],
+)
+def test_hostile_mapping_is_value_free_and_non_raising_at_top_level_and_nested(hostile: Mapping[str, Any]) -> None:
+    top_level = scrub_payload_for_audit(hostile)
+    nested = scrub_payload_for_audit({"hostile": hostile, "ordinary": "stable"})
+
+    assert top_level == {"_redaction_status": "credential_scrub_failure"}
+    assert nested == {"hostile": REDACTED, "ordinary": "stable"}
+    assert "ghp_" not in repr(top_level) + repr(nested)
+    assert "sk-" not in repr(top_level) + repr(nested)
 
 
 def test_plain_text_passes_through() -> None:

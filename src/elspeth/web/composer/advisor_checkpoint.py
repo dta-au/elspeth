@@ -75,6 +75,7 @@ from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import (
     _capture_composer_llm_completion_fields,
     _MalformedLLMResponseError,
+    _require_no_credential_material_in_completion_fields,
     advisor_provider_failure_types,
 )
 from elspeth.web.composer.provider_quota import composer_quota_scope, quota_provider_calls
@@ -82,7 +83,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
-from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
 
@@ -373,11 +374,21 @@ class AdvisorCheckpointOwner:
                 timeout=effective_timeout,
             )
             if not response.choices:
+                empty_response_metadata = admit_llm_provider_metadata(
+                    response,
+                    choice=None,
+                    message=None,
+                    pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
+                )
+                _require_no_credential_material_in_completion_fields(
+                    content=None,
+                    tool_calls=(),
+                    provider_metadata=empty_response_metadata,
+                    surface="composer_advisor_response",
+                )
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty choices array",
-                    provider_metadata=admit_llm_provider_metadata(
-                        response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
-                    ),
+                    provider_metadata=empty_response_metadata,
                 )
             # F4: validate content BEFORE marking SUCCESS. None / empty /
             # whitespace-only content (content-filter triggered, malformed
@@ -401,21 +412,35 @@ class AdvisorCheckpointOwner:
                 try:
                     raw_content = response.choices[0].message.content
                 except (AttributeError, IndexError, KeyError, TypeError):
+                    missing_content_metadata = admit_llm_provider_metadata(
+                        response,
+                        choice=None,
+                        message=None,
+                        pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
+                    )
+                    _require_no_credential_material_in_completion_fields(
+                        content=None,
+                        tool_calls=(),
+                        provider_metadata=missing_content_metadata,
+                        surface="composer_advisor_response",
+                    )
                     raise _MalformedLLMResponseError(
                         "Advisor response carries no message content",
-                        provider_metadata=admit_llm_provider_metadata(
-                            response,
-                            choice=None,
-                            message=None,
-                            pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
-                        ),
+                        provider_metadata=missing_content_metadata,
                     ) from None
-                response_metadata = admit_llm_provider_metadata(
+                admitted_metadata = admit_llm_provider_metadata(
                     response,
                     choice=response.choices[0],
                     message=response.choices[0].message,
                     pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
                 )
+                _require_no_credential_material_in_completion_fields(
+                    content=raw_content if type(raw_content) is str else None,
+                    tool_calls=(),
+                    provider_metadata=admitted_metadata,
+                    surface="composer_advisor_response",
+                )
+                response_metadata = admitted_metadata
             # elspeth-b6be9e991f: exact runtime type check, mirroring the
             # diagnostics path. The earlier ``str(raw_content).strip()``
             # emptiness probe let a non-string content object (list/dict/int
@@ -424,19 +449,14 @@ class AdvisorCheckpointOwner:
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty, whitespace-only, or non-string content",
                     text_received=type(raw_content) is str,
-                    provider_metadata=admit_llm_provider_metadata(
-                        response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
-                    ),
+                    provider_metadata=response_metadata,
                 )
             if response_metadata is None:
                 raise AuditIntegrityError("Advisor response metadata was not captured")
-            require_no_credential_material(
-                {
-                    "content": raw_content,
-                    "reasoning_content": response_metadata.reasoning_content,
-                    "reasoning_details": response_metadata.reasoning_details,
-                    "thinking_blocks": response_metadata.thinking_blocks,
-                },
+            _require_no_credential_material_in_completion_fields(
+                content=raw_content,
+                tool_calls=(),
+                provider_metadata=response_metadata,
                 surface="composer_advisor_response",
             )
             guidance = raw_content
@@ -474,15 +494,8 @@ class AdvisorCheckpointOwner:
             raise
         except CredentialMaterialRefused as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
-            if response_metadata is not None:
-                response_metadata = replace(
-                    response_metadata,
-                    reasoning_content=None,
-                    reasoning_details=None,
-                    thinking_blocks=None,
-                )
-            else:
-                response = None
+            response_metadata = None
+            response = None
             error_class = type(exc).__name__
             error_message = "credential_material_rejected"
             raise

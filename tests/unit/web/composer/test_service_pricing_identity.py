@@ -12,6 +12,7 @@ from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.audit import BufferingRecorder, llm_call_audit_envelope
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.config import WebSettings
+from elspeth.web.credential_guard import CredentialMaterialRefused
 
 
 @pytest.mark.asyncio
@@ -66,3 +67,64 @@ async def test_direct_service_call_uses_role_pricing_identity(tmp_path: Path, mo
     public_call = llm_call_audit_envelope(call)["call"]
     assert isinstance(public_call, dict)
     assert public_call["pricing_model"] == call.pricing_model
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["tools", "text", "advisor"])
+async def test_malformed_completion_credential_metadata_is_refused_before_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+) -> None:
+    candidate = "ghp_" + "a" * 36
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        composer_model="openai/primary-datazone",
+        composer_advisor_model="openai/advisor-datazone",
+    )
+    service = ComposerServiceImpl.for_trained_operator(catalog=MagicMock(spec=CatalogService), settings=settings)
+    response = ModelResponse(
+        model="provider-returned-version",
+        choices=[{"message": {"role": "assistant", "content": "ordinary"}, "finish_reason": "stop"}],
+        usage=Usage(prompt_tokens=100, completion_tokens=20, total_tokens=120),
+    )
+    response.choices[0].message.__dict__["content"] = 123
+    response.choices[0].message.__dict__["reasoning_content"] = candidate
+    response._hidden_params = {}
+
+    async def complete(**_kwargs: Any) -> ModelResponse:
+        return response
+
+    monkeypatch.setattr(provider_gateway, "_litellm_acompletion", complete)
+    recorder = BufferingRecorder()
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        if surface == "advisor":
+            await service._advisor_checkpoint._call_advisor_with_audit(
+                {"trigger": "reactive", "problem_summary": "stuck", "recent_errors": [], "attempted_actions": []},
+                recorder=recorder,
+            )
+        elif surface == "text":
+            await service._provider_gateway._call_text_llm_with_audit(
+                [{"role": "user", "content": "Explain."}],
+                timeout=5.0,
+                recorder=recorder,
+            )
+        else:
+            await service._provider_gateway._call_llm_with_audit(
+                [{"role": "user", "content": "Explain."}],
+                [],
+                timeout=5.0,
+                recorder=recorder,
+            )
+
+    assert caught.value.surface in {"composer_provider_response", "composer_advisor_response"}
+    assert len(recorder.llm_calls) == 1
+    call = recorder.llm_calls[0]
+    assert call.status.value == "malformed_response"
+    assert call.error_message == "credential_material_rejected"
+    assert candidate not in repr(call.to_dict())
