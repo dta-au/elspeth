@@ -54,3 +54,26 @@ floors: overall 85%, Landscape 92%, canonical 99%, orchestrator 90%, and
 contracts 62%. The lint stage is the existing nonfatal keyless diagnostic;
 this evidence does not assert operator signature clearance. Remote required
 checks remain the delivery acceptance criterion.
+
+## Incremental frontend CI repair review
+
+**GO; no actionable findings.** Astra reviewed the three-file frontend diff against `bc429a72f75f8ed7e1a6e816687a8e2f21c29685`: the [Composer page object](../../src/elspeth/web/frontend/tests/e2e/page-objects/composer-page.ts), [preferences browser tests](../../src/elspeth/web/frontend/tests/e2e/composer-preferences.spec.ts), and [proposal browser fixture](../../src/elspeth/web/frontend/tests/e2e/composer-proposals.spec.ts). The helper waits for the successful creation response, that response's session ID in the URL, and actual chat-input focus. Source inspection confirmed that these observations cover the store publication and subsequent workspace focus handoff responsible for the CI race. The regression holds the real response while the previous chat remains visible and proves that the helper stays pending until creation completes. Existing narrow account-menu preferences assertions remain unchanged.
+
+The first complete frontend run failed because the proposal fixture returned default HTTP 200 while the [real session endpoint](../../src/elspeth/web/sessions/routes/sessions.py) declares HTTP 201. The fixture now returns 201 explicitly, preserving the helper's readiness contract and the proposal assertions. No production code, timeout increase, forced click, or weakened assertion was introduced. The implementation lane executed the terminal checks below; Astra reviewed the patch and evidence and independently confirmed `git diff --check` exit 0. A complete frontend rerun and remote required CI remain separate acceptance checks.
+
+```text
+Original-helper negative control: exit 1 at creationFinished assertion
+  Expected: false
+  Received: true
+Restored preferences-only run: exit 0; 3 passed (25.0s)
+First full frontend run: exit 1; 100 passed, 10 skipped, 1 failed
+Final preferences + proposals run, retries disabled: exit 0; 4 passed (25.0s)
+Explicit E2E typecheck of all three changed files: exit 0
+Explicit lint of all three changed files: exit 0
+```
+
+The parent subsequently completed the full frontend E2E rerun with CI settings:
+exit 0, 101 passed, 10 skipped in 3.8 minutes. SHA256 checks of all three changed
+browser-test files matched before and after the run. The Python production tree
+is unchanged from the successful frozen gate above. Remote CI on the published
+commit remains the final acceptance check.

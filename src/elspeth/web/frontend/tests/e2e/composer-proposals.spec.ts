@@ -143,7 +143,7 @@ async function installDeterministicComposerRoutes(page: Page): Promise<void> {
         updated_at: "2026-05-14T00:00:00Z",
       };
       sessions.unshift(session);
-      await route.fulfill({ json: session });
+      await route.fulfill({ status: 201, json: session });
       return;
     }
 

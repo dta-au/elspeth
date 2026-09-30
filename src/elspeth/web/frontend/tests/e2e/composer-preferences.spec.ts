@@ -6,6 +6,47 @@ import { authedContext, setShowAdvanced, tokenFromStorageState } from "./helpers
 import { ComposerPage } from "./page-objects/composer-page";
 
 test.describe("composer preferences", () => {
+  test("new session readiness waits while the previous chat remains visible", async ({ page }) => {
+    const composer = new ComposerPage(page);
+    await composer.goto();
+    await composer.createSession("Existing session");
+    const previousUrl = page.url();
+    let releaseResponse!: () => void;
+    const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+    let requestReceived!: () => void;
+    const requestGate = new Promise<void>((resolve) => { requestReceived = resolve; });
+    await page.route("**/api/sessions", async (route) => {
+      if (route.request().method() !== "POST") {
+        await route.continue();
+        return;
+      }
+      const response = await route.fetch();
+      requestReceived();
+      await responseGate;
+      await route.fulfill({ response });
+    });
+    let creationFinished = false;
+    const creation = composer.createSession("Pending session").then(() => {
+      creationFinished = true;
+    });
+    try {
+      await requestGate;
+      await expect(page.getByLabel("Chat panel", { exact: true })).toBeVisible();
+      // A real browser interaction gives the helper time to finish if it
+      // incorrectly treats the still-visible old chat as the new session.
+      await page.getByRole("button", { name: /account/i }).click();
+      await expect(page.getByRole("button", { name: /composer preferences/i })).toBeVisible();
+      expect(creationFinished).toBe(false);
+      expect(page.url()).toBe(previousUrl);
+      await page.keyboard.press("Escape");
+    } finally {
+      releaseResponse();
+      await creation;
+    }
+    expect(page.url()).not.toBe(previousUrl);
+    await expect(composer.chatInput()).toBeFocused();
+  });
+
   test("freeform chat opens directly in new and resumed sessions", async ({ page }) => {
     const composer = new ComposerPage(page);
     await composer.goto();
