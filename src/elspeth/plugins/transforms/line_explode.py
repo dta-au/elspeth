@@ -29,6 +29,7 @@ from elspeth.contracts.errors import PluginContractViolation
 from elspeth.contracts.field_collision import detect_field_collisions
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 DEFAULT_MAX_LINES = 10_000
 HARD_MAX_LINES = 100_000
+DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 _LINE_BOUNDARY_CHARS = frozenset(("\n", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"))
 
 
@@ -56,6 +58,12 @@ class LineExplodeConfig(TransformDataConfig):
         gt=0,
         le=HARD_MAX_LINES,
         description="Maximum number of output lines this transform may emit for one input row",
+    )
+    max_output_bytes: int = Field(
+        default=DEFAULT_MAX_OUTPUT_BYTES,
+        gt=0,
+        le=DEFAULT_MAX_OUTPUT_BYTES,
+        description="Maximum estimated serialized size of all rows emitted for one input row",
     )
 
     @field_validator("source_field", "output_field", "index_field")
@@ -301,7 +309,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3e0da1a937815a93"
+    source_file_hash: str | None = "sha256:fc120a4fc004db14"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -344,6 +352,7 @@ class LineExplode(BaseTransform):
         self._include_index = cfg.include_index
         self._index_field = cfg.index_field
         self._max_lines = cfg.max_lines
+        self._max_output_bytes = cfg.max_output_bytes
 
         # process() copies the whole input row minus the consumed source field
         # onto every emitted line, so the row's other columns — including an
@@ -496,6 +505,26 @@ class LineExplode(BaseTransform):
                 "This is a pipeline configuration error — the transform's output fields collide with fields already present in the row."
             )
         base = {k: v for k, v in row_data.items() if k != normalized_source_field}
+
+        # Refuse the amplification before deepcopy() materializes it.  A line
+        # count alone is not a memory bound: every output retains a full copy
+        # of the other fields, so a modest nested value multiplied by thousands
+        # of lines can exhaust the process.  Canonical bytes give a stable,
+        # content-sensitive estimate; the per-row allowance covers emitted
+        # field names, the optional integer index, and container overhead.
+        retained_bytes = len(canonical_json(base).encode("utf-8"))
+        emitted_line_bytes = sum(len(line.encode("utf-8")) for line in lines)
+        estimated_output_bytes = (retained_bytes + 64) * len(lines) + emitted_line_bytes
+        if estimated_output_bytes > self._max_output_bytes:
+            return TransformResult.error(
+                {
+                    "reason": "output_too_large",
+                    "estimated_output_bytes": estimated_output_bytes,
+                    "max_output_bytes": self._max_output_bytes,
+                    "line_count": len(lines),
+                },
+                retryable=False,
+            )
 
         output_rows: list[dict[str, Any]] = []
         for i, line in enumerate(lines):
