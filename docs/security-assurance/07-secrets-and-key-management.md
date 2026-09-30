@@ -632,13 +632,16 @@ once the authenticating key itself is compromised [EV-226] [EV-316].
 ### 7.1 Deployment record
 
 The public product document names the boundary; the controlled copy records
-the deployment's decision and final risk-register identifier.
+whether each topic applies and, when it does, its final risk-register
+identifier. An acceptance decision is recorded on that risk; it does not
+replace the risk record. A `Not applicable` disposition requires dated
+evidence.
 
-| Topic requiring a deployment decision | Controlled risk register reference or acceptance record |
-|---|---|
-| Strength and rotation policy for SSO secrets that receive presence checks only | DEPLOYMENT-TODO: |
-| Landscape SQLCipher passphrase lifecycle and lack of in-product re-key | DEPLOYMENT-TODO: |
-| Fingerprint-key custody and loss of comparison continuity on rotation | DEPLOYMENT-TODO: |
-| Managed-field recognition boundary and author handling of arbitrary text or unrecognised fields | DEPLOYMENT-TODO: |
-| Any assessed use of `ELSPETH_ALLOW_RAW_SECRETS` | DEPLOYMENT-TODO: |
-| Exposure through non-masked settings, process environment or operator tooling | DEPLOYMENT-TODO: |
+| Topic requiring a deployment decision | Applicability disposition | Controlled `R-nnn` | Decision evidence |
+|---|---|---|---|
+| Strength and rotation policy for SSO secrets that receive presence checks only | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Landscape SQLCipher passphrase lifecycle and lack of in-product re-key | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Fingerprint-key custody and loss of comparison continuity on rotation | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Managed-field recognition boundary and author handling of arbitrary text or unrecognised fields | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Any assessed use of `ELSPETH_ALLOW_RAW_SECRETS` | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Exposure through non-masked settings, process environment or operator tooling | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |

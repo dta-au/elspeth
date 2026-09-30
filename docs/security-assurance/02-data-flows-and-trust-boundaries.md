@@ -1,7 +1,7 @@
 # 02 — Data flows and trust boundaries
 
 **Status:** product baseline complete; Deployment record required ·
-**Reviewed against:** `release/0.8.1` candidate @ `cb20ed2e2` (2026-09-30) ·
+**Reviewed against:** `release/0.8.1` candidate @ `eee4bb941` (2026-10-01) ·
 **Owner:** ELSPETH maintainer
 
 This document shows where data enters, moves through and leaves the ELSPETH
@@ -30,7 +30,9 @@ flowchart LR
     subgraph ELSPETH["ELSPETH product boundary"]
         WEB["Web application<br/>FastAPI + SPA"]
         CMP["Web Composer<br/>planner + advisor"]
+        CLI["CLI + configuration loader"]
         ENG["Engine + plugins"]
+        PDFW["Spawned PDFium worker<br/>native parser"]
         LMCP["Landscape MCP<br/>optional, read-only"]
         CMCP["Composer MCP<br/>optional, stdio"]
         LS[("Landscape<br/>audit DB")]
@@ -41,6 +43,11 @@ flowchart LR
         CMS[("Composer MCP<br/>scratch files")]
     end
 
+    subgraph OPTIONAL["Optional compatibility-gateway deployment boundary"]
+        GW["Compatibility gateway<br/>static bearer + adapter"]
+    end
+
+    CFG["Operator YAML, environment,<br/>templates and CLI flags"]
     IDP["Identity provider"]
     LLM["LLM providers"]
     EXT["Data sources and sinks"]
@@ -49,11 +56,15 @@ flowchart LR
     SEC["Secret store"]
     OBS["Telemetry back ends"]
     MAIL["Deployment email<br/>delivery service"]
+    OAUTH["Gateway OAuth endpoint"]
+    ORGLLM["Organisation model API"]
 
     CU -->|"HTTPS API and run WebSocket"| WEB
     AU -->|"HTTPS or signed review link"| WEB
     AD -->|"HTTPS admin routes"| WEB
-    OP -->|"local CLI"| ENG
+    OP -->|"local CLI"| CLI
+    CFG -->|"configuration inputs"| CLI
+    CLI -->|"validated, expanded settings"| ENG
     AU <-->|"read-only stdio tools"| LMCP
     LMCP -->|"read-only queries"| LS
     MH <-->|"tool calls and results over stdio"| CMCP
@@ -66,6 +77,8 @@ flowchart LR
     ENG -->|"row data in prompts"| LLM
     ENG <--> EXT
     ENG -->|"documents and text"| SVC
+    ENG -->|"untrusted PDF bytes"| PDFW
+    PDFW -->|"bounded images and text"| ENG
     ENG -->|"HTTP(S) request data"| WWW
     ENG --> LS
     WEB --> LS
@@ -79,6 +92,9 @@ flowchart LR
     WEB --> SEC
     WEB -->|"audit-correlated and<br/>health/failure signals"| OBS
     ENG -->|"audit-correlated and<br/>health/failure signals"| OBS
+    ENG -.->|"optional: chat request + static bearer"| GW
+    GW -->|"OAuth client credentials"| OAUTH
+    GW -->|"translated request/response"| ORGLLM
 ```
 
 The deployment platform surrounds this product diagram. Browser TLS
@@ -128,11 +144,14 @@ at a deployment-controlled component (§ 7).
 | F12 | Audit write/export | Engine/web → Landscape → export target | Audit records, payload references, hashes and signed-export material | Internal; then trusted → external export | Audit-first writes, canonical hashing, Tier-1 validation, immutable export snapshots and resumable export. Optional HMAC-signed export requires deployment key custody [EV-312]–[EV-318], [EV-327] |
 | F13 | Secret resolution | Engine/web → secret store | Secret references and values | Internal/external secret boundary | Runtime resolution; fingerprint rather than value in audit; allowlisted server-secret names; encrypted user-secret store; no-value APIs and error scrubbing [EV-207]–[EV-218] |
 | F14 | Telemetry | Web/engine → telemetry backend | Operational metrics/traces; at `full`, LLM/HTTP request and response payloads | Trusted → external backend | Audit-correlated domain telemetry is emitted after its audit write. `lifecycle` carries identifiers/counts; `rows` adds row activity but removes content hashes; `full` adds prompts, completions and HTTP bodies. Health/failure counters may describe suppressed or failed audit paths and never prove audit success [EV-321]–[EV-324], [EV-329] |
-| F15 | Shareable review | Reviewer → web | Signed capability token | Tier 3 → authorised read | Separate HMAC key, constant-time verification, expiry and signed-in recipient; read-only frozen-snapshot view [EV-117] |
+| F15 | Shareable review | Reviewer → web | Signed capability token | Tier 3 → authorised read | Separate HMAC key, constant-time verification, expiry, active sign-in, rate limit and digest-bound read-only snapshot. The token is a replayable bearer capability: any active identity holding it may reuse it until expiry, payload removal or global key rotation. It has no recipient binding, one-time use or per-token revocation, and re-minting does not invalidate older tokens; the nonce distinguishes mints but is not replay defence [EV-117] |
 | F16 | Landscape analysis MCP | Auditor MCP client ↔ local server → Landscape | Tool calls, bounded query results and audit data | Local host boundary | Local stdio; read-only connection and tools. SQL accepts one `SELECT` or `WITH … SELECT` statement with a row cap [EV-319], [EV-330] |
 | F17 | Public status/health | Anyone → web | Build/deployment identity, model names, banner and redacted health/readiness | Unauthenticated | `/api/system/status`, `/api/health` and `/api/ready` intentionally require no session token; readiness returns redacted checks [EV-105], [EV-328] |
-| F18 | Local email verification | Browser → web → owner-only outbox → deployment email process → user | Email address, local user ID, delivery ID, raw one-time token and verification URL | Tier 3 registration; trusted record → external delivery | Product stores only the token hash in the token table but durably publishes the delivery payload to an owner-only JSONL outbox. ELSPETH supplies no mail transport; the deployer must protect, deliver and retain/dispose of the outbox under local policy [EV-018] |
-| F19 | Standalone Composer MCP | MCP host ↔ `elspeth-composer` ↔ scratch store; host ↔ its LLM provider | Tool definitions/calls/results, composition state, generated YAML and session/audit files | MCP client Tier 3 → product; local filesystem boundary; optional host → provider egress | Local stdio only, with no application sign-in or network listener. Blob/secret tools are excluded; arguments are schema-validated; sessions use compare-and-swap files and tool invocations append to JSONL sidecars. Host process identity, scratch permissions and LLM-provider handling are deployment controls [EV-019] |
+| F18 | Local email verification | Browser → web → `auth.db` token/outbox tables → owner-only JSONL → deployment email process → recipient → verification route | Email address, local user ID, delivery ID, raw one-time token and verification URL | Tier 3 registration; trusted record → external delivery → Tier 3 claim | The lookup table holds only a hash, but the raw 24-hour bearer token and URL are durably persisted in both the `auth.db` outbox payload and mode-0600 JSONL. Claim is transactionally single-use, rate-limited and audit-coupled. It marks the local account verified; session-token issuance still passes the separate identity admission/active-state wall. ELSPETH supplies no mail transport; recipient correctness, mailbox/delivery confidentiality, outbox-reader identity and retention are deployment controls [EV-018] |
+| F19 | Standalone Composer MCP | MCP host ↔ `elspeth-composer` ↔ scratch store; host ↔ its LLM provider | Tool definitions/calls/results, composition state, generated YAML and session/event files | MCP client Tier 3 → trained-operator tool authority; local filesystem boundary; optional host → provider egress | Local stdio only, with no application sign-in, per-user ownership or network listener. Blob/secret tools are excluded and arguments are schema-validated, but the host can discover and mutate every session in its shared scratch directory. CAS detects stale writes; sidecar hashes detect accidental inconsistency, not a filesystem actor that rewrites state and hashes coherently, and cross-process sidecar safety is out of scope. Dedicated single-tenant scratch/process identity and host-provider handling are deployment controls [EV-019] |
+| F20 | Operator pipeline configuration and execution | Operator/configuration source → CLI loader → engine/plugins → configured sources and sinks | YAML, plugin names/options, paths/URLs, environment placeholders and resolved secrets, template bytes, run mode and flags | External configuration → validated settings → effectful operator authority | Safe YAML loading, closed/typed settings, pre-expansion credential/output guards, explicit `--execute`, graph/replay validation and sink-effect preflight reduce mistakes. Configuration is executable authority, not a sandbox: provenance, review, template/environment custody, working directory and the invoking OS account are deployment controls [EV-021] |
+| F21 | Compatibility gateway | ELSPETH or compatible client → gateway → OAuth endpoint and organisation model API | Static inbound bearer, messages/tools/response schemas/model alias, OAuth client credentials/token and translated request/response | Client Tier 3 → gateway; executable adapter → secret-bearing process; gateway → external services | Strict bearer parsing/constant-time comparison, closed configuration, fixed HTTPS-or-loopback origins, bounded schemas/bodies, forbidden authority headers, no redirects, metadata-only logs and bounded errors constrain the wire path. A bearer holder obtains the configured upstream authority; the gateway has no end-user identity, and executable adapter code is trusted deployment code inside the process [EV-022] |
+| F22 | Native PDF rasterisation | Uploaded/source PDF → hash-verified payload → parent transform → spawned one-document PDFium worker → temporary images/text → output | Attacker-controlled PDF bytes, rendered pixels and extracted text | Tier 3 bytes → native parser → Tier 2 output | Input/page/pixel/text bounds, spawned single-use worker, Linux CPU/address-space limits, wall timeout/kill, temporary-directory cleanup, output-path containment and renderer-identity hashing limit crashes and resource use. This is not an OS security sandbox; non-Linux lacks the rlimits, and native compromise inherits the worker/service account's environment, filesystem and network authority [EV-023] |
 
 ## 4. Outbound request controls
 
@@ -213,6 +232,8 @@ privacy obligations.
 | Email delivery service | Email address, local user ID, verification URL and raw one-time token read from the outbox | `email_verified` local registration | F18; [EV-018] |
 | Telemetry backend | `lifecycle`: identifiers/counts; `rows`: row activity without content hashes; `full`: LLM/HTTP request and response payloads including prompts, completions and bodies | Pipeline telemetry enabled; operational metrics configured | F14; [EV-322]–[EV-324] |
 | Composer MCP host and its LLM provider | Tool definitions, calls/results, composition state, generated YAML and any context the host places in prompts | Optional Composer MCP use | F19; [EV-019] |
+| Operator-configured sources, services and sinks | Paths, requests, row data, secrets and outputs selected by operator YAML/CLI | Operator executes F20 | F20; [EV-021] |
+| Gateway OAuth and organisation model services | OAuth client identity/token, messages, tools, schemas and model responses | Optional gateway use | F21; [EV-022] |
 | Audit export target | Audit records, hashes, payload references/content according to export configuration, signatures and manifest | Configured export or resume | F12; [EV-316], [EV-327] |
 
 The Composer and `full` telemetry flows can send content outside ELSPETH before
@@ -228,7 +249,10 @@ authoring and observability paths as well as runtime plugins.
 | Composer proposal ↔ committed pipeline | A model mutation must not apply twice, over newer state or after stale review | Proposal/base/head checks, operation fence and write lock; trust mode controls approval | [EV-403], [EV-510] |
 | Payload ↔ audit metadata | Retention may remove content without erasing lineage | Payload references are hash-verified; purge retains Landscape hashes/rows | [EV-313], [EV-325], [EV-326] |
 | Pipeline event ↔ telemetry projection | Operational visibility must not silently become a content export | Granularity filter; row-derived content hashes removed at `rows`; `full` is explicit | [EV-321], [EV-322] |
-| Composer MCP process ↔ scratch directory | A local host user can supply tool data and influence persistent composition files | Session-ID path guard, schema validation, compare-and-swap save and append-only tool-event sidecars | [EV-019] |
+| Composer MCP process ↔ scratch directory | The host has trained-operator mutation authority over every session in a shared directory; another filesystem writer can disclose or coherently rewrite state/evidence | Session-ID path guard, schema validation and CAS; dedicated single-tenant directory/process custody is required because sidecars are neither cross-process safe nor cryptographic tamper evidence | [EV-019] |
+| Operator configuration source ↔ expanded settings ↔ plugins | Tampered YAML, environment, templates or flags can acquire the invoking operator's file, network, secret and sink authority | Safe/strict parsing, targeted pre-expansion guards, explicit execution and effect preflight; provenance and OS-account authority remain deployment controls | [EV-021] |
+| Gateway client ↔ adapter/process ↔ OAuth/upstream | A static bearer grants upstream use, while the selected adapter executes in the credential-bearing process | Strict/bounded wire contracts and fixed origins constrain requests; listener placement, bearer/OAuth custody and trusted adapter provenance remain deployment controls | [EV-022] |
+| Engine parent ↔ native PDFium child | Hostile PDF bytes enter native code; child crash/resource isolation is weaker than hostile-code containment | Spawned one-task worker, Linux rlimits, timeout/kill, contained temporary outputs and measured renderer identity; deployment sandboxing and least privilege remain required | [EV-023] |
 
 ## 7. Deployment record — actual endpoints and boundary placement
 
@@ -246,3 +270,6 @@ Complete this table in the controlled copy for each installation.
 | F16 | Landscape MCP host and database account | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | F18 | Email outbox reader and delivery service | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | F19 | Composer MCP host, scratch directory and host LLM provider | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| F20 | YAML/config repository, templates, environment/secret source, working directory and CLI host account | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| F21 | Gateway listener, image/adapter identity, bearer/OAuth custody, rate limit, OAuth/upstream origins and readiness reachability | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| F22 | PDFium version, platform, worker UID/capabilities, mounts, environment, network/syscall controls and untrusted-PDF policy | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |

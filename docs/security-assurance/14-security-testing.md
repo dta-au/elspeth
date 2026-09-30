@@ -2,7 +2,7 @@
 
 **Status:** product testing baseline and findings follow-up method complete;
 independent penetration testing record open · **Reviewed against:** `release/0.8.1`
-@ `004c0eee0` (2026-09-30) · **Owner:** ELSPETH maintainer
+@ `eee4bb941` (2026-10-01) · **Owner:** ELSPETH maintainer
 
 Records the security testing carried out, who did it, what was in scope and
 what was found. Separate internal review from independent testing — an
@@ -60,6 +60,23 @@ detailed report in the controlled copy.
 | Full report location and access control | DEPLOYMENT-TODO: controlled copy only |
 | Remediation retest date, scope and outcome | DEPLOYMENT-TODO: |
 
+### 3.1 Deployment record — finding reconciliation
+
+Keep the detailed register in the controlled copy and reconcile every finding
+from the assessor's report. Final finding dispositions are `Open`,
+`Remediation in progress`, `Accepted risk`, and `Closed`.
+
+| Report finding ID | Severity | Disposition | Controlled risk ID | Remediation / mitigation ref | Independent retest result and date | Closure verifier | Unresolved reason / acceptance expiry |
+|---|---|---|---|---|---|---|---|
+| DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+
+Record the authoritative report-finding count, the reconciled-row count and
+unresolved omissions with the query or instrument used. The gate requires
+report count = reconciled count and unresolved omissions = 0. `Closed`
+requires an independent successful retest against stated closure criteria;
+`Accepted risk` requires a live `R-nnn` acceptance and remains unresolved for
+finding-closure purposes.
+
 ## 4. Findings follow-up
 
 1. **Receive sensitive findings privately.** Use the channels and handling
@@ -79,11 +96,14 @@ detailed report in the controlled copy.
    behaviour and passes on the repair. Run the focused test, its negative
    controls and every affected gate from [09](09-secure-development-lifecycle.md).
    Supply-chain fixes also rerun the relevant dependency or image scan.
-5. **Review and close.** Record the fixing commit, commands and exit statuses,
-   review result, affected release or image digest, and disclosure decision.
-   A penetration-test finding closes only after the assessor or another
-   suitably independent tester verifies the repair, or the authorised role
-   records a time-bounded acceptance in the controlled risk register.
+5. **Review, verify and close.** Record the fixing commit, commands and exit
+   statuses, review result, affected release or image digest, and disclosure
+   decision. A penetration-test finding closes only after the assessor or
+   another suitably independent tester verifies that its closure criteria are
+   met. A time-bounded risk acceptance can authorise continued operation, but
+   it leaves the finding open with disposition `Accepted risk`, linked risk
+   ID, accepting authority, scope, expiry and review trigger; it is not closure
+   evidence.
 6. **Coordinate disclosure.** Publish an advisory or release note only after a
    fix or effective mitigation is available, coordinating timing with the
    reporter where possible.

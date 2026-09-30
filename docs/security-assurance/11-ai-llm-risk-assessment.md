@@ -106,6 +106,8 @@ The product supplies these boundaries:
   [EV-503];
 - gateway and OpenRouter endpoints require HTTPS except for loopback use, and
   web-authored OpenRouter nodes cannot override `base_url`;
+- Azure content-safety endpoints require HTTPS on port 443, an approved Azure
+  AI Services hostname suffix, and no query or fragment [EV-514];
 - secret values are not part of Composer state. The model sees approved secret
   names, scopes and availability, while the redaction manifest removes
   internal paths and sensitive arguments [EV-014];

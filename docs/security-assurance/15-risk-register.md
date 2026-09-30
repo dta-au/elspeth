@@ -2,7 +2,7 @@
 
 **Status:** public schema complete — populated register held in the controlled
 deployment copy · **Reviewed against:** `release/0.8.1` candidate @
-`cb20ed2e2` (2026-09-30) · **Owner:**
+`eee4bb941` (2026-10-01) · **Owner:**
 ELSPETH maintainer
 
 > **Do not populate this file in the public repository.** Open risks,
@@ -19,7 +19,7 @@ record a risk decision for this device or any other installation.
 
 - Use `R-nnn` identifiers. Preserve every risk ID assigned by a source
   document; never renumber or reuse an ID, including after closure.
-- `R-001` through `R-016` are reserved by
+- `R-001` through `R-024` are reserved by
   [04](04-threat-model.md). Create controlled records for every `Residual`
   reference. Record an applicability disposition for every `Deployment`
   reference so each public pointer remains resolvable.
@@ -76,7 +76,9 @@ silently adjust a calculated rating.
 
 Keep one row per stable risk ID. The source references column may contain
 multiple threat, control, finding or issue IDs, but the structured statement
-must still describe one coherent risk.
+must still describe one coherent risk. Qualify every reference by source, for
+example `04:T-030`, `05:ism-2026-06::1234` or `14:PEN-2026-07`; an
+unqualified control or finding ID is not a stable cross-source identity.
 
 | ID | Controlled title and cause–event–consequence statement | Affected assets / security objectives | Scope and assumptions | Source references | Existing controls and evidence | Control owner | Control effectiveness | Inherent likelihood | Inherent consequence | Inherent rating |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -124,20 +126,27 @@ assuming that silence means there were no findings:
 3. Every residual AI / LLM risk in
    [11](11-ai-llm-risk-assessment.md).
 4. Every `Partially implemented` and `Not implemented` control in
-   [05](05-statement-of-applicability.md), plus any inherited control whose
-   evidence or responsibility is incomplete.
-5. Privacy threshold, impact and treatment findings from
+   [05](05-statement-of-applicability.md), every deficient control-effectiveness
+   or assessment result, and any inherited/shared control whose evidence or
+   responsibility is incomplete.
+5. Identity, access and authorisation gaps or deficient deployment controls
+   from [06](06-identity-and-access.md).
+6. Secret, key-custody, rotation and compromise gaps from
+   [07](07-secrets-and-key-management.md).
+7. Logging, audit, monitoring and evidence-integrity gaps from
+   [08](08-logging-audit-and-monitoring.md).
+8. Privacy threshold, impact and treatment findings from
    [12](12-privacy-impact-assessment.md).
-6. Internal security reviews, independent assessments, penetration tests and
+9. Internal security reviews, independent assessments, penetration tests and
    verification failures recorded by
    [14](14-security-testing.md).
-7. Vulnerability and supply-chain exceptions, accepted scanner suppressions
+10. Vulnerability and supply-chain exceptions, accepted scanner suppressions
    and overdue remediation tracked under
    [10](10-vulnerability-and-supply-chain.md).
-8. Open security-labelled issues and private vulnerability reports. Use a
+11. Open security-labelled issues and private vulnerability reports. Use a
    controlled source reference; do not copy exploit-enabling detail into a
    public issue.
-9. Incidents, near misses, provider advisories, architecture reviews,
+12. Incidents, near misses, provider advisories, architecture reviews,
    readiness failures and deployment drift that change likelihood,
    consequence or control effectiveness.
 
@@ -173,7 +182,10 @@ control before relying on a zero count.
 | Document 04 `Residual` references | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Document 04 `Deployment` references | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Document 11 residual AI / LLM risks | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
-| Document 05 partial / not-implemented / deficient inherited controls | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Document 05 partial / not-implemented / deficient effectiveness or assessment results / incomplete inherited/shared controls | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Document 06 identity and access gaps | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Document 07 secret and key-management gaps | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Document 08 logging, audit and monitoring gaps | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Document 12 privacy findings | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Document 14 internal and independent test findings | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 | Document 10 vulnerability and supply-chain exceptions | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |

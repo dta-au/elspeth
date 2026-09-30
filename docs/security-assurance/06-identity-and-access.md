@@ -18,6 +18,7 @@ Existing material:
 
 - [guarantees.md § 11 Authentication and identity](../release/guarantees.md#11-authentication-and-identity-rc-52)
   and [§ 13 Multi-user session](../release/guarantees.md#13-multi-user-session-rc-52)
+  [EV-002]
 - [Platform Architecture § Security-Relevant Design Choices](../release/platform-architecture.md#security-relevant-design-choices)
 - [Identity workflow cutover runbook](../runbooks/identity-workflow-cutover.md)
 - Source: `src/elspeth/web/auth/`, `src/elspeth/web/coordination/identity_authority.py`
@@ -669,17 +670,19 @@ read-only copy of it to another person
 ### 7.1 Deployment record
 
 The public product document names the control boundary; the controlled copy
-records the deployment's decision and final risk-register identifier. Do not
-put sensitive finding detail in this repository.
+records whether each topic applies and, when it does, its final risk-register
+identifier. An acceptance decision is recorded on that risk; it does not
+replace the risk record. A `Not applicable` disposition requires dated
+evidence. Do not put sensitive finding detail in this repository.
 
-| Topic requiring a deployment decision | Controlled risk register reference or acceptance record |
-|---|---|
-| Local-account password and MFA policy | DEPLOYMENT-TODO: |
-| Session termination, bearer-token storage and idle timeout | DEPLOYMENT-TODO: |
-| Authentication rate limiting and reverse-proxy client-address trust | DEPLOYMENT-TODO: |
-| Any approved unauthenticated-route exception | DEPLOYMENT-TODO: |
-| Local credential-administration and two-store deletion residual risk | DEPLOYMENT-TODO: |
-| Shareable-link lifetime, distribution and all-links-at-once revocation | DEPLOYMENT-TODO: |
+| Topic requiring a deployment decision | Applicability disposition | Controlled `R-nnn` | Decision evidence |
+|---|---|---|---|
+| Local-account password and MFA policy | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Session termination, bearer-token storage and idle timeout | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Authentication rate limiting and reverse-proxy client-address trust | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Any approved unauthenticated-route exception | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Local credential-administration and two-store deletion residual risk | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Shareable-link lifetime, distribution and all-links-at-once revocation | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
 
 ## 8. Current evidence map
 

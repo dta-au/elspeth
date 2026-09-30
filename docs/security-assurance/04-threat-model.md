@@ -2,8 +2,8 @@
 
 **Status:** product threat model and method complete; deployment decisions and
 risk acceptance open · **Reviewed against:**
-`release/0.8.1` candidate @ `cb20ed2e2`
-(2026-09-30) · **Owner:** ELSPETH maintainer
+`release/0.8.1` candidate @ `eee4bb941`
+(2026-10-01) · **Owner:** ELSPETH maintainer
 
 Identifies what is worth protecting, who controls each input, where an
 attacker can act, which controls stand in the way, and how severe a failure
@@ -59,8 +59,8 @@ validating, running and auditing data pipelines. Users sign in, upload
 source data, work with an LLM-backed Composer that proposes pipeline
 changes, store secret references, run pipelines through plugins, and inspect
 runs, outputs, audit records and shareable review links. The same repository
-holds the command-line runtime, the plugins, the Landscape audit store and
-local MCP tools for querying audit data.
+holds the command-line runtime, plugins, Landscape audit store, local MCP
+tools, native PDFium parser worker and optional compatibility gateway.
 
 The web application is multi-user. Every user authenticates through one
 configured provider ([06 § 1](06-identity-and-access.md#1-authentication)),
@@ -153,7 +153,7 @@ controls on this channel are in [09](09-secure-development-lifecycle.md) and
 ## 4. Attack surfaces and controls
 
 Each subsection lists the attacker's goal, the controls in place at
-`cb20ed2e272579529c776abf3942ce449e8a3859`, and where residual risk is
+`eee4bb9419265e69ac13012a1c5fe421d6ba7240`, and where residual risk is
 recorded. Evidence IDs refer to
 [16](16-evidence-index.md).
 
@@ -421,7 +421,7 @@ Controls:
 
 Risk reference: see controlled risk register `R-001`.
 
-### 4.8 Audit store, MCP and local tooling
+### 4.8 Audit store and Landscape analysis MCP
 
 **Goal:** alter or delete audit evidence, or read all audit data through a
 tooling surface.
@@ -435,10 +435,11 @@ selection
 ([08 § 2](08-logging-audit-and-monitoring.md#2-integrity)) [EV-315] [EV-316]. The Landscape
 MCP server runs locally over stdio, opens the database read-only, accepts a
 single `SELECT` or `WITH` statement inside a read-only transaction, and caps
-rows [EV-407]. The Composer MCP server validates session identifiers
-wherever it builds a file path. An MCP server exposed to an untrusted agent
-or network can still disclose every audit record it can read, including
-personal information; exposing one is an operator decision (§ 7).
+rows [EV-407]. A Landscape MCP server exposed to an untrusted agent or network
+can still disclose every audit record it can read, including
+personal information; exposing one is an operator decision (§ 7). The
+standalone Composer MCP is a separate, mutation-capable authoring surface in
+§ 4.15 and is not covered by these read-only controls.
 
 Risk references: see controlled risk register `R-011`; activate `R-012` when
 the deployment decision makes it applicable.
@@ -495,6 +496,93 @@ governance combinations [EV-110] [EV-320] [EV-328] [EV-409] [EV-627]
 Risk reference: activate controlled risk register `R-016` when the deployment
 decision makes it applicable.
 
+### 4.13 Operator configuration and CLI execution
+
+**Goal:** tamper with YAML, referenced templates, environment/secret inputs,
+working-directory-relative files or CLI flags so the operator executes a
+different pipeline with the operator process's file, network, credential and
+sink authority.
+
+The CLI safe-loads YAML, rejects unknown settings, applies targeted
+pre-expansion credential/output guards, expands the approved environment,
+materialises templates, constructs strict settings and requires explicit
+`--execute`. Graph, replay and sink-effect preflight run before execution
+resources are created [EV-021]. These checks establish structure and some
+dangerous-pattern rules; they do not prove provenance or business intent, and
+the CLI is deliberately not a sandbox. Repository/path custody, change review,
+environment and template integrity, working directory, secret source and
+invoking OS account are deployment controls.
+
+Risk reference: activate `R-021` when an actor outside the authorised change
+path can alter operator configuration.
+
+### 4.14 Email verification and share capabilities
+
+Local email verification stores only a hash in the lookup table, but stores
+the raw 24-hour bearer token and URL in both the `auth.db` outbox payload and
+mode-0600 JSONL for delivery. A transactionally successful claim is single-use,
+rate-limited and audit-coupled. Theft before claim lets the reader consume the
+recipient's one verification claim; any session-token issuance still passes
+the separate identity admission/active-state wall. Recipient correctness,
+delivery/mailbox security and outbox lifecycle remain deployment controls
+[EV-018].
+
+A share link is intentionally replayable by any active signed-in identity that
+holds it. HMAC integrity, expiry, rate limiting, no-referrer policy and a
+digest-bound read-only snapshot constrain it, but the nonce is not replay
+defence and there is no intended-recipient binding, one-time use, per-token
+revocation or invalidation of older tokens on re-mint. Payload removal or
+global signing-key rotation invalidates access [EV-117].
+
+Risk references: `R-017` for share-capability theft/replay and `R-018` for
+email-verification token theft/substitution.
+
+### 4.15 Standalone Composer MCP
+
+The Composer MCP is a trained-operator authoring surface, not the read-only
+Landscape MCP. Its stdio host can discover, load, mutate, save and delete every
+session in a shared scratch directory without ELSPETH application identity or
+per-user ownership. Blob/secret tools are excluded, arguments are
+schema-validated, paths are guarded and state writes use CAS. JSONL sidecars
+are single-tenant application records: cross-process safety is out of scope,
+and stored hashes do not resist a filesystem actor that rewrites state and
+hashes coherently. The host also decides what tool/state content reaches its
+LLM provider [EV-019]. Dedicated process identity, single-tenant scratch
+custody and host/provider policy are deployment controls.
+
+Risk references: activate `R-019` for host/model mutation authority and
+`R-020` for scratch/session/evidence tampering.
+
+### 4.16 Compatibility gateway
+
+The optional gateway accepts one static inbound bearer and translates a
+bounded OpenAI-compatible request through a selected Python adapter to an
+operator-pinned OAuth/upstream origin. Strict bearer parsing and constant-time
+comparison, closed configuration, bounded schemas/bodies, forbidden authority
+headers, no redirects, metadata-only logs and fixed error envelopes constrain
+the wire path. The gateway has no end-user or tenant identity: bearer theft or
+an exposed listener grants use of its configured upstream authority. Adapter
+code executes inside the secret-bearing process, so returned-plan validation
+is not code containment [EV-022].
+
+Risk references: activate `R-022` for bearer/listener exposure; `R-023` covers
+adapter/runtime compromise. Supply-chain risk `R-015` remains separately
+applicable to admission of the artefact.
+
+### 4.17 Native PDFium parsing
+
+The PDF rasteriser gives attacker-controlled bytes to native PDFium in a
+spawned one-document worker. Size/page/pixel/text bounds, one task per process,
+Linux CPU/address-space limits, wall timeout/kill, temporary-output path
+containment and renderer-identity hashing limit crashes, exhaustion and output
+substitution [EV-023]. This boundary is not an OS security sandbox: non-Linux
+workers lack the rlimits, and native code execution inherits the worker/service
+account's environment, filesystem and network authority. Platform sandboxing,
+least privilege, egress denial and PDFium vulnerability management remain
+deployment controls.
+
+Risk reference: `R-024`.
+
 ## 5. Threat register
 
 Status meanings:
@@ -544,6 +632,14 @@ controlled register.
 | T-027 | S, T, R, D, E | Compromised dependency, action or image | 4.11 | Release artefacts and runtime (I, A) | SHA and digest pinning, scanning, provenance and signing | Residual | Critical — a compromised artefact executes with product authority | `R-015` |
 | T-028 | S, T, I, D, E | Unsafe deployment configuration undermines a product control | 4.12 | All deployment assets (C, I, A) | Fail-closed profiles, start-up checks and readiness | Deployment | Critical — the affected control may be a primary trust boundary | `R-016` if applicable |
 | T-029 | S, E | Reuse of a valid stolen session token | 4.1 | Identities and session tokens (C, I) | Bounded token/refresh lifetime and per-request identity-state check | Residual | High — the bearer can impersonate the identity until the credential loses authority | `R-001` |
+| T-030 | S, I | Stolen share capability replayed by another active identity | 4.14 | Frozen review content and participant privacy (C) | HMAC, sign-in/active check, expiry, rate limit, digest-bound read-only view, payload removal/global rotation | Residual | High — a bearer can repeatedly disclose sensitive review content during the capability lifetime | `R-017` |
+| T-031 | S, I, E | Email-verification token theft or substitution wins the one valid claim | 4.14 | Verification attribution and, when separately admitted, session authority (C, I) | 24-hour expiry, transactional single-use claim, rate limit, owner-only outbox, audit-coupled issuance and identity admission wall | Residual | High — the wrong actor can consume the verification claim and, if admitted, receive session authority | `R-018` |
+| T-032 | T, I, D, E | Untrusted MCP host/model abuses trained-operator mutation authority | 4.15 | Composition state and generated pipeline (C, I, A) | Local stdio, closed schemas, path guards, no blob/secret tools; dedicated host/scratch is deployment-controlled | Deployment | High — no app identity separates the host from all sessions in its scratch directory | `R-019` if applicable |
+| T-033 | T, R, I | Filesystem actor coherently tampers with Composer MCP state or evidence | 4.15 | Composition and local event evidence (C, I) | CAS, atomic replacement and byte/hash consistency checks | Deployment | High — coherent state/hash rewriting or shared writers defeats the application checks | `R-020` if applicable |
+| T-034 | T, I, E | Tampered YAML, environment or template executes with CLI operator authority | 4.13 | Host files, secrets, network and sink targets (C, I) | Safe/strict parsing, targeted guards, explicit execution, graph/replay/effect preflight | Deployment | Critical — substituted configuration can exercise the operator account's full intended runtime authority | `R-021` if applicable |
+| T-035 | S, I, D, E | Gateway bearer stolen or listener exposed | 4.16 | Upstream model authority, prompts and service capacity (C, A) | Strict constant-time bearer check, bounded API and deployment ingress/rate controls | Deployment | High — one static bearer authorises use without end-user/tenant attribution | `R-022` if applicable |
+| T-036 | T, I, E | Gateway adapter/runtime compromised | 4.16 | Gateway credentials, prompts and responses (C, I) | Fixed-origin/bounded wire validation, supply-chain admission and non-root image | Residual | Critical — adapter code already executes inside the credential-bearing process | `R-023` |
+| T-037 | T, I, D, E | Crafted PDF exploits native PDFium worker | 4.17 | Service account, pipeline data and runtime (C, I, A) | Spawn/recycle, bounds, Linux rlimits, timeout/kill, temporary-output containment and measured renderer identity | Residual | Critical — process isolation does not contain native code with inherited service-account authority | `R-024` |
 
 ### 5.1 STRIDE coverage by surface
 
@@ -560,11 +656,16 @@ the register above gives the primary consequence and controls.
 | 4.5 Secrets and environment | Identity and secret ownership are handled at 4.1–4.2 | T-018, T-019 | Fingerprinted audit records address attribution; no separate path | T-018, T-019 | No distinct secret-use availability path; T-026 covers shared capacity | T-018, T-019 |
 | 4.6 Network egress | Destination authority is covered by T-020 | T-020, T-021 | External-call audit covers attribution; no separate path | T-020, T-021 | T-026 covers shared capacity | T-020 |
 | 4.7 Frontend rendering | T-004 | T-022 | Rendering creates no durable security claim; no separate path | T-004, T-022 | T-026 covers shared web capacity | T-022 |
-| 4.8 Audit, MCP and tooling | T-024 covers misplaced tool authority | T-023 | T-023 | T-024 | T-026 covers shared service capacity | T-024 |
+| 4.8 Audit store and Landscape analysis MCP | T-024 covers misplaced tool authority | T-023 | T-023 | T-024 | T-026 covers shared service capacity | T-024 |
 | 4.9 Information and observability | Identity-bearing surfaces are covered at 4.1 | Endpoints are read-only; no separate tampering path | Endpoints make no user-attributed decision; no separate path | T-025 | T-026 covers shared web capacity | Endpoints grant no additional authority; no separate path |
 | 4.10 Resource exhaustion | Not applicable to the availability-only surface | Not applicable to the availability-only surface | Not applicable to the availability-only surface | Not applicable to the availability-only surface | T-015, T-026 | Not applicable to the availability-only surface |
 | 4.11 Supply chain and build | T-027 (artefact identity) | T-027 | T-027 (provenance) | Disclosure is a consequence of T-027, not a separate supply-chain path | T-027 | T-027 |
 | 4.12 Deployment hardening | T-028 | T-028 | Deployment records provide attribution; T-028 covers loss of that control | T-028 | T-028 | T-028 |
+| 4.13 Operator configuration and CLI | Operator/change identity is a deployment control; T-034 covers substitution | T-034 | T-034 covers provenance loss; runtime audit records effects | T-034 | T-026 covers shared capacity; malicious effects are T-034 | T-034 |
+| 4.14 Email verification and share capabilities | T-030, T-031 | Signature/token integrity controls are part of T-030/T-031 | Access/auth events attribute observed use but do not bind the intended recipient | T-030, T-031 | T-026 covers shared web capacity | T-031 |
+| 4.15 Standalone Composer MCP | Host OS identity is the authority boundary; T-032 covers misplaced authority | T-032, T-033 | T-033 | T-032, T-033 | T-032 | T-032 |
+| 4.16 Compatibility gateway | T-035 | T-036 | Gateway events provide bounded attribution; T-035 covers absent user identity | T-035, T-036 | T-035 | T-035, T-036 |
+| 4.17 Native PDFium parsing | Parser identity is measured; no separate spoofing path | T-037 | Renderer identity/audit attribution does not prevent compromise | T-037 | T-037 | T-037 |
 
 ## 6. Severity calibration
 
@@ -599,8 +700,9 @@ payloads causing single-user denial of service; unauthenticated status
 leaks useful for reconnaissance.
 
 **Low:** self-inflicted script injection with no token exposure; verbose
-validation errors revealing non-sensitive topology; CLI path or environment
-expansion where only the operator controls the YAML; build, test or
+validation errors revealing non-sensitive topology; intended CLI path or
+environment expansion in YAML authored and executed by the same authorised
+operator (not unauthorised substitution covered by T-034); build, test or
 developer-tool issues not reachable in production; denial of service that
 needs local filesystem access or trusted administrator configuration.
 
@@ -628,6 +730,12 @@ controlled register and reconcile them as required by
 | Network ingress, egress and TLS controls inherited from the platform | Control and evidence references | DEPLOYMENT-TODO: |
 | Who can reach `/api/system/status`, `/api/ready` and `/metrics` | — | DEPLOYMENT-TODO: |
 | MCP servers deployed, and to whom they are exposed | — | DEPLOYMENT-TODO: |
+| Composer MCP host/provider, dedicated process identity, single-tenant scratch custody and cross-process exclusion | — | DEPLOYMENT-TODO: |
+| Share links enabled, maximum lifetime, approved delivery/URL-log handling, recipient guidance and global-rotation incident effect | — | DEPLOYMENT-TODO: |
+| Email outbox reader/delivery identity, mailbox/transport protection and failed/stale-record retention | — | DEPLOYMENT-TODO: |
+| CLI/YAML repository/path, authorised changers/reviewers, template/environment/working-directory custody and host OS account | — | DEPLOYMENT-TODO: |
+| Compatibility gateway listener/health reachability, image/adapter identity, bearer/OAuth custody, rate limits and fixed egress origins | — | DEPLOYMENT-TODO: |
+| PDFium version/platform, worker UID/capabilities, mounts, environment, network/syscall restrictions and untrusted-PDF policy | — | DEPLOYMENT-TODO: |
 | Audit export signing mode | `unsigned` / `hmac_sha256` | DEPLOYMENT-TODO: |
 | Export signer and key custody | Role, key identifier, storage and rotation authority | DEPLOYMENT-TODO: |
 | Signed-export verification procedure and result | Procedure/evidence reference and last verification | DEPLOYMENT-TODO: |

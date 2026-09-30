@@ -20,6 +20,7 @@ fill those in the controlled copy, not in this public file.
 Existing material:
 
 - [guarantees.md § 1 Audit guarantees](../release/guarantees.md#1-audit-guarantees)
+  [EV-002]
 - [Landscape System](../architecture/landscape.md) and
   [Landscape Entry Points](../architecture/landscape-entry-points.md).
   The inventory figures in `landscape.md` are dated; § 1.2 below is the
@@ -161,7 +162,7 @@ recorded in `run_coordination_events` (§ 2.5).
 `src/elspeth/contracts/auth.py` and the database CHECK constraint
 `ck_auth_events_event_type` both list the same **24 event types**; a write
 with any other value is refused by the database, so an unlisted event cannot
-be recorded by mistake [EV-302].
+be recorded by mistake [EV-106] [EV-302].
 
 | Group | Event types |
 |---|---|
@@ -331,6 +332,14 @@ If that write fails, the endpoint returns HTTP 500
 (`audit_access_log_write_failed`) and no transcript rows
 ([Tier-1 runbook](../runbooks/audit-tier1-violation.md#immediate-response))
 [EV-308].
+
+The shipped writers store the exact string exposed as
+`request.client.host`; they do not truncate or hash it. Physical session
+deletion cascades the row, while durable-history soft archive retains it and
+there is no independent expiry or purge. The reverse-proxy trust, necessity
+and literal-address retention decision are recorded in
+[12 § 4.2](12-privacy-impact-assessment.md#42-audit-access-network-address-policy)
+[EV-813].
 
 Record deployment-specific residual-risk acceptance in
 [15 — Risk register](15-risk-register.md).
@@ -794,3 +803,23 @@ it (scheduled query, export or read-only replica): DEPLOYMENT-TODO:
 
 Who may use `explain` and `elspeth-mcp` against the production databases, and
 through which read-only account: DEPLOYMENT-TODO:
+
+## 7. Controlled risk references
+
+### 7.1 Deployment record
+
+The controlled copy records whether each logging and audit topic applies and,
+when it does, the final risk-register identifier. An acceptance decision is
+recorded on that risk; it does not replace the risk record. A `Not applicable`
+disposition requires dated evidence. The reconciliation in
+[15 § 6](15-risk-register.md#6-deployment-record--source-reconciliation)
+counts these rows as the authoritative Document 08 source population.
+
+| Topic requiring a deployment decision | Applicability disposition | Controlled `R-nnn` | Decision evidence |
+|---|---|---|---|
+| Authentication and administrative audit gaps, including suppressed writes | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Session and Composer audit durability, audit-access logging and literal client-address retention | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Production access to audit records, `explain` and Landscape analysis MCP | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Privileged database alteration, direct write authority and database encryption | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Retention, payload purge, soft-archived managed blobs, backups and legal holds | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |
+| Export signing, resume, verifier independence and evidence custody | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: | DEPLOYMENT-TODO: |

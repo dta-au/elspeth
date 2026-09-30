@@ -1,7 +1,7 @@
 # 12 — Privacy impact assessment
 
 **Status:** reusable product assessment complete; deployment record open ·
-**Reviewed against:** `release/0.8.1` candidate @ `cb20ed2e2` (2026-09-30) ·
+**Reviewed against:** `release/0.8.1` candidate @ `eee4bb941` (2026-10-01) ·
 **Owner:** ELSPETH maintainer
 
 This document supplies a reusable privacy impact assessment (PIA) method and
@@ -111,17 +111,20 @@ record is personal information.
 | Web identity and profile | Verified local or SSO identity | Authentication, admission, attribution and administration | Sessions `identities` | Authorised administrators; audit projections | Activated, disabled and retired identities remain to anchor history; a stale never-activated pending identity can be explicitly purged under configured retention | Necessarily personal in authenticated Web use [EV-806] [EV-812] |
 | Bounded active-identity claims snapshot | Verified IdP claims at activation | Forensics and identity binding | Sessions `identities.raw_claims_json` | Restricted administrative/audit access | Kept with the identity record; IdP-provided membership and role attributes are outside the owned claims boundary | Personal; may include deployment-dependent profile attributes [EV-806] |
 | Local credentials | User/admin input and generated reset material | Local authentication | Separate `auth.db` | Authentication and authorised credential administrators | Credential deletion is separate from identity retirement; deployment backups may retain copies | Personal and security-sensitive |
+| User-scoped pipeline secrets | Authenticated user input through the Web secret API | Resolve credentials for approved pipeline destinations | Sessions `user_secrets` (name, identity/provider binding, encrypted value, salt, version and timestamps) | Owning user through metadata/create/delete APIs; ELSPETH runtime at resolution; approved external destination at use | Per-secret deletion exists; disabling `user_secrets_enabled` stops use but leaves rows stored; no automatic expiry or identity-retirement cascade; backups may retain copies | Necessarily account-associated and security-sensitive; names can reveal service relationships and values may contain personal information [EV-212] [EV-813] |
+| Composer preferences and tutorial progress | Authenticated user's Web interactions | Account-level display choices and resumable tutorial state | Sessions `user_preferences` | Owning user and Web application | PATCH can reset individual fields; no whole-row product deletion or automatic expiry; identity retirement does not cascade | Personal activity data linked to an identity; session/run IDs and source-data hash link to other records [EV-813] |
 | Roles and oversight relationships | Administrators and governance workflow | Authorisation, review and accountability | Sessions identity role and relationship tables | Authorised administrators, reviewers and audit | Role grants are retained and revoked rather than deleted so history remains readable | Personal employment/authority information |
 | Authentication and administrative events | Web authentication and admin actions | Security monitoring and accountability | Landscape `auth_events` | Authorised audit readers, exports and monitoring | Audit metadata has no product-wide automatic expiry | Personal activity and device/network metadata [EV-807] |
+| Audit-grade read and workflow-inspection access evidence | Audit-grade transcript reads and governed workflow inspection | Accountability for access to sensitive Composer evidence | Sessions `audit_access_log` (reader, path, allowlisted query arguments, literal `request.client.host`, timestamp and writer) | Restricted service/audit access and authorised operators | Cascades only with physical session deletion; retained by durable-history soft archive; no standalone product expiry or purge | Necessarily personal: identifies the reader and can contain a literal network address [EV-308] [EV-811] [EV-813] |
 | Composer messages and raw/tool audit rows | Authors, providers and tools | Pipeline authoring, audit and recovery | Sessions `chat_messages` and related receipt rows | Authors, authorised reviewers, share-link readers within exposed view, provider during composition | Immutable while the session exists; durable-history session soft-archives, no-durable session can be physically deleted | Frequently personal if users discuss people or upload content [EV-808] |
 | Composition states, proposals, reviews and approvals | Authoring and governance actions | Versioning, decision evidence and execution admission | Sessions composition, proposal, interpretation, review, approval and library tables | Authors, reviewers, approvers, share-link readers within exposed view | Durable governance history causes soft archive rather than physical session deletion | Can identify authors/reviewers and contain content-derived information |
-| Uploads, managed blobs and session files | User upload or Composer `create_blob` | Authoring inputs and pipeline processing | Managed blob/session directories plus custody metadata | Planner when read, pipeline plugins, reviewers and configured sinks | Blob update/delete tools exist; `create_blob` is immediate even under `explicit_approve`; archive, backup and custody effects must be assessed | May contain arbitrary personal or sensitive information [EV-808] |
+| Uploads, managed blobs and session files | User upload or Composer `create_blob` | Authoring inputs and pipeline processing | Managed blob/session directories plus custody metadata | Planner when read, pipeline plugins, reviewers and configured sinks | Physical session deletion purges the blob directory. Durable-history soft archive retains blob metadata and raw files; archived-session blob routes are unavailable, so there is no supported post-archive per-blob purge or automatic expiry | May contain arbitrary personal or sensitive information [EV-808] |
 | Source rows, documents and quarantine records | Source systems, files, APIs and users | Pipeline processing and error handling | In-memory processing, payload store, Landscape row/token/error records and configured working storage | Transforms, LLM/search/safety services, sinks, operators and exports | Depends on payload purge and destination; audit metadata can remain after content purge | May contain arbitrary personal or sensitive information |
 | Pipeline outputs and sink effects | Transforms, models and deterministic steps | Deliver pipeline results | Landscape evidence, payload store and configured sinks | Sink recipients, reviewers and exports | Sink copies follow destination policy; ELSPETH preserves effect/audit evidence | May contain original, derived or model-generated personal information |
 | External-call requests and responses | Pipeline and connected services | LLM, retrieval, web, document analysis and other transforms | Landscape `calls` metadata plus payload store | Configured provider/service; authorised audit readers | Payload blobs default to 90-day purge eligibility and require explicit purge; hashes/metadata remain | Often content-rich and potentially personal [EV-809] [EV-810] |
 | Composer/provider call evidence | Planner, advisor and session-title calls | Authoring, advice and usage accounting | Sessions transcript/audit rows and token ledger | Provider and authorised session/audit readers | Follows session archive/delete mechanics; provider copy is separate | User messages and model output may be personal |
 | Token and quota usage | Composer and Web-run AI calls | Cost/quota enforcement and accountability | Sessions token ledger and provider-attempt tables | User/admin views and audit | Usage history makes a session durable; schedule is deployment-defined | Links activity and consumption to identities |
-| Shareable-review capability and access evidence | Author/reviewer workflow | Read-only external review | Sessions review/share records and operational/audit events | Anyone holding a valid signed capability, within the exposed review view | Expiry and revocation are product controls; retained access evidence follows store policy | Can expose pipeline content and identify participants [EV-811] |
+| Shareable-review capability and access evidence | Author/reviewer workflow | Read-only external review | Sessions review/share records and operational/audit events | Any active signed-in identity holding a valid capability, within the exposed review view | Expiry, payload removal and global signing-key rotation bound access; there is no recipient binding, one-time use or per-token revocation; retained access evidence follows store policy | Can expose pipeline content and identify participants [EV-811] |
 | Application logs, metrics and traces | Runtime components | Operations, security and diagnostics | Deployment log/telemetry back ends | Operators and configured observability providers | Deployment-controlled; full LLM telemetry can contain prompts/responses | Can include identifiers, request metadata and content at higher granularity |
 | Exports | Authorised user/operator | Audit analysis, portability and reporting | Chosen export target | Export recipients and later systems | Independent copy; not removed by purging the live payload store | Mirrors selected audit and payload information |
 | Backups and replicas | Deployment infrastructure | Recovery and availability | Deployment-managed storage | Infrastructure operators and recovery systems | Independent schedule and deletion lag | Mirrors the stores backed up |
@@ -140,6 +143,29 @@ content class.
 | Dataset / information class | People represented | Source and collection method | Purpose and necessity | Classification / sensitivity | Stores | Recipients | Volume and frequency |
 |---|---|---|---|---|---|---|---|
 | DEPLOYMENT-TODO: dataset or class | DEPLOYMENT-TODO: affected people | DEPLOYMENT-TODO: source and method | DEPLOYMENT-TODO: purpose and necessity | DEPLOYMENT-TODO: approved classification | DEPLOYMENT-TODO: stores and copies | DEPLOYMENT-TODO: recipients | DEPLOYMENT-TODO: scale and cadence |
+
+### 4.2 Audit-access network-address policy
+
+The shipped `audit_access_log` writers store the exact string exposed as
+`request.client.host`; ELSPETH does not truncate or hash it. The value is
+trustworthy as a client address only when the deployment's reverse-proxy and
+forwarded-header trust is correct. Physical session deletion cascades the row,
+but durable-history soft archive retains it and the product supplies no
+independent expiry or purge [EV-813].
+
+This literal-storage choice requires an explicit deployment decision. Record
+the necessity and legal basis, authorised readers, proxy-trust configuration,
+approved retention, incident use and treatment of backups and exports. A
+deployment that cannot approve literal retention requires a product change to
+omit, truncate or keyed-hash the value; documentation or configuration cannot
+make the current writer do so.
+
+| Decision | Deployment value |
+|---|---|
+| Literal network-address collection and legal basis | DEPLOYMENT-TODO: |
+| Authoritative client-address / trusted-proxy configuration | DEPLOYMENT-TODO: |
+| Authorised readers, approved retention and destruction evidence | DEPLOYMENT-TODO: |
+| Backups, exports and incident-use treatment | DEPLOYMENT-TODO: |
 
 ## 5. Data-flow analysis
 
@@ -247,11 +273,14 @@ single period.
 |---|---|---|---|---|---|
 | Payload-store bodies | Eligible after `payload_store_retention_days`, default 90 days | Explicit `elspeth purge`; not an automatic timer | Expired payload blobs are removed | Landscape metadata and hashes remain; explain reports content unavailable | Purge must be operated and does not remove external, export or backup copies [EV-809] |
 | Landscape audit records | Run, call, row, token, auth and effect events | No product-wide automatic expiry | Payload references can become unavailable after purge; audit metadata remains | Identity, timing, hashes, status and other audit fields | Correction/deletion can conflict with audit integrity and records obligations; deployment decision required |
-| Composer sessions and transcripts | Session archive request | Database decision under session fence | Durable-history session is soft-archived and retains transcript; no-durable session can be physically deleted | Durable authoring, usage, run, review and approval evidence remains after soft archive | Transcript content is immutable while the session exists [EV-808] |
+| Composer sessions and transcripts | Session archive request | Database decision under session fence | Durable-history session is soft-archived and retains transcript; no-durable session can be physically deleted | Durable authoring, usage, run, review and approval evidence remains after soft archive | Transcript content is immutable while the session exists [EV-519] [EV-808] |
 | Activated/retired identity, role and relationship records | Administrative lifecycle actions | Disable/retire/revoke operations | Activated, disabled and retired identities are retained to anchor audit; role history is revoked rather than deleted | Identity and authority history | Audit and authority history remains subject to the deployment's records and privacy decision [EV-113] |
 | Never-activated pending identities | `identity_pending_retention_days`, default 90 days | Explicit admin-only `POST /api/auth/admin/identities/purge-pending`; not an automatic timer | Deletes rows strictly older than the database-clock cutoff, at most 200 per call | Bounded summary and one attributable Landscape event per deleted identity; response returns exact IDs and `has_more` | Does not remove provider, export, log or backup copies; activated, disabled and dormancy-re-pended identities are ineligible [EV-812] |
 | Local credentials | Administrative credential lifecycle | Authorised credential administration | Credential can be deleted separately; a bound identity is retired and its audit history remains | Identity/audit history and deployment backups | Removing a credential does not erase other stores |
-| Managed blobs and session files | User/author actions and session lifecycle | Coordinated blob/session operations | Update/delete and physical session deletion paths exist; durable-history archive can retain related evidence | Custody, proposal and audit evidence according to operation | Immediate `create_blob`, exports and backups require separate handling |
+| User-scoped secrets | Explicit user create/update; no age trigger | Authenticated per-secret DELETE | Deletes the live Sessions row; disabling user secrets does not delete stored rows | Audit fingerprints/history and backups may remain | No automatic expiry or identity-retirement cascade; address dormant/retired accounts and backups [EV-813] |
+| Composer preferences and tutorial progress | First preference/tutorial write; no age trigger | GET/PATCH only | Individual nullable fields can be cleared, but no whole-row deletion exists | Identity-linked row, update time and uncleared tutorial linkage | No automatic expiry; identity retirement is not a purge [EV-813] |
+| Audit-access log, including literal network address | Audit-grade or governed inspection read; no age trigger | Session FK cascade only | Removed with physical session deletion; retained on durable-history soft archive | Reader identity, path, allowlisted query arguments, literal client-host string, time and writer | No standalone expiry/purge; deployment retention cannot presently be enforced independently [EV-813] |
+| Managed blobs and session files | User/author actions and session lifecycle; no age trigger | Per-blob operations while live; fenced session archive | Physical deletion purges the raw session blob directory; soft archive retains blob rows and raw files | On soft archive, filename, provenance, hashes and complete raw content remain | Archived sessions cannot use normal blob routes; no product TTL or post-soft-archive purge, so retention may be indefinite [EV-808] |
 | Logs and telemetry | Deployment logging configuration | Deployment/logging platform | Platform-specific expiry or deletion | Aggregates or archives may remain | Higher granularity can create content copies outside product purge |
 | Provider/search/safety/tracing/sink copies | External service receipt | Provider contract and portal/API | Provider-specific | Provider logs, abuse-monitoring or backups may remain | ELSPETH cannot enforce provider deletion |
 | Exports and backups | Export/backup operation | Deployment process | Independent deletion and media lifecycle | Copies may remain after source deletion | Restore can reintroduce deleted information unless procedures prevent it |
@@ -274,6 +303,10 @@ for session archive mechanics.
 |---|---|---|---|
 | Identity/profile | Authorised identity/admin views and audit | Update from the authoritative identity process; disable/retire identity | IdP source-of-truth and retained identity/audit history must be reconciled |
 | Roles and relationships | Authorised administration and audit events | Revoke or supersede; history remains | Historical authority records should not be rewritten as though they never occurred |
+| User-scoped secrets | Owning user can list names/availability; plaintext is never returned by inventory APIs | Authenticated per-secret replacement or deletion | Identity retirement and feature disablement do not erase rows; audit fingerprints and backups are separate copies |
+| Composer preferences/tutorial progress | Authenticated GET | PATCH can clear supported fields; no whole-row delete | Account retirement preserves the row; related session/run records may remain |
+| Audit-access evidence | No general end-user export/correction surface; authorised database/audit procedure required | No standalone correction/deletion; physical parent-session deletion cascades | Do not rewrite evidence as if the read did not occur; address literal-IP necessity, accuracy, retention and annotation explicitly |
+| Managed blobs in a soft-archived session | No normal blob API access after archive | No supported post-soft-archive per-blob delete | Raw content remains for session/audit consistency; privacy deletion requires a future evidence-preserving mechanism, not direct filesystem/SQL edits |
 | Composer transcript and decisions | Authorised transcript/review views; controlled share links | Message bodies cannot be edited while the session exists; append an explanation/correction or physically delete only when no durable history permits | A correction must remain distinguishable from the original evidence |
 | Pipeline source/output content | `elspeth explain`, Web inspection, MCP analysis and exports according to authority | Correct authoritative source and rerun; purge eligible payload body when allowed | Audit hashes/metadata and downstream sinks may retain the original event |
 | Model-generated personal information | As pipeline output, call payload or downstream sink record | Human verification, correction at the destination, annotation and controlled rerun | Model output is not an authoritative source merely because it is recorded |
@@ -328,9 +361,11 @@ documents a reasoned alternative:
    abuse-monitoring, retention and deletion terms;
 3. keep content-rich tracing and telemetry disabled until its purpose,
    recipients, access and retention have been assessed;
-4. configure and operate payload purge, pending-identity purge, session
-   archive, log expiry, provider deletion and backup disposal as separate
-   controls;
+4. configure and operate payload purge, pending-identity purge, per-user secret
+   retirement, session archive, audit-access/IP retention, managed-blob
+   retention, log expiry, provider deletion and backup disposal as separate
+   controls; record where no automatic or selective purge exists and do not
+   claim archive as deletion;
 5. restrict administrative, audit, MCP, export and share-link access and review
    it periodically;
 6. provide collection/privacy notices in the Web/IdP workflow and at indirect
@@ -342,7 +377,11 @@ documents a reasoned alternative:
 9. treat model-generated personal information as unverified until an
    authoritative source or trained reviewer confirms it; and
 10. connect privacy complaints and breaches to the incident-response plan,
-    provider notification and affected-person communication.
+    provider notification and affected-person communication; and
+11. before enabling authenticated Web use, approve or remediate literal
+    `audit_access_log` network-address storage and durable-history retention of
+    raw managed blobs; record inability to meet the destruction schedule as a
+    privacy risk rather than an implemented control.
 
 ### 12.1 Deployment record — recommendation response
 

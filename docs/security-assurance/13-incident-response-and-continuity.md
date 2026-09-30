@@ -1,7 +1,7 @@
 # 13 — Incident response and continuity
 
 **Status:** generic response and continuity method complete; deployment records
-open · **Reviewed against:** `release/0.8.1` @ `49c184508` (2026-09-30) ·
+open · **Reviewed against:** `release/0.8.1` @ `eee4bb941` (2026-10-01) ·
 **Owner:** ELSPETH maintainer
 
 This document defines the reusable security-incident and continuity method for
@@ -353,7 +353,57 @@ Make and retain a decision even when the outcome is “notification not
 required.” Reassess whenever scope, affected data, affected people or impact
 changes.
 
-### 7.1 Deployment record — obligations and decision
+### 7.1 Australian Notifiable Data Breaches decision path — when applicable
+
+Use this path only where the deployment's obligation register establishes that
+the entity and affected information are subject to the Australian NDB scheme.
+Other Australian, state, territory, contractual and overseas duties remain
+separate. This procedure follows the OAIC's
+[quick reference guide for responding to data breaches](https://www.oaic.gov.au/privacy/notifiable-data-breaches/quick-reference-guide-for-responding-to-data-breaches)
+and detailed
+[NDB scheme guidance](https://www.oaic.gov.au/privacy/notifiable-data-breaches/preventing-preparing-for-and-responding-to-data-breaches/data-breach-preparation-and-response/part-4-notifiable-data-breach-ndb-scheme)
+[EV-814].
+
+1. **Trigger and clock.** When the entity becomes aware of reasonable grounds
+   to suspect that there may have been an eligible data breach, record the
+   grounds and awareness date/time, assign the assessment owner, and promptly
+   start a reasonable and expeditious assessment. Do not wait for certainty,
+   completed forensics, a board meeting or a later incident phase.
+2. **Assessment target.** Take all reasonable steps to complete the assessment
+   within 30 calendar days after the day of awareness. Treat 30 days as the
+   maximum wherever possible and aim to finish sooner. If completion in that
+   period is not reasonable, record the steps taken, reason for delay,
+   remaining questions, owners and dated completion plan; continue without
+   pause.
+3. **Eligibility test.** Record a supported yes/no/unknown answer for each
+   element: (a) personal information held by the entity was subject to
+   unauthorised access or disclosure, or was lost in circumstances likely to
+   result in unauthorised access or disclosure; (b) a reasonable person in the
+   entity's position would regard serious harm to one or more individuals as
+   likely—more probable than not—after a holistic assessment; and (c) remedial
+   action has not prevented that likely risk. Consider the information and
+   safeguards, whether safeguards can be overcome, possible recipients and
+   their intent/capability, affected cohorts, and serious physical,
+   psychological, emotional, financial or reputational harm.
+4. **Remedial-action branch.** Contain and remediate at any time, then
+   re-evaluate likely serious harm. If action prevents the likely risk for all
+   individuals—or, for lost information, prevents unauthorised access or
+   disclosure—record why the incident is not eligible for NDB notification
+   and continue other reporting, review and corrective action. If only some
+   people are protected, continue the eligibility and notification path for
+   the remainder.
+5. **Transition without delay.** As soon as there are reasonable grounds to
+   believe an eligible breach occurred, whether before, during or at the end
+   of assessment, move immediately to notification; do not wait for the
+   30-day target. Record any statutory exception and whether it leaves a
+   partial duty. Unless an exception applies, as soon as practicable give the
+   OAIC a statement and notify the individuals at risk of serious harm. The
+   statement identifies the entity/contact, describes the breach and kinds of
+   information, and recommends practical steps. If neither direct-notification
+   option is practicable, publish the statement and take reasonable steps to
+   publicise its contents.
+
+### 7.2 Deployment record — obligations, assessment and decision
 
 | Field | Deployment or incident value |
 |---|---|
@@ -365,6 +415,12 @@ changes.
 | Decision time and facts available at that time | DEPLOYMENT-TODO: |
 | Affected data, classification, people, services and jurisdictions | DEPLOYMENT-TODO: controlled copy only |
 | Applicability decision and rationale for each obligation | DEPLOYMENT-TODO: controlled copy only |
+| NDB suspicion grounds, awareness date/time, assessment owner and 30-calendar-day target | DEPLOYMENT-TODO: controlled copy only |
+| Assessment start/status/completion, reasonable steps and any delay rationale | DEPLOYMENT-TODO: controlled copy only |
+| Eligibility limbs, facts, affected cohorts and serious-harm rationale | DEPLOYMENT-TODO: controlled copy only |
+| Remedial action, verification and cohort-specific effect on likely harm | DEPLOYMENT-TODO: controlled copy only |
+| Reasonable-grounds-to-believe time, exception decision and notification population | DEPLOYMENT-TODO: controlled copy only |
+| OAIC statement fields/version/time and individual notification or publication evidence | DEPLOYMENT-TODO: controlled copy only |
 | Notification approver, content version and legal/communications review | DEPLOYMENT-TODO: controlled copy only |
 | Recipient, transmission time and delivery evidence | DEPLOYMENT-TODO: controlled copy only |
 | Follow-up, correction or continuing-update commitment | DEPLOYMENT-TODO: controlled copy only |
