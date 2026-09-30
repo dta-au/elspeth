@@ -165,6 +165,7 @@ class LLMConfig(TransformDataConfig):
     image_inputs: list[ImageInputConfig] | None = Field(
         None,
         min_length=1,
+        max_length=20,
         description="Row columns to resolve as image message parts (absent = text-only)",
         json_schema_extra={"composer_tier": "advanced"},
     )
@@ -405,10 +406,16 @@ class LLMConfig(TransformDataConfig):
         """
         if self.image_inputs is None:
             return self
-        names = [spec.field for spec in self.image_inputs]
-        duplicates = sorted({name for name in names if names.count(name) > 1})
+        names: set[str] = set()
+        duplicates: set[str] = set()
+        for spec in self.image_inputs:
+            if spec.field in names:
+                duplicates.add(spec.field)
+            names.add(spec.field)
         if duplicates:
-            raise ValueError(f"Duplicate image_inputs field names: {duplicates}. Each entry's field must be unique")
+            raise ValueError(
+                f"Duplicate image_inputs field names: {sorted(duplicates)}. Each entry's field must be unique"
+            )
         return self
 
     def _field_extraction_templates(self) -> tuple[tuple[str, str], ...]:
