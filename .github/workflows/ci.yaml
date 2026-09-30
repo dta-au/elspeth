@@ -1040,9 +1040,9 @@ jobs:
           exit-code: "1"
 
       - name: Allocate isolated gateway qualification ports and credentials
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}/gateway
         run: |
-          uv run --project gateway --frozen --extra test --no-default-groups python - <<'PY'
+          uv run --frozen --extra test --no-default-groups python - <<'PY'
           import os
           from pathlib import Path
 
@@ -1065,10 +1065,10 @@ jobs:
           PY
 
       - name: Start deterministic gateway qualification backends
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}/gateway
         run: |
           set -euo pipefail
-          uv run --project gateway --frozen --extra test --no-default-groups \
+          uv run --frozen --extra test --no-default-groups \
             python -m mock.backends \
             --oauth-port "$GATEWAY_OAUTH_PORT" \
             --upstream-port "$GATEWAY_UPSTREAM_PORT" \

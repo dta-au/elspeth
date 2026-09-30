@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +125,51 @@ def test_required_ci_audits_and_qualifies_the_standalone_gateway() -> None:
     aggregate_run = _step(aggregate, "Check all jobs passed")["run"]
     assert "needs.gateway.result" in aggregate_run
     assert '!= "success"' in aggregate_run
+
+
+def test_gateway_qualification_helpers_run_from_gateway_package() -> None:
+    gateway = _yaml(CI_WORKFLOW)["jobs"]["gateway"]
+    expected_working_directory = "${{ env.CI_CHECKOUT_PATH }}/gateway"
+
+    credentials = _step(gateway, "Allocate isolated gateway qualification ports and credentials")
+    assert credentials["working-directory"] == expected_working_directory
+    assert "uv run --frozen --extra test --no-default-groups python" in credentials["run"]
+    assert "--project gateway" not in credentials["run"]
+    assert "from mock.stack import" in credentials["run"]
+
+    backends = _step(gateway, "Start deterministic gateway qualification backends")
+    assert backends["working-directory"] == expected_working_directory
+    assert "uv run --frozen --extra test --no-default-groups" in backends["run"]
+    assert "--project gateway" not in backends["run"]
+    assert "python -m mock.backends" in backends["run"]
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    helper_commands = (
+        [sys.executable, "-c", "from mock.stack import MOCK_CLIENT_ID"],
+        [sys.executable, "-m", "mock.backends", "--help"],
+    )
+    for command in helper_commands:
+        old_directory = subprocess.run(
+            command,
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+        assert old_directory.returncode != 0
+        assert "No module named 'mock'" in old_directory.stderr
+
+        repaired_directory = subprocess.run(
+            command,
+            cwd=GATEWAY,
+            check=False,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+        assert repaired_directory.returncode == 0, repaired_directory.stderr
 
 
 def test_root_audit_ignore_set_contains_only_current_chromadb_exceptions() -> None:
