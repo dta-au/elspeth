@@ -77,3 +77,15 @@ exit 0, 101 passed, 10 skipped in 3.8 minutes. SHA256 checks of all three change
 browser-test files matched before and after the run. The Python production tree
 is unchanged from the successful frozen gate above. Remote CI on the published
 commit remains the final acceptance check.
+
+## Incremental Moment dependency review
+
+**GO; no actionable findings.** Astra reviewed the root [lockfile](../../package-lock.json) change against `2ac9bd0ec46a538676bb2f066f732500fe624a2f`. Parsed comparison confirmed that only Moment's version, registry URL, and integrity value changed, selecting 2.31.0 instead of 2.30.1. Both immediate parent ranges (`^2.29.4` in Moment Timezone and Sequelize) accept the new version, and root dependency/engine metadata still matches [package.json](../../package.json). No manifest override is needed for the locked install. The [GitHub-reviewed advisory](https://github.com/advisories/GHSA-4p3w-j4w9-5jqw) names 2.31.0 as the patched version. Structural checks and `git diff --check` passed.
+
+The parent reproduced the advisory with a fresh npm cache (exit 1), then checked
+the repaired lockfile with a separate fresh cache (exit 0, no vulnerabilities).
+A clean `npm ci` exited 0, verifying installation and tarball integrity. All
+nine real Azurite blob source and sink tests passed with exit 0; Moment Timezone
+UTC conversion and Sequelize import checks also passed. Python source and the
+frontend dependency tree are unchanged. Remote required checks on the final
+published commit remain the acceptance boundary.
