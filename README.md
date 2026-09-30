@@ -92,9 +92,10 @@ describe what is exported and how to configure it.
 ## What changed in 0.8.1
 
 This release changes recovery and audit storage. For SQLite installations,
-the cutover is from session epoch 53 to 71 and Landscape epoch 38 to 48;
-archive or export evidence you need, stop the old service, recreate both stale
-databases in the same service-stop window, and install 0.8.1. See the
+the cutover is from session epoch 53 to 71 and Landscape epoch 38 to 49;
+ELSPETH does not migrate either store in place. Archive or export evidence you
+need, stop the old service, recreate both stale databases in the same service-stop
+window, and install 0.8.1. See the
 [release notes](CHANGELOG.md) and [deployment runbooks](docs/runbooks/index.md)
 before upgrading.
 

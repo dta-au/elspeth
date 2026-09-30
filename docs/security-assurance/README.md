@@ -1,7 +1,7 @@
 # Security assurance pack
 
 **Product baseline:** reviewed · **Reviewed against:** `release/0.8.1` @
-`49c184508` (2026-09-30) · **Deployment template:** ready · **Deployment
+`352430f4f` (2026-09-30) · **Deployment template:** ready · **Deployment
 record:** unpopulated by design · **Owner:** ELSPETH maintainer
 
 This folder is ELSPETH's public, reusable security-assurance baseline. It

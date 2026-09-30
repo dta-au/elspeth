@@ -2,7 +2,7 @@
 
 **Status:** public schema complete — populated register held in the controlled
 deployment copy · **Reviewed against:** `release/0.8.1` @
-`49c1845085d36811b120ef1c540048463e32aabc` (2026-09-30) · **Owner:**
+`352430f4f659704d50efffc5dfca967ae9b73ebb` (2026-09-30) · **Owner:**
 ELSPETH maintainer
 
 > **Do not populate this file in the public repository.** Open risks,
@@ -140,6 +140,18 @@ assuming that silence means there were no findings:
 9. Incidents, near misses, provider advisories, architecture reviews,
    readiness failures and deployment drift that change likelihood,
    consequence or control effectiveness.
+
+### 5.1 Public submission-item dispositions at the reviewed baseline
+
+These are assurance-scope dispositions, not populated deployment risks or
+risk acceptances. A controlled deployment copy reopens an item if its actual
+scope or evidence differs.
+
+| Assessment item | Disposition | Evidence and scope condition |
+|---|---|---|
+| Configured pending-identity retention had no production invocation path | Closed at the reviewed product baseline | Admin-only explicit purge applies configured retention, returns and audits the exact bounded deletion result, and has unit and PostgreSQL contention evidence [EV-812] |
+| Active identities could author or run without the intended `user` role | Closed at the reviewed product baseline | Live same-provider human unscoped `user` authority is required at owner workload routes and re-proved at chargeable and ticket boundaries; reserved roles remain non-authorising [EV-104] |
+| Unattended machine-to-Web-API access | Resolved by explicit 0.8.1 assessed-use-case exclusion | `service` remains reserved and unimplemented. No service credential is claimed, and a human bearer token is not a service credential. A future in-scope machine integration requires a new control and risk assessment [EV-104] |
 
 De-duplicate only after import. A duplicate disposition must name the
 canonical risk ID and preserve every source reference. A finding assigned to

@@ -2,7 +2,7 @@
 
 **Status:** product threat model and method complete; deployment decisions and
 risk acceptance open · **Reviewed against:**
-`release/0.8.1` @ `49c1845085d36811b120ef1c540048463e32aabc`
+`release/0.8.1` @ `352430f4f659704d50efffc5dfca967ae9b73ebb`
 (2026-09-30) · **Owner:** ELSPETH maintainer
 
 Identifies what is worth protecting, who controls each input, where an
@@ -141,6 +141,10 @@ controls on this channel are in [09](09-secure-development-lifecycle.md) and
   where required; ELSPETH does not read IdP group or role claims
   ([06 § 1.1](06-identity-and-access.md#11-providers)).
 - Operators hold the keys in § 2 and do not expose them to users.
+- Unattended machine-to-Web-API access is excluded from the 0.8.1 assessed
+  use case. The reserved `service` identity kind has no credential or
+  service-authenticated route, and a human bearer token is not treated as a
+  service credential [EV-104].
 - If every web user is a trusted operator, pipeline misuse is mainly
   operational risk. If users are separated tenants, the boundaries between
   what a user configures and what the runtime does become high-value
@@ -149,7 +153,7 @@ controls on this channel are in [09](09-secure-development-lifecycle.md) and
 ## 4. Attack surfaces and controls
 
 Each subsection lists the attacker's goal, the controls in place at
-`49c1845085d36811b120ef1c540048463e32aabc`, and where residual risk is
+`352430f4f659704d50efffc5dfca967ae9b73ebb`, and where residual risk is
 recorded. Evidence IDs refer to
 [16](16-evidence-index.md).
 
@@ -172,9 +176,10 @@ Controls:
   user takes effect on their next request
   ([06 § 1.4](06-identity-and-access.md#14-session-tokens)) [EV-102].
 - The run-progress WebSocket accepts only a single-use, short-lived ticket
-  bound to the run and user, minted after an ownership check; a session token
-  in the WebSocket URL is refused (`src/elspeth/web/execution/routes.py`)
-  [EV-401].
+  bound to the run and user. Ticket issue and consumption re-check an active
+  human identity for the authenticated configured provider, ownership and a
+  live unscoped `user` grant; a session token in the WebSocket URL is refused
+  (`src/elspeth/web/execution/routes.py`) [EV-104] [EV-401].
 - Sign-in, registration and SSO routes are rate-limited per client, and
   failed attempts are audited in `auth_events`
   ([06 § 1.5](06-identity-and-access.md#15-sign-in-rate-limiting)) [EV-106].
@@ -200,9 +205,15 @@ Controls:
 - State, run and blob identifiers resolve only inside their own session;
   blob inputs are pinned to the owning session and content hash when a run
   is admitted.
-- Seven roles, re-read per request and re-checked inside each mutating
-  transaction; a caller without the role gets 404
-  ([06 § 2.2](06-identity-and-access.md#22-roles)) [EV-107] [EV-108].
+- Seven roles are re-read rather than trusted from the bearer token. Owner
+  authoring and workload routes require an active human identity for the
+  authenticated configured provider and a live, unrevoked, unexpired,
+  unscoped `user`
+  grant. Chargeable run admission and WebSocket ticket issue/consumption
+  re-prove that authority at their durable boundaries. Reserved `auditor` and
+  `oversight` grants remain non-authorising
+  ([06 § 2.2](06-identity-and-access.md#22-roles)) [EV-104] [EV-107]
+  [EV-108].
 - With workflow governance on: a run needs an approval bound to the exact
   frozen composition; the author cannot approve, the requester cannot
   review, the publisher cannot curate; cross-user inspection is limited to
@@ -495,7 +506,7 @@ controlled register.
 | T-005 | S | Credential stuffing against local accounts | 4.1 | Identities (C, I) | Rate limit, bcrypt, uniform failure and audit | Residual | High — success compromises an account | `R-002` |
 | T-006 | S, E | Self-registration by unintended users | 4.1 | Identities and deployment boundary (I) | `registration_mode` and admission states | Deployment | Medium — impact depends on admission and tenancy decisions | `R-003` if applicable |
 | T-007 | I, E | Reading another user's session, run, blob or secret | 4.2 | User data and secrets (C) | Ownership checks, uniform 404 and scoped identifiers | Controlled | Critical — the path crosses a user confidentiality boundary | — |
-| T-008 | S, E | Acting with a role not held | 4.2 | Authorisation and configuration (I) | Live role checks in the request and mutation transaction | Controlled | Critical — privileged actions may affect system-wide controls | — |
+| T-008 | S, E | Acting with a role not held | 4.2 | Authorisation and configuration (I) | Live role checks at request entry and at durable chargeable, ticket and mutation boundaries; reserved roles confer no implicit authority | Controlled | Critical — privileged actions may affect system-wide controls | — |
 | T-009 | T, R, E | Author approving their own run | 4.2 | Composition and approval records (I) | Governance separation of duties | Deployment | High — approval provenance and workflow integrity fail | `R-004` if applicable |
 | T-010 | T, I, E | Prompt injection causing unsafe but authorised egress | 4.3 | Pipeline data and composition (C, I) | Operator profiles, plugin policy, required controls and declared-field templates | Residual | Medium — authorised connectors can disclose data to an unintended public destination | `R-005` |
 | T-011 | T, E | Malformed or invented tool arguments reaching handlers | 4.3 | Composition and configuration (I) | Server-side closed-schema validation | Controlled | High — unvalidated arguments could cross the planner/server authority boundary | — |

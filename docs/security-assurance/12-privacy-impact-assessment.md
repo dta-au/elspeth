@@ -1,7 +1,7 @@
 # 12 — Privacy impact assessment
 
 **Status:** reusable product assessment complete; deployment record open ·
-**Reviewed against:** `release/0.8.1` @ `49c184508` (2026-09-30) ·
+**Reviewed against:** `release/0.8.1` @ `352430f4f` (2026-09-30) ·
 **Owner:** ELSPETH maintainer
 
 This document supplies a reusable privacy impact assessment (PIA) method and
@@ -108,7 +108,7 @@ record is personal information.
 
 | Data category | Collection or source | Purpose | Product store | Possible recipients / flows | Product retention or deletion mechanics | Personal-information potential |
 |---|---|---|---|---|---|---|
-| Web identity and profile | Verified local or SSO identity | Authentication, admission, attribution and administration | Sessions `identities` | Authorised administrators; audit projections | Identity is disabled or retired rather than erased when it anchors history; lifecycle fields remain | Necessarily personal in authenticated Web use [EV-806] |
+| Web identity and profile | Verified local or SSO identity | Authentication, admission, attribution and administration | Sessions `identities` | Authorised administrators; audit projections | Activated, disabled and retired identities remain to anchor history; a stale never-activated pending identity can be explicitly purged under configured retention | Necessarily personal in authenticated Web use [EV-806] [EV-812] |
 | Bounded active-identity claims snapshot | Verified IdP claims at activation | Forensics and identity binding | Sessions `identities.raw_claims_json` | Restricted administrative/audit access | Kept with the identity record; IdP-provided membership and role attributes are outside the owned claims boundary | Personal; may include deployment-dependent profile attributes [EV-806] |
 | Local credentials | User/admin input and generated reset material | Local authentication | Separate `auth.db` | Authentication and authorised credential administrators | Credential deletion is separate from identity retirement; deployment backups may retain copies | Personal and security-sensitive |
 | Roles and oversight relationships | Administrators and governance workflow | Authorisation, review and accountability | Sessions identity role and relationship tables | Authorised administrators, reviewers and audit | Role grants are retained and revoked rather than deleted so history remains readable | Personal employment/authority information |
@@ -245,7 +245,8 @@ single period.
 | Payload-store bodies | Eligible after `payload_store_retention_days`, default 90 days | Explicit `elspeth purge`; not an automatic timer | Expired payload blobs are removed | Landscape metadata and hashes remain; explain reports content unavailable | Purge must be operated and does not remove external, export or backup copies [EV-809] |
 | Landscape audit records | Run, call, row, token, auth and effect events | No product-wide automatic expiry | Payload references can become unavailable after purge; audit metadata remains | Identity, timing, hashes, status and other audit fields | Correction/deletion can conflict with audit integrity and records obligations; deployment decision required |
 | Composer sessions and transcripts | Session archive request | Database decision under session fence | Durable-history session is soft-archived and retains transcript; no-durable session can be physically deleted | Durable authoring, usage, run, review and approval evidence remains after soft archive | Transcript content is immutable while the session exists [EV-808] |
-| Identity, role and relationship records | Administrative lifecycle actions | Disable/retire/revoke operations | Identities are retained to anchor audit; role history is revoked rather than deleted | Identity and authority history | `identity_pending_retention_days` defaults to 90 but is validation-only at this baseline; no runtime purge enforces it [EV-812] |
+| Activated/retired identity, role and relationship records | Administrative lifecycle actions | Disable/retire/revoke operations | Activated, disabled and retired identities are retained to anchor audit; role history is revoked rather than deleted | Identity and authority history | Audit and authority history remains subject to the deployment's records and privacy decision [EV-113] |
+| Never-activated pending identities | `identity_pending_retention_days`, default 90 days | Explicit admin-only `POST /api/auth/admin/identities/purge-pending`; not an automatic timer | Deletes rows strictly older than the database-clock cutoff, at most 200 per call | Bounded summary and one attributable Landscape event per deleted identity; response returns exact IDs and `has_more` | Does not remove provider, export, log or backup copies; activated, disabled and dormancy-re-pended identities are ineligible [EV-812] |
 | Local credentials | Administrative credential lifecycle | Authorised credential administration | Credential can be deleted separately; a bound identity is retired and its audit history remains | Identity/audit history and deployment backups | Removing a credential does not erase other stores |
 | Managed blobs and session files | User/author actions and session lifecycle | Coordinated blob/session operations | Update/delete and physical session deletion paths exist; durable-history archive can retain related evidence | Custody, proposal and audit evidence according to operation | Immediate `create_blob`, exports and backups require separate handling |
 | Logs and telemetry | Deployment logging configuration | Deployment/logging platform | Platform-specific expiry or deletion | Aggregates or archives may remain | Higher granularity can create content copies outside product purge |
@@ -324,8 +325,9 @@ documents a reasoned alternative:
    abuse-monitoring, retention and deletion terms;
 3. keep content-rich tracing and telemetry disabled until its purpose,
    recipients, access and retention have been assessed;
-4. configure and operate payload purge, session archive, log expiry, provider
-   deletion and backup disposal as separate controls;
+4. configure and operate payload purge, pending-identity purge, session
+   archive, log expiry, provider deletion and backup disposal as separate
+   controls;
 5. restrict administrative, audit, MCP, export and share-link access and review
    it periodically;
 6. provide collection/privacy notices in the Web/IdP workflow and at indirect

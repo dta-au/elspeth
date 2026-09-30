@@ -2,7 +2,7 @@
 
 **Status:** generic product records, controls and response guidance complete;
 deployment records remain open ·
-**Reviewed against:** `release/0.8.1` @ `49c1845085d36811b120ef1c540048463e32aabc`
+**Reviewed against:** `release/0.8.1` @ `352430f4f659704d50efffc5dfca967ae9b73ebb`
 (2026-09-30) · **Owner:** ELSPETH maintainer
 
 Describes what ELSPETH records, how the record is protected from tampering,
@@ -56,15 +56,15 @@ and the audit-write flow in
 | External calls (LLM, HTTP) | Landscape: `calls`, `operations`, `call_verifications` | Call type, status, request and response hashes and payload references, latency, token counts, error, exactly one parent (node state or operation) | MCP `get_calls`, `get_llm_usage_report`; [guarantees § 4.1](../release/guarantees.md#41-call-recording) |
 | Authentication success / failure | Landscape: `auth_events` | Event type, outcome, provider, principal, failure category, request id, client host, user agent, metadata (§ 1.3) | `SELECT event_type, outcome, failure_category, occurred_at FROM auth_events WHERE username = :u ORDER BY occurred_at` |
 | Session mutation | Sessions database: `composition_states`, `chat_messages`, `session_operation_receipts` and `_events`, `proposal_events` (§ 1.4) | Session owner, writer principal, version and provenance, request and result hashes | [Tier-1 runbook triage queries](../runbooks/audit-tier1-violation.md#triage-queries) |
-| Administrative actions | Landscape: `auth_events` (identity, role, relationship, quota and workflow-governance events) | Actor identity, target identity, role and scope, note, `on_behalf_of`, `console_request_id` | `SELECT * FROM auth_events WHERE event_type IN ('role_granted','role_revoked','identity_disabled')` |
+| Administrative actions | Landscape: `auth_events` (identity, role, relationship, quota, pending-identity purge and workflow-governance events) | Actor identity, target identity, role and scope, note, `on_behalf_of`, `console_request_id`; purge summary fields and exact deleted identity IDs | `SELECT * FROM auth_events WHERE event_type IN ('role_granted','role_revoked','identity_disabled','pending_identities_purged')` |
 | Secret resolution (fingerprint only) | Landscape: `secret_resolutions` | Run, source, vault URL, secret name, keyed fingerprint (64 lower-case hex), latency; never the value (§ 1.5) | MCP `query` on `secret_resolutions` by `run_id` |
 | Application errors | Pipeline: Landscape `validation_errors`, `transform_errors`, `node_states.error_json`. Web: structured log events keyed by request id | Error class and reason; for web, the `X-Request-ID` every response carries | [Tier-1 runbook § Correlating a reported error](../runbooks/audit-tier1-violation.md#correlating-a-reported-error-to-its-server-log) |
 
 ### 1.2 Landscape inventory
 
-Measured at `49c1845085d36811b120ef1c540048463e32aabc` from the live SQLAlchemy metadata
+Measured at `352430f4f659704d50efffc5dfca967ae9b73ebb` from the live SQLAlchemy metadata
 (`elspeth.core.landscape.schema.metadata`): **49 tables**, schema epoch
-**48**, 150 CHECK constraints and 107 foreign keys (65 of them composite,
+**49**, 150 CHECK constraints and 107 foreign keys (65 of them composite,
 so a record cannot bind to evidence from another run) [EV-301].
 
 | Purpose | Tables |
@@ -140,7 +140,7 @@ PY
 Expected output at the reviewed commit:
 
 ```text
-schema_epoch 48
+schema_epoch 49
 tables 49
 check_constraints 150
 foreign_keys 107
@@ -159,7 +159,7 @@ recorded in `run_coordination_events` (§ 2.5).
 
 `auth_events` is a closed vocabulary. The `AuthAuditEventType` literal in
 `src/elspeth/contracts/auth.py` and the database CHECK constraint
-`ck_auth_events_event_type` both list the same **23 event types**; a write
+`ck_auth_events_event_type` both list the same **24 event types**; a write
 with any other value is refused by the database, so an unlisted event cannot
 be recorded by mistake [EV-302].
 
@@ -169,6 +169,7 @@ be recorded by mistake [EV-302].
 | Admission and authority | `identity_activated`, `identity_disabled`, `identity_enabled`, `role_granted`, `role_revoked`, `relationship_asserted`, `relationship_revoked` |
 | Workflow governance | `approval_requested`, `approval_decided`, `review_requested`, `review_request_cancelled`, `review_attested`, `library_published`, `library_accepted`, `library_rejected`, `library_deprecated`, `library_recalled` |
 | Quotas | `quota_set`, `quota_exceeded` |
+| Identity lifecycle maintenance | `pending_identities_purged` |
 
 Each row carries `outcome` (`success` or `failure`), `provider` (one of the
 five sign-in providers), the principal (`user_id`, `username` and the durable
@@ -205,14 +206,19 @@ How the product records them at the reviewed commit [EV-303] [EV-304]
   handler runs, without writing an `auth_events` row or incrementing the
   suppression counter (`src/elspeth/web/auth/routes.py`).
 - **Administrative mutations** (activation, disable, enable, role and
-  relationship changes, quota changes) synchronously write the Landscape
+  relationship changes, quota changes and pending-identity purge)
+  synchronously write the Landscape
   audit row before the Sessions transaction commits. If the Landscape write
   fails, the exception rolls back the Sessions mutation. The two databases
   use separate engines and transactions; ELSPETH does not claim a distributed
   transaction, so a later Sessions commit failure can leave an audit event for
   a mutation that did not commit
   (`src/elspeth/web/coordination/identity_authority.py`,
-  `src/elspeth/web/auth/audit.py`). Each event carries the acting identity,
+  `src/elspeth/web/auth/audit.py`). Pending purge submits one bounded summary
+  containing the batch ID, configured retention, deleted count, exact deleted
+  IDs and `has_more`, plus one event naming each exact `DELETE … RETURNING`
+  identity, as a single Landscape batch before Sessions commit [EV-812]. Each
+  event carries the acting identity,
   and `on_behalf_of` and `console_request_id` so that a change made through a
   service identity names the person who asked.
 - A disabled identity is kept, not deleted, so it keeps anchoring its audit
@@ -747,7 +753,7 @@ dashboards, a monitoring backend or alert routing.
 | `prometheus_scrape_forbidden_tenant_labels` | The scrape contained `run_id`, `session_id` or `user_id`; the endpoint withheld the entire body | Treat this as a telemetry data-boundary incident, identify the instrument that added the label, and keep the scrape disabled until the label is removed |
 | `TelemetryExporterError`, repeated `ALL telemetry exporters failing`, or an AWS collector-health signal | Telemetry delivery is unavailable or losing events; the Landscape remains authoritative for completed audit writes | Check endpoint reachability, credentials and exporter service status using [Telemetry guide — All Exporters Failing](../guides/telemetry.md#all-exporters-failing). Determine from configuration whether flush must fail the run or disable telemetry |
 | Authentication failures or `auth_failure_audit_suppressed_total` increase | Authentication is being refused; suppression means the per-client write cap skipped bearer-failure audit writes. Endpoint rate-limit rejection is a separate signal and leaves no `auth_events` row | Query `auth_events` by category, principal and request id, then correlate endpoint 429 responses separately; distinguish access-state, token, provider, rate-limit and credential failures before responding ([06](06-identity-and-access.md)) |
-| Administrative event | An identity, role, relationship, quota or workflow-governance mutation was attempted | Review actor, target, outcome, `on_behalf_of` and `console_request_id`; investigate an unrecognised event through the [incident-response runbook](../runbooks/incident-response.md) |
+| Administrative event | An identity, role, relationship, quota, pending-identity purge or workflow-governance mutation was attempted | Review actor, target, outcome, `on_behalf_of` and `console_request_id`; for purge, reconcile the bounded summary, exact per-identity rows and `has_more`; investigate an unrecognised event through the [incident-response runbook](../runbooks/incident-response.md) |
 | Audited run or external-call failure | A run ended uncleanly or an external call failed | Diagnose from Landscape or the read-only MCP tools, then follow the relevant pipeline section of the [incident-response runbook](../runbooks/incident-response.md) |
 | Database audit reports a direct audit-table write, trigger change or schema change | A privileged database action may have bypassed application controls | Preserve database and platform audit evidence; follow [Database maintenance](../runbooks/database-maintenance.md) and the [incident-response runbook](../runbooks/incident-response.md) |
 

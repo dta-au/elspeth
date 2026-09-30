@@ -1,7 +1,7 @@
 # 00 — Assurance-pack lifecycle and completion plan
 
 **Status:** maintained lifecycle guide · **Product baseline reviewed against:**
-`release/0.8.1` @ `49c184508` (2026-09-30) · **Owner:** ELSPETH
+`release/0.8.1` @ `352430f4f` (2026-09-30) · **Owner:** ELSPETH
 maintainer
 
 This document defines how to maintain the reusable ELSPETH security-assurance
@@ -218,21 +218,23 @@ authorised, time-bounded acceptance:
    retain every historical signer key for the evidence-retention period and
    exercise `elspeth audit-export verify` against the delivered artifact
    [EV-316].
-2. **Retention automation.** Payload purge is an explicit operator action,
-   audit metadata has no product-wide automatic expiry, and the pending-
-   identity purge authority has no production caller. Define, operate and
-   evidence the required purge, archive, legal-hold and deletion jobs; fix the
-   missing automation where policy requires product enforcement [EV-325]
-   [EV-326] [EV-812].
+2. **Retention automation.** Payload purge and the admin-only pending-identity
+   purge are explicit operator actions; neither is an automatic timer, and
+   audit metadata has no product-wide automatic expiry. Define, operate and
+   evidence the required purge, archive, legal-hold and deletion jobs. The
+   pending-identity operation applies configured retention in bounded batches
+   and records its exact result [EV-325] [EV-326] [EV-812].
 3. **Backup and whole-deployment recovery.** The supplied runbook does not
    schedule backups, prove that they ran, provide atomic cross-store recovery,
    or cover every store, secret and external effect. Build the deployment's
    complete backup design and pass a restore exercise against the assessed
    architecture [EV-007] [EV-804].
-4. **Non-browser Web API identity.** The reviewed Web API has no implemented
-   service credential. If the assessed use case requires machine access to the
-   Web API, implement and assess that capability or redesign the integration;
-   do not represent a human bearer token as a service identity. See
+4. **Non-browser Web API identity.** Unattended machine-to-Web-API access is
+   outside the 0.8.1 assessed use case. The `service` identity discriminator
+   is reserved, and the reviewed Web API has no service credential or
+   service-authenticated route. A future assessed use case that requires this
+   access must implement and assess a separate credential and authorisation
+   contract; a human bearer token is not a service credential. See
    [06 § 5.1](06-identity-and-access.md#51-inside-the-application).
 5. **Independent testing.** The product repository contains no completed
    independent penetration-test record. Obtain one for the assessed release
@@ -257,17 +259,22 @@ change with regression evidence, or an explicit decision that the affected
 capability is outside the submitted scope. Where the capability remains in
 scope, an assessor or accepting authority may make the item release-blocking.
 
+The two High IAM findings from the preceding baseline are resolved at the
+reviewed commit: the configured pending-identity retention now has an explicit
+admin-only purge operation [EV-812], and Web workload admission now requires a
+live unscoped `user` grant at request and durable chargeable boundaries
+[EV-104]. Unattended machine-to-Web-API access is resolved for this assessment
+by its explicit 0.8.1 scope exclusion; this disposition does not claim a
+service-identity feature.
+
 The additional judge lint and quality workflow is intentionally advisory and
 outside the standard enforcement package. Its absence from branch protection
 is therefore not a defect and is not included in this backlog [EV-611].
 
 | Priority | Confirmed gap | Required engineering outcome | Submission effect |
 |---|---|---|---|
-| High | `identity_pending_retention_days` is validated, and a purge authority exists, but no production caller invokes it [EV-812]. | Add a supported scheduled or operator-invoked purge path with authority checks, audit evidence and lifecycle tests, or remove the setting and state that pending identities are retained until explicit administration. | Blocking when the submission claims that pending identities are automatically deleted after the configured period or when that deletion is required by the approved privacy schedule. |
 | High | The optional gateway resolves ranged dependencies during each image build; it has no lockfile and is outside the root dependency audit and Dependabot coverage [EV-722]. | Add a reproducible lock/update path, dependency and image audit, SBOM/provenance coverage and CI enforcement for the gateway artifact. | Blocking when the gateway is part of the assessed deployment or supplied as an approved product artifact. Otherwise exclude it explicitly and require the deployer to build, scan and pin its own image. |
-| High | Web authoring and run admission use active identity state rather than requiring the intended `user` role; `auditor` and `oversight` role grants add no route authority at this baseline [EV-104]. | Decide and enforce one coherent authorisation contract. If `user` is the author/run permission, add live route and mutation checks with negative tests. Keep reserved roles non-authorising until their permitted read surfaces and tests exist. | Blocking when the SoA or deployment design claims role-based least privilege for authoring/running, or claims implemented auditor/oversight access. Otherwise record the active-identity authority model and accept its residual risk. |
 | Medium | Secret-reference enforcement, fingerprinting and export evidence cover managed references and recognised credential-bearing fields, not arbitrary text or unrecognised options [EV-208] [EV-215]. Universal sink-output redaction is not provided [EV-002]. | Either add a defined, tested data-loss-prevention boundary for the additional inputs and outputs in scope, or constrain authoring, provider and sink use so the field-scoped control is sufficient. Do not restore a universal “secrets never enter state or output” claim without corresponding enforcement. | Blocking only when the selected control baseline requires technical prevention across arbitrary user content or every sink. In all other cases retain `R-008`, user guidance and destination-specific controls. |
-| Medium | The Web identity model reserves a `service` kind, but the Web API has no non-browser service credential and refuses service pre-provisioning [EV-104]. | If machine-to-Web-API use is required, implement a separately authenticated, least-privilege service identity with issuance, rotation, revocation, audit and route-authorisation tests. Otherwise remove machine access from the assessed use cases. | Blocking only for an architecture that requires unattended Web API access. Human bearer tokens must not be documented as service credentials. |
 | Low | The Python audit command still carries a PyJWT advisory exception that matched no advisory for the locked version at the review date [EV-708]. | Remove the stale exception before the next public release, or retain it only with a fresh advisory match, reachability review, owner and expiry under the documented exception policy. Continue dated review of the Chroma client-only exceptions. | A stale unmatched exception is a release-hygiene defect; any matched exception follows the severity and acceptance policy in [10](10-vulnerability-and-supply-chain.md). |
 
 The independent penetration test may add further software defects. Add each

@@ -1,7 +1,7 @@
 # 06 — Identity and access
 
 **Status:** product control baseline complete; deployment records open ·
-**Reviewed against:** `release/0.8.1` @ `49c1845085d36811b120ef1c540048463e32aabc`
+**Reviewed against:** `release/0.8.1` @ `352430f4f659704d50efffc5dfca967ae9b73ebb`
 (2026-09-30) · **Owner:** ELSPETH maintainer
 
 Describes how users are identified, authenticated and authorised, and how
@@ -149,7 +149,7 @@ in § 7.1.
 Every sign-in, whichever provider, ends with ELSPETH issuing its own session
 token (`src/elspeth/web/auth/session_token.py`) [EV-102].
 
-| Property | Value at `49c1845085d36811b120ef1c540048463e32aabc` |
+| Property | Value at `352430f4f659704d50efffc5dfca967ae9b73ebb` |
 |---|---|
 | Format and algorithm | JWT, HS256 |
 | Signing key | Derived from `secret_key` with HKDF-SHA256 under a purpose-specific label (`src/elspeth/web/key_derivation.py`). Placeholder, undersized (under 32 bytes) and single-repeated-byte keys are refused outside local test hosts ([01 § 7](01-system-overview-and-boundary.md#7-security-relevant-settings--deployment-record)) |
@@ -187,7 +187,7 @@ the server trusts the proxy's forwarded headers — a Deployment record item
 
 Authentication and authority events are written to the `auth_events` table
 in the Landscape (`src/elspeth/core/landscape/schema.py`) [EV-106]. The
-event vocabulary is closed — 23 types, in `AuthAuditEventType`
+event vocabulary is closed — 24 types, in `AuthAuditEventType`
 (`src/elspeth/contracts/auth.py`), backed by a database CHECK constraint —
 so an unknown event type fails the write.
 
@@ -197,7 +197,8 @@ so an unknown event type fails the write.
 | `token_issued` | Any token issued, with how (`login`, `register`, `email_verification`, `refresh`, SSO complete) and its issue and expiry times |
 | `auth_failure` | Any refused authentication, with a failure category, the stage, and the exception class — never the external error text |
 | `logout` | Sign-out |
-| Admission and authority events | § 3.5 |
+| Admission and authority events | § 3.4 |
+| `pending_identities_purged` | One summary and one attributable event for each identity removed by the explicit pending-identity purge (§ 4) |
 
 Each row records the provider, identity, username, request ID, client
 address and user agent. Failure categories separate a bad credential
@@ -257,13 +258,13 @@ revoked by administrators, never deleted, and optionally time-limited
 (`expires_at`). The vocabulary is closed — seven roles in `IdentityRole`,
 backed by a CHECK constraint [EV-107].
 
-| Role | Intended purpose | Enforced at `49c1845085d36811b120ef1c540048463e32aabc` |
+| Role | Intended purpose | Enforced at `352430f4f659704d50efffc5dfca967ae9b73ebb` |
 |---|---|---|
 | `admin` | Deployment operations: identities, roles, approver relationships, quotas | Yes — every identity-administration and quota route (§ 3.1) |
 | `approver` | Decides approval requests; may appoint a curator for someone they directly oversee | Yes, when workflow governance is on (§ 2.5) |
 | `reviewer` | Attests review requests | Yes, when workflow governance is on |
 | `curator` | Accepts, rejects, deprecates and recalls library entries | Yes, when workflow governance is on |
-| `user` | Author and run pipelines; publish to and fork from the library | Library publishing and forking check it when workflow governance is on. Web authoring and running are admitted by `active` identity state and do not require this role; record the deployment's risk decision in § 7.1 [EV-104] |
+| `user` | Author and run pipelines; publish to and fork from the library | Owner workspace, authoring, execution, replay, cancellation, ticket issue and WebSocket consumption require a live unrevoked, unexpired, unscoped grant held by an active human identity for the authenticated configured provider. Chargeable admission and ticket boundaries re-check it transactionally [EV-104] |
 | `auditor` | Reserved for future read-only audit authority | Non-authorising at this commit: recording the role grants no additional route access [EV-104] |
 | `oversight` | Reserved for future oversight authority | Non-authorising at this commit: recording the role grants no additional route access; quota changes require `admin` [EV-104] |
 
@@ -283,11 +284,17 @@ hold which roles; that is the deploying organisation's policy, recorded in
 
 ### 2.3 Enforcement on each request
 
-Every protected route calls the same dependency (`get_current_user`,
-`src/elspeth/web/auth/middleware.py`), which applies the checks in § 1.4.
-Role checks read the role store on each request; they are not cached in the
-token. Identity, role, relationship and quota mutations re-check the actor's
-authority inside the same sessions-database transaction as the change. Local
+Every protected route applies `get_current_user`, directly or through a more
+specific dependency, for the checks in § 1.4. Owner workload routes use
+`require_pipeline_user` (`src/elspeth/web/auth/middleware.py`), which re-reads
+the identity and roles, then requires an active human identity for the
+authenticated configured provider with a live, unrevoked, unexpired,
+deployment-wide `user` grant. Chargeable run admission and WebSocket ticket
+issue and consumption lock and re-check the identity, provider, ownership and `user`
+grant at their durable boundary; their database clock is sampled after the
+authority locks [EV-104]. Role checks are not cached in the token. Identity,
+role, relationship and quota mutations re-check the actor's authority inside
+the same sessions-database transaction as the change. Local
 credential administration is a separate two-store path: it performs a live
 per-request capability check before changing `auth.db`, and account deletion
 uses the fencing and compensation controls in § 3.3. A caller without the
@@ -382,6 +389,7 @@ Separate compartments are separate deployments.
 | Capability | Route | Who |
 |---|---|---|
 | List identities; pre-provision, activate, enable, disable | `/api/auth/admin/identities…` | Live `admin` role |
+| Purge one bounded batch of stale, never-activated pending identities | `POST /api/auth/admin/identities/purge-pending` | Live `admin` role, re-checked inside the purge transaction |
 | Grant and revoke roles | `/api/auth/admin/roles…` | Live `admin` role; an `approver` may grant only `curator`, only to someone they directly oversee, only with governance on |
 | Assert and revoke approver relationships | `/api/auth/admin/relationships…` | Live `admin` role |
 | Directory of people (merged view of identities and local accounts) | `/api/auth/admin/people…` | Either capability below; each source is shown only to its own capability |
@@ -448,16 +456,25 @@ a later credential.
 
 ### 3.4 Recording administrative actions
 
-Every change to identities, roles, relationships and quotas writes its
+Every change to identities, roles, relationships and quotas invokes its
 `auth_events` row (`identity_activated`, `identity_disabled`,
 `identity_enabled`, `role_granted`, `role_revoked`,
-`relationship_asserted`, `relationship_revoked`, `quota_set`) inside the
-same transaction as the change: if the audit write fails, the change does
-not commit. Activation needs a note and disabling needs a reason; both are
-recorded. Each row names the acting identity and carries the
+`relationship_asserted`, `relationship_revoked`, `quota_set`) before the
+Sessions mutation transaction commits: if the separately owned Landscape
+audit write fails, the Sessions change rolls back. Activation needs a note
+and disabling needs a reason; both are recorded. Each row names the acting
+identity and carries the
 `on_behalf_of` and `console_request_id` keys, which are empty when a human
 administrator acts for themselves (`src/elspeth/web/auth/audit.py`,
 `src/elspeth/contracts/auth.py`).
+
+Pending-identity purge writes `pending_identities_purged` synchronously as one
+Landscape batch. The summary contains `batch_id`, configured retention,
+deleted count, exact deleted IDs and `has_more`; each attributable row names
+one deleted identity and the batch. Audit failure rolls back the Sessions
+deletion. The two stores do
+not form a distributed transaction, so the existing audit-before-Sessions-
+commit residual still applies [EV-812].
 
 ### 3.5 Deployment record
 
@@ -482,17 +499,25 @@ administrator acts for themselves (`src/elspeth/web/auth/audit.py`,
 | Re-enable | An administrator re-enables with a note | `identity_enabled` |
 | Subject rebound | If a signed-in SSO subject's verified email differs from the one first seen, the identity is disabled and the sign-in refused, in case the IdP has reissued the subject to someone else | `identity_disabled` (cause `rebound`), `auth_failure` (`sso_identity_rebound`) |
 | Dormancy | At sign-in, an `active` identity whose previous sign-in is older than `identity_dormancy_days` (default 90) is returned to `pending` and must be re-approved. Applies to local and SSO identities; the last active human administrator is exempt | `identity_disabled` (cause `dormant`); for the exempt administrator, the same event type with outcome `failure` |
+| Pending retention purge | An administrator calls `POST /api/auth/admin/identities/purge-pending`; the request cannot override deployment retention | `pending_identities_purged` summary plus one event for each deleted identity |
 | Removal (local) | `elspeth composer users remove USERNAME --reason "…"` or the administrator delete route. The credential is deleted. If a bound identity exists, it is retired: disabled, and its subject rewritten so a later account with the same username gets a new identity rather than inheriting the old one | Operational deletion log in every successful route case; `identity_disabled` (cause `credential_deleted`, with the reason) when a bound identity is retired |
 | Removal (SSO) | Disable in ELSPETH, and remove or disable the person at the IdP | `identity_disabled` |
 
 Activated and retired identity records are not deleted. They anchor the
 person's audit history: sessions, runs and audit events refer to them
 (`src/elspeth/web/coordination/identity_authority.py`) [EV-113] [EV-114].
-The repository also contains `purge_stale_pending_identities`, which can
-delete never-activated `pending` identities after a retention period. No
-runtime path calls that surface in this release;
-`identity_pending_retention_days` is validated configuration only. Record and
-reassess the retention behaviour before wiring the purge into a deployment.
+Never-activated `pending` identities are the narrower exception. A live
+administrator can call `POST /api/auth/admin/identities/purge-pending`; the
+route reads `identity_pending_retention_days` (default 90), accepts no
+retention override, and deletes only rows with `first_seen_at < cutoff`.
+The authority locks the human-admin population, actor identity and actor role
+rows, re-checks the administrator, and only then samples the database clock.
+Each call deletes at most 200 rows in deterministic order through
+`DELETE … RETURNING`, returns the exact deleted identity IDs and `has_more`,
+and derives both the response and audit population from rows actually
+deleted. Activated, disabled and dormancy-re-pended identities remain
+ineligible [EV-812]. This is an explicit operation, not an automatic timer; the
+deployment records its cadence and evidence in § 4.1.
 
 **Offboarding note.** Disabling a person at the IdP stops new sign-ins. A
 session token already issued remains valid until it expires (at most 24
@@ -541,6 +566,7 @@ targets, review cadence and evidence location.
 | Mover process: how role changes are requested and approved | DEPLOYMENT-TODO: |
 | Leaver process: disable in ELSPETH and at the IdP; target time | DEPLOYMENT-TODO: |
 | `identity_dormancy_days` | DEPLOYMENT-TODO: |
+| `identity_pending_retention_days`, purge cadence, operator and retained audit query | DEPLOYMENT-TODO: |
 | Access review cadence, reviewer, and where the record of each review is kept | DEPLOYMENT-TODO: |
 | Link between ELSPETH identities and the agency's HR or directory records | DEPLOYMENT-TODO: |
 
@@ -548,12 +574,17 @@ targets, review cadence and evidence location.
 
 ### 5.1 Inside the application
 
-The identity model has a `service` kind for a future organisation console
-acting on a person's behalf, restricted to `admin` or `oversight`. Service
-credentials are not implemented at this commit: pre-provisioning a `service`
-identity is refused (`ServiceIdentityProvisioningUnavailable`), and no
-non-browser credential can call the web API. Every API caller is a person
-who signed in through the configured provider [EV-104].
+Unattended machine-to-Web-API access is outside the 0.8.1 assessed use case.
+The identity model reserves a `service` kind for a future organisation
+console acting on a person's behalf, restricted to `admin` or `oversight`,
+but service identity authentication is unimplemented. Pre-provisioning a
+`service` identity is refused (`ServiceIdentityProvisioningUnavailable`), and
+no service credential or service-authenticated Web route exists. Current Web
+API callers are people who signed in through the configured provider; their
+bearer tokens are human session credentials and must not be represented as
+service credentials. Any future machine-access contract requires separate
+issuance, rotation, revocation, audit and route-authorisation assessment
+[EV-104].
 
 ### 5.2 Identities the application runs as
 
@@ -647,7 +678,6 @@ put sensitive finding detail in this repository.
 | Session termination, bearer-token storage and idle timeout | DEPLOYMENT-TODO: |
 | Authentication rate limiting and reverse-proxy client-address trust | DEPLOYMENT-TODO: |
 | Any approved unauthenticated-route exception | DEPLOYMENT-TODO: |
-| Active-identity authoring/running without a `user` role | DEPLOYMENT-TODO: |
 | Local credential-administration and two-store deletion residual risk | DEPLOYMENT-TODO: |
 | Shareable-link lifetime, distribution and all-links-at-once revocation | DEPLOYMENT-TODO: |
 
@@ -671,12 +701,13 @@ source; this table does not create a separate deployment test result.
 | EV-110 | Workflow governance authorities and readiness refusal |
 | EV-111 | First-administrator bootstrap |
 | EV-112 | Local credential administration and `dev_admin_user` |
-| EV-113 | Account lifecycle: rebound, dormancy, retirement, last-administrator protection |
+| EV-113 | Account lifecycle: rebound, dormancy, retirement, last-administrator protection and the never-activated pending boundary |
 | EV-114 | `elspeth composer users` commands |
 | EV-115 | AWS ECS task roles and database roles |
 | EV-116 | Azure Container Apps managed identities |
 | EV-117 | Shareable review links |
 | EV-119 | JWKS retrieval, permitted key types, cache lifecycle, retry throttle and maximum stale authority |
+| EV-812 | Configured, bounded and audited pending-identity purge |
 
 Whether these controls are sufficient for the deployment is assessed in
 [04](04-threat-model.md); open limitations are tracked in
