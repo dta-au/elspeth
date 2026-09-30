@@ -965,6 +965,7 @@ jobs:
           # once upstream ships a fix.
           uv run --with "pip-audit>=2.9,<3" pip-audit \
             --strict \
+            --timeout 60 \
             --requirement requirements-audit.txt \
             --no-deps \
             --disable-pip \
