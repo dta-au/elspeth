@@ -479,7 +479,7 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        item that the new resume refuses as corruption, so only a bump — not
 #        a fold — keeps such a store from opening. Populated epoch-47 stores
 #        require delete/recreate.
-SQLITE_SCHEMA_EPOCH = 48
+SQLITE_SCHEMA_EPOCH = 49
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -2836,7 +2836,7 @@ auth_events_table = Table(
         "'review_requested', 'review_request_cancelled', 'review_attested', "
         "'library_published', 'library_accepted', 'library_rejected', "
         "'library_deprecated', 'library_recalled', "
-        "'quota_set', 'quota_exceeded'"
+        "'quota_set', 'quota_exceeded', 'pending_identities_purged'"
         ")",
         name="ck_auth_events_event_type",
     ),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace as _replace_dataclass
+from typing import Annotated
 
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -89,10 +90,10 @@ from ._helpers import (
     composer_turn_end_assistant_row,
     convergence_progress_event,
     freeform_planner_progress_reason,
-    get_current_user,
     get_rate_limiter,
     maybe_auto_title_session,
     merge_composer_meta_updates,
+    require_pipeline_user,
     slog,
 )
 from .composer.pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
@@ -135,7 +136,7 @@ def register_message_routes(router: APIRouter) -> None:
         session_id: UUID,
         body: SendMessageRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
         # In-flight compose tally for the SPA's post-abort settlement signal
         # (elspeth-06a23adfcc); decrements only after the route fully unwinds.
@@ -1047,7 +1048,7 @@ def register_message_routes(router: APIRouter) -> None:
     async def get_messages(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         include_llm_audit: bool = Query(

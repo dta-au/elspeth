@@ -55,6 +55,7 @@ from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.auth import (
     ActivationRole,
+    AuthProviderType,
     IdentityAccessState,
     IdentityProviderType,
     IdentityRole,
@@ -581,9 +582,13 @@ class RelationshipChanged:
 @dataclass(frozen=True, slots=True)
 class PendingIdentitiesPurged:
     identity_ids: tuple[str, ...]
+    batch_id: str
+    has_more: bool
     actor_identity_id: str
     retention_days: int
     at: datetime
+    on_behalf_of: str | None
+    console_request_id: str | None
 
 
 @final
@@ -819,6 +824,7 @@ _ROLES_OF_IDENTITY: Final = (
     .where(identity_roles_table.c.identity_id == bindparam("identity_id"))
     .order_by(identity_roles_table.c.granted_at, identity_roles_table.c.role_id)
 )
+_ROLES_OF_IDENTITY_FOR_UPDATE: Final = _ROLES_OF_IDENTITY.with_for_update()
 _ROLE_BY_ID_FOR_UPDATE: Final = select(identity_roles_table).where(identity_roles_table.c.role_id == bindparam("role_id")).with_for_update()
 _RELATIONSHIP_BY_ID_FOR_UPDATE: Final = (
     select(identity_relationships_table)
@@ -891,6 +897,8 @@ _PENDING_ROWS: Final = (
     .where(identities_table.c.access_state == "pending", identities_table.c.activated_at.is_(None))
     .order_by(identities_table.c.first_seen_at, identities_table.c.identity_id)
 )
+_PENDING_PURGE_BATCH_LIMIT: Final = 200
+_PENDING_ROWS_FOR_PURGE: Final = _PENDING_ROWS.limit(_PENDING_PURGE_BATCH_LIMIT).with_for_update()
 # The identity's live allowance, if it has one.  ``activate_identity`` asks
 # because R9 made that route reachable for an identity that ALREADY holds a
 # quota row: before R9, only a never-activated ``pending`` row could be
@@ -2387,6 +2395,31 @@ class RepositoryIdentityAuthority:
             record(outcome)
             return outcome
 
+    def holds_active_human_role(
+        self,
+        *,
+        identity_id: str,
+        provider: AuthProviderType,
+        role: IdentityRole,
+    ) -> bool:
+        """Require an active human from this browser provider with a live deployment role."""
+        _require_nonblank(identity_id, "identity_id")
+        _require_role(role)
+        with self._engine.connect() as conn:
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            identity = conn.execute(_IDENTITY_BY_ID, {"identity_id": identity_id}).one_or_none()
+            if identity is None or identity.kind != "human" or identity.provider != provider or identity.access_state != "active":
+                return False
+            rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
+        return any(grant.role == role and grant.scope is None for grant in _active_grants(rows, now))
+
+    def is_active_human_identity(self, *, identity_id: str, provider: AuthProviderType) -> bool:
+        """Authenticate only a human identity owned by the configured browser provider."""
+        _require_nonblank(identity_id, "identity_id")
+        with self._engine.connect() as conn:
+            identity = conn.execute(_IDENTITY_BY_ID, {"identity_id": identity_id}).one_or_none()
+        return identity is not None and identity.kind == "human" and identity.provider == provider and identity.access_state == "active"
+
     # -- admin mutations -----------------------------------------------------
 
     def pre_provision_identity(
@@ -3217,25 +3250,44 @@ class RepositoryIdentityAuthority:
             raise ValueError("retention_days must be a positive integer")
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
-            actor_row = conn.execute(_IDENTITY_BY_ID, {"identity_id": actor.identity_id}).one_or_none()
-            actor_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": actor.identity_id}).all(), now)
+            # Match role-revocation lock order: every mutation that can remove
+            # admin authority first locks the live human-admin population.
+            # The exact actor row/grants are then locked so authorization and
+            # deletion share one linearization point on PostgreSQL.
+            conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
+            actor_row = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": actor.identity_id}).one_or_none()
+            actor_grants = _active_grants(
+                conn.execute(_ROLES_OF_IDENTITY_FOR_UPDATE, {"identity_id": actor.identity_id}).all(),
+                now,
+            )
             verified = _verified_actor(actor, actor_row, actor_grants)
             cutoff = now - timedelta(days=retention_days)
-            candidates = conn.execute(_PENDING_ROWS).all()
+            candidates = conn.execute(_PENDING_ROWS_FOR_PURGE).all()
             stale = tuple(row.identity_id for row in candidates if _ensure_utc(row.first_seen_at) < cutoff)
+            deleted: tuple[str, ...] = ()
             if stale:
-                conn.execute(
-                    delete(identities_table).where(
-                        identities_table.c.identity_id.in_(stale),
-                        identities_table.c.access_state == "pending",
-                        identities_table.c.activated_at.is_(None),
-                    )
+                deleted_set = set(
+                    conn.execute(
+                        delete(identities_table)
+                        .where(
+                            identities_table.c.identity_id.in_(stale),
+                            identities_table.c.access_state == "pending",
+                            identities_table.c.activated_at.is_(None),
+                        )
+                        .returning(identities_table.c.identity_id)
+                    ).scalars()
                 )
+                deleted = tuple(identity_id for identity_id in stale if identity_id in deleted_set)
+            next_candidate = conn.execute(_PENDING_ROWS.limit(1)).one_or_none()
             outcome = PendingIdentitiesPurged(
-                identity_ids=stale,
+                identity_ids=deleted,
+                batch_id=uuid.uuid4().hex,
+                has_more=next_candidate is not None and _ensure_utc(next_candidate.first_seen_at) < cutoff,
                 actor_identity_id=verified.identity_id,
                 retention_days=retention_days,
                 at=now,
+                on_behalf_of=actor.on_behalf_of,
+                console_request_id=actor.console_request_id,
             )
             record(outcome)
             return outcome

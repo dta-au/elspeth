@@ -32,7 +32,7 @@ from elspeth.web.sessions.models import blobs_table, quota_policies_table, sessi
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.helpers.session_fences import seed_live_compose_context, seed_live_operation_context
 from tests.unit.web._sync_asgi_client import SyncASGITestClient
 from tests.unit.web.blobs import test_service as blob_service_tests
@@ -170,6 +170,7 @@ def _quota_app(engine: Engine, tmp_path: Path, recorded: list[QuotaExceeded]) ->
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,
     )
+    wire_test_pipeline_user_authority(app, identity_id=IDENTITY, engine=engine)
     app.state.session_service = session_service
     app.state.blob_service = BlobServiceImpl(
         engine, tmp_path, session_operation_authority=authority, quota_exceeded_recorder=recorded.append

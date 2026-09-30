@@ -49,7 +49,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import ForkSessionResponse
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.helpers.session_fences import create_blob_under_fence, read_blob_content_under_fence
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -972,6 +972,7 @@ def _make_fork_app(
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=b"\x00" * 32,
     )
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
     app.state.composer_service = None
 
     from elspeth.web.middleware.rate_limit import ComposerRateLimiter
@@ -2005,6 +2006,7 @@ class TestForkEndpoint:
             composer_rate_limit_per_minute=10,
             shareable_link_signing_key=b"\x00" * 32,
         )
+        wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
         app.state.composer_service = None
 
         from elspeth.web.middleware.rate_limit import ComposerRateLimiter

@@ -15,11 +15,11 @@ AuthProviderType = Literal["local", "oidc", "entra", "vanguard", "google"]
 """Closed discriminator for the ways a browser can authenticate.
 
 One value per registered IdP profile, plus ``local``.  ``service`` is
-deliberately absent: a service identity holds an operator-issued credential
-and never completes an OIDC walk, so it has no profile and cannot be the
-``auth_provider`` of a container, a session, or a user secret.  The profile
-registry asserts parity against this Literal at import, which makes an
-unregistered value a boot failure rather than a test failure.
+deliberately absent: service identity rows are reserved vocabulary and no
+machine-to-Web-API authentication scheme is shipped in this release. They
+cannot be the ``auth_provider`` of a container, a session, or a user secret.
+The profile registry asserts parity against this Literal at import, which
+makes an unregistered value a boot failure rather than a test failure.
 """
 
 IdentityProviderType = Literal[AuthProviderType, "service"]
@@ -50,8 +50,9 @@ IdentityRole = Literal[
 ``user`` may author and run; ``approver`` decides approvals and holds approver
 edges; ``reviewer`` attests; ``curator`` gates the library; ``admin`` is
 container operations (identity, roles, org tree) and is never combined with a
-workload role; ``auditor`` is read-only over the audit surfaces; ``oversight``
-is read plus quota-policy write, with no activation, role grant, or disable.
+workload role. ``auditor`` and ``oversight`` are reserved vocabulary in this
+release and confer no route authority; their intended future audit and narrow
+operations surfaces require separate admission contracts before activation.
 
 Activation grants a role chosen from ``user``, ``approver``, ``reviewer`` or
 ``none``.  ``none`` is a request argument, not a stored role -- it writes no
@@ -89,12 +90,14 @@ AUTH_EVENT_ON_BEHALF_OF_KEY: Final = "on_behalf_of"
 AUTH_EVENT_CONSOLE_REQUEST_ID_KEY: Final = "console_request_id"
 """The two provenance keys every admin-mutation ``auth_events`` row carries (spec rev2.2).
 
-An organisation console acts through a ``service`` identity on behalf of a
-person, and the row must say so at the moment it is written: a row written
-without these keys is permanently anonymous, because nothing later can
-reconstruct who asked.  Pinned here, at L0, so the writer and every reader
-name the same keys; the writer records both on every admin mutation, ``None``
-when the actor is a human administrator acting for themselves.
+The reserved future organisation-console design acts through a ``service``
+identity on behalf of a person, and the row must say so at the moment it is
+written: a row written without these keys is permanently anonymous, because
+nothing later can reconstruct who asked.  0.8.1 ships no service credential
+or service-authenticated Web route.  Pinned here, at L0, so the writer and
+every reader name the same keys; the writer records both on every admin
+mutation, ``None`` when the actor is a human administrator acting for
+themselves.
 """
 
 AuthAuditEventType = Literal[
@@ -125,6 +128,8 @@ AuthAuditEventType = Literal[
     "library_recalled",
     "quota_set",
     "quota_exceeded",
+    # Identity lifecycle maintenance.
+    "pending_identities_purged",
 ]
 """Closed vocabulary of auditable authentication and authority events.
 

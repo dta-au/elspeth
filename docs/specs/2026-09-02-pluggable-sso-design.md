@@ -162,11 +162,13 @@ computed). The registry asserts parity at import:
 Adding an IdP is a deliberate edit to an L0 contract.
 
 **`AuthProviderType` is the set of things that can authenticate a browser
-[rev2.7, D19].** `service` is not one of them, so it is not a member: a
-`service` identity holds an operator-issued credential and never completes an
-OIDC walk, there is no `service` profile, and putting it in `AuthProviderType`
-fails the parity assert above **at import**, which is a boot failure rather
-than a test failure. Two L0 types, therefore:
+[rev2.7, D19].** `service` is not one of them, so it is not a member. In
+0.8.1, `service` is reserved identity vocabulary: there is no service
+credential issuer, service-authenticated Web router, or machine-to-Web-API
+access. The later organisation-console design uses a distinct credential and
+never an OIDC browser walk. Putting `service` in `AuthProviderType` fails the
+parity assert above **at import**, which is a boot failure rather than a test
+failure. Two L0 types, therefore:
 
 - `AuthProviderType = Literal["local", "oidc", "entra", "vanguard", "google"]`
   — the login mechanism. Governs `WebSettings.auth_provider`, the profile
@@ -674,14 +676,14 @@ compatibility-record example.
 | column | type | notes |
 |--------|------|-------|
 | identity_id | text PK | surrogate; the key every ownership and future workflow table references |
-| provider | text | CHECK `_IDENTITY_PROVIDER_TYPE_CHECK` = the `IdentityProviderType` values: the five IdP values (`local` included, D7) plus `service` [rev2.7, D19]. A `service` identity authenticates by an operator-issued credential, not OIDC; the mechanism is not built now. This is a **different** constant from the `_AUTH_PROVIDER_TYPE_CHECK` on `sessions`/`user_secrets`, which stays at the five login values — see §1. |
+| provider | text | CHECK `_IDENTITY_PROVIDER_TYPE_CHECK` = the `IdentityProviderType` values: the five IdP values (`local` included, D7) plus reserved `service` [rev2.7, D19]. Machine-to-Web-API authentication is explicitly excluded from 0.8.1: there is no service credential issuer or service-authenticated router, and a human browser bearer token is never a service credential. The `service` row value reserves the later organisation-console data contract. This is a **different** constant from the `_AUTH_PROVIDER_TYPE_CHECK` on `sessions`/`user_secrets`, which stays at the five login values — see §1. |
 | kind | text | CHECK `('human','service')`, default `human` [rev2.2]. Service identities may hold only `admin` or `oversight`, never `approver`, `reviewer`, `user`, or `curator`, and may not approve, attest, or publish (CHECKs on the workflow tables). |
 | subject | text | IdP `sub`, or local username |
 | username | text | display only, non-blank; changes update the row and write an audit row. **A `pending` row has no profile yet (`raw_claims_json` is taken at activation) and a pre-provisioned row has never logged in, so `username` is the IdP `subject` until a login supplies better [rev2.8].** That keeps the column NOT NULL and non-blank on every path, and it is what the admin sees in the pending queue. |
 | display_name | text null | |
 | email | text null | |
 | organisation_id | text null | VANguard ABN; null elsewhere |
-| raw_claims_json | text null | bounded 16 KiB; declared profile keys plus `iss aud iat exp`; `groups`, `_claim_*`, `picture`, `at_hash`, `nonce` stripped; forensics only, never returned by any API. **Taken at activation, not at first sight [rev2.2]:** a `pending` row holds only provider, subject, and organisation_id, so the container does not accumulate profile PII of people who merely tried. Never-activated `pending` rows are purged on the same lazy schedule [rev2.8], evaluated when an admin lists pending identities, after `identity_pending_retention_days` (default 90, optional setting). No background task. |
+| raw_claims_json | text null | bounded 16 KiB; declared profile keys plus `iss aud iat exp`; `groups`, `_claim_*`, `picture`, `at_hash`, `nonce` stripped; forensics only, never returned by any API. **Taken at activation, not at first sight [rev2.2]:** a `pending` row holds only provider, subject, and organisation_id, so the container does not accumulate profile PII of people who merely tried. An administrator explicitly calls `POST /api/auth/admin/identities/purge-pending`; it uses the configured `identity_pending_retention_days` (default 90), deletes a bounded batch strictly older than the database-time cutoff, and synchronously audits the exact rows deleted. No listing side effect or background task. |
 | subject_email_at_first_seen | text null | D10 detection |
 | rebound_at | datetime null | D10 detection: verified email changed under the same subject |
 | first_seen_at | datetime | row creation, including for a pre-provisioned row nobody has used [rev2.8] |
@@ -716,7 +718,7 @@ trap that let the epoch number survive three reviews.
 |--------|------|-------|
 | role_id | text PK | |
 | identity_id | text FK | |
-| role | text | CHECK `('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')` [rev2.3]; L0 Literal `IdentityRole`. `user` = may author and run; `approver` = the functional/matrix lead: may decide approvals (role-based eligibility, see approvals) and hold `approver` edges; `reviewer` = may attest; `curator` = library gate; `admin` = container operations: identity, roles, and org-tree administration, held by someone technical, never a workload role (D14); `auditor` = read-only over the audit surfaces, no authoring, no run, all reads through `audit_access_log`; `oversight` = read plus quota-policy write, no activation, no role grant, no disable — the role the organisation console holds. Activation (D12) grants a role chosen from `user`, `approver`, `reviewer` or **`none`** [rev2.7, D20]; `admin` may never be combined with a workload role (R8), so activating an identity that holds `admin` requires `none` and the route refuses any other value. `none` is a request argument, not a stored role: it writes no `identity_roles` row. |
+| role | text | CHECK `('admin', 'approver', 'reviewer', 'user', 'curator', 'auditor', 'oversight')` [rev2.3]; L0 Literal `IdentityRole`. `user` = may author and run; `approver` = the functional/matrix lead: may decide approvals (role-based eligibility, see approvals) and hold `approver` edges; `reviewer` = may attest; `curator` = library gate; `admin` = container operations: identity, roles, and org-tree administration, held by someone technical, never a workload role (D14). `auditor` and `oversight` are reserved values that authorize no Web API route in 0.8.1; their intended read-only audit and later organisation-console meanings do not create current authority. Activation (D12) grants a role chosen from `user`, `approver`, `reviewer` or **`none`** [rev2.7, D20]; `admin` may never be combined with a workload role (R8), so activating an identity that holds `admin` requires `none` and the route refuses any other value. `none` is a request argument, not a stored role: it writes no `identity_roles` row. |
 | expires_at | datetime null | [rev2.2] JIT grants. The console's role in a container is granted with an expiry by a *container* admin (the compartment owner reads the console in, not the reverse). |
 | note | text null | [rev2.2] Reason for the grant; activation is the most consequential act in the model and must carry one. |
 | scope | text null | reserved (library id, team id); null = deployment-wide |
@@ -1002,7 +1004,17 @@ existing dev-admin gate is local-only and structlog-only by design):
 - `GET roles`, `POST roles`, `POST roles/{id}/revoke`.
 - `GET relationships` (paginated), `POST relationships`,
   `POST relationships/{id}/revoke`.
+- `POST identities/purge-pending` deletes at most 200 never-activated pending
+  rows strictly older than the configured retention cutoff. The request cannot
+  override retention; the response reports exact deleted IDs and `has_more`.
 - Every mutation writes its `auth_events` row before responding.
+
+The 0.8.1 Web authoring and execution routes require an active human identity
+from the configured browser provider with a live, unscoped `user` grant.
+`auditor` and `oversight` do not authorize authoring, execution, replay,
+cancellation, ticket issuance, or WebSocket consumption. Machine Web access is
+reserved and unsupported in this release; the service provenance fields above
+do not create an authentication path.
 
 `POST identities/{id}/activate` takes `role ∈ {user, approver, reviewer,
 none}` and refuses a workload role for an identity holding `admin` (R8)

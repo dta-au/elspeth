@@ -13,7 +13,7 @@ from sqlalchemy import Engine, delete, insert, select, update
 from elspeth.web.auth.models import AuthenticationError, UserIdentity
 from elspeth.web.coordination.membership_authority import _DATABASE_CLOCK_SQL, _database_clock_value, _ensure_utc
 from elspeth.web.execution.websocket_ticket import WebSocketTicket
-from elspeth.web.sessions.models import identities_table, runs_table, sessions_table, websocket_tickets_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table, runs_table, sessions_table, websocket_tickets_table
 
 _EXPIRY_CLEANUP_BATCH_SIZE = 100
 
@@ -53,16 +53,30 @@ class RepositorySessionWebsocketTicketAuthority:
             identity = conn.execute(
                 select(identities_table).where(identities_table.c.identity_id == user.user_id).with_for_update()
             ).one_or_none()
+            user_roles = conn.execute(
+                select(identity_roles_table.c.scope, identity_roles_table.c.expires_at, identity_roles_table.c.revoked_at)
+                .where(
+                    identity_roles_table.c.identity_id == user.user_id,
+                    identity_roles_table.c.role == "user",
+                )
+                .with_for_update()
+            ).all()
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            holds_user_role = any(
+                row.scope is None and row.revoked_at is None and (row.expires_at is None or _ensure_utc(row.expires_at) > now)
+                for row in user_roles
+            )
             if (
                 identity is None
+                or identity.kind != "human"
                 or identity.access_state != "active"
+                or not holds_user_role
                 or session is None
                 or session.archived_at is not None
                 or session.user_id != user.user_id
                 or session.auth_provider_type != identity.provider
             ):
                 raise AuthenticationError("Run WebSocket access refused")
-            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             # Credentials are transient even when run history is retained. Bound
             # each issuance's cleanup and skip tickets held by another transaction;
             # no identity/session lock is acquired after these ticket locks.
@@ -111,10 +125,22 @@ class RepositorySessionWebsocketTicketAuthority:
             identity = conn.execute(
                 select(identities_table).where(identities_table.c.identity_id == candidate.user_id).with_for_update()
             ).one_or_none()
+            user_roles = conn.execute(
+                select(identity_roles_table.c.scope, identity_roles_table.c.expires_at, identity_roles_table.c.revoked_at)
+                .where(
+                    identity_roles_table.c.identity_id == candidate.user_id,
+                    identity_roles_table.c.role == "user",
+                )
+                .with_for_update()
+            ).all()
             record = conn.execute(
                 select(websocket_tickets_table).where(websocket_tickets_table.c.ticket_digest == digest).with_for_update()
             ).one_or_none()
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            holds_user_role = any(
+                row.scope is None and row.revoked_at is None and (row.expires_at is None or _ensure_utc(row.expires_at) > now)
+                for row in user_roles
+            )
             if record is None or record.consumed_at is not None:
                 return None
             consumed = conn.execute(
@@ -129,7 +155,9 @@ class RepositorySessionWebsocketTicketAuthority:
                 or _ensure_utc(record.expires_at) <= now
                 or identity is None
                 or identity.identity_id != record.user_id
+                or identity.kind != "human"
                 or identity.access_state != "active"
+                or not holds_user_role
                 or identity.provider != record.auth_provider_type
                 or session is None
                 or session.user_id != record.user_id

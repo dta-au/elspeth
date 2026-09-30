@@ -34,6 +34,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.sessions.protocol import RunEventRecord
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -87,7 +88,7 @@ class FakeRunRecord:
 
 @dataclass(slots=True)
 class FakeSettings:
-    auth_provider: str = "test"
+    auth_provider: str = "local"
     data_dir: str = "/tmp/elspeth-test-data"
 
 
@@ -224,6 +225,7 @@ def _create_ws_test_app(
     app.state.broadcaster = broadcaster or FakeBroadcaster()
     app.state.session_service = FakeSessionService()
     app.state.settings = FakeSettings()
+    wire_test_pipeline_user_authority(app, identity_id=_TEST_USER_ID)
     app.state.websocket_ticket_store = WebSocketTicketStore()
     app.state.run_progress_reader = None
 

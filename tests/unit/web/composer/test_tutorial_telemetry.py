@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI
 from structlog.testing import capture_logs
@@ -11,6 +13,7 @@ from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer import tutorial_telemetry as tutorial_telemetry_module
 from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon_router
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -46,6 +49,8 @@ def test_abandon_route_increments_counter(monkeypatch) -> None:
         return identity
 
     app.dependency_overrides[get_current_user] = _mock_user
+    app.state.settings = SimpleNamespace(auth_provider="local")
+    wire_test_pipeline_user_authority(app, identity_id="alice")
     app.include_router(create_tutorial_abandon_router())
     client = TestClient(app)
 

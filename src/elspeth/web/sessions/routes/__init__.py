@@ -1,7 +1,7 @@
 """Session API routes -- /api/sessions/* with IDOR protection.
 
-All endpoints require authentication via Depends(get_current_user).
-Session-scoped endpoints verify ownership before any business logic.
+Owner-workspace endpoints require a live deployment-wide ``user`` role.
+Session-scoped endpoints then verify ownership before any business logic.
 """
 
 from __future__ import annotations

@@ -46,6 +46,8 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions import models
 from elspeth.web.sessions.engine import create_session_engine
@@ -119,6 +121,16 @@ def _route_client(tmp_path: Path, settings: WebSettings) -> TestClient:
     identity = UserIdentity(user_id="alice", username="alice")
     with eng.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        conn.execute(
+            insert(models.identity_roles_table).values(
+                role_id=str(uuid4()),
+                identity_id="alice",
+                role="user",
+                scope=None,
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
 
     async def mock_user() -> UserIdentity:
         return identity
@@ -150,6 +162,10 @@ def _route_client(tmp_path: Path, settings: WebSettings) -> TestClient:
     # (matches production wiring in ``web/app.py:579``).
     app.state.sessions_telemetry = service._telemetry
     app.state.session_engine = eng
+    app.state.identity_authority = RepositoryIdentityAuthority(
+        eng,
+        lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
+    )
     app.state.settings = settings
     app.state.composer_service = None
     app.state.rate_limiter = ComposerRateLimiter(limit=100)

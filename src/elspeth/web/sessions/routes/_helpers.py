@@ -1,7 +1,8 @@
 """Session API routes -- /api/sessions/* with IDOR protection.
 
-All endpoints require authentication via Depends(get_current_user).
-Session-scoped endpoints verify ownership before any business logic.
+Owner-workspace endpoints require a live deployment-wide ``user`` role through
+``require_pipeline_user``. Session-scoped endpoints then verify ownership
+before any business logic.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -2556,7 +2557,7 @@ def _composer_heartbeat_http_error(cancel: _ComposerHeartbeatCancel) -> HTTPExce
 async def _track_compose_inflight(
     session_id: UUID,
     request: Request,
-    user: Annotated[UserIdentity, Depends(get_current_user)],
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> AsyncIterator[None]:
     """Count this request in the session's in-flight compose tally.
 
@@ -3933,7 +3934,6 @@ __all__ = [
     "deep_thaw",
     "execute_tool",
     "generate_public_yaml",
-    "get_current_user",
     "get_rate_limiter",
     "insert",
     "json",
@@ -3948,6 +3948,7 @@ __all__ = [
     "record_session_completed",
     "record_session_switched",
     "redact_source_storage_path",
+    "require_pipeline_user",
     "run_sync_in_worker",
     "scrub_text_for_audit",
     "slog",

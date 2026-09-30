@@ -64,6 +64,8 @@ from elspeth.web.composer.service import ComposerAvailability, ComposerServiceIm
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.composer.yaml_generator import PUBLIC_EXPORT_REBIND_GUIDANCE, PUBLIC_EXPORT_REDACTION_HEADER
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
@@ -88,6 +90,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     ChatMessageRole,
@@ -105,7 +108,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -749,6 +752,7 @@ def _make_progress_route_app(
         return identity
 
     app.dependency_overrides[get_current_user] = mock_user
+    wire_test_pipeline_user_authority(app, identity_id=user_id)
     app.state.session_service = service
     app.state.settings = WebSettings(
         data_dir=tmp_path,
@@ -788,6 +792,16 @@ def _make_app(
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id=user_id)
+        conn.execute(
+            identity_roles_table.insert().values(
+                role_id=str(uuid.uuid4()),
+                identity_id=user_id,
+                role="user",
+                scope=None,
+                granted_by_identity_id=user_id,
+                granted_at=datetime.now(UTC),
+            )
+        )
         if quota_enabled:
             from tests.helpers.fenced_session import seed_token_policies
 
@@ -824,6 +838,10 @@ def _make_app(
     # Phase 6A B3 — YAML export route's audit-write reaches into
     # ``app.state.session_engine`` for the composer_completion_events insert.
     app.state.session_engine = engine
+    app.state.identity_authority = RepositoryIdentityAuthority(
+        engine,
+        lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
+    )
     # Phase 8 Sub-task 7c — the YAML-export route emits
     # ``composer.session.completed_total`` via
     # ``request.app.state.sessions_telemetry``. Mirror the same
@@ -4259,6 +4277,7 @@ class TestIDORProtection:
                 return identity
 
             app.dependency_overrides[get_current_user] = mock_user
+            wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
             app.state.session_service = service
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
@@ -4510,6 +4529,7 @@ class TestSendMessageStateIdValidation:
                 return identity
 
             app.dependency_overrides[get_current_user] = mock_user
+            wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
             app.state.session_service = service
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
@@ -7947,6 +7967,7 @@ transforms:
                 return identity
 
             app.dependency_overrides[get_current_user] = mock_user
+            wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
             app.state.session_service = service
             app.state.settings = WebSettings(
                 data_dir=tmp_path,
@@ -10684,6 +10705,11 @@ class TestComposerProgressRoutes:
     @pytest.mark.asyncio
     async def test_progress_endpoint_enforces_session_ownership(self, tmp_path) -> None:
         app, service = _make_progress_route_app(tmp_path)
+        wire_test_pipeline_user_authority(
+            app,
+            identity_id="bob",
+            engine=app.state.pipeline_user_identity_engine,
+        )
 
         async def bob_user():
             return UserIdentity(user_id="bob", username="bob")

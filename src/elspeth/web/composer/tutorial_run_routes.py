@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.tutorial_models import (
     TutorialCancelRequest,
@@ -37,7 +37,7 @@ def create_tutorial_run_router() -> APIRouter:
     async def get_tutorial_sample(
         session_id: UUID,
         request: Request,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> TutorialSampleResponse:
         """Return only the public sample addresses for an owned session."""
         await verify_session_ownership(session_id, user, request)
@@ -48,7 +48,7 @@ def create_tutorial_run_router() -> APIRouter:
     async def get_readiness(
         session_id: UUID,
         request: Request,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> TutorialReadinessResponse:
         state_id = await get_tutorial_readiness(request=request, user=user, session_id=session_id)
         return TutorialReadinessResponse(state_id=state_id)
@@ -57,7 +57,7 @@ def create_tutorial_run_router() -> APIRouter:
     async def run_tutorial(
         body: TutorialRunRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     ) -> TutorialRunResponse:
         await rate_limiter.check(user.user_id)
@@ -71,7 +71,7 @@ def create_tutorial_run_router() -> APIRouter:
     async def cancel_tutorial(
         body: TutorialCancelRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> TutorialCancelResponse:
         return await cancel_tutorial_run(
             request=request,
@@ -82,7 +82,7 @@ def create_tutorial_run_router() -> APIRouter:
     @router.delete("/orphans", response_model=TutorialOrphanCleanupResponse)
     async def delete_tutorial_orphans(
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> TutorialOrphanCleanupResponse:
         return await cleanup_tutorial_orphans(request=request, user=user)
 

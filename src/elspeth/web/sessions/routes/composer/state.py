@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from dataclasses import replace
-from typing import NotRequired, TypedDict
+from typing import Annotated, NotRequired, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -91,10 +91,10 @@ from .._helpers import (
     _verify_session_ownership,
     datetime,
     generate_public_yaml,
-    get_current_user,
     merge_composer_meta_updates,
     record_session_completed,
     record_session_switched,
+    require_pipeline_user,
     slog,
 )
 
@@ -524,7 +524,7 @@ async def _state_with_imported_source_blobs(
 async def get_composer_progress(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> ComposerProgressSnapshot:
     """Return the latest provider-safe composer progress for a session."""
     session = await _verify_session_ownership(session_id, user, request)
@@ -551,7 +551,7 @@ async def get_composer_progress(
 async def get_composer_preferences(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> ComposerPreferencesResponse:
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
@@ -567,7 +567,7 @@ async def update_composer_preferences(
     session_id: UUID,
     body: UpdateComposerPreferencesRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> ComposerPreferencesResponse:
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
@@ -616,7 +616,7 @@ async def update_composer_preferences(
 async def get_current_state(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse | None:
     """Get the current (highest-version) composition state."""
     session = await _verify_session_ownership(session_id, user, request)
@@ -642,7 +642,7 @@ async def get_current_state(
 async def get_state_versions(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> list[CompositionStateResponse]:
@@ -666,7 +666,7 @@ async def revert_state(
     session_id: UUID,
     body: RevertStateRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse:
     """Revert the pipeline to a prior composition state version (R1).
 
@@ -848,7 +848,7 @@ async def import_state_yaml(
     session_id: UUID,
     body: ImportStateYamlRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse:
     """Seed a session's composition state from exported runtime YAML."""
     session = await _verify_session_ownership(session_id, user, request)
@@ -1062,7 +1062,7 @@ def _reject_resolved_interpretation_requirements(state: CompositionState) -> Non
 async def seed_state_for_e2e(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionStateResponse:
     """Test-only state seed endpoint for Playwright-managed E2E runs."""
     if not request.app.state.settings.e2e_state_seed_enabled:
@@ -1258,7 +1258,7 @@ async def _verified_yaml_export_blob_ids(
 async def get_state_yaml(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> StateYamlResponse:
     """Get YAML representation of the current composition state (M1).
 

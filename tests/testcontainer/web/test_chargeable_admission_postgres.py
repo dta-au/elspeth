@@ -22,7 +22,13 @@ from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCan
 from elspeth.web.execution.envelope import RunExecutionInput
 from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import composition_states_table, identities_table, run_start_permits_table, runs_table
+from elspeth.web.sessions.models import (
+    composition_states_table,
+    identities_table,
+    identity_roles_table,
+    run_start_permits_table,
+    runs_table,
+)
 from elspeth.web.sessions.protocol import RunRecord, RunStartPermitRecord, SessionOperationMutationTransaction
 from elspeth.web.sessions.schema import initialize_session_schema
 
@@ -51,6 +57,16 @@ def admission_engine(external_deployment_postgres_url: str) -> Iterator[Engine]:
 def _admit(engine: Engine) -> tuple[PostgresSessionOperationRepository, SessionOperationContext, RunRecord]:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        conn.execute(
+            insert(identity_roles_table).values(
+                role_id="user-role-alice",
+                identity_id="alice",
+                role="user",
+                scope=None,
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
     authority = PostgresSessionOperationRepository(engine)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="chargeable admission", auth_provider_type="local", owner_instance_id="owner", lease_seconds=120
@@ -209,6 +225,88 @@ def test_permit_first_excludes_disable_then_recovery_preserves_allowance(admissi
         execution = conn.execute(select(runs_table).where(runs_table.c.id == str(run.id))).one()
     assert execution.status == "failed"
     assert execution.saga_state == "admission_refusal_pending"
+
+
+def test_user_role_revoke_first_forces_wait_then_committed_refusal(admission_engine: Engine) -> None:
+    authority, context, run = _admit(admission_engine)
+    attempted = Event()
+    backend: list[int] = []
+
+    def probe(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _execution_context: Any, _many: bool) -> None:
+        if statement.startswith("SELECT") and "FROM identity_roles" in statement and "FOR UPDATE" in statement:
+            backend.append(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            attempted.set()
+
+    event.listen(admission_engine, "before_cursor_execute", probe)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with admission_engine.begin() as revoking:
+                blocker = revoking.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+                revoking.execute(
+                    update(identity_roles_table)
+                    .where(identity_roles_table.c.role_id == "user-role-alice")
+                    .values(revoked_at=datetime.now(UTC))
+                )
+                future = workers.submit(_issue, authority, context, run.id)
+                assert attempted.wait(10), "permit never attempted its user-role row lock"
+                _assert_lock_wait(admission_engine, backend[0], blocker)
+                assert not future.done()
+            refused = future.result(timeout=10)
+    finally:
+        event.remove(admission_engine, "before_cursor_execute", probe)
+    assert refused.state is StartPermitState.REFUSED
+    assert refused.admission_decision is not None
+    assert refused.admission_decision.refusal_reason is AdmissionRefusalReason.USER_ROLE_REQUIRED
+
+
+def test_permit_first_excludes_user_role_revoke_and_recheck_refuses_execution(admission_engine: Engine) -> None:
+    authority, context, run = _admit(admission_engine)
+    decided = Event()
+    release = Event()
+    revoke_attempted = Event()
+    holder_pid: list[int] = []
+    writer_pid: list[int] = []
+
+    def capture_holder(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _execution_context: Any, _many: bool) -> None:
+        if statement.startswith("SELECT") and "FROM identity_roles" in statement and "FOR UPDATE" in statement:
+            holder_pid.append(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+
+    def park_after_decision(tx: SessionOperationMutationTransaction) -> RunStartPermitRecord:
+        permit = tx.runs.issue_start_permit(run_id=run.id, policy=_POLICY)
+        assert permit.state is StartPermitState.START_PERMITTED
+        decided.set()
+        assert release.wait(20), "permit transaction was never released"
+        return permit
+
+    def revoke() -> None:
+        with admission_engine.begin() as conn:
+            writer_pid.append(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            revoke_attempted.set()
+            conn.execute(
+                update(identity_roles_table).where(identity_roles_table.c.role_id == "user-role-alice").values(revoked_at=datetime.now(UTC))
+            )
+
+    event.listen(admission_engine, "before_cursor_execute", capture_holder)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(authority.mutate, context, park_after_decision)
+            try:
+                assert decided.wait(10), "permit never reached the transaction barrier"
+                second = workers.submit(revoke)
+                assert revoke_attempted.wait(10)
+                _assert_lock_wait(admission_engine, writer_pid[0], holder_pid[0])
+                assert not second.done()
+            finally:
+                release.set()
+            permitted = first.result(timeout=10)
+            second.result(timeout=10)
+    finally:
+        event.remove(admission_engine, "before_cursor_execute", capture_holder)
+    rechecked = _issue(PostgresSessionOperationRepository(admission_engine), context, run.id)
+    assert rechecked.state is StartPermitState.START_PERMITTED
+    assert rechecked.permit_id == permitted.permit_id
+    assert rechecked.execution_refusal is not None
+    assert rechecked.execution_refusal.refusal_reason is AdmissionRefusalReason.USER_ROLE_REQUIRED
 
 
 def test_disabled_identity_retains_existing_permit_for_cancellation_cleanup(admission_engine: Engine) -> None:

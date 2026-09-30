@@ -29,7 +29,7 @@ from elspeth.core.landscape.schema import auth_events_table
 from elspeth.web.app import _build_local_auth_provider
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.local import AccessPending, LocalAuthProvider
-from elspeth.web.auth.models import IdentityClaims
+from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
@@ -105,6 +105,24 @@ def _identity_id(authority: RepositoryIdentityAuthority, username: str) -> str:
     record = authority.read_identity_by_natural_key(provider="local", subject=username)
     assert record is not None
     return record.identity_id
+
+
+async def test_a_browser_token_cannot_authenticate_a_reserved_service_identity(
+    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority], request: pytest.FixtureRequest
+) -> None:
+    """Browser bearer verification includes the row's human/provider contract."""
+    engine, authority = substrate
+    provider = _provider(_local_settings(tmp_path), authority, request)
+    provider.create_user("automation", "password123", display_name="Automation")
+    token = await provider.login("automation", "password123")
+    identity_id = _identity_id(authority, "automation")
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table).where(identities_table.c.identity_id == identity_id).values(provider="service", kind="service")
+        )
+
+    with pytest.raises(AuthenticationError, match="Invalid token"):
+        await provider.authenticate(token)
 
 
 async def test_a_dormant_local_login_is_re_pended_and_refused_at_the_admission_wall(

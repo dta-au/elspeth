@@ -1646,7 +1646,7 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 71, Landscape epoch 48 and `run_web_plugin_policy` presence,
+session epoch 71, Landscape epoch 49 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
@@ -3332,7 +3332,7 @@ if test "$DEPLOYMENT_MODE" = upgrade; then
     .backward_compatible == false
     and .rollback_permitted == false
     and .schema_facts.previous.landscape_epoch == 29
-    and .schema_facts.candidate.landscape_epoch == 48
+    and .schema_facts.candidate.landscape_epoch == 49
   ' "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" compatibility-record \
     "$COMPATIBILITY_RECORD_SHA256" "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null

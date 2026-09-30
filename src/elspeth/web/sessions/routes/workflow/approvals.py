@@ -16,7 +16,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.config import WebSettings
@@ -174,7 +174,7 @@ def create_approvals_router() -> APIRouter:
         body: ApprovalRequestBody,
         request: Request,
         response: Response,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ApprovalView:
         _require_governance(request)
         session = await _verify_session_ownership(session_id, user, request)
@@ -375,7 +375,7 @@ def create_approvals_router() -> APIRouter:
         approval_id: str,
         request: Request,
         response: Response,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ApprovalView:
         _require_governance(request)
         authority = _authority(request)

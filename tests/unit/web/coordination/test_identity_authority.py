@@ -1128,6 +1128,72 @@ def test_purge_removes_only_stale_pending_rows(engine, authority) -> None:
         authority.purge_stale_pending_identities(actor=actor, retention_days=0, record=_noop)
 
 
+def test_purge_retains_exact_cutoff_disabled_and_dormancy_repending(engine, authority) -> None:
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    exact_cutoff = _pending(authority, "exact-cutoff")
+    disabled = _pending(authority, "disabled")
+    dormant = _provision(authority, actor, "dormant")
+    fixed_now = datetime(2030, 1, 1, tzinfo=UTC)
+    authority._clock_sql = "SELECT '2030-01-01 00:00:00'"
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == exact_cutoff.identity_id)
+            .values(first_seen_at=fixed_now - timedelta(days=90))
+        )
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == disabled.identity_id)
+            .values(
+                access_state="disabled",
+                first_seen_at=fixed_now - timedelta(days=120),
+                disabled_at=fixed_now,
+                disable_reason="administratively disabled",
+            )
+        )
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == dormant.record.identity_id)
+            .values(
+                access_state="pending",
+                first_seen_at=fixed_now - timedelta(days=120),
+                disabled_at=fixed_now,
+                disable_reason="dormant",
+            )
+        )
+
+    outcome = authority.purge_stale_pending_identities(actor=actor, retention_days=90, record=_noop)
+
+    assert outcome.identity_ids == ()
+    assert authority.read_identity(identity_id=exact_cutoff.identity_id) is not None
+    assert authority.read_identity(identity_id=disabled.identity_id) is not None
+    assert authority.read_identity(identity_id=dormant.record.identity_id) is not None
+
+
+def test_purge_is_bounded_reports_more_and_audit_failure_rolls_back(engine, authority) -> None:
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    pending = tuple(_pending(authority, f"stale-{index}") for index in range(201))
+    for record in pending:
+        _age_identity(engine, record.identity_id, days=120)
+
+    first = authority.purge_stale_pending_identities(actor=actor, retention_days=90, record=_noop)
+
+    assert len(first.identity_ids) == 200
+    assert first.has_more is True
+    assert len(set(first.identity_ids)) == 200
+    remaining = tuple(record.identity_id for record in pending if authority.read_identity(identity_id=record.identity_id) is not None)
+    assert len(remaining) == 1
+
+    def reject_audit(_outcome: PendingIdentitiesPurged) -> None:
+        raise _AuditOutage
+
+    with pytest.raises(_AuditOutage):
+        authority.purge_stale_pending_identities(actor=actor, retention_days=90, record=reject_audit)
+    assert authority.read_identity(identity_id=remaining[0]) is not None
+
+
 def test_list_identities_filters_by_state_and_bounds_the_page(authority) -> None:
     root = _bootstrap(authority)
     actor = _actor(root.record.identity_id)

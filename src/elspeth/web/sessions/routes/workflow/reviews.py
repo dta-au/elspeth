@@ -17,7 +17,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import MAX_AUTH_AUDIT_TEXT_LENGTH, AuthAuditWriter
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.review_authority import (
@@ -179,7 +179,7 @@ def create_reviews_router() -> APIRouter:
         body: RequestReviewBody,
         request: Request,
         response: Response,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ReviewRequestView:
         _require_governance(request)
         session = await _verify_session_ownership(session_id, user, request)
@@ -297,7 +297,7 @@ def create_reviews_router() -> APIRouter:
         request_id: str,
         request: Request,
         response: Response,
-        user: Annotated[UserIdentity, Depends(get_current_user)],
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ReviewRequestView:
         _require_governance(request)
         recorder = _recorder(request)

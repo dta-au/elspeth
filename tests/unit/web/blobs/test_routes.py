@@ -32,7 +32,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -81,6 +81,7 @@ def _make_app(
         shareable_link_signing_key=b"\x00" * 32,
     )
     app.state.settings = settings
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
     app.state.session_service = session_service
     app.state.blob_service = blob_service
 
@@ -435,6 +436,7 @@ class TestIDORProtection:
             app.state.session_service = session_service
             app.state.blob_service = blob_service
             app.state.settings = settings
+            wire_test_pipeline_user_authority(app, identity_id=uid, engine=engine)
 
             from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 

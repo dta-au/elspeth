@@ -1151,9 +1151,7 @@ def _build_local_auth_provider(
     """
 
     def _principal_is_active(identity_id: str) -> bool:
-        record = identity_authority.read_identity(identity_id=identity_id)
-        # An absent row is never an implicit grant.
-        return record is not None and record.is_active
+        return identity_authority.is_active_human_identity(identity_id=identity_id, provider="local")
 
     def _record_admission(identity_id: str, username: str, quota_written: bool) -> None:
         # Runs INSIDE ensure_identity's transaction, so a failed audit rolls
@@ -1668,8 +1666,7 @@ def _create_app(
     app.state.library_state_seeder = seed_state_from_runtime_yaml
 
     def recovery_principal_is_active(identity_id: str) -> bool:
-        record = identity_authority.read_identity(identity_id=identity_id)
-        return record is not None and record.is_active
+        return identity_authority.is_active_human_identity(identity_id=identity_id, provider=settings.auth_provider)
 
     app.state.principal_is_active = recovery_principal_is_active
 

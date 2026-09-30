@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable
 from dataclasses import replace
+from typing import Annotated
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import AuditIntegrityError
@@ -47,8 +48,8 @@ from .._helpers import (
     cast,
     deep_thaw,
     execute_tool,
-    get_current_user,
     merge_composer_meta_updates,
+    require_pipeline_user,
     run_sync_in_worker,
     slog,
 )
@@ -241,7 +242,7 @@ async def _await_accept_state_data[T](
 async def list_composition_proposals(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     status: ProposalLifecycleStatus | None = Query(None),  # noqa: B008
 ) -> list[CompositionProposalResponse]:
     session = await _verify_session_ownership(session_id, user, request)
@@ -257,7 +258,7 @@ async def list_composition_proposals(
 async def list_proposal_events(
     session_id: UUID,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> list[ProposalEventResponse]:
     session = await _verify_session_ownership(session_id, user, request)
     service: SessionServiceProtocol = request.app.state.session_service
@@ -273,8 +274,8 @@ async def accept_composition_proposal(
     session_id: UUID,
     proposal_id: UUID,
     request: Request,
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     body: AcceptProposalRequest | None = None,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
 ) -> CompositionProposalResponse:
     session = await _verify_session_ownership(session_id, user, request)
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
@@ -683,7 +684,7 @@ async def reject_composition_proposal(
     proposal_id: UUID,
     body: RejectProposalRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
 ) -> CompositionProposalResponse:
     session = await _verify_session_ownership(session_id, user, request)
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))

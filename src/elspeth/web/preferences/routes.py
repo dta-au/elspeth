@@ -5,14 +5,15 @@ Two endpoints under ``/api/composer-preferences``:
   - ``PATCH`` — partial update; missing fields are preserved. Empty
     payload is a no-op success.
 
-Both endpoints require auth (the standard ``get_current_user``
-dependency). Cross-user isolation is via ``user.user_id`` scoping at the
-service layer.
+Both endpoints require a live deployment-wide ``user`` grant. Cross-user
+isolation is via ``user.user_id`` scoping at the service layer.
 """
+
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.middleware.rate_limit import (
     WebRateLimiter,
@@ -31,7 +32,7 @@ def create_preferences_router() -> APIRouter:
     @router.get("", response_model=ComposerPreferences)
     async def get_preferences(
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ComposerPreferences:
         service: PreferencesService = request.app.state.preferences_service
         return await service.get_composer_preferences(user.user_id)
@@ -40,7 +41,7 @@ def create_preferences_router() -> APIRouter:
     async def update_preferences(
         body: UpdateComposerPreferencesRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> ComposerPreferences:
         # Panel C1: per-user rate limit — metered by the WRITE bucket
@@ -48,8 +49,8 @@ def create_preferences_router() -> APIRouter:
         # This PATCH is a cheap DB upsert, and the tutorial legitimately
         # fires resume-state persists in bursts; sharing the LLM-sized
         # bucket let those bursts 429 the tutorial-completion save.
-        # Read GET is intentionally unguarded — idempotent, safe to
-        # spam, no write amplification.
+        # Read GET has the same workload-role boundary, but no write-rate
+        # limit because it is idempotent and has no write amplification.
         await rate_limiter.check(user.user_id)
         service: PreferencesService = request.app.state.preferences_service
         try:

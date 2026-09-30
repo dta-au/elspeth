@@ -23,7 +23,7 @@ from elspeth.web.secrets.service import WebSecretService
 from elspeth.web.secrets.user_store import UserSecretStore
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -83,6 +83,7 @@ def _make_app(
     app.dependency_overrides[get_current_user] = mock_user
     app.state.secret_service = secret_service
     app.state.settings = _MockSettings()
+    wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
 
     app.include_router(create_secrets_router())
     return app
@@ -436,6 +437,7 @@ class TestCrossUserIsolation:
         app_a.dependency_overrides[get_current_user] = mock_user_a
         app_a.state.secret_service = secret_service
         app_a.state.settings = mock_settings
+        wire_test_pipeline_user_authority(app_a, identity_id="alice", engine=engine)
         app_a.include_router(create_secrets_router())
 
         # App for User B — same service, different identity
@@ -448,6 +450,7 @@ class TestCrossUserIsolation:
         app_b.dependency_overrides[get_current_user] = mock_user_b
         app_b.state.secret_service = secret_service
         app_b.state.settings = mock_settings
+        wire_test_pipeline_user_authority(app_b, identity_id="bob", engine=engine)
         app_b.include_router(create_secrets_router())
 
         return TestClient(app_a), TestClient(app_b)

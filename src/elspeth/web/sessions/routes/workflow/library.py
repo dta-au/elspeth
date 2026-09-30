@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import get_current_user, require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
@@ -168,6 +168,14 @@ async def _governed_user(request: Request, user: Annotated[UserIdentity, Depends
     return user
 
 
+async def _governed_pipeline_user(
+    request: Request,
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
+) -> UserIdentity:
+    _require_governance(request)
+    return user
+
+
 async def _curator(request: Request, user: Annotated[UserIdentity, Depends(get_current_user)]) -> UserIdentity:
     _require_governance(request)
     if not await _live_curator_fast_screen(request, user):
@@ -278,7 +286,7 @@ def create_library_router() -> APIRouter:
         body: PublishLibraryEntryRequest,
         request: Request,
         response: Response,
-        user: Annotated[UserIdentity, Depends(_governed_user)],
+        user: Annotated[UserIdentity, Depends(_governed_pipeline_user)],
     ) -> LibraryEntryView:
         session = await _verify_session_ownership(session_id, user, request)
         service: SessionServiceProtocol = request.app.state.session_service
@@ -405,7 +413,7 @@ def create_library_router() -> APIRouter:
         entry_id: str,
         request: Request,
         response: Response,
-        user: Annotated[UserIdentity, Depends(_governed_user)],
+        user: Annotated[UserIdentity, Depends(_governed_pipeline_user)],
     ) -> LibraryForkResponse:
         settings = _settings(request)
         try:

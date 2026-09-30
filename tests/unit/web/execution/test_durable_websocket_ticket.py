@@ -14,6 +14,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     composition_states_table,
     identities_table,
+    identity_roles_table,
     runs_table,
     sessions_table,
     websocket_tickets_table,
@@ -35,6 +36,16 @@ def seed_ticket_run(engine: Engine) -> tuple[str, str, UserIdentity]:
                 username="current-name",
                 access_state="active",
                 first_seen_at=now,
+            )
+        )
+        conn.execute(
+            insert(identity_roles_table).values(
+                role_id=str(uuid4()),
+                identity_id=identity_id,
+                role="user",
+                scope=None,
+                granted_by_identity_id=identity_id,
+                granted_at=now,
             )
         )
         conn.execute(
@@ -72,7 +83,7 @@ def test_digest_only_single_use_and_current_identity(ticket_engine):
     assert first.consume(ticket=issued.ticket, run_id=run_id) is None
 
 
-@pytest.mark.parametrize("refusal", ["wrong-run", "expired", "disabled", "wrong-owner", "archived", "provider"])
+@pytest.mark.parametrize("refusal", ["wrong-run", "expired", "disabled", "role", "wrong-owner", "archived", "provider"])
 def test_consumption_rechecks_live_authorization(ticket_engine, refusal):
     session_id, run_id, user = seed_ticket_run(ticket_engine)
     authority = RepositorySessionWebsocketTicketAuthority(ticket_engine)
@@ -82,6 +93,8 @@ def test_consumption_rechecks_live_authorization(ticket_engine, refusal):
             conn.execute(update(websocket_tickets_table).values(expires_at=datetime.now(UTC) - timedelta(seconds=1)))
         elif refusal == "disabled":
             conn.execute(update(identities_table).values(access_state="disabled"))
+        elif refusal == "role":
+            conn.execute(update(identity_roles_table).values(revoked_at=datetime.now(UTC)))
         elif refusal == "wrong-owner":
             other_owner = str(uuid4())
             ensure_test_identity(conn, identity_id=other_owner)

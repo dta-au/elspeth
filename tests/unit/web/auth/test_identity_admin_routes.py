@@ -94,6 +94,9 @@ class _RecordingAuditWriter:
     def record_relationship_changed(self, request: Request | None, **kwargs: Any) -> None:
         self._note("record_relationship_changed", request, kwargs)
 
+    def record_pending_identities_purged(self, request: Request | None, **kwargs: Any) -> None:
+        self._note("record_pending_identities_purged", request, kwargs)
+
     def record_quota_exceeded(self, outcome: Any) -> None:
         return None
 
@@ -257,6 +260,42 @@ async def test_console_provenance_from_a_human_is_refused_and_leaves_no_row(harn
 
 
 # ── identities ───────────────────────────────────────────────────────────
+
+
+async def test_admin_can_run_the_configured_bounded_pending_purge(harness: _Harness) -> None:
+    stale_id = _pending(harness, "alice")
+    fresh_id = _pending(harness, "bob")
+    with harness.engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == stale_id)
+            .values(first_seen_at=datetime.now(UTC) - timedelta(days=91))
+        )
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        rejected_override = await client.post(
+            "/api/auth/admin/identities/purge-pending",
+            headers=root,
+            json={"retention_days": 1},
+        )
+        response = await client.post("/api/auth/admin/identities/purge-pending", headers=root, json={})
+        replay = await client.post("/api/auth/admin/identities/purge-pending", headers=root, json={})
+
+    assert rejected_override.status_code == 422
+    assert response.status_code == 200, response.text
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["retention_days"] == 90
+    assert response.json()["deleted_identity_ids"] == [stale_id]
+    assert response.json()["deleted_count"] == 1
+    assert response.json()["has_more"] is False
+    assert replay.status_code == 200
+    assert replay.json()["deleted_identity_ids"] == []
+    assert harness.authority.read_identity(identity_id=stale_id) is None
+    assert harness.authority.read_identity(identity_id=fresh_id) is not None
+    calls = [call for call in harness.audit.calls if call.method == "record_pending_identities_purged"]
+    assert len(calls) == 2
+    assert calls[0].kwargs["outcome"].identity_ids == (stale_id,)
+    assert calls[1].kwargs["outcome"].identity_ids == ()
 
 
 async def test_the_queue_lists_pending_rows_as_subject_and_organisation_only(harness: _Harness) -> None:

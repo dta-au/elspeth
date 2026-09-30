@@ -17,6 +17,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
 from elspeth.web.shareable_reviews.service import CompositionNotRunnableError
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,7 @@ def _app_with_share_service(shareable_review_service: object, *, session_id: UUI
     app.state.write_rate_limiter = ComposerRateLimiter(limit=100)
     app.state.shareable_review_service = shareable_review_service
     app.state.session_service = _SessionService(session=_SessionRecord(id=session_id, user_id="alice", auth_provider_type="local"))
+    wire_test_pipeline_user_authority(app, identity_id="alice")
     app.dependency_overrides[get_current_user] = _mock_user
     app.include_router(create_shareable_reviews_router())
     return app

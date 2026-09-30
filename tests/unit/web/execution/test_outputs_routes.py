@@ -36,6 +36,7 @@ from elspeth.web.execution.schemas import (
     RunOutputsResponse,
     RunStatusResponse,
 )
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 
 _TEST_USER_ID = "test-user-123"
 _TEST_SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -225,6 +226,7 @@ def _create_test_app(
     if settings is None:
         settings = _FakeSettings()
     app.state.settings = settings
+    wire_test_pipeline_user_authority(app, identity_id=_TEST_USER_ID)
 
     fake_user = UserIdentity(user_id=_TEST_USER_ID, username="testuser")
 

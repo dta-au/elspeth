@@ -612,6 +612,26 @@ recorded in `identity_roles` with a granting identity, a timestamp, an optional
 expiry, and a note. The roles are a closed set: `admin`, `approver`, `reviewer`,
 `user`, `curator`, `auditor`, `oversight`.
 
+Pipeline authoring, execution, replay, cancellation, and progress-ticket
+operations require a live deployment-wide `user` grant on an active human
+identity from the configured browser provider. The check is repeated at each
+route and again at durable execution and WebSocket-consumption boundaries.
+`auditor` and `oversight` remain reserved role values and authorize no Web API
+route in 0.8.1.
+
+Machine-to-Web-API authentication is reserved and unavailable in 0.8.1.
+`service` remains a storage discriminator for the future organisation-console
+contract; there is no service credential issuer or service-authenticated Web
+router in this release. A human browser bearer token must never be stored,
+rotated, or presented as a service credential.
+
+Administrators remove never-activated pending rows with
+`POST /api/auth/admin/identities/purge-pending`. The server uses
+`identity_pending_retention_days`; callers cannot supply a shorter window.
+Each request deletes a deterministic batch of at most 200 rows strictly older
+than the database-time cutoff and writes the exact deleted identity IDs to the
+authentication audit trail. Repeat while `has_more` is true.
+
 The practical consequence for a first-time deployment: **a first login lands
 pending, not active.** Someone who authenticates successfully is refused access
 until an administrator admits them. That is the design, and it is why

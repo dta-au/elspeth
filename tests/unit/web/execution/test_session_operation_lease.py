@@ -71,7 +71,7 @@ from elspeth.web.sessions.models import run_events_table
 from elspeth.web.sessions.protocol import CompositionStateData, SessionOperationAuthority, SessionServiceProtocol
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 _USER_ID = "execution-lease-user"
@@ -342,6 +342,7 @@ def _route_harness(session_id: UUID) -> _RouteHarness:
     session_service = _RouteSessionService(session_id)
     app.state.session_service = session_service
     app.state.settings = SimpleNamespace(auth_provider="local")
+    wire_test_pipeline_user_authority(app, identity_id=_USER_ID)
     request = Request(
         {
             "type": "http",
@@ -387,6 +388,7 @@ def _http_route_app(
     app.state.session_service = session_service
     app.state.execution_service = execution_service
     app.state.settings = SimpleNamespace(auth_provider="local")
+    wire_test_pipeline_user_authority(app, identity_id=_USER_ID)
 
     async def authenticated_user() -> UserIdentity:
         return UserIdentity(user_id=_USER_ID, username="execution-lease-user")
