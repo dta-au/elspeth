@@ -302,7 +302,7 @@ def test_host_runner_unit_job_proves_the_docker_and_non_root_ids_on_every_push()
     """
     job = _job("host-runner-unit")
     assert "container" not in job
-    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["runs-on"] == ["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]
     run = next(step for step in job["steps"] if "pytest" in str(step.get("run", "")))
     assert run["env"] == {"ELSPETH_CI_DOCKER_REQUIRED": "1", "ELSPETH_CI_NON_ROOT_REQUIRED": "1"}
     tokens = run["run"].replace("\\\n", " ").split()

@@ -299,7 +299,9 @@ def test_workflow_requires_all_shards_and_combined_unchanged_floors() -> None:
     assert "matrix.shard" in jobs["test"]["env"]["CI_CHECKOUT_PATH"]
     aggregate = jobs["coverage"]
     assert aggregate["needs"] == ["test"]
-    assert aggregate["if"] == "always()"
+    assert aggregate["if"] == (
+        "always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)"
+    )
     commands = "\n".join(step.get("run", "") for step in aggregate["steps"])
     assert "needs.test.result" in commands
     for floor in (85, 92, 99, 90, 62):

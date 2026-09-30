@@ -22,6 +22,7 @@ import dataclasses
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from itertools import count
 from uuid import uuid4
 
 import httpx
@@ -200,7 +201,16 @@ def _driver(replicas: _RecordedReplicas) -> tuple[ReplicaProbeDriver, _FakeReade
         )
 
     observer = PostgresEvidenceObserver(sessions=reader, landscape=reader)
-    return ReplicaProbeDriver(controller=_controller(), observer=observer, client_factory=client_factory), reader
+    dispatch_ticks = count()
+    clock_lock = threading.Lock()
+
+    def clock() -> float:
+        # Recorded transports supply deterministic dispatch observations;
+        # operational probes retain the real monotonic clock and 5 ms gate.
+        with clock_lock:
+            return next(dispatch_ticks) / 1024.0
+
+    return ReplicaProbeDriver(controller=_controller(), observer=observer, client_factory=client_factory, clock=clock), reader
 
 
 # --------------------------------------------------------------------------- P1 / P2 against recorded transports
