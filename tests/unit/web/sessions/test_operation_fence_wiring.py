@@ -247,10 +247,8 @@ def test_pending_interpretation_policy_is_neutral_and_command_has_one_constructo
     assert "SessionPendingInterpretationCommand(" not in inspect.getsource(coordination_repository)
 
 
-def test_pending_interpretation_validator_rejects_any_non_exact_catalog_carrier() -> None:
-    """Validation dependencies are nominally typed (ADR-032): a carrier that
-    merely wraps a runtime handle is refused for not being the exact
-    process-local catalog, with no object-graph scan deciding the verdict."""
+def test_pending_interpretation_validator_rejects_any_non_exact_input_carrier() -> None:
+    """A runtime carrier cannot replace the closed owned validation inputs."""
     from elspeth.web.sessions.pending_interpretation import _SessionPendingInterpretationValidator
 
     class SlottedCatalogBase:
@@ -264,12 +262,9 @@ def test_pending_interpretation_validator_rejects_any_non_exact_catalog_carrier(
 
     engine = create_session_engine("sqlite:///:memory:")
     try:
-        with pytest.raises(TypeError, match=r"catalog must be the exact process-local CatalogServiceImpl"):
+        with pytest.raises(TypeError, match=r"validation_inputs must be exact SessionInterpretationValidationInputs"):
             _SessionPendingInterpretationValidator(
-                profile_aware=False,
-                plugin_snapshot=None,
-                profile_registry=None,
-                catalog=types.SimpleNamespace(nested={"catalog": MixedStorageCatalog(engine)}),
+                validation_inputs=types.SimpleNamespace(nested={"catalog": MixedStorageCatalog(engine)}),
                 session_id="session",
                 user_id=None,
             )

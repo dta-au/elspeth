@@ -12779,8 +12779,9 @@ class TestGetPluginAssistance:
         assert "For how <adjective> phrasing, use the adjective itself as user_term" in hints
         assert "only an llm_prompt_template review is incomplete" in hints
         assert "Do not stop by saying the rubric is part of the reviewed prompt" in hints
-        assert "options.schema declares INPUT fields arriving from upstream" in hints
-        assert "Never require this node's generated fields as input" in hints
+        assert "required_input_fields names upstream columns" in hints
+        assert "schema.fields may declare output types (ADR-050)" in hints
+        assert "Never require this node's generated fields as upstream inputs" in hints
         assert "pass-through guarantees come from upstream" in hints
         assert "good_colour_pair_answer / approximate_hex_answer downstream" in hints
         assert "Single-query LLM output is written to response_field" in hints

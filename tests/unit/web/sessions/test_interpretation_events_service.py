@@ -1684,7 +1684,7 @@ async def test_resolve_interpretation_preserves_validator_text(service, monkeypa
     monkeypatch.setattr(
         service,
         "_validate_patched_composition_state",
-        lambda _state, *, plugin_snapshot, session_id, user_id: ValidationSummary(
+        lambda _state, *, validation_inputs, session_id, user_id: ValidationSummary(
             is_valid=False,
             errors=(ValidationEntry(component="node", message=canary, severity="high"),),
         ),

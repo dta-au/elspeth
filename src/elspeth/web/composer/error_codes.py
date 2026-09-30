@@ -192,6 +192,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "value_transform_result_type_incompatible",
         "vague_term_unwired",
         "validation_error",
+        "web_scrape_auth_unavailable",
         "web_scrape_http_identity_invalid",
     }
 )

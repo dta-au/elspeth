@@ -40,6 +40,13 @@ class CSVSourceConfig(TabularSourceDataConfig):
     - columns, field_mapping (field normalization is mandatory)
     """
 
+    snapshot_for_resume: bool = Field(
+        default=False,
+        strict=True,
+        description="For a single-source pipeline, materialize at most 64 MiB of immutable rows before processing so a failed run can resume unread rows.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
     delimiter: str = Field(
         default=",",
         description="Single-character delimiter used to split CSV fields.",
@@ -99,7 +106,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:45058cd036b765f7"
+    source_file_hash: str | None = "sha256:929e808dd1833616"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by

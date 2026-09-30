@@ -961,7 +961,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # from the merged manifest through the canonical corpus loader.
 # B3 runtime attribution: value_transform's three union-collision-fail pins
 # moved with its source hash; the reopen-resume case does not use that plugin.
-EXPECTED_CASE_REGISTRY_SHA256 = "f94b0669f1a58b9b946d20be8b97da7e36c69ce57218551afe687cc97b724d84"
+# Strict snapshot opt-in: csv/json source hashes moved; the exact projection
+# pins retain their behavior and the checkpoint full-history hash was measured
+# by the production harness. This digest comes from the canonical loader.
+EXPECTED_CASE_REGISTRY_SHA256 = "e8e271c54627b84c847b1d8bef8c7265371d2e66d52dcae2423ed9593ec82f9b"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

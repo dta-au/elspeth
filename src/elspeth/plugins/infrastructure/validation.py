@@ -42,7 +42,8 @@ class ValidationError:
     Attributes:
         field: Field name that failed validation
         message: Human-readable error message
-        value: The invalid value (for debugging)
+        value: None for configuration errors. Resolved inputs can contain
+               credentials and are never diagnostic evidence.
     """
 
     field: str
@@ -76,9 +77,9 @@ def validate_source_config(
         raise
     except ValueError as exc:
         # Same contract as validate_transform_config: dispatch rejection is a
-        # config error, reported rather than raised. The value is absent when
-        # the missing key IS the error.
-        return [ValidationError(field="provider", message=str(exc), value=config["provider"] if "provider" in config else None)]
+        # config error, reported rather than raised. Input values are omitted
+        # from configuration diagnostics because they may contain credentials.
+        return [ValidationError(field="provider", message=str(exc), value=None)]
 
     # Handle special case: null_source has no config class
     if config_model is None:
@@ -147,9 +148,9 @@ def validate_transform_config(
         # engine fault: report it through the same channel as a Pydantic
         # rejection so ``PluginManager`` raises the standard prefixed
         # ValueError and every composer probe abstains instead of crashing
-        # ``CompositionState.validate()`` (elspeth-2ed41f0a4a census). The
-        # value is absent when the missing key IS the error.
-        return [ValidationError(field="provider", message=str(exc), value=config["provider"] if "provider" in config else None)]
+        # ``CompositionState.validate()`` (elspeth-2ed41f0a4a census). Resolved
+        # configuration values are excluded from the diagnostic projection.
+        return [ValidationError(field="provider", message=str(exc), value=None)]
 
     if config_model is None:
         return []  # No validation needed
@@ -214,7 +215,7 @@ def validate_schema_config(
             ValidationError(
                 field="schema",
                 message=str(e),
-                value=schema_config,
+                value=None,
             )
         ]
 
@@ -232,15 +233,15 @@ def _extract_wrapped_plugin_config_error(
     cause = error.__cause__
 
     if cause is None:
-        return [ValidationError(field="config", message=str(error), value=config)]
+        return [ValidationError(field="config", message=str(error), value=None)]
 
     if type(cause) is PydanticValidationError:
         return _extract_errors(cause)
 
     if type(cause) is ValueError:
         if "schema" in config:
-            return [ValidationError(field="schema", message=str(cause), value=config["schema"])]
-        return [ValidationError(field="config", message=str(cause), value=config)]
+            return [ValidationError(field="schema", message=str(cause), value=None)]
+        return [ValidationError(field="config", message=str(cause), value=None)]
 
     raise error from cause
 
@@ -305,11 +306,12 @@ def _extract_errors(
     LLM-composer — receive an actionable message rather than the bare
     ``"Field required"`` (cf. elspeth-861b0c58f5). The enrichment mirrors
     ``config_base._format_validation_error_cause`` so the structured
-    extraction path and the joined-string path stay in sync.
+    extraction path and the joined-string path stay in sync. Resolved config
+    inputs never enter the diagnostic projection, even for outer-model errors.
     """
     errors: list[ValidationError] = []
 
-    for err in pydantic_error.errors():
+    for err in pydantic_error.errors(include_input=False):
         # Pydantic error dict has: loc, msg, type, ctx
         # Model-level validators (@model_validator) produce loc=() — empty tuple.
         # Use "__model__" sentinel so the field is never empty.
@@ -319,14 +321,11 @@ def _extract_errors(
         if tuple(err["loc"]) == ("schema",) and err["type"] == "missing":
             message = _SCHEMA_REQUIRED_GUIDANCE
 
-        # Pydantic error dict includes failing input value.
-        value = err["input"]
-
         errors.append(
             ValidationError(
                 field=field_path,
                 message=message,
-                value=value,
+                value=None,
             )
         )
 

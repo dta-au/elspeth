@@ -147,7 +147,9 @@ class QuarantineRouter:
                 f"in from_plugin_instances()."
             ) from exc
 
-        validation_error_id = loop_ctx.ctx.pop_pending_quarantine_validation_error_id(source_item.row)
+        validation_error_id = source_item.validation_error_id
+        if validation_error_id is None:
+            validation_error_id = loop_ctx.ctx.pop_pending_quarantine_validation_error_id(source_item.row)
         # Sanitize quarantine data at Tier-3 boundary: replace non-finite
         # floats (NaN, Infinity) with None so downstream canonical JSON
         # and stable_hash operations succeed. The quarantine_error records

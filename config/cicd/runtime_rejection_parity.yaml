@@ -53,6 +53,19 @@ sites:
     an emitted option is covered (report_assemble join_with/title, truncate.suffix, web_scrape.text_separator,
     batch_classifier_metrics.positive_label, batch_outlier_annotator.output_prefix, pdf_rasterize.page_text_field,
     and the sink headers option on csv/json/aws_s3/azure_blob) rather than report_assemble alone.'
+- key: 4f7881b6a096bf18
+  path: src/elspeth/config_loading.py
+  qualname: _reject_web_scrape_auth_literal
+  exception: ValueError
+  message: web_scrape auth.credential must be an exact environment secret reference
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - web_scrape_auth_unavailable
+  note: 'CompositionState.validate rejects every non-None web_scrape auth option, including missing, literal,
+    malformed and wired credential values. This stronger authoring gate matches the current disabled authenticated
+    runtime feature; composer_hidden alone is only catalog projection and is not the admission proof.
+    Tests: test_web_scrape_auth_is_unavailable_during_authoring and test_auth_refusal_does_not_reject_unauthenticated_or_other_plugins.'
 - key: d4c584dc8e39ee9b
   path: src/elspeth/config_loading.py
   qualname: load_settings

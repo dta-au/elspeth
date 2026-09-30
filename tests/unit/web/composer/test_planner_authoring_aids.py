@@ -1777,6 +1777,17 @@ class TestModelCatalogAid:
         assert "models_omitted" in guidance
         assert "details_via" in guidance
         assert "Never invent a slug" in guidance
+        assert "catalog list_models serves" in guidance
+        assert "provider_model_counts and total_models include every known provider" in guidance
+        assert "absence from models_by_provider means identifiers were not carried" in guidance
+        assert "closed llm provider-option set" in guidance
+        assert "only its identifiers are carried or authorable" in guidance
+        assert "no catalogued identifiers" in guidance
+        assert "operator-configured" in guidance
+        assert "over-budget provider with model_count and details_via" in guidance
+        assert "follow that marker before binding its slug" in guidance
+        assert "recall one from training" in guidance
+        assert "preflight rejects an unserved slug" in guidance
 
     def test_a_profile_bound_slug_reaches_the_prompt_only_as_public_inventory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2528,6 +2539,17 @@ class TestNamedButMissingFile:
         assert "never uploaded" in rules
         assert "list_blobs" in rules
         assert "named gap" in rules
+
+
+def test_llm_rules_distinguish_upstream_requirements_from_generated_output_declarations() -> None:
+    view, _snapshot = _trained_view()
+    rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+    assert "declares any guaranteed prefixed fields" not in rendered
+    assert "STILL required" not in rendered
+    assert "required_input_fields names upstream columns" in rendered
+    assert "schema.fields can declare output types (ADR-050)" in rendered
+    assert "output_fields" in rendered and "downstream" in rendered
+    assert "every query supplies" in rendered
 
 
 class TestRun2PackEdits:

@@ -73,6 +73,40 @@ MAX_AUDIT_QUERY_FINGERPRINTS = 64
 _QUERY_REDACTION_SENTINEL_KEY = "__elspeth_query_redacted"
 _QUERY_REDACTION_SENTINEL_VALUE = "too_many_fields"
 _URL_BEARING_RESPONSE_HEADERS = frozenset({"content-location", "location"})
+_LINK_CAPABILITY_QUERY_KEYS = frozenset({"cursor", "continuation", "next_token", "page_token", "session", "state"})
+_LINK_ITEM = r'<[^<>\r\n]+>\s*;\s*rel\s*=\s*(?:"[a-z ]+"|[a-z]+)'
+_SAFE_LINK_HEADER = re.compile(rf"{_LINK_ITEM}(?:\s*,\s*{_LINK_ITEM})*", re.IGNORECASE)
+_LINK_URL = re.compile(r"<([^<>\r\n]+)>")
+
+
+def safe_link_header_for_audit(value: str) -> str:
+    """Keep only simple page links whose full value is safe to replay."""
+    if (
+        len(value) > MAX_AUDIT_QUERY_CHARS
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+        or _SAFE_LINK_HEADER.fullmatch(value) is None
+    ):
+        return "<redacted-http-link>"
+    try:
+        for match in _LINK_URL.finditer(value):
+            url = match.group(1)
+            parsed = urlsplit(url)
+            if fingerprint_url(url) != url:
+                return "<redacted-http-link>"
+            if len(parsed.query) > MAX_AUDIT_QUERY_CHARS:
+                return "<redacted-http-link>"
+            pairs = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=MAX_AUDIT_QUERY_FIELDS)
+            if any(
+                not key
+                or is_sensitive_query_param(key)
+                or key.lower() in _LINK_CAPABILITY_QUERY_KEYS
+                or len(key) + len(val) > MAX_AUDIT_QUERY_CHARS
+                for key, val in pairs
+            ):
+                return "<redacted-http-link>"
+    except (ValueError, UnicodeError, FrameworkBugError):
+        return "<redacted-http-link>"
+    return value
 
 
 def _query_redaction_sentinel() -> dict[str, str | int | float]:
@@ -205,6 +239,9 @@ def filter_response_headers(headers: dict[str, str]) -> dict[str, str]:
     result: dict[str, str] = {}
     for key, value in headers.items():
         if is_sensitive_header(key):
+            continue
+        if key.lower() == "link":
+            result[key] = safe_link_header_for_audit(value)
             continue
         if key.lower() in _URL_BEARING_RESPONSE_HEADERS:
             try:

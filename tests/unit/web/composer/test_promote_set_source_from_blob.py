@@ -41,7 +41,13 @@ from elspeth.web.composer.redaction import (
 )
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.composer.tools import _execute_create_blob, _execute_patch_source_options, _execute_set_source_from_blob
+from elspeth.web.composer.tools import (
+    _execute_create_blob,
+    _execute_patch_source_options,
+    _execute_set_source_from_blob,
+    _execute_update_blob,
+    execute_tool,
+)
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
@@ -1067,6 +1073,131 @@ class TestEchoedServerOwnedMetadata:
         assert "interpretation_requirements" in result.data["server_owned_metadata_note"]
         requirements = deep_thaw(result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY])
         assert requirements == options[INTERPRETATION_REQUIREMENTS_KEY]
+
+    @pytest.mark.parametrize("public_dispatch", [False, True])
+    @pytest.mark.parametrize("echo_review", [False, True])
+    def test_route_only_rebind_preserves_approved_source_and_replay(
+        self, tmp_path: Path, operation_scopes: ExitStack, public_dispatch: bool, echo_review: bool
+    ) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, resolved_options = self._resolved_state(state, options)
+        caller_options = {"schema": {"mode": "observed"}}
+        if echo_review:
+            caller_options[INTERPRETATION_REQUIREMENTS_KEY] = resolved_options[INTERPRETATION_REQUIREMENTS_KEY]
+            caller_options[SOURCE_AUTHORING_KEY] = resolved_options[SOURCE_AUTHORING_KEY]
+        arguments = {
+            "blob_id": options["blob_ref"],
+            "on_success": "rows",
+            "on_validation_failure": "retained_failures",
+            "options": caller_options,
+        }
+        for _attempt in range(2):
+            previous_version = state.version
+            if public_dispatch:
+                assert ctx.plugin_snapshot is not None
+                result = execute_tool(
+                    "set_source_from_blob",
+                    arguments,
+                    state,
+                    ctx.catalog,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    data_dir=ctx.data_dir,
+                    session_engine=ctx.session_engine,
+                    session_id=ctx.session_id,
+                    session_operation_context=ctx.session_operation_context,
+                    session_operation_authority=ctx.session_operation_authority,
+                    validate_arguments=True,
+                    require_data_dir_for_paths=True,
+                )
+            else:
+                result = _execute_set_source_from_blob(arguments, state, ctx)
+            assert result.success, result.data
+            source = result.updated_state.sources["source"]
+            assert source.on_validation_failure == "retained_failures"
+            assert source.options["blob_ref"] == options["blob_ref"]
+            assert deep_thaw(source.options[INTERPRETATION_REQUIREMENTS_KEY]) == resolved_options[INTERPRETATION_REQUIREMENTS_KEY]
+            assert deep_thaw(source.options[SOURCE_AUTHORING_KEY]) == resolved_options[SOURCE_AUTHORING_KEY]
+            assert result.updated_state.version == previous_version + 1
+            state = CompositionState.from_dict(json.loads(json.dumps(result.updated_state.to_dict())))
+
+    @pytest.mark.parametrize("same_content", [False, True])
+    def test_rebind_approval_is_content_bound_not_blob_id_bound(
+        self, tmp_path: Path, operation_scopes: ExitStack, same_content: bool
+    ) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, resolved_options = self._resolved_state(state, options)
+        created = _execute_create_blob(
+            {
+                "filename": "replacement.csv",
+                "mime_type": "text/csv",
+                "content": "name,score\nada,42\n" if same_content else "name,score\nada,43\n",
+            },
+            state,
+            ctx,
+        )
+        assert created.success, created.data
+        assert created.data["blob_id"] != options["blob_ref"]
+        result = _execute_set_source_from_blob(
+            {"blob_id": created.data["blob_id"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, state, ctx
+        )
+        assert result.success, result.data
+        source_options = result.updated_state.sources["source"].options
+        (requirement,) = deep_thaw(source_options[INTERPRETATION_REQUIREMENTS_KEY])
+        if same_content:
+            assert requirement == resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]
+            assert deep_thaw(source_options[SOURCE_AUTHORING_KEY]) == resolved_options[SOURCE_AUTHORING_KEY]
+        else:
+            assert requirement["status"] == "pending"
+            assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] != resolved_options[SOURCE_AUTHORING_KEY]["content_hash"]
+            assert source_options[SOURCE_AUTHORING_KEY]["review_event_id"] is None
+
+    def test_rebind_changed_bytes_at_same_blob_id_requires_new_approval(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, approved_state, options = self._bound_source(tmp_path, operation_scopes)
+        approved_state, resolved_options = self._resolved_state(approved_state, options)
+        # A referenced blob cannot be replaced. Replace it while unbound, then
+        # present the old approval snapshot to the binding boundary.
+        updated = _execute_update_blob({"blob_id": options["blob_ref"], "content": "name,score\nada,43\n"}, _empty_state(), ctx)
+        assert updated.success, updated.data
+        assert updated.data["blob_id"] == options["blob_ref"]
+        result = _execute_set_source_from_blob(
+            {"blob_id": options["blob_ref"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, approved_state, ctx
+        )
+        assert result.success, result.data
+        source_options = result.updated_state.sources["source"].options
+        (requirement,) = deep_thaw(source_options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert requirement["status"] == "pending"
+        assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] == updated.data["content_hash"]
+        assert source_options[SOURCE_AUTHORING_KEY]["content_hash"] != resolved_options[SOURCE_AUTHORING_KEY]["content_hash"]
+        assert source_options[SOURCE_AUTHORING_KEY]["review_event_id"] is None
+
+    @pytest.mark.parametrize("change", [{"source_name": "other"}, {"plugin": "text"}])
+    def test_rebind_does_not_transfer_approval_between_components(
+        self, tmp_path: Path, operation_scopes: ExitStack, change: dict[str, str]
+    ) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, _resolved_options = self._resolved_state(state, options)
+        caller_options = {"schema": {"mode": "observed"}, **({"column": "line"} if "plugin" in change else {})}
+        result = _execute_set_source_from_blob(
+            {"blob_id": options["blob_ref"], "on_success": "rows", "options": caller_options, **change}, state, ctx
+        )
+        assert result.success, result.data
+        target = "other" if "source_name" in change else "source"
+        (requirement,) = deep_thaw(result.updated_state.sources[target].options[INTERPRETATION_REQUIREMENTS_KEY])
+        assert requirement["status"] == "pending"
+        if target == "other":
+            assert result.updated_state.sources["source"] == state.sources["source"]
+
+    def test_rebind_rejects_stale_stored_approval_without_mutation(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
+        ctx, state, options = self._bound_source(tmp_path, operation_scopes)
+        state, resolved_options = self._resolved_state(state, options)
+        resolved_options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] = "f" * 64
+        state = state.with_named_source("source", replace(state.sources["source"], options=resolved_options))
+        result = _execute_set_source_from_blob(
+            {"blob_id": options["blob_ref"], "on_success": "rows", "options": {"schema": {"mode": "observed"}}}, state, ctx
+        )
+        assert not result.success
+        assert result.updated_state == state
+        assert result.validation.errors[0].error_code == "review_reconciliation_failed"
 
     def test_patch_echoing_reduced_resolved_row_keeps_the_review_resolved(self, tmp_path: Path, operation_scopes: ExitStack) -> None:
         """The planner-context projection of a resolved row round-trips: the

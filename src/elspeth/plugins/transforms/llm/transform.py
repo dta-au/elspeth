@@ -1213,7 +1213,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1c09ac95a0ef3b1e"
+    source_file_hash: str | None = "sha256:472746765fba66e5"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -2087,7 +2087,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     "Objective extraction such as identifying primary colours used does not by itself need a vague_term review unless you add subjective scoring, ranking, thresholds, or category semantics.",
                     "For how <adjective> phrasing, use the adjective itself as user_term unless the user supplied a more specific criterion phrase; do not use the whole how-phrase.",
                     "Token-usage and model-ID fields are appended automatically as <response_field>_usage / _model — don't hand-add them.",
-                    "options.schema declares INPUT fields arriving from upstream; required_input_fields names required upstream columns. Never require this node's generated fields as input or hand-add their guarantees.",
+                    "required_input_fields names upstream columns and bounds template visibility (ADR-051). Never require this node's generated fields as upstream inputs. options.schema.fields may declare output types (ADR-050); it does not extract fields from the reply.",
                     "The plugin derives generated outputs from response_field and output_fields; pass-through guarantees come from upstream.",
                     "In multi-query mode, input_fields maps template variables to upstream columns. Per-query output_fields generates <queryname>_<suffix>; downstream consumers use those exact names.",
                     "For the colour example, require colour on the LLM and good_colour_pair_answer / approximate_hex_answer downstream.",

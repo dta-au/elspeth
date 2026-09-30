@@ -13,6 +13,9 @@ transforms:
       content_field: page_content
       fingerprint_field: page_fingerprint
       format: markdown  # markdown | text | raw
+      response_mode: page  # page | json | xml; JSON/XML require format: raw
+      charset_policy: declared_or_utf8  # or utf8_only
+      accepted_mime_types: []  # optional exact MIME allowlist within the mode
       text_separator: " "  # text format only
       fingerprint_mode: content  # content | full
 
@@ -20,6 +23,10 @@ transforms:
         abuse_contact: compliance@example.com
         scraping_reason: "Compliance monitoring"
         timeout: 30
+        max_body_bytes: 10485760  # decoded streaming cap
+        max_decoded_body_bytes: 10485760  # optional narrower post-fetch cap
+        max_encoded_body_bytes: 10485760
+        max_decompression_ratio: 200
         allowed_hosts: public_only  # public_only | allow_private | CIDR list
         allowed_origins: [https://example.gov.au]  # optional exact scheme, host, port
 
@@ -120,6 +127,25 @@ request. The serialized body limit defaults to 1 MiB. `format: raw` returns a
 JSON response as text, ready for a downstream JSON transform; `markdown` and
 `text` accept HTML and other text responses, not `application/json`.
 
+The default `response_mode: page` retains the existing HTML/text extraction
+behavior. To validate an API response as JSON or XML before it receives a
+fingerprint, set `format: raw` and `response_mode: json` or `xml`. JSON must be
+valid, complete UTF-8 JSON with no `NaN`, `Infinity`, or duplicate object keys. XML must be well formed
+and cannot contain a document type declaration or entity declaration. The
+result remains text for a downstream parser; no untrusted document structure
+is added to the row by this option.
+
+Response bytes are decoded strictly, using a supported declared charset or
+UTF-8 when none is declared. Supported charsets are UTF-8, ASCII, ISO-8859-1,
+Windows-1252 and UTF-16 variants. `charset_policy: utf8_only` rejects other
+declared charsets. `accepted_mime_types` narrows the response mode to a list of
+exact MIME types. Missing, binary, or unaccepted content types fail the row.
+The HTTP client accepts identity, gzip and deflate transfer encodings, bounds
+encoded and decoded bytes separately, and rejects excessive expansion. Empty,
+partial (206), no-content (204/205), and 304 responses do not become page
+fingerprints. A 304 cannot be used until conditional content reuse has a
+versioned cache and audit contract.
+
 POST does not follow redirects or retry failed requests automatically. A
 restarted run may still issue the request again, so use this mode only for
 endpoints where repeated retrieval is safe. Request JSON is retained in the
@@ -195,7 +221,64 @@ matches fails the row instead of silently dropping candidates. The default
 limits are 200 records, 4,096 characters per value, and 100,000 characters
 across all extracted values. This only accepts HTML responses. Configure
 selectors for each site after inspecting its current markup, and treat every
-candidate as unverified source data.
+candidate as unverified source data. Set `records.provenance_field` to retain
+aligned source URL, selector, attribute, and match evidence for each column.
+An HTML `href` column with `resolve_url: true` resolves relative links against
+the final page URL and requires explicit `http.allowed_origins`.
+
+For a JSON API, set `format: raw`, `response_mode: json`, and select records
+with exact object keys and array indexes:
+
+```yaml
+records:
+  field: candidates
+  provenance_field: candidate_sources
+  records_path: [results]
+  columns:
+    - {field: name, path: [name], required: true}
+    - {field: status, path: [registration, status]}
+```
+
+`records_path` must select an array of objects. Column paths select scalar
+values or scalar arrays; `multiple: first`, `one`, or `all` controls the
+selection. JSON extraction bounds document size, record count, values per
+record, total values, individual value length, and the combined output and
+provenance size. JSON and CSS record configurations cannot be mixed. Extracted
+values remain untrusted.
+
+For bounded GET pagination, configure exact allowed origins and either a
+CSS next link or an HTTP `Link` header:
+
+```yaml
+pagination:
+  mode: next_link_css
+  next_link_selector: a.next
+  max_pages: 5
+  max_elapsed_seconds: 120
+  max_total_body_bytes: 10485760
+  max_total_content_chars: 1000000
+  max_total_records: 1000
+```
+
+For JSON APIs, use `mode: link_header` and omit `next_link_selector`. Each
+page passes the same SSRF, origin, response syntax, MIME, charset, and byte
+limits, and is individually audited. All pages enrich one input row; extracted
+records and their provenance are combined in order. Page-mode raw text is
+joined with newlines. Paginated JSON emits an array of the admitted page
+documents. Paginated XML emits a `pages` element with one `page` child per
+response; each child's text preserves the original XML document. These
+envelopes also apply to a single page, and their size counts against the
+aggregate content limit. Audit metadata records every page and the stop reason.
+Repeated URLs and `max_pages` stop before another fetch; elapsed or aggregate
+limits fail the row. POST pagination and opaque credential or cursor links
+are refused.
+
+Authenticated execution remains unavailable: configured `auth` is hidden
+from Composer's catalog and refuses the row before DNS or HTTP. Response
+validation does not protect confidential authenticated bodies, which the
+ordinary audit client persists before extraction. Enabling auth requires the
+retention and access policy and protected evidence boundary described in the
+[authenticated response design gate](../design/2026-09-29-web-auth-response-evidence-gate.md).
 
 ## Output Fields
 
@@ -206,7 +289,8 @@ candidate as unverified source data.
 | `fetch_status` | int | HTTP status code |
 | `fetch_url_final` | str | Final URL after redirects |
 | `fetch_url_final_ip` | str | Final resolved IP after redirects |
-| `{records.field}` | list | CSS-selected candidate objects, when `records` is configured |
+| `{records.field}` | list | CSS-selected or JSON-path candidate objects, when configured |
+| `{records.provenance_field}` | list | Aligned column source evidence, when configured |
 
 ## Text Extraction And Line Splitting
 
@@ -236,6 +320,11 @@ hardcodes the fix; the plugin owns it.
 - Optional exact destination and redirect policy via `http.allowed_origins`
 - Scheme whitelist (http/https only)
 - SSL certificate verification (always enabled)
+- `Link` response headers are retained for replay only when their full value
+  contains simple links and bounded noncredential query values, such as a
+  search term and page number. Complex links, credential-shaped parameters,
+  and opaque cursor/capability parameters are redacted in the audit record and
+  cannot be replayed as exact transport evidence.
 
 ## Installation
 

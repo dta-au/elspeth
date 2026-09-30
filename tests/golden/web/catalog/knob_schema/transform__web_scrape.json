@@ -156,6 +156,45 @@
         "tier": "common"
       },
       {
+        "default": "page",
+        "description": "Page extraction, strict JSON text, or strict XML text. JSON/XML require format raw.",
+        "enum": [
+          "page",
+          "json",
+          "xml"
+        ],
+        "kind": "enum",
+        "label": "Response Mode",
+        "name": "response_mode",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": [],
+        "description": "Optional exact MIME allowlist that narrows the response mode's accepted types.",
+        "kind": "json-value",
+        "label": "Accepted Mime Types",
+        "name": "accepted_mime_types",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": "declared_or_utf8",
+        "description": "Use a supported declared charset or UTF-8 fallback, or require UTF-8.",
+        "enum": [
+          "declared_or_utf8",
+          "utf8_only"
+        ],
+        "kind": "enum",
+        "label": "Charset Policy",
+        "name": "charset_policy",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "default": " ",
         "description": "Separator inserted between DOM text nodes when format is text.",
         "kind": "text",
@@ -191,10 +230,20 @@
       },
       {
         "default": null,
-        "description": "Bounded CSS-selected result records emitted as a row field. An href column may set resolve_url: true to emit an approved absolute URL; this requires http.allowed_origins.",
-        "kind": "json-object",
+        "description": "Bounded CSS-selected or JSON-path result records emitted as a row field. An href column may set resolve_url: true to emit an approved absolute URL; this requires http.allowed_origins.",
+        "kind": "json-value",
         "label": "Records",
         "name": "records",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
+        "default": null,
+        "description": "GET-only bounded next-page discovery; all pages enrich one input row and each fetch is audited.",
+        "kind": "json-object",
+        "label": "Pagination",
+        "name": "pagination",
         "nullable": true,
         "required": false,
         "tier": "common"

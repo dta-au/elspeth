@@ -898,8 +898,9 @@ class RowTokenRepository:
         if run_id is None:
             run_id = self._ownership.resolve_run_id_for_row(row_id)
 
-        # Persist a self-contained {data, contract} envelope before the DB write so
-        # the token_data_ref is available atomically at INSERT time.
+        # Prepare the self-contained {data, contract} envelope and its identity
+        # before the DB write. Only a new effect stores the bytes: a committed
+        # receipt must be validated without rewriting payload evidence on retry.
         # The envelope carries both the row data and its SchemaContract so recovery can
         # reconstruct a faithful PipelineRow without any nodes-table lookup: the token's
         # own contract is the per-row truth, whatever the node's recorded output contract
@@ -911,20 +912,13 @@ class RowTokenRepository:
         envelope = {"data": dict(merged_payload), "contract": merged_contract.to_checkpoint_format()}
         envelope_bytes = checkpoint_dumps(envelope).encode("utf-8")
         expected_token_data_ref = sha256(envelope_bytes).hexdigest()
-        token_data_ref = self._payload_store.store(envelope_bytes)
-        if token_data_ref != expected_token_data_ref:
-            raise AuditIntegrityError(
-                "coalesce_tokens payload store violated its content-addressed contract: "
-                f"expected {expected_token_data_ref}, got {token_data_ref}"
-            )
-
         canonical_parent_ids = tuple(sorted(ordered_parent_ids))
         parent_set_hash = stable_hash(canonical_parent_ids)
         effect_hash = stable_hash(
             {
                 "ordered_parent_ids": ordered_parent_ids,
                 "step_in_pipeline": step_in_pipeline,
-                "token_data_ref": token_data_ref,
+                "token_data_ref": expected_token_data_ref,
             }
         )
         scope = (
@@ -1012,6 +1006,13 @@ class RowTokenRepository:
                     f"distinct remaining paths={len(remaining_paths)}"
                 )
             merged_frames = remaining_paths.pop()
+
+            token_data_ref = self._payload_store.store(envelope_bytes)
+            if token_data_ref != expected_token_data_ref:
+                raise AuditIntegrityError(
+                    "coalesce_tokens payload store violated its content-addressed contract: "
+                    f"expected {expected_token_data_ref}, got {token_data_ref}"
+                )
 
             join_group_id = generate_id()
             token_id = generate_id()
@@ -1304,6 +1305,12 @@ class RowTokenRepository:
         )
         if token_row is None:
             raise AuditIntegrityError("coalesce effect result tuple no longer resolves to its merged token")
+        if (
+            token_row["row_id"] != effect["row_id"]
+            or token_row["step_in_pipeline"] != effect["step_in_pipeline"]
+            or token_row["token_data_ref"] != expected_token_data_ref
+        ):
+            raise AuditIntegrityError("coalesce effect result token has divergent row, step or payload identity")
         parent_links = tuple(
             conn.execute(
                 select(token_parents_table.c.parent_token_id)

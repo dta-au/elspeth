@@ -127,6 +127,21 @@ REFERENCES = discover_builtin_references()
 REFERENCES_BY_IDENTITY = {f"{reference.kind}:{reference.plugin_cls.name}": reference for reference in REFERENCES}
 
 
+def test_llm_live_assistance_separates_upstream_requirements_from_generated_outputs() -> None:
+    assistance = REFERENCES_BY_IDENTITY["transform:llm"].plugin_cls.get_agent_assistance()
+    assert assistance is not None
+    hints = "\n".join(assistance.composer_hints)
+    assert "options.schema declares INPUT" not in hints
+    assert "schema.fields may declare output types (ADR-050)" in hints
+    assert "required_input_fields names upstream columns" in hints
+    assert "output_fields" in hints and "unprefixed" in hints
+    example = next(example for example in assistance.examples if "colour" in example.title)
+    after = deep_thaw(example.after)
+    assert after["required_input_fields"] == ["colour"]
+    assert after["schema"]["fields"] == ["colour: str"]
+    assert set(after["queries"]) == {"good_colour_pair", "approximate_hex"}
+
+
 def _identity(reference: BuiltinReference) -> str:
     return f"{reference.kind}:{reference.plugin_cls.name}"
 

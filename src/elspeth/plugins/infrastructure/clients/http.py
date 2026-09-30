@@ -10,6 +10,7 @@ import base64
 import binascii
 import re
 import time
+import zlib
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from ipaddress import IPv4Network, IPv6Network
@@ -113,6 +114,16 @@ class HTTPResponseBodyTooLargeError(httpx.HTTPError):
         self.response_data = response_payload.to_dict()
 
 
+class HTTPResponseEncodingLimitError(httpx.HTTPError):
+    """A streamed encoded response exceeded a declared transfer policy."""
+
+    def __init__(self, *, reason: str, response_payload: HTTPCallResponse) -> None:
+        super().__init__(f"HTTP response encoding policy refused: {reason}")
+        self.reason = reason
+        self.response_payload = response_payload
+        self.response_data = response_payload.to_dict()
+
+
 class AuditedHTTPClient(AuditedClientBase):
     """HTTP client that automatically records all calls to audit trail.
 
@@ -157,6 +168,8 @@ class AuditedHTTPClient(AuditedClientBase):
         member_token: WorkerMembershipToken | None = None,
         work_item: TokenWorkItem | None = None,
         max_response_body_bytes: int | None = None,
+        max_encoded_response_bytes: int | None = None,
+        max_decompression_ratio: int | None = None,
         call_mode_session: CallModeSession | None = None,
         archived_auth_for_replay: bool = False,
         semantic_managed_identity_verify: bool = False,
@@ -180,6 +193,10 @@ class AuditedHTTPClient(AuditedClientBase):
         """
         if max_response_body_bytes is not None and max_response_body_bytes <= 0:
             raise ValueError("max_response_body_bytes must be > 0 when configured")
+        if max_encoded_response_bytes is not None and max_encoded_response_bytes <= 0:
+            raise ValueError("max_encoded_response_bytes must be > 0 when configured")
+        if max_decompression_ratio is not None and max_decompression_ratio <= 0:
+            raise ValueError("max_decompression_ratio must be > 0 when configured")
         if archived_auth_for_replay and (call_mode_session is None or call_mode_session.mode is not RunMode.REPLAY):
             raise ValueError("archived_auth_for_replay requires a replay call-mode session")
         if semantic_managed_identity_verify and (call_mode_session is None or call_mode_session.mode is not RunMode.VERIFY):
@@ -200,6 +217,8 @@ class AuditedHTTPClient(AuditedClientBase):
         self._base_url = base_url
         self._default_headers = headers or {}
         self._max_response_body_bytes = max_response_body_bytes
+        self._max_encoded_response_bytes = max_encoded_response_bytes
+        self._max_decompression_ratio = max_decompression_ratio
         self._call_mode_session = call_mode_session
         self._archived_auth_for_replay = archived_auth_for_replay
         self._semantic_managed_identity_verify = semantic_managed_identity_verify
@@ -842,6 +861,7 @@ class AuditedHTTPClient(AuditedClientBase):
         full_url: str,
         observed_body_size: int,
         redirect_count: int = 0,
+        reason: str = "body_too_large",
     ) -> HTTPCallResponse:
         """Build bounded audit metadata for a response aborted by the body cap."""
         response_dto = HTTPCallResponse(
@@ -850,7 +870,7 @@ class AuditedHTTPClient(AuditedClientBase):
             body_size=observed_body_size,
             body={
                 "_truncated": True,
-                "_reason": "body_too_large",
+                "_reason": reason,
                 "_captured_body": False,
                 "_observed_body_size": observed_body_size,
                 "_max_body_bytes": self._require_response_body_cap(full_url),
@@ -875,8 +895,30 @@ class AuditedHTTPClient(AuditedClientBase):
         max_body_bytes = self._require_response_body_cap(full_url)
         chunks: list[bytes] = []
         observed_body_size = 0
-        chunk_size = min(max_body_bytes + 1, 64 * 1024)
-        for chunk in response.iter_bytes(chunk_size=chunk_size):
+        observed_encoded_size = 0
+        encoding = (response.headers["content-encoding"] if "content-encoding" in response.headers else "identity").strip().lower()
+        if encoding not in {"identity", "gzip", "deflate"}:
+            raise HTTPResponseEncodingLimitError(
+                reason="unsupported_content_encoding",
+                response_payload=self._build_truncated_response_payload(
+                    response, full_url=full_url, observed_body_size=0, redirect_count=redirect_count, reason="unsupported_content_encoding"
+                ),
+            )
+        predecoded = response.is_stream_consumed
+        decoder = (
+            None
+            if predecoded or encoding == "identity"
+            else zlib.decompressobj(16 + zlib.MAX_WBITS)
+            if encoding == "gzip"
+            else zlib.decompressobj()
+        )
+        # HTTP's deflate label is used for both zlib-wrapped and raw DEFLATE
+        # streams. Retain only the bounded prefix until the wrapped decoder
+        # produces output, so a header failure can be retried from byte zero.
+        deflate_prefix: bytearray | None = bytearray() if encoding == "deflate" and not predecoded else None
+
+        def append_decoded(chunk: bytes) -> None:
+            nonlocal observed_body_size
             observed_body_size += len(chunk)
             if observed_body_size > max_body_bytes:
                 response_payload = self._build_truncated_response_payload(
@@ -893,14 +935,147 @@ class AuditedHTTPClient(AuditedClientBase):
                 )
             chunks.append(chunk)
 
-        # ``iter_bytes()`` above has ALREADY applied content-decoding
-        # (gzip/deflate/br) to the body. Reconstructing the Response with the
-        # original ``Content-Encoding`` header makes httpx re-decode the
-        # already-decoded body on read -> DecodingError ("incorrect header
-        # check"). Drop the now-inaccurate content-encoding/length so the
-        # reconstructed body is treated as identity. (iter_bytes is kept
-        # deliberately: the body cap is measured on the DECODED size, which is
-        # the decompression-bomb-relevant size.)
+        def decode_pending(encoded: bytes) -> None:
+            if decoder is None:
+                raise RuntimeError("compressed decoder is absent")
+            pending = encoded
+            while pending:
+                previous = pending
+                decoded = decoder.decompress(pending, min(64 * 1024, max_body_bytes - observed_body_size + 1))
+                append_decoded(decoded)
+                pending = decoder.unconsumed_tail
+                if pending == previous and not decoded:
+                    raise zlib.error("compressed decoder made no progress")
+
+        if predecoded:
+            append_decoded(response.content)
+            if encoding == "identity":
+                observed_encoded_size = observed_body_size
+            else:
+                length_header = response.headers["content-length"] if "content-length" in response.headers else ""
+                if not length_header.isascii() or not length_header.isdecimal():
+                    raise HTTPResponseEncodingLimitError(
+                        reason="unmeasured_content_encoding",
+                        response_payload=self._build_truncated_response_payload(
+                            response,
+                            full_url=full_url,
+                            observed_body_size=observed_body_size,
+                            redirect_count=redirect_count,
+                            reason="unmeasured_content_encoding",
+                        ),
+                    )
+                observed_encoded_size = int(length_header)
+            if self._max_encoded_response_bytes is not None and observed_encoded_size > self._max_encoded_response_bytes:
+                raise HTTPResponseEncodingLimitError(
+                    reason="encoded_body_too_large",
+                    response_payload=self._build_truncated_response_payload(
+                        response,
+                        full_url=full_url,
+                        observed_body_size=observed_body_size,
+                        redirect_count=redirect_count,
+                        reason="encoded_body_too_large",
+                    ),
+                )
+
+        raw_chunk_size = min(max_body_bytes + 1, 64 * 1024)
+        if self._max_encoded_response_bytes is not None:
+            raw_chunk_size = min(raw_chunk_size, self._max_encoded_response_bytes + 1)
+        for raw_chunk in () if predecoded else response.iter_raw(chunk_size=raw_chunk_size):
+            observed_encoded_size += len(raw_chunk)
+            if self._max_encoded_response_bytes is not None and observed_encoded_size > self._max_encoded_response_bytes:
+                raise HTTPResponseEncodingLimitError(
+                    reason="encoded_body_too_large",
+                    response_payload=self._build_truncated_response_payload(
+                        response,
+                        full_url=full_url,
+                        observed_body_size=observed_body_size,
+                        redirect_count=redirect_count,
+                        reason="encoded_body_too_large",
+                    ),
+                )
+            if decoder is None:
+                append_decoded(raw_chunk)
+                continue
+            if deflate_prefix is not None:
+                prefix_cap = self._max_encoded_response_bytes or max_body_bytes
+                if len(deflate_prefix) + len(raw_chunk) > prefix_cap:
+                    raise HTTPResponseEncodingLimitError(
+                        reason="encoded_body_too_large",
+                        response_payload=self._build_truncated_response_payload(
+                            response,
+                            full_url=full_url,
+                            observed_body_size=observed_body_size,
+                            redirect_count=redirect_count,
+                            reason="encoded_body_too_large",
+                        ),
+                    )
+                deflate_prefix.extend(raw_chunk)
+            try:
+                decode_pending(raw_chunk)
+            except zlib.error as exc:
+                if deflate_prefix is not None and observed_body_size == 0:
+                    decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+                    try:
+                        decode_pending(bytes(deflate_prefix))
+                    except zlib.error as raw_exc:
+                        raise HTTPResponseEncodingLimitError(
+                            reason="invalid_content_encoding",
+                            response_payload=self._build_truncated_response_payload(
+                                response,
+                                full_url=full_url,
+                                observed_body_size=observed_body_size,
+                                redirect_count=redirect_count,
+                                reason="invalid_content_encoding",
+                            ),
+                        ) from raw_exc
+                    deflate_prefix = None
+                else:
+                    raise HTTPResponseEncodingLimitError(
+                        reason="invalid_content_encoding",
+                        response_payload=self._build_truncated_response_payload(
+                            response,
+                            full_url=full_url,
+                            observed_body_size=observed_body_size,
+                            redirect_count=redirect_count,
+                            reason="invalid_content_encoding",
+                        ),
+                    ) from exc
+            if observed_body_size > 0:
+                deflate_prefix = None
+
+        if decoder is not None:
+            if not decoder.eof or decoder.unused_data:
+                raise HTTPResponseEncodingLimitError(
+                    reason="invalid_content_encoding",
+                    response_payload=self._build_truncated_response_payload(
+                        response,
+                        full_url=full_url,
+                        observed_body_size=observed_body_size,
+                        redirect_count=redirect_count,
+                        reason="invalid_content_encoding",
+                    ),
+                )
+            append_decoded(decoder.flush(max_body_bytes - observed_body_size + 1))
+
+        if (
+            encoding != "identity"
+            and self._max_decompression_ratio is not None
+            and observed_encoded_size > 0
+            and observed_body_size > observed_encoded_size * self._max_decompression_ratio
+        ):
+            raise HTTPResponseEncodingLimitError(
+                reason="decompression_ratio_exceeded",
+                response_payload=self._build_truncated_response_payload(
+                    response,
+                    full_url=full_url,
+                    observed_body_size=observed_body_size,
+                    redirect_count=redirect_count,
+                    reason="decompression_ratio_exceeded",
+                ),
+            )
+
+        # Reconstruct from bounded decoded bytes without the old wire encoding
+        # headers, so callers cannot accidentally decompress the content twice.
         decoded_headers = httpx.Headers(
             [(key, value) for key, value in response.headers.multi_items() if key.lower() not in ("content-encoding", "content-length")]
         )
@@ -1050,7 +1225,7 @@ class AuditedHTTPClient(AuditedClientBase):
             latency_ms = (time.perf_counter() - start) * 1000
             response_payload: HTTPCallResponse | None = None
             response_data: Mapping[str, Any] | None = None
-            if isinstance(e, HTTPResponseBodyTooLargeError):
+            if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
                 response_data = e.response_data
 
@@ -1420,7 +1595,7 @@ class AuditedHTTPClient(AuditedClientBase):
 
             response_payload: HTTPCallResponse | None = None
             error_response_data: Mapping[str, Any] | None = None
-            if isinstance(e, HTTPResponseBodyTooLargeError):
+            if isinstance(e, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError)):
                 response_payload = e.response_payload
                 error_response_data = e.response_data
             elif response is not None:
@@ -1714,7 +1889,11 @@ class AuditedHTTPClient(AuditedClientBase):
                     )
             except Exception as hop_err:
                 hop_latency_ms = (time.perf_counter() - hop_start) * 1000
-                hop_response_payload = hop_err.response_payload if isinstance(hop_err, HTTPResponseBodyTooLargeError) else None
+                hop_response_payload = (
+                    hop_err.response_payload
+                    if isinstance(hop_err, (HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError))
+                    else None
+                )
                 # Record the failed hop in the audit trail so lineage is complete
                 error_data = HTTPCallError(
                     type=type(hop_err).__name__,

@@ -815,20 +815,21 @@ def _llm_on_error_rules(*, output_control: str | None) -> list[str]:
 
 
 _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
-    "An llm node writes the model's reply as ONE raw string into the field "
-    "named by options.response_field (default llm_response). Prompt text that "
-    "asks for JSON or named keys does NOT create row fields — nothing is "
-    "flattened out of the reply.",
-    "Downstream nodes may require only that response field (plus fields "
-    "passed through from the node's input). To obtain several named result "
-    "fields from one llm node, use one of the TWO blessed shapes: the "
-    "plugin's multi_query mechanism (its schema declares the per-query "
-    "output fields), or — in single-prompt mode — the top-level "
-    "response_format + output_fields pair, whose extracted fields land "
+    "In single-prompt mode an llm node writes the raw reply to options.response_field "
+    "(default llm_response). Asking for JSON or named keys in free text alone does NOT "
+    "create row fields. Configured output_fields extracts and types the named fields.",
+    "options.required_input_fields names upstream columns and bounds the row visible to templates. "
+    "Never require this node's generated outputs as upstream inputs. The plugin derives generated "
+    "field names and types from response_field and output_fields. options.schema.fields can declare "
+    "output types (ADR-050); schema alone does not extract fields from a reply. Upstream pass-through "
+    "guarantees come from the upstream producer.",
+    "Downstream nodes may require the actual generated fields and fields passed through from upstream. "
+    "To obtain named typed results, use the plugin's queries mechanism with per-query output_fields, "
+    "or — in single-prompt mode — the top-level response_format + output_fields pair, whose extracted fields land "
     "UNPREFIXED: each entry becomes a row field named exactly its suffix.",
-    "If a prompt asks for structured JSON anyway, the JSON arrives as one "
-    "string in the response field; wire a schema-proven parser transform "
-    "when downstream nodes need its keys as row fields.",
+    "Preserve downstream requirements for fields those consumers use. Do not erase them or widen "
+    "their schema to any/flexible to silence a contradiction in the plugin's output contract; "
+    "report that contradiction with the configured output_fields and the exact downstream names.",
     # Session 891b7b1e: a free-text 'reply with only the category word'
     # prompt fed reference_join key_field with on_miss:fail + on_error:
     # discard — one 'Billing.' or lowercase reply silently drops the row.
@@ -860,8 +861,9 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     '{"field_a": "field_a", "field_b": "field_b"} — a query without '
     "input_fields is rejected.",
     "The per-query prompt key is 'template' (a Jinja2 override), NOT "
-    "prompt_template. The top-level options.prompt_template is STILL "
-    "required and is the fallback for any query that omits template.",
+    "prompt_template. The top-level options.prompt_template is the fallback for queries without "
+    "a template; it is optional when every query supplies its own template. Keep BOTH prompt roles: "
+    "one shared system_prompt plus each query's effective user template.",
     # run-3 E2: the output contract — each query KEY prefixes its output row
     # fields, so downstream nodes can require them by exact name.
     "Each query key names its output row fields by PREFIX: the raw reply "
@@ -879,8 +881,12 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "max_tokens). In mapping form the mapping key supplies the query name; "
     "in LIST form each entry additionally REQUIRES its own name key. There "
     "is NO per-query response_field or schema — output naming comes "
-    "exclusively from the query-key prefix, and the node-level schema block "
-    "declares any guaranteed prefixed fields.",
+    "from the query-key prefix and output_fields suffix. Node-level schema output declarations use "
+    "the exact generated names and must admit the configured output_fields types.",
+    "For example, two queries good_colour_pair and approximate_hex can each map input_fields "
+    "{shade: colour} and declare output_fields [{suffix: answer, type: string}]. The LLM input "
+    "required_input_fields is [colour]; good_colour_pair_answer and approximate_hex_answer are generated "
+    "outputs that downstream contracts may require, never this node's upstream input requirements.",
     # run-4 P4: no interpretation delivery exists for per-query templates.
     "NEVER put {{interpretation:...}} tokens inside a queries.*.template — "
     "review resolution rewrites only the node-level prompt_template/"
@@ -2074,21 +2080,17 @@ def planner_model_catalog() -> _ModelCatalog:
 
 
 _MODEL_CATALOG_GUIDANCE: Final[str] = (
-    "This model catalog is rendered at prompt build from the same catalog the "
-    "list_models tool serves and is current for this deployment. A slug in "
-    "models_by_provider is served: bind it directly, with no discovery call. "
-    "provider_model_counts and total_models are every provider the catalog "
-    "knows, so a provider absent from models_by_provider is still a real "
-    "provider — its identifiers were not carried. authorable_providers is the "
-    "closed set an llm node's provider option may name; identifiers are "
-    "carried only for those, because a slug from any other provider cannot be "
-    "authored here. A provider named in authorable_providers with no "
-    "provider_model_counts entry has no catalogued identifiers on this "
-    "deployment — those endpoints are operator-configured. Each models_omitted "
-    "entry names a provider whose identifiers exceeded the byte budget and "
-    "carries its model_count and a details_via marker; follow the marker "
-    "before binding a slug for that provider. Never invent a slug and never "
-    "recall one from training: an unserved slug is rejected at preflight."
+    "Current at prompt build, this is the catalog list_models serves. Bind a "
+    "served models_by_provider slug directly, with no discovery call. "
+    "provider_model_counts and total_models include every known provider; "
+    "absence from models_by_provider means identifiers were not carried. "
+    "authorable_providers is the closed llm provider-option set; only its "
+    "identifiers are carried or authorable. An authorable provider absent from "
+    "provider_model_counts has no catalogued identifiers: its endpoints are "
+    "operator-configured. Each models_omitted entry names an over-budget "
+    "provider with model_count and details_via; follow that marker before "
+    "binding its slug. Never invent a slug or recall one from training: "
+    "preflight rejects an unserved slug."
 )
 
 _EXPRESSION_GRAMMAR_GUIDANCE: Final[str] = (

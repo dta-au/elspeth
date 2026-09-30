@@ -10,9 +10,9 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, final
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
 from elspeth.contracts.aws_s3 import (
     S3_MAX_KEY_BYTES,
@@ -289,6 +289,65 @@ class OperatorProfileResolver(Protocol):
     def check_local_requirements(self, alias: str) -> LocalRequirementResult: ...
 
     def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None: ...
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class DetachedProfileLowering:
+    """Closed private binding for pure lowering, with no retained resolver.
+
+    JSON carries only settings, never credentials or live service objects.
+    Reconstructing one resolver uses its existing pure lowering implementation
+    and preserves option-dependent checks and audit identities.
+    """
+
+    kind: str
+    profile_json: str | None = field(repr=False)
+    region: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not str or self.kind not in {"llm", "bedrock_guardrail", "s3", "textract", "azure_search", "unavailable"}:
+            raise TypeError("detached profile lowering kind must be exact")
+        if self.profile_json is not None and type(self.profile_json) is not str:
+            raise TypeError("detached profile settings must be an exact JSON string")
+        if self.region is not None and type(self.region) is not str:
+            raise TypeError("detached profile region must be an exact string")
+        if self.kind == "unavailable":
+            if self.profile_json is not None or self.region is not None:
+                raise TypeError("unavailable detached profile cannot retain settings")
+        elif self.profile_json is None:
+            raise TypeError("detached profile lowering requires settings")
+        elif self.kind in {"s3", "textract"}:
+            if self.region is None:
+                raise TypeError("detached storage profile lowering requires a region")
+        elif self.region is not None:
+            raise TypeError("detached non-storage profile cannot retain a region")
+
+    def lower_options(self, *, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        if self.kind == "unavailable":
+            raise ValueError("profile_unavailable")
+        assert self.profile_json is not None
+        resolver: OperatorProfileResolver
+        if self.kind == "llm":
+            profile = TypeAdapter(RuntimeLLMProfile).validate_json(self.profile_json, strict=True)
+            resolver = _LLMProfileResolver(((profile.alias, profile),), preferred_alias=None)
+        elif self.kind == "bedrock_guardrail":
+            resolver = _BedrockGuardrailProfileResolver(
+                (BedrockGuardrailProfileSettings.model_validate_json(self.profile_json, strict=True),), default_alias=None
+            )
+        elif self.kind == "s3":
+            assert self.region is not None
+            resolver = _S3SourceProfileResolver(
+                (AWSS3SourceProfileSettings.model_validate_json(self.profile_json, strict=True),), region=self.region
+            )
+        elif self.kind == "textract":
+            assert self.region is not None
+            resolver = _TextractProfileResolver(
+                (AWSTextractProfileSettings.model_validate_json(self.profile_json, strict=True),), region=self.region
+            )
+        else:
+            resolver = _AzureSearchProfileResolver((AzureSearchProfileSettings.model_validate_json(self.profile_json, strict=True),))
+        return resolver.lower_options(alias, safe_options)
 
 
 class _LLMProfileResolver:
@@ -1678,6 +1737,35 @@ class OperatorProfileRegistry:
         if plugin_id not in self._resolvers:
             raise ValueError("plugin_has_no_operator_profile")
         return self._resolvers[plugin_id].lower_options(alias, safe_options)
+
+    def detach_validation_lowering(self, plugin_id: PluginId, *, alias: str) -> DetachedProfileLowering:
+        """Copy one admitted binding into closed data before entering a mutation."""
+        if plugin_id not in self._resolvers:
+            return DetachedProfileLowering("unavailable", None)
+        resolver = self._resolvers[plugin_id]
+        if type(resolver) is _LLMProfileResolver:
+            if alias not in resolver._profiles:
+                return DetachedProfileLowering("unavailable", None)
+            return DetachedProfileLowering(
+                "llm", TypeAdapter(RuntimeLLMProfile).dump_json(resolver._profiles[alias], warnings="error").decode()
+            )
+        if type(resolver) is _BedrockGuardrailProfileResolver:
+            if alias not in resolver._profiles:
+                return DetachedProfileLowering("unavailable", None)
+            return DetachedProfileLowering("bedrock_guardrail", resolver._profiles[alias].model_dump_json())
+        if type(resolver) is _S3SourceProfileResolver:
+            if alias not in resolver._profiles:
+                return DetachedProfileLowering("unavailable", None)
+            return DetachedProfileLowering("s3", resolver._profiles[alias].model_dump_json(), resolver._region)
+        if type(resolver) is _TextractProfileResolver:
+            if alias not in resolver._profiles:
+                return DetachedProfileLowering("unavailable", None)
+            return DetachedProfileLowering("textract", resolver._profiles[alias].model_dump_json(), resolver._region)
+        if type(resolver) is _AzureSearchProfileResolver:
+            if alias not in resolver._profiles:
+                return DetachedProfileLowering("unavailable", None)
+            return DetachedProfileLowering("azure_search", resolver._profiles[alias].model_dump_json())
+        raise TypeError("operator profile registry contains an unsupported validation resolver")
 
     def profile_availability(
         self,

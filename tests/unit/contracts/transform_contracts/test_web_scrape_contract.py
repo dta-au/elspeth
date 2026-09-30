@@ -248,6 +248,9 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
             "fetch_request_hash": "test-request-ref-hash",
             "fetch_response_raw_hash": "test-response-ref-hash",
             "fetch_response_processed_hash": "test-processed-content-hash",
+            "fetch_charset": "utf-8",
+            "fetch_content_type": "text/html",
+            "fetch_decoded_body_bytes": 38,
         }
 
         limiter = _context_mock(ctx.rate_limit_registry.get_limiter.return_value, "rate limiter")

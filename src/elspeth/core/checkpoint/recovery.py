@@ -69,10 +69,37 @@ __all__ = [
     "SourceLifecycleResumeGate",
     "UnsatisfiableGroupMember",
     "check_group_satisfiability_resumable",
+    "check_http_effects_resumable",
     "check_run_status_resumable",
     "check_source_lifecycle_resumable",
     "group_binding_view_from_graph",
 ]
+
+
+def check_http_effects_resumable(graph: ExecutionGraph) -> ResumeCheck:
+    """Refuse automatic re-dispatch of a web search POST after interruption.
+
+    The HTTP call is recorded after network dispatch. A process can die after
+    the remote server accepts a POST but before its call reaches Landscape;
+    scheduler recovery cannot distinguish that state from an unsent request.
+    Until a pre-dispatch reservation and reconciliation record exist, even a
+    read-only POST search must be resumed by an operator, not automatically.
+    The same pure gate serves advisory and enforcing resume admission.
+    """
+    for node in graph.get_nodes():
+        if node.plugin_name != "web_scrape":
+            continue
+        method = node.config.get("method", "GET")
+        if method != "GET":
+            return ResumeCheck(
+                can_resume=False,
+                reason=(
+                    f"web_scrape method {method!r} has no pre-dispatch effect reservation; "
+                    "a prior request may have reached the remote service without an audit call"
+                ),
+                cause=ResumeRefusalCause.UNCERTAIN_REMOTE_EFFECT,
+            )
+    return ResumeCheck(can_resume=True)
 
 
 # TIER-2: Operator-interpretable refuse signal — the audit DB is intact and
@@ -620,6 +647,10 @@ class RecoveryManager:
         topology_check = validator.validate(checkpoint, graph)
         if not topology_check.can_resume:
             return topology_check
+
+        effect_check = check_http_effects_resumable(graph)
+        if not effect_check.can_resume:
+            return effect_check
 
         # Source-lifecycle completeness (elspeth-1f5b83cd28): the same shared
         # gate resume() enforces via IncompleteSourceResumeError. A clean,

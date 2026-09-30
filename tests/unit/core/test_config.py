@@ -5890,3 +5890,20 @@ class TestLoadSettingsYamlDocumentShape:
         config_file.write_text(doc)
         with pytest.raises(ValueError, match="must be a YAML mapping"):
             load_settings(config_file)
+
+
+def test_web_scrape_auth_requires_exact_env_reference_for_file_settings(tmp_path: Path) -> None:
+    from elspeth.config_loading import _reject_web_scrape_auth_literal, load_settings
+
+    base = {"transforms": [{"plugin": "web_scrape", "options": {"auth": {"credential": "literal-token"}}}]}
+    with pytest.raises(ValueError, match=r"web_scrape auth\.credential must be an exact environment secret reference"):
+        _reject_web_scrape_auth_literal(base)
+    config_path = tmp_path / "settings.yaml"
+    config_path.write_text("transforms:\n  - plugin: web_scrape\n    options:\n      auth:\n        credential: literal-token\n")
+    with pytest.raises(ValueError, match=r"web_scrape auth\.credential must be an exact environment secret reference"):
+        load_settings(config_path)
+    base["transforms"][0]["options"]["auth"]["credential"] = "${WEB_SEARCH_TOKEN}"
+    _reject_web_scrape_auth_literal(base)
+    base["transforms"][0]["options"]["auth"]["credential"] = "${WEB_SEARCH_TOKEN:-fallback}"
+    with pytest.raises(ValueError, match="exact environment secret reference"):
+        _reject_web_scrape_auth_literal(base)

@@ -20,7 +20,7 @@ files:
     dict[str, Any]: 2
   src/elspeth/config_loading.py:
     Mapping[str, object]: 1
-    boundary: 1
+    boundary: 2
   src/elspeth/contracts/audit.py:
     Mapping[str, object]: 3
     dict[str, Any]: 1
@@ -595,6 +595,7 @@ files:
   src/elspeth/plugins/transforms/web_scrape.py:
     Mapping[str, object]: 1
     dict[str, Any]: 2
+    dict[str, object]: 2
   src/elspeth/telemetry/exporters/azure_monitor.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 2
@@ -967,10 +968,10 @@ files:
   src/elspeth/web/plugin_policy/profiles.py:
     Mapping[str, object]: 2
     dict[str, Any]: 21
-    dict[str, object]: 10
+    dict[str, object]: 11
   src/elspeth/web/plugin_policy/validation.py:
     Mapping[str, object]: 1
-    dict[str, object]: 2
+    dict[str, object]: 3
   src/elspeth/web/preferences/service.py:
     dict[str, object]: 2
   src/elspeth/web/provider_config_policy.py:
@@ -992,6 +993,8 @@ files:
     Mapping[str, Any]: 2
   src/elspeth/web/sessions/fork_custody.py:
     Mapping[str, Any]: 3
+  src/elspeth/web/sessions/interpretation_validation.py:
+    dict[str, object]: 1
   src/elspeth/web/sessions/mutation_capabilities.py:
     Mapping[str, Any]: 4
   src/elspeth/web/sessions/operation_receipts.py:
@@ -1032,7 +1035,7 @@ totals:
   Mapping[str, Any]: 738
   Mapping[str, object]: 297
   MutableMapping[str, Any]: 8
-  boundary: 58
+  boundary: 59
   dict[str, Any]: 1061
-  dict[str, object]: 375
-  soft: 2479
+  dict[str, object]: 380
+  soft: 2484

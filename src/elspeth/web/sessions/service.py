@@ -142,6 +142,11 @@ from elspeth.web.sessions.fork_custody import (
     _verify_fork_settlement_blob_custody,
 )
 from elspeth.web.sessions.inline_blob_preflight import InlinePreflightState, SessionInlineBlobSnapshot, prepare_session_inline_blob_snapshot
+from elspeth.web.sessions.interpretation_validation import (
+    SessionInterpretationValidationInputs,
+    build_interpretation_validation_inputs,
+    validate_composition_state_with_interpretation_inputs,
+)
 from elspeth.web.sessions.locking import (
     acquire_session_advisory_xact_lock,
     process_session_lock,
@@ -699,7 +704,7 @@ class SessionServiceImpl:
         self,
         state: CompositionState,
         *,
-        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        validation_inputs: SessionInterpretationValidationInputs,
         session_id: str,
         user_id: str | None,
         inline_blob_snapshot: SessionInlineBlobSnapshot | None = None,
@@ -717,23 +722,8 @@ class SessionServiceImpl:
         session locks it may run under are per-session, so calling it inside
         the resolution transaction serialises only this session's writes.
         """
-        if self._plugin_snapshot_factory is None:
-            summary = state.validate()
-        else:
-            if plugin_snapshot is None:
-                raise AuditIntegrityError("Profile-aware composition validation has no principal snapshot")
-
-            from elspeth.web.plugin_policy.validation import validate_authored_composition_state
-
-            assert self._operator_profile_registry is not None
-            assert self._catalog is not None
-            result = validate_authored_composition_state(
-                state,
-                snapshot=plugin_snapshot,
-                profile_registry=self._operator_profile_registry,
-                catalog=self._catalog,
-            )
-            summary = result.validation
+        summary = validate_composition_state_with_interpretation_inputs(state, validation_inputs).validation
+        plugin_snapshot = validation_inputs.plugin_snapshot
         if not summary.is_valid or self._runtime_preflight is None:
             return summary
 
@@ -3624,11 +3614,14 @@ class SessionServiceImpl:
             if snapshot_config is not None
             else None
         )
-        validator = _SessionPendingInterpretationValidator(
+        validation_inputs = build_interpretation_validation_inputs(
             profile_aware=self._plugin_snapshot_factory is not None,
             plugin_snapshot=plugin_snapshot,
             profile_registry=self._operator_profile_registry,
             catalog=self._catalog,
+        )
+        validator = _SessionPendingInterpretationValidator(
+            validation_inputs=validation_inputs,
             runtime_preflight=self._runtime_preflight,
             inline_blob_snapshot=inline_blob_snapshot,
             expected_anchor=expected_anchor if inline_blob_snapshot is not None else None,
@@ -3732,6 +3725,12 @@ class SessionServiceImpl:
         sid = str(session_id)
         eid = str(event_id)
         principal_user_id, plugin_snapshot = await self._session_principal_context(sid)
+        validation_inputs = build_interpretation_validation_inputs(
+            profile_aware=self._plugin_snapshot_factory is not None,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
 
         if type(session_operation_context) is not SessionOperationContext:
             raise TypeError("session_operation_context must be an exact SessionOperationContext")
@@ -4006,14 +4005,14 @@ class SessionServiceImpl:
                 if inline_blob_snapshot is None:
                     patched_validation = self._validate_patched_composition_state(
                         state_from_record(patched_state_record),
-                        plugin_snapshot=plugin_snapshot,
+                        validation_inputs=validation_inputs,
                         session_id=sid,
                         user_id=principal_user_id,
                     )
                 else:
                     patched_validation = self._validate_patched_composition_state(
                         state_from_record(patched_state_record),
-                        plugin_snapshot=plugin_snapshot,
+                        validation_inputs=validation_inputs,
                         session_id=sid,
                         user_id=principal_user_id,
                         inline_blob_snapshot=inline_blob_snapshot,

@@ -117,6 +117,8 @@ class PipelineConfig:
             raise OrchestrationInvariantError("PipelineConfig requires at least one sink")
         if not self.sources:
             raise OrchestrationInvariantError("PipelineConfig requires at least one source")
+        if len(self.sources) > 1 and any(source.config.get("snapshot_for_resume") is True for source in self.sources.values()):
+            raise OrchestrationInvariantError("snapshot_for_resume currently requires exactly one source in the pipeline")
         # Freeze mutable container fields. freeze_fields deep-freezes recursively,
         # converting nested dicts/lists to MappingProxyType/tuple throughout.
         # transforms/gates/coalesce_settings contain frozen dataclass instances

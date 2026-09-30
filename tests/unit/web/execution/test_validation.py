@@ -313,6 +313,7 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
     """Execution rejects an unrepairable source failure route before construction."""
     from elspeth.plugins.infrastructure.manager import PluginManager
     from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.coverage import control_coverage_findings
 
     manager = PluginManager()
     manager.register_builtin_plugins()
@@ -348,7 +349,11 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
             replace(
                 _make_node(
                     plugin="azure_content_safety",
-                    options={"detect_only": False, "fields": ["briefing"]},
+                    options={
+                        "detect_only": False,
+                        "fields": ["briefing"],
+                        "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4},
+                    },
                 ),
                 on_success="primary",
             ),
@@ -358,6 +363,14 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
         metadata=PipelineMetadata(),
         version=1,
     )
+
+    # Prove the success path is protected so the rejection below isolates
+    # the source's unprotected validation-failure route.
+    discard_state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], on_validation_failure="discard")},
+    )
+    assert control_coverage_findings(discard_state, PluginCapability.CONTENT_SAFETY) == ()
 
     with patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as constructor:
         result = validate_pipeline_for_trained_operator(

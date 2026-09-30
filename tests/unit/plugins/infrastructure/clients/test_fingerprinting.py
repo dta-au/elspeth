@@ -257,6 +257,25 @@ class TestFilterResponseHeaders:
         assert "!!!!" not in persisted
         assert "FRAGMENT_SECRET" not in persisted
 
+    def test_link_header_preserves_simple_page_links_for_replay(self) -> None:
+        link = '</search?SearchText=Acme&page=2>; rel="next", </search?SearchText=Acme&page=3>; rel="last"'
+        assert filter_response_headers({"Link": link}) == {"Link": link}
+
+    @pytest.mark.parametrize(
+        "link",
+        [
+            '<https://example.test/search?token=RAW_SECRET>; rel="next"',
+            '<https://example.test/search?page=2>; rel="next"; title="RAW_SECRET"',
+            '<https://user:RAW_SECRET@example.test/search?page=2>; rel="next"',
+            '<https://example.test/search?page=2#RAW_SECRET>; rel="next"',
+            '<https://example.test/search?cursor=RAW_SECRET>; rel="next"',
+        ],
+    )
+    def test_link_header_redacts_non_replay_safe_values(self, link: str) -> None:
+        result = filter_response_headers({"Link": link})
+        assert result == {"Link": "<redacted-http-link>"}
+        assert "RAW_SECRET" not in str(result)
+
 
 class TestFingerprintQueryBounds:
     """Bounds for query redaction at external URL/params boundaries."""

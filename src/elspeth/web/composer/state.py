@@ -8483,6 +8483,19 @@ class CompositionState:
                 errors.append(abuse_contact_error)
             errors.extend(_validate_web_scrape_http_identity_not_placeholder(node))
 
+            # The catalog hides this reserved option, but authored state can
+            # still contain it. Match the runtime's disabled auth boundary
+            # before reporting that an authenticated pipeline is runnable.
+            if node.plugin == "web_scrape" and "auth" in node.options and node.options["auth"] is not None:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        "Authenticated web_scrape is unavailable until response evidence is secret safe. Remove the auth option.",
+                        "high",
+                        "web_scrape_auth_unavailable",
+                    )
+                )
+
             errors.extend(_validate_llm_prompt_roles_present(node))
             errors.extend(_validate_prompt_template_variable_bindings(node))
             errors.extend(_validate_multi_query_template_variable_bindings(node))

@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.errors import RuntimePreflightFailedError
@@ -151,6 +152,179 @@ def _declared_input_row() -> PipelineRow:
             locked=True,
         ),
     )
+
+
+@pytest.mark.parametrize("multi_query", [False, True], ids=["single", "multi"])
+@pytest.mark.parametrize(
+    ("output_type", "python_type", "value"),
+    [("string", str, "green"), ("integer", int, 3), ("number", float, 0.5), ("boolean", bool, True), ("enum", str, "green")],
+)
+def test_successful_structured_fields_are_required_and_nonnullable(
+    multi_query: bool, output_type: str, python_type: type, value: object
+) -> None:
+    output_field = {"suffix": "answer", "type": output_type}
+    if output_type == "enum":
+        output_field["values"] = ["green", "blue"]
+    config = _make_config(schema={"mode": "flexible", "fields": ["text: str"]})
+    if multi_query:
+        config["queries"] = {"quality": {"input_fields": {"text": "text"}, "output_fields": [output_field]}}
+    else:
+        config["output_fields"] = [output_field]
+    transform, provider = _make_transform_with_mock_provider(config)
+    provider.execute_query.return_value = LLMQueryResult(
+        content=json.dumps({"answer": value}), usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    field_name = "quality_answer" if multi_query else "answer"
+    prefix = "quality_llm_response" if multi_query else "llm_response"
+    data = result.row.to_dict()
+    transform.output_schema.model_validate(data, strict=True)
+    assert transform._output_schema_config is not None
+    declared = {field.name: field for field in transform._output_schema_config.fields}
+    for name, expected_type in ((field_name, python_type), (prefix, str), (f"{prefix}_model", str)):
+        model_field = transform.output_schema.model_fields[name]
+        assert model_field.annotation is expected_type
+        assert model_field.is_required()
+        assert declared[name].required is True
+        assert declared[name].nullable is False
+        emitted = result.row.contract.get_field(name)
+        assert emitted.python_type is expected_type
+        assert emitted.required is True
+        assert emitted.nullable is False
+        for invalid in ({key: item for key, item in data.items() if key != name}, {**data, name: None}):
+            with pytest.raises(ValidationError):
+                transform.output_schema.model_validate(invalid, strict=True)
+    usage_name = f"{prefix}_usage"
+    assert transform.output_schema.model_fields[usage_name].is_required()
+    assert declared[usage_name].field_type == "any"
+    with pytest.raises(ValidationError):
+        transform.output_schema.model_validate({key: item for key, item in data.items() if key != usage_name}, strict=True)
+
+
+@pytest.mark.parametrize("multi_query", [False, True], ids=["single", "multi"])
+def test_observed_success_preserves_dynamic_schema_and_upstream_contract(multi_query: bool) -> None:
+    config = _make_config()
+    output_fields = [{"suffix": "answer", "type": "string"}]
+    if multi_query:
+        config["queries"] = {"quality": {"input_fields": {"text": "text"}, "output_fields": output_fields}}
+    else:
+        config["output_fields"] = output_fields
+    transform, provider = _make_transform_with_mock_provider(config)
+    provider.execute_query.return_value = LLMQueryResult(
+        content='{"answer": "green"}', usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    row = _make_row({"text": "hello", "upstream": 7})
+    result = transform._process_row(row, _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    assert not transform.output_schema.model_fields
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is None
+    assert result.row["upstream"] == 7
+    assert result.row.contract.get_field("upstream") == row.contract.get_field("upstream")
+
+
+@pytest.mark.parametrize("response_field", ["llm_response", "custom_response"])
+@pytest.mark.parametrize("collision_suffix", ["", "_model", "_usage"])
+def test_multi_query_operational_fields_keep_emission_precedence(response_field: str, collision_suffix: str) -> None:
+    """Accepted name collisions must describe the operational value that wins at emission."""
+    suffix = f"{response_field}{collision_suffix}"
+    config = _make_config(
+        response_field=response_field,
+        schema={"mode": "flexible", "fields": ["text: str"]},
+        queries={
+            "quality": {
+                "input_fields": {"text": "text"},
+                "output_fields": [{"suffix": suffix, "type": "integer"}, {"suffix": "answer", "type": "integer"}],
+            }
+        },
+    )
+    transform, provider = _make_transform_with_mock_provider(config)
+    content = json.dumps({suffix: 42, "answer": 7})
+    usage = TokenUsage.known(10, 5)
+    provider.execute_query.return_value = LLMQueryResult(content=content, usage=usage, model="gpt-4o", finish_reason=FinishReason.STOP)
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+    prefix = f"quality_{response_field}"
+    assert result.row[prefix] == content
+    assert result.row[f"{prefix}_model"] == "gpt-4o"
+    assert result.row[f"{prefix}_usage"] == usage.to_dict()
+    assert result.row["quality_answer"] == 7
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is not None
+    names = [field.name for field in transform._output_schema_config.fields]
+    assert names == ["text", prefix, f"{prefix}_usage", f"{prefix}_model", "quality_answer"]
+    assert list(transform.output_schema.model_fields) == names
+    for name, expected_type in ((prefix, str), (f"{prefix}_model", str), (f"{prefix}_usage", object), ("quality_answer", int)):
+        emitted = result.row.contract.get_field(name)
+        assert emitted.python_type is expected_type
+        assert emitted.required is True
+        assert emitted.nullable is (expected_type is object)
+        model_field = transform.output_schema.model_fields[name]
+        assert model_field.annotation is (Any if expected_type is object else expected_type)
+        assert model_field.is_required()
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("suffix", ["llm_response", "llm_response_model", "llm_response_usage"])
+def test_operational_collision_output_admission_matches_the_emitted_type(compatible: bool, suffix: str) -> None:
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+    emitted_type = "any" if suffix.endswith("_usage") else "str"
+    authored_type = emitted_type if compatible else "int"
+    config = _make_config(
+        schema={"mode": "flexible", "fields": ["text: str", f"quality_{suffix}: {authored_type}"]},
+        queries={"quality": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": suffix, "type": "integer"}]}},
+    )
+    if not compatible:
+        with pytest.raises(PluginConfigError, match=r"never admits|token-usage mapping"):
+            LLMTransform(config)
+    else:
+        transform = LLMTransform(config)
+        declarations = {field.name: field.field_type for field in transform.created_output_fields()}
+        assert declarations[f"quality_{suffix}"] == emitted_type
+
+
+@pytest.mark.parametrize("operational_last", [False, True])
+def test_multi_query_overlapping_generated_fields_follow_query_order(operational_last: bool) -> None:
+    """Cross-query overlap follows the same last-query precedence as row assembly."""
+    queries = {
+        "quality": {"input_fields": {"text": "text"}, "output_fields": [{"suffix": "detail_llm_response", "type": "integer"}]},
+        "quality_detail": {"input_fields": {"text": "text"}},
+    }
+    if not operational_last:
+        queries = dict(reversed(tuple(queries.items())))
+    transform, provider = _make_transform_with_mock_provider(
+        _make_config(schema={"mode": "flexible", "fields": ["text: str"]}, queries=queries)
+    )
+    content = '{"detail_llm_response": 42}'
+    provider.execute_query.return_value = LLMQueryResult(
+        content=content, usage=TokenUsage.known(10, 5), model="gpt-4o", finish_reason=FinishReason.STOP
+    )
+    result = transform._process_row(_make_row(), _make_ctx())
+    assert result.status == "success"
+    assert result.row is not None
+    _run_post_emission_check(transform, result.row)
+    transform.output_schema.model_validate(result.row.to_dict(), strict=True)
+    name = "quality_detail_llm_response"
+    assert result.row[name] == (content if operational_last else 42)
+    emitted = result.row.contract.get_field(name)
+    assert emitted.python_type is (str if operational_last else int)
+    assert emitted.required is True
+    assert emitted.nullable is False
+    assert transform._output_schema_config is not None
+    assert transform._output_schema_config.fields is not None
+    names = [field.name for field in transform._output_schema_config.fields]
+    assert len(names) == len(set(names))
+    assert list(transform.output_schema.model_fields) == names
 
 
 def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:

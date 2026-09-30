@@ -83,6 +83,13 @@ class JSONSourceConfig(SourceDataConfig):
     Supports field_mapping for overriding normalized field names.
     """
 
+    snapshot_for_resume: bool = Field(
+        default=False,
+        strict=True,
+        description="For a single-source pipeline, materialize at most 64 MiB of immutable rows before processing so a failed run can resume unread rows.",
+        json_schema_extra={"composer_tier": "advanced"},
+    )
+
     format: Literal["json", "jsonl"] | None = Field(
         default=None,
         description="Input JSON format. When omitted, the source auto-detects JSONL from a .jsonl filename and JSON otherwise.",
@@ -177,7 +184,7 @@ class JSONSource(BaseSource):
     name = "json"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3594f36338bc9898"
+    source_file_hash: str | None = "sha256:b7e16113907d55c3"
     config_model = JSONSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str

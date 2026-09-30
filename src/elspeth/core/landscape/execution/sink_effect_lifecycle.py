@@ -867,6 +867,8 @@ class SinkEffectLifecycle:
             if (
                 type(item) is not dict
                 or set(item) != {"error_hash", "ordinal", "reason_hash"}
+                or type(item["ordinal"]) is not int
+                or item["ordinal"] < 0
                 or type(item["reason_hash"]) is not str
                 or _LOWER_HEX_64.fullmatch(item["reason_hash"]) is None
                 or type(item["error_hash"]) is not str
