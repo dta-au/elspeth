@@ -23,7 +23,7 @@ from elspeth.contracts.call_data import HTTPCallError, HTTPCallRequest, HTTPCall
 from elspeth.contracts.call_mode import ReplayCallEvidence, VerificationDecision
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import RunMode
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
@@ -490,6 +490,50 @@ def test_ssrf_http_replay_records_redirect_hop_before_parent_without_network(moc
                 "source_call_id": item["source_call_id"],
                 "identity": "archived_fingerprint",
             }
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("key", [None, ""])
+@pytest.mark.parametrize("allow_raw", ["false", "true"])
+@respx.mock
+def test_ssrf_forced_header_without_key_refuses_before_transport_or_audit_record(
+    method, key, allow_raw, mock_execution, mock_telemetry_emit, monkeypatch
+):
+    monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+    if key is not None:
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", key)
+    monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", allow_raw)
+    route = respx.route(method=method, url="https://93.184.216.34/search").mock(return_value=httpx.Response(200, text="ok"))
+    request = SSRFSafeRequest(
+        original_url="https://example.com/search",
+        resolved_ip="93.184.216.34",
+        host_header="example.com",
+        port=443,
+        path="/search",
+        scheme="https",
+        bare_hostname="example.com",
+    )
+    client = AuditedHTTPClient(
+        **mock_audit_authority(),
+        execution=mock_execution,
+        state_id="test-state-001",
+        run_id="test-run-001",
+        telemetry_emit=mock_telemetry_emit,
+    )
+    try:
+        with pytest.raises(FrameworkBugError, match="ELSPETH_FINGERPRINT_KEY") as error:
+            client.request_ssrf_safe(
+                method,
+                request,
+                headers={"X-Requested-With": "0000"},
+                fingerprinted_header_names=frozenset({"x-requested-with"}),
+            )
+    finally:
+        client.close()
+    assert "0000" not in str(error.value)
+    assert route.call_count == 0
+    assert mock_execution.record_call.call_count == 0
+    assert mock_telemetry_emit.call_count == 0
 
 
 def test_ssrf_http_replay_refuses_archived_cross_origin_bound_header(mock_execution, mock_telemetry_emit, monkeypatch):

@@ -998,7 +998,10 @@ _EXPECTED_PRODUCTION_CALLER_SHA256 = "2be2a394f3d500e08b4af400dd259c4f56720894d7
 # QR arrivals and departures named above. Measured by scripts/fencing_inventory.py
 # --baseline against a git archive of a375d7f13.
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 154
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "1241860a5c22bd0a007e83bb935481d2d86e9cd680bb6db6c3f71ac4a4017667"
+# Export retry repair: 154 edges remain; _reserve_export -> _lock_stream moves
+# 30cdda6842ae896d -> 79fef0a1995bd81d because create excludes existing winners.
+# Measured by the gate's scanner against 49c184508: one moved, no arrivals/departures.
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "7ee575f619b21c40b64fbb73541cb1be5508dc32a1bf1dcae95c1b6b72081f92"
 _EXPECTED_COORDINATION_CALL_COUNT = 43
 _EXPECTED_COORDINATION_CALL_SHA256 = "0ff714e77188e7496cd3543a78e637d4a7107921bff7656e4af3100980af6d9e"
 _EXPECTED_INTERNAL_EDGE_COUNT = 93

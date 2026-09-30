@@ -22,8 +22,18 @@ export class ComposerPage {
 
   async createSession(_title: string): Promise<void> {
     await this.page.getByRole("button", { name: /session switcher/i }).click();
+    const createdSession = this.page.waitForResponse((response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/api/sessions" &&
+      response.status() === 201,
+    );
     await this.page.getByRole("menuitem", { name: "+ New session" }).click();
+    const session = await (await createdSession).json() as { id: string };
+    // The previous session's chat remains visible during creation. Wait for
+    // the requested session and its focus handoff before another interaction.
+    await this.page.waitForURL((url) => url.hash === `#/${session.id}`);
     await this.waitForChatReady();
+    await this.chatInput().and(this.page.locator(":focus")).waitFor({ state: "visible" });
   }
 
   async sendMessage(content: string): Promise<void> {
