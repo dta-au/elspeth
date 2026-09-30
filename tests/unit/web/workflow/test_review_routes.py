@@ -70,6 +70,15 @@ def app(closed_local_app: Any) -> Any:
                 )
             )
         conn.execute(
+            insert(identity_roles_table).values(
+                role_id="user-bob",
+                identity_id="bob",
+                role="user",
+                granted_at=now,
+                granted_by_identity_id="alice",
+            )
+        )
+        conn.execute(
             insert(sessions_table).values(
                 id=SESSION,
                 user_id="alice",

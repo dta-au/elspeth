@@ -25,7 +25,7 @@ from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricExporte
 from opentelemetry.sdk.resources import Resource
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import create_engine, inspect
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import CompileError, OperationalError, ProgrammingError
 from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
@@ -72,6 +72,7 @@ from elspeth.web.deployment_contract import DeploymentConfigurationError
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
 from elspeth.web.operator_telemetry import OperatorTelemetryFactories, OperatorTelemetryRuntime
 from elspeth.web.readiness import READINESS_CHECK_NAMES, ReadinessCache, ReadinessCheck, ReadinessProbeRunner, ReadinessReport
+from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
@@ -200,6 +201,19 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
     }
     defaults.update(overrides)
     return WebSettings(**defaults)  # type: ignore[arg-type]
+
+
+def _ensure_test_user(conn: Connection, *, identity_id: str) -> None:
+    ensure_test_identity(conn, identity_id=identity_id)
+    conn.execute(
+        identity_roles_table.insert().values(
+            role_id=f"user-{identity_id}",
+            identity_id=identity_id,
+            role="user",
+            granted_by_identity_id=identity_id,
+            granted_at=datetime.now(UTC),
+        )
+    )
 
 
 async def _save_session_seed_state(
@@ -432,7 +446,7 @@ class TestCreateApp:
 
         app = create_app(_settings(tmp_path))
         with app.state.session_engine.begin() as conn:
-            ensure_test_identity(conn, identity_id="test-user")
+            _ensure_test_user(conn, identity_id="test-user")
 
         async def _mock_user() -> UserIdentity:
             return UserIdentity(user_id="test-user", username="test-user")
@@ -3364,7 +3378,7 @@ class TestValidationErrorRedaction:
 
         app = create_app(_settings(tmp_path))
         with app.state.session_engine.begin() as conn:
-            ensure_test_identity(conn, identity_id="test-user")
+            _ensure_test_user(conn, identity_id="test-user")
 
         identity = UserIdentity(user_id="test-user", username="test-user")
 

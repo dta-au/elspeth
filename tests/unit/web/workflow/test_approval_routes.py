@@ -153,6 +153,16 @@ def _seed(client: TestClient) -> tuple[str, str, _Audit, _CompiledExecution]:
                     granted_at=now - timedelta(days=1),
                 )
             )
+        for identity_id in ("addressed", "cover", "outsider"):
+            conn.execute(
+                insert(identity_roles_table).values(
+                    role_id=f"user-{identity_id}",
+                    identity_id=identity_id,
+                    role="user",
+                    granted_by_identity_id="alice",
+                    granted_at=now - timedelta(days=1),
+                )
+            )
     audit = _Audit()
     compiled = _CompiledExecution()
     client.app.state.approval_authority = ApprovalTransactionAuthority(engine)

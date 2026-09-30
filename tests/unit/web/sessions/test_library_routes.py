@@ -63,7 +63,7 @@ def library_client(closed_local_app: SyncASGITestClient, tmp_path: Path) -> tupl
     with engine.begin() as conn:
         for identity_id in ("alice", "bob", "carol"):
             ensure_test_identity(conn, identity_id=identity_id)
-        for identity_id in ("alice", "bob"):
+        for identity_id in ("bob",):
             conn.execute(
                 insert(identity_roles_table).values(
                     role_id=str(uuid4()),
@@ -328,7 +328,7 @@ def test_fork_requires_a_live_same_provider_user(
     actor.identity_id = "bob"
     before = client.get("/api/sessions").json()
     refused = client.post(f"/api/library/{published['entry_id']}/fork")
-    assert (refused.status_code, refused.json()["detail"]["error_type"]) == (409, "library_forker_not_active")
+    assert (refused.status_code, refused.json()["detail"]["error_type"]) == (403, "user_role_required")
     assert client.get("/api/sessions").json() == before
 
 
