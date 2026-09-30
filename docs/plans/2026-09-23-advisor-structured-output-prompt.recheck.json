@@ -1,0 +1,52 @@
+{
+  "verdict": "APPROVED_WITH_WARNINGS",
+  "decision": "GO for implementation",
+  "summary": "No blocking plan defects found across source reality, architecture, quality and systems review. One implementation caution concerns preserving empty-text versus absent-response conformance evidence.",
+  "plan_file": "docs/plans/2026-09-23-advisor-structured-output-prompt.md",
+  "review_date_local": "2026-09-23",
+  "source_base": "4afd73169719954aeac8661629c5b58caf67ff14",
+  "checkout_head": "3ac5e0ed85982a9c4355ecacc897afdbf72c62bc",
+  "blocking_issues": [],
+  "warnings": [
+    {
+      "id": "W1",
+      "source": "All four review lenses",
+      "plan_lines": "201-206",
+      "issue": "The shared call helper currently rejects empty or whitespace-only text and absent/non-string content through the same malformed-response exception. Counting only successful returned strings would lose the false-versus-null distinction required by D.",
+      "evidence": "At the source base, service.py:8300-8306 collapses these cases before the checkpoint provider-failure handler at 8920-8928.",
+      "resolution": "Preserve a typed observation of whether textual content was received across the call boundary. Explicitly test empty and whitespace-only text against absent/non-string content, including retry behavior. The plan already requires these semantics; this is an implementation caution, not a prerequisite plan amendment."
+    }
+  ],
+  "reviewer_summaries": {
+    "reality": "GO: checkpoint-only schema options, bounded retry and role-specific boot probe fit the pinned source.",
+    "architecture": "GO: actual session readers carry audit payloads opaquely and history readers exclude checkpoint audit rows; additive producer fields do not inherently require an epoch cut.",
+    "quality": "GO: strict admission, sanitization order, meaningful controls, compatibility fixtures and whole-tree/PostgreSQL gates are specified.",
+    "systems": "GO: final-attempt failure classification, deadline handling, count timing and audit-before-telemetry ordering are preserved."
+  },
+  "compatibility_evidence": [
+    "At source_base, sessions/service.py:9725-9788 maps stored messages without checkpoint-envelope decoding.",
+    "sessions/protocol.py:1024-1081 validates the message wrapper without requiring checkpoint conformance fields.",
+    "sessions/routes/_helpers.py:1570-1582 excludes audit-role rows from ordinary history; 1641-1678 excludes them from model conversation history after control-message discrimination.",
+    "composer/control_messages.py:85-89 rejects other envelope kinds before requiring control-envelope fields."
+  ],
+  "provider_check": {
+    "finding": "Current OpenRouter documentation supports require_parameters routing and explicitly distinguishes endpoint support from universal schema enforcement, consistent with A.6.",
+    "sources": [
+      "https://openrouter.ai/docs/guides/features/structured-outputs",
+      "https://openrouter.ai/docs/guides/routing/provider-selection"
+    ],
+    "limit": "No authenticated provider request or deployed-model acceptance was performed. The plan's provider survey and live checks remain implementation deliverables."
+  },
+  "validation": {
+    "performed": [
+      "Immutable source inspection at the specified base",
+      "Four independent review lenses and synthesis",
+      "Official OpenRouter documentation check",
+      "Verified plan matches the revision identified by the existing review",
+      "Rechecked source branch and checkout HEAD"
+    ],
+    "not_performed": ["Implementation", "Application test suites", "Live provider acceptance", "Merge", "Push", "Deployment"],
+    "code_map": "No successful retired code index analysis was available. A refresh was started then cancelled; no code-map result supports this review. Source conclusions use immutable Git reads.",
+    "scope": "The plan and existing review report were preserved. This file records the independent recheck."
+  }
+}
