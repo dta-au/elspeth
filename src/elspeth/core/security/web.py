@@ -200,8 +200,7 @@ def _validated_url_hostname(url: str, parsed: urllib.parse.ParseResult) -> str |
             hostname = httpx.URL(scheme=parsed.scheme, host=hostname).raw_host.decode("ascii")
         return hostname
     except (ValueError, httpx.InvalidURL):
-        pass
-    raise SSRFBlockedError(f"Malformed URL; {_safe_url_diagnostic(url, parsed)}.", kind="malformed_url")
+        raise SSRFBlockedError(f"Malformed URL; {_safe_url_diagnostic(url, parsed)}.", kind="malformed_url") from None
 
 
 def _validated_url_port(url: str, parsed: urllib.parse.ParseResult) -> int | None:
