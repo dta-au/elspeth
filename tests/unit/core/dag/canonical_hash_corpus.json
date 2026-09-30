@@ -39,6 +39,7 @@
     "examples/fixed_web_search/settings_fixture_detail.yaml": "bddc8f527c8267bccf64c0b4d03d61c817814c42711424ef27322e397222e18d",
     "examples/fixed_web_search/settings_fixture_form.yaml": "c4046d8a4e8f3d60070defd74876dfff1e100ccca1a8d9de79b16be37dac5126",
     "examples/fixed_web_search/settings_fixture_multipart.yaml": "5b505bfc333a14620fbf6f93abbe435ea15546fa9242ebed46edf34ca63b860f",
+    "examples/fixed_web_search/settings_fixture_pagination.yaml": "24325a33bfc871074cfe3c7757e01555f5c32298ee6313ef635821c4e1734f35",
     "examples/fixed_web_search/settings_fixture_registry.yaml": "256ce5c35b8220578071c18161f0ca67a5ca219048615fbe7bf32a8923d76200",
     "examples/fork_coalesce/settings.yaml": "ab7ab69db8ed7ca7d728f0f5b7dbd3911777c91cda7f1796cadf2793f83fe03e",
     "examples/fork_coalesce/settings_per_branch.yaml": "e0d9c20f3762f6d7aa4d7e80caf93d03c9d624b63a82230a8da3acded8bec30c",
