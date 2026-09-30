@@ -17,6 +17,7 @@ class DocumentRefusalKind(StrEnum):
     ENCRYPTED = "encrypted"  # PdfiumError err_code 4 (password/security)
     MALFORMED = "malformed"  # PdfiumError err_code 3 / any other open failure
     TOO_MANY_PAGES = "too_many_pages"
+    OVERSIZE_OUTPUT = "oversize_output"
 
 
 class PageRefusalKind(StrEnum):
@@ -37,6 +38,7 @@ class RasterizeRequest:
     max_pages: int
     max_page_pixels: int
     max_page_bytes: int
+    max_total_bytes: int
     output_dir: Path  # parent-owned temp dir; worker writes page-<n>.png files here
     extract_text: bool
     max_page_text_bytes: int  # only evaluated when extract_text is True
