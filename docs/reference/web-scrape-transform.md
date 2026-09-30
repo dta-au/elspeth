@@ -36,6 +36,8 @@ transforms:
         - nav
 ```
 
+### URL, origin policy, and query parameters
+
 Set exactly one URL source: `url_field` names a field containing an absolute
 HTTP(S) address in each row; `url` fixes the absolute address in the node.
 The latter is useful when many rows search the same site. Both use the same
@@ -75,6 +77,8 @@ must be a string; missing, invalid, or oversized URLs fail before DNS. Query
 parameter names associated with credentials are rejected. Query values and the
 resulting URL are audit evidence, so search terms should not contain secrets.
 
+### Request headers
+
 For public pages that require request headers, use `headers` for fixed values
 and `header_fields` to read values from each row:
 
@@ -100,6 +104,8 @@ When any configured header is present, GET redirects must stay on the
 initial request's exact scheme, hostname, and effective port. A cross-origin
 redirect is recorded as a blocked hop and is never fetched, even when
 `http.allowed_origins` otherwise permits its destination.
+
+### JSON POST requests
 
 GET is the default. To request data with POST, add a JSON object to each input
 row and name its field explicitly:
@@ -127,6 +133,14 @@ request. The serialized body limit defaults to 1 MiB. `format: raw` returns a
 JSON response as text, ready for a downstream JSON transform; `markdown` and
 `text` accept HTML and other text responses, not `application/json`.
 
+POST does not follow redirects or retry failed requests automatically.
+Pipelines containing POST retrieval refuse automatic resume. Starting a new
+run can issue the request again, so use this mode only for endpoints where
+repeated retrieval is safe. Request JSON is retained in the HTTP audit trail;
+do not put credentials in the body.
+
+### Response syntax, charset, and size limits
+
 The default `response_mode: page` retains the existing HTML/text extraction
 behavior. To validate an API response as JSON or XML before it receives a
 fingerprint, set `format: raw` and `response_mode: json` or `xml`. JSON must be
@@ -146,10 +160,7 @@ partial (206), no-content (204/205), and 304 responses do not become page
 fingerprints. A 304 cannot be used until conditional content reuse has a
 versioned cache and audit contract.
 
-POST does not follow redirects or retry failed requests automatically. A
-restarted run may still issue the request again, so use this mode only for
-endpoints where repeated retrieval is safe. Request JSON is retained in the
-HTTP audit trail; do not put credentials in the body.
+### URL-encoded POST forms
 
 For an HTML form, set `method: POST`, a fixed `url` or a row `url_field`, and
 `request_form_field` instead of `request_json_field`:
@@ -180,6 +191,8 @@ encoded body are retained in HTTP audit evidence; do not put credentials in
 the form row. This mode submits HTTP form data; filling a rendered browser
 form is a separate planned browser capability.
 
+### Multipart POST forms
+
 For a multipart search, use `request_multipart_field` instead of the JSON or
 URL-encoded form field. The row value is an ordered list of up to 256 parts:
 
@@ -198,6 +211,8 @@ blob fails before DNS. The audit request records each part, the content type,
 boundary, exact body size, and SHA-256 digest. Replay binds each file reference
 to the source run's declared multipart field and verifies the retained bytes.
 Do not put credentials in text or file parts.
+
+### HTML record extraction
 
 For an HTML search page, `records` extracts a bounded list of candidate
 records into one output field:
@@ -226,6 +241,8 @@ aligned source URL, selector, attribute, and match evidence for each column.
 An HTML `href` column with `resolve_url: true` resolves relative links against
 the final page URL and requires explicit `http.allowed_origins`.
 
+### JSON record extraction
+
 For a JSON API, set `format: raw`, `response_mode: json`, and select records
 with exact object keys and array indexes:
 
@@ -245,6 +262,8 @@ selection. JSON extraction bounds document size, record count, values per
 record, total values, individual value length, and the combined output and
 provenance size. JSON and CSS record configurations cannot be mixed. Extracted
 values remain untrusted.
+
+### GET pagination
 
 For bounded GET pagination, configure exact allowed origins and either a
 CSS next link or an HTTP `Link` header:
@@ -273,12 +292,22 @@ Repeated URLs and `max_pages` stop before another fetch; elapsed or aggregate
 limits fail the row. POST pagination and opaque credential or cursor links
 are refused.
 
+### Unavailable authenticated and browser execution
+
 Authenticated execution remains unavailable: configured `auth` is hidden
 from Composer's catalog and refuses the row before DNS or HTTP. Response
 validation does not protect confidential authenticated bodies, which the
 ordinary audit client persists before extraction. Enabling auth requires the
 retention and access policy and protected evidence boundary described in the
 [authenticated response design gate](../design/2026-09-29-web-auth-response-evidence-gate.md).
+
+Live browser execution is also unavailable. The
+[`core/browser` boundary](../../src/elspeth/core/browser/boundary.py) supplies
+bounded request-admission and archived-output replay contracts; it opens no
+sockets, launches no browser, and registers no pipeline plugin. The
+[browser egress release gate](../design/2026-09-29-web-browser-egress-gate.md)
+requires a separately isolated worker and enforcing gateway, with deployment
+proof that browser traffic cannot bypass audit and destination policy.
 
 ## Output Fields
 
