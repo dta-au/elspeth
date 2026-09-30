@@ -1,17 +1,8 @@
 # Frontend remediation planning input
 
-> **Historical diagnostic input, retained 2026-09-30.** The
-> [parent plan's current execution context](../2026-09-23-web-review-remediation.md#current-execution-context)
-> governs implementation. The original reproductions and negative cases remain
-> useful; named paths and tests must be resolved against today's frontend.
-> Guided turns are removed and the tutorial uses `TutorialFreeformShell.tsx`.
-> Keep ordinary proposal/store race and accessibility requirements, verify
-> current equivalent repairs, and avoid restoring retired components to satisfy
-> dated test names. No tests or live browser acceptance are claimed by this sheet.
-
 Read-only source review on 2026-09-23; no production edits or tests run. Live HEAD measured with `git rev-parse HEAD`: `1e9cafa9d47df5654926509ef13a2a3e9e4452c8`. Review pin: `74c0ce0db`. All assigned issue files read, including verifier corrections. Some review paths are shorthand or incorrect; verified paths below take precedence. In this report **FE** means `src/elspeth/web/frontend`, **SRC** means `src/elspeth/web/frontend/src`; these are path abbreviations, not additional directories.
 
-## Evidence and disposition at the 2026-09-23 checkpoint
+## Current-tree evidence and already-fixed disposition
 
 `git log --oneline 74c0ce0db..HEAD -- src/elspeth/web/frontend` returned:
 

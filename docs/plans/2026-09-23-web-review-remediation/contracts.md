@@ -1,14 +1,5 @@
 # Contract, prompt and pricing remediation planning
 
-> **Historical diagnostic input, retained 2026-09-30.** The
-> [parent plan's current execution context](../2026-09-23-web-review-remediation.md#current-execution-context)
-> governs implementation. The paths, line references, proposed fixes and test
-> selections below describe the 2026-09-23 investigation. Guided/deferred paths
-> have since been removed and Composer ownership has moved. Reconcile each
-> contract requirement against the current freeform pipeline and preserved
-> worktree changes before writing code. Do not rebuild obsolete marker machinery
-> or erase a downstream contract merely to reproduce an old probe result.
-
 Read-only assessment of R01, R17, R18, R27–R34 and R39–R47. No production edits or tests run. Issue text and verification verdicts read; cited live source inspected. Paths below are relative to the repository root; the frontend is `src/elspeth/web/frontend`, not a top-level `frontend` directory.
 
 ## Current evidence and ownership

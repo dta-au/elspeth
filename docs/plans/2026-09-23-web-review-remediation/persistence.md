@@ -1,18 +1,8 @@
 # Persistence, credentials, provenance and deployment remediation plan
 
-> **Historical diagnostic input, retained 2026-09-30.** The
-> [parent plan's current execution context](../2026-09-23-web-review-remediation.md#current-execution-context)
-> governs implementation. These source/epoch observations and proposed ownership
-> windows are dated 2026-09-23. Resolve current session application owners,
-> schemas and equivalent integrated fixes before applying any patch. Any new
-> SQL, persistence or lock change needs serial PostgreSQL proof as well as
-> affected SQLite checks. Legacy tracker IDs are archive references; current
-> coordination uses GitHub Issues. This recovery does not authorize store resets
-> or establish deployment acceptance.
-
 Read-only planning, 2026-09-23. Baseline inspected: `1e9cafa9d` on `release/0.8.1`; review pin: `74c0ce0db`. No production edits, commits or tests were performed by this lane. Owned issue set: R05, R07, R08, R09, R11, R12, R13, R35, R36, R50, R51, R52, R59, R71, R72, R73.
 
-## Evidence and coordination at the 2026-09-23 checkpoint
+## Current evidence and coordination
 
 `git diff --stat 74c0ce0db..HEAD -- src/elspeth/web/auth src/elspeth/web/coordination src/elspeth/web/execution src/elspeth/web/shareable_reviews src/elspeth/web/config.py deploy/compose deploy/linux-systemd docs/guides/docker.md docs/reference/environment-variables.md` printed:
 

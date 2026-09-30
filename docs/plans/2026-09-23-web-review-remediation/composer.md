@@ -1,19 +1,8 @@
 # Composer remediation planning: R02, R03, R14–R16, R21–R26, R53
 
-> **Historical diagnostic input, retained 2026-09-30.** Read the
-> [parent plan's current execution context](../2026-09-23-web-review-remediation.md#current-execution-context)
-> before using this sheet. Its source sites, missing-work statements, epoch-66
-> proposal and service ownership describe the 2026-09-23 checkpoint, not the
-> current release. At recovery base `a2f0281ff`, Sessions/hard-cut are epoch 71
-> and the advisor parses structured output through `advisor_output.py` and
-> `advisor_checkpoint.py`; R23's prose/markdown parser design is superseded.
-> Preserve its boundary rejection and note-projection requirements through the
-> current structured contract. Re-derive remaining acceptance tests and owners;
-> do not recreate an old parser or infer closure from these dated notes.
-
 Read-only investigation on 2026-09-23. Source checkpoint: `1e9cafa9d47df5654926509ef13a2a3e9e4452c8`; review checkpoint: `74c0ce0db`. No production changes, tests, commits, service actions or database reads performed. Paths below are repository-relative. Tests named below are proposed, not passed. These are 12 assigned issue IDs, not a new finding inventory.
 
-## Drift evidence and disposition at the 2026-09-23 checkpoint
+## Live-drift evidence and disposition
 
 Commands and relevant raw output:
 

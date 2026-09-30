@@ -125,18 +125,33 @@ Rows are in execution order within each workstream.
 | K6: AKS overlay | [K6-aks-overlay.md](K6-aks-overlay.md) | K1 |
 | K7: Qualify routing without affinity | [K7-no-affinity-routing.md](K7-no-affinity-routing.md) | K5, K6 |
 | K8: Runbook and public-claim flip | [K8-runbook-and-claim-flip.md](K8-runbook-and-claim-flip.md) | K7, I11 |
-| I0: One schema pass: token ledger nullability | [I0-ledger-nullability.md](I0-ledger-nullability.md) | — |
-| I8: The enforcement switch and the R11 startup refusal | [I8-governance-switch.md](I8-governance-switch.md) | I0 |
-| I1: Token usage ledger and R14 daily enforcement | [I1-token-ledger-quota.md](I1-token-ledger-quota.md) | I8 |
-| I2: Storage quota R13 at every byte-admitting site | [I2-storage-quota.md](I2-storage-quota.md) | I1 |
-| I3: Approvals — request, decide, withdraw, supersede, and the R2 execute gate | [I3-approvals.md](I3-approvals.md) | I2 |
-| I4: Review requests and reviewer attestations | [I4-reviews.md](I4-reviews.md) | I3 |
-| I5: Shared library — publish, curate, browse, fork | [I5-shared-library.md](I5-shared-library.md) | I3 |
-| I6: Compartment marking | [I6-compartment-marking.md](I6-compartment-marking.md) | I4, I5 |
-| I7: Scoped reads — workflow inspect, approver audit view, delegated administration | [I7-scoped-reads.md](I7-scoped-reads.md) | I6 |
-| I9: Frontend — mailbox, completion bar, readiness row, admin UI, library, quota status | [I9-frontend.md](I9-frontend.md) | I7 |
-| I10: Workflow-governance suite (fire + mutation per refusal) | [I10-governance-suite.md](I10-governance-suite.md) | I8, I9 |
-| I11: Cutover mechanics — the operator's instructions for the workflow-epoch window | [I11-cutover.md](I11-cutover.md) | I10 |
+| I0: One schema pass: token ledger nullability | [I0-ledger-nullability.md][archived-i0] | — |
+| I8: The enforcement switch and the R11 startup refusal | [I8-governance-switch.md][archived-i8] | I0 |
+| I1: Token usage ledger and R14 daily enforcement | [I1-token-ledger-quota.md][archived-i1] | I8 |
+| I2: Storage quota R13 at every byte-admitting site | [I2-storage-quota.md][archived-i2] | I1 |
+| I3: Approvals — request, decide, withdraw, supersede, and the R2 execute gate | [I3-approvals.md][archived-i3] | I2 |
+| I4: Review requests and reviewer attestations | [I4-reviews.md][archived-i4] | I3 |
+| I5: Shared library — publish, curate, browse, fork | [I5-shared-library.md][archived-i5] | I3 |
+| I6: Compartment marking | [I6-compartment-marking.md][archived-i6] | I4, I5 |
+| I7: Scoped reads — workflow inspect, approver audit view, delegated administration | [I7-scoped-reads.md][archived-i7] | I6 |
+| I9: Frontend — mailbox, completion bar, readiness row, admin UI, library, quota status | [I9-frontend.md][archived-i9] | I7 |
+| I10: Workflow-governance suite (fire + mutation per refusal) | [I10-governance-suite.md][archived-i10] | I8, I9 |
+| I11: Cutover mechanics — the operator's instructions for the workflow-epoch window | [I11-cutover.md][archived-i11] | I10 |
+
+The completed I-task files are archived locally under `docs-archive/2026-09-23-completed-plans/`. These links point to the committed versions; workstream K remains active here.
+
+[archived-i0]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I0-ledger-nullability.md
+[archived-i1]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I1-token-ledger-quota.md
+[archived-i2]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I2-storage-quota.md
+[archived-i3]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I3-approvals.md
+[archived-i4]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I4-reviews.md
+[archived-i5]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I5-shared-library.md
+[archived-i6]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I6-compartment-marking.md
+[archived-i7]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I7-scoped-reads.md
+[archived-i8]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I8-governance-switch.md
+[archived-i9]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I9-frontend.md
+[archived-i10]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I10-governance-suite.md
+[archived-i11]: https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-13-kubernetes-and-identity/I11-cutover.md
 
 ---
 

@@ -1,303 +1,124 @@
-# Composer async operations implementation plan
+# Composer Async Operations Implementation Plan (re-based 2026-09-28)
 
-**Goal:** Deliver the [revised design](../specs/2026-09-16-composer-async-operations-design.md)
-for elspeth-7a663a062c on `release/0.8.1`: five Composer authoring routes
-return a durable 202 handle without waiting for a provider, and a short poll
-delivers the exact terminal result.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Each task lives in its own file under [`2026-09-20-composer-async-operations/`](2026-09-20-composer-async-operations/); execute them in order N00 → N19.
 
-**Scope:** One hard cutover for `/messages`, `/recompose`, `/guided/plan`,
-`/guided/respond`, and `/guided/chat`. The existing `guided_operations` table
-and other guided operation routes retain their contracts. No Composer route
-may author a server-derived graph or gain a tutorial-only path.
+**Goal:** Make `POST /{session_id}/messages` and `POST /{session_id}/recompose` acknowledge an accepted turn with a short `202`, run the turn in an app-owned worker that no longer depends on the POST socket, and deliver the exact former `MessageWithStateResponse`, or the exact former public error, through short authenticated polls. A middlebox that cuts idle requests at 60–125 s can then no longer destroy a healthy turn. That includes the first-run tutorial, whose Build now uses `/messages`.
 
-**Working setup:** Confirm the target release branch and its current SHA
-before implementation. Use a dedicated worktree with both source roots on
-`PYTHONPATH`; verify `elspeth.__file__` and `elspeth_lints.__file__` resolve
-inside it. Read `CONTRIBUTING.md` § Whole-tree gates before code edits. Freeze
-the final tip before broad validation and rerun a gate if it advances. The
-schema change requires a reviewed session epoch update; coordinate the
-deployed-store reset and `bootstrap-admin` with the release operator rather
-than treating a local test database as deployment approval.
-In commands below, `ELSPETH_WORKTREE` is the absolute path to that dedicated
-worktree, exported by the implementer before running them.
+**Architecture:**
 
-## 0. Establish the failure and contract inventory
+- **Admission.** Admission commits a queued `composer_async_operations` row, keyed by the client-minted `operation_id`. The same id is the `message_ingress_receipts` key, so there is one id per send.
+- **Start.** A worker on every instance claims the row. In **one** locked transaction it then:
+  1. advances the session's COMPOSE `SessionOperationLease` fence;
+  2. checks ownership, the bound base and (recompose) the transcript, refusing a moved base before any side effect;
+  3. marks the job `running`.
 
-**Read:** `docs/specs/2026-09-16-composer-async-operations-review.md`,
-`src/elspeth/web/sessions/routes/_helpers.py`, the five route handlers listed
-below, `src/elspeth/web/sessions/routes/guided_operations.py`,
-`src/elspeth/web/coordination/lifecycle.py`, and
-`src/elspeth/web/frontend/src/stores/sessionStore.ts`.
+  It then adopts the minted lease.
+- **Turn.** The rebuilt route body runs under that lease. A positive fence predicate refuses every non-audit write once the job is cancel-marked or terminal.
+- **Terminal.** One composite transaction publishes the assistant row, the audit cohort, the pending-proposal read and the terminal row.
+- **Recovery.** A reaper settles expired queued rows and dead owners without replaying a provider turn.
+- **SPA.** It keeps the id and body in `sessionStorage`, polls to terminal, and feeds the result into the existing reducers.
 
-1. Add one failing route integration test under
-   `tests/unit/web/sessions/routes/test_composer_async_operations.py`: hold the
-   provider beyond an HTTP client's short deadline and show the current POST
-   remains pending. Use a controlled event, not a wall-clock sleep. Preserve
-   the existing success DTO as the expected terminal value.
-2. Build a reviewed table of *every* `HTTPException` and cancellation exit in
-   `messages.py`, `composer/compose.py`, `composer/guided_plan.py`,
-   `composer/guided.py` (`respond`, `chat`), and
-   `composer/guided_chat_atomic.py`. Assign each site to stable pre-202
-   admission or post-202 terminal projection. The test for each public error
-   compares the old status/body with the new terminal envelope. Do not use a
-   text count as proof that the inventory is complete; inspect route control
-   flow and use an AST instrument with a known positive and negative control
-   as a cross-check.
-3. Record the current frontend success side effects for all five routes:
-   message, state, proposals, validation reset, selected node, guided session,
-   next turn, terminal, and interpretation refresh. The terminal result must
-   exercise the same reducers.
+**Tech Stack:** Python 3.12, FastAPI 0.136, SQLAlchemy Core on SQLite and PostgreSQL, pydantic v2, asyncio; React + Zustand + Vitest + Playwright.
 
-**Gate:** The reproduction fails on the old synchronous behavior, and the
-inventory has a source anchor and expected public outcome for each exit.
-Do this before choosing error adapters or changing the route signatures.
+**Spec:** [`docs/specs/2026-09-16-composer-async-operations-design.md`](../specs/2026-09-16-composer-async-operations-design.md) (second amendment, 2026-09-28).
 
-## 1. Add the durable transport job schema
+**Interface contract:** [`contract.md`](2026-09-20-composer-async-operations/contract.md). It fixes every cross-task name, signature, column and wire shape, the owner rulings, and decisions E1–E25. It has no override tables.
 
-**Modify:** `src/elspeth/web/sessions/models.py`,
-`src/elspeth/web/sessions/schema.py`,
-`src/elspeth/web/sessions/protocol.py`,
-`src/elspeth/web/sessions/service.py`.
+**Decision record:** [`panel-2026-09-28/`](2026-09-20-composer-async-operations/panel-2026-09-28/). It holds the storage panel (`RECOMMENDATION.md`, B′ 9/9) and the owner rulings 1–7 (`RULINGS.md`).
 
-**Test:** `tests/unit/web/sessions/test_schema.py`, a new
-`tests/unit/web/sessions/test_composer_async_operation_service.py`,
-`tests/testcontainer/web/test_schema_probe_postgres.py`.
+**Evidence:** [`findings-2026-09-28/`](2026-09-20-composer-async-operations/findings-2026-09-28/). This is a re-survey pinned at `1effedab2`, with a completeness critique (44/44 anchors verified). The 09-25 plan, findings and review are in the [historical snapshot of `history/2026-09-25/`](https://github.com/dta-au/elspeth/tree/5cf32329378de8042a80c449010f9f0039ac9a05/docs/plans/2026-09-20-composer-async-operations/history/2026-09-25/). They are kept for the review items they resolved, which the task files carry forward by id; none of their line anchors is current.
 
-1. Define `composer_async_operations` with a composite `(session_id,
-   operation_id)` primary key, closed five-kind and four-status checks,
-   bounded request JSON, actor identity, claim token/expiry, cancellation
-   marker, terminal public JSON, schema discriminator, canonical hash, and
-   timestamps. Check queued, running, completed, and failed NULL bundles on
-   both dialects. Clear request JSON on terminal settlement. Add a scan index
-   for queued jobs and expired claims.
-2. Update the schema-shape identity and all epoch mirrors from the current
-   release tip. Do not alter `guided_operations` constraints or rename that
-   table. PostgreSQL reflection of every new CHECK and index must equal the
-   declared schema, including one-value or JSON checks.
-3. Add owned request, job, and result types. Parse untrusted JSON into a
-   route-specific strict DTO before work. Validate and hash the public result
-   DTO before write and validate it again on read. The stored response must be
-   the exact body the former synchronous route returned.
+## Owner rulings this plan implements
 
-**Gate:** A duplicate `(session_id, operation_id)` cannot create two jobs;
-invalid status bundles and hash mismatches fail closed; SQLite and PostgreSQL
-schema tests pass. Run serial PostgreSQL tests with:
+- **Scope.** Freeform is the only composer (guided was removed in `7001600fe`). The cutover set is the two routes above. The tutorial rides it with no tutorial branch.
+- **R0.** 202 + poll ships now, and a later streaming UI reads the same row.
+- **R2.** The terminal is a composite transaction.
+- **R3.** The running state is bound to the COMPOSE lease via `adopt`.
+- **1 and 6.** One id per send, `operation_id` everywhere. Ingress is the immutable acceptance record written by the worker. The ingress 409s and the SPA transcript-matching recovery are deleted.
+- **2.** A positive fence predicate.
+- **3.** No events table, but forensic columns on the terminal row.
+- **4.** A delete guard, and retention with the session.
+- **5 and 7.** A moved base is refused before any side effect, and an absent `state_id` means "no state".
+- **B′.** A separate table, with a request normaliser shared with receipts and pinned by a golden vector. If the vector moves, ship C.
 
-```bash
-cd "$ELSPETH_WORKTREE" && \
-  log="$(mktemp /tmp/composer-async-schema.XXXXXX.log)" && \
-  PYTHONPATH="$ELSPETH_WORKTREE/src:$ELSPETH_WORKTREE/elspeth-lints/src" \
-  "$ELSPETH_WORKTREE/.venv/bin/python" -m pytest \
-  tests/testcontainer/web/test_schema_probe_postgres.py -m testcontainer -n 0 \
-  > "$log" 2>&1
-status=$?
-printf 'exit=%s log=%s\n' "$status" "$log"
-tail -50 "$log"
-exit "$status"
-```
+## Global Constraints
 
-## 2. Implement reservation, claim, and terminal transactions
+These are copied from the spec and the rulings. Every task's requirements include them.
 
-**Modify:** `src/elspeth/web/sessions/service.py` and the session-store
-repository/facet that owns `guided_operations` writes. Keep the transport
-writer in the same session mutation authority; do not add a second direct
-engine writer from route code.
+- The cutover set is exactly `compose_message` (`POST /{session_id}/messages`) and `compose_recompose` (`POST /{session_id}/recompose`). `kind` is a closed two-value CHECK.
+- "The LLM remains the author of pipeline structure; no provider bypass is introduced." There is no tutorial-only dispatch, polling or fallback (composer invariants 1–2).
+- An accepted POST returns `202` with `{"operation_id","kind","status","poll_after_ms"}` only after authentication, ownership, strict body validation, soft capacity admission and an atomic queue insert. It never waits for a compose lock, a provider or a worker claim.
+- A retry reuses the exact id and body. The server hashes the normalised body (excluding `operation_id`, including `state_id` and, for recompose, `expected_user_message_id`) with session and kind. A mismatch is 409, and a new id is a new user action. At most one nonterminal job exists per session; this is a schema index, enforced as 409 `composer_operation_active`.
+- The poll checks ownership on every call, returns `Cache-Control: no-store`, and never returns an exception string or a secret-bearing detail. A missing job is 404.
+- The job row, not progress or `inflight_requests`, is the settlement authority.
+- The start transaction guarantees there is no side effect before `running`. A `running` row is never taken over and never returns to queued; there is no provider replay. A retry of the same id never creates another user row.
+- One absolute deadline is set at admission from `composer_timeout_seconds`. Queue time consumes it, and each stage gets only the remaining time.
+- The worker has no `Request` and never calls `request.receive()`. The LLM-call audit cohort is persisted `audit_only` before any cancel terminal.
+- A post-202 error keeps today's public HTTP meaning inside the terminal envelope. Unknown exceptions use the generic envelope only after audit and server diagnostics are retained.
+- Budgets change only in their relationship. The compose budget is decoupled from the transport ceiling for the async routes. The ceiling still bounds the synchronous consumers: diagnostics, proposal Accept and the tutorial run wait.
+- No PostgreSQL advisory lock is added. The in-process `asyncio.Lock` is a queueing aid, not the cross-instance authority.
+- AGENTS.md applies throughout:
+  - a worktree with both source roots on `PYTHONPATH`;
+  - commits by pathspec, and no `git stash`;
+  - no `# noqa` or `type: ignore`, and no `getattr`/`hasattr` on owned types;
+  - the key-free trust-tier lint compared as a finding set and never re-signed by an agent.
 
-**Test:** `tests/unit/web/sessions/test_composer_async_operation_service.py`,
-`tests/testcontainer/web/test_cross_process_composer_postgres.py`,
-`tests/testcontainer/web/test_session_operation_fence_postgres.py`.
+## Review Focus
 
-1. Reserve by client UUID, session, kind, actor, and canonical request hash.
-   Same binding returns the existing job; any mismatch returns 409. Commit the
-   queue row before a route can send 202. Add bounded queue capacity and one
-   absolute deadline at admission from the configured compose budget. Queue
-   time and provider time share that deadline. The three guided
-   routes use `guided_operation_request_hash` exactly; the freeform routes
-   use a versioned equivalent that also excludes `operation_id`.
-2. Claim the oldest available queued job per session with a database token.
-   PostgreSQL uses `FOR UPDATE SKIP LOCKED`; SQLite uses a transactional
-   compare-and-swap. A queued claim may be reclaimed after expiry only because
-   no side effect is permitted before `running`.
-3. Require the existing `SessionOperationLease` COMPOSE authority before
-   transitioning to `running`. On conflict, release the queue claim and retry
-   later. All side-effecting service calls must verify the live transport and
-   session lease fences. A running lease is renewed by the server, not by SPA
-   polls. An expired running job never replays; it honors a committed cancel
-   or terminalizes as `worker_lost`.
-4. Commit a validated public success or safe failure envelope with its hash
-   under the job fence. For freeform turns, the final result and assistant
-   publication share a transaction. For guided turns, bind the internal guided
-   operation to the same UUID/hash. Prepare the validated public DTO before
-   the final transaction, then commit internal completion and transport
-   publication atomically. A repair path never invokes the provider again.
+These are the inputs the spec implies but the task tests are most likely to under-exercise. Each has an owning task that pins it.
 
-**Gate:** Concurrent same-ID POSTs result in one row; different instances
-cannot run two turns for one session; stale owners cannot commit; a crash
-before `running` is reclaimable and a crash after `running` is terminal without
-provider replay. Use controlled interleavings on both SQLite and PostgreSQL.
+1. **Client clock skew.** A browser whose clock is minutes off must neither cancel early nor wait forever. The deadline is a `performance.now()` deadline from `deadline_remaining_ms`, which is computed on the DB clock. Owners: N03, N13, N15.
+2. **The session disappears under live custody** (archived elsewhere, or an epoch reset). The poll's `session_missing` 404 stops polling, clears custody and takes today's not-found path, without resubmitting. Owner: N15.
+3. **Browser storage refuses the descriptor.** The turn runs from memory custody. After a reload the server's `composer_operation_active` 409 reattaches the user; with the transcript-matching fallback gone, it is the only reattach path. Owners: N14, N15.
+4. **Two tabs press Send with different ids.** The D8 index admits exactly one; the loser attaches and never shows a failed row. Owners: N05 (race), N15.
+5. **An archived session's running job after its owner dies.** It is settled through `settle_lost_inactive_session` and never leaks capacity. Owners: N05, N12.
+6. **The head moves while a send is queued** (fork, revert or Accept in another tab). The result is a terminal 409 `stale_compose_state`, with no user row and no provider call. Owners: N06, N15.
+7. **A resend after a stale refusal must not replay the refused id.** Retry mints a new id with the reloaded head; only a network-ambiguous retry reuses the id and body. Owner: N15.
+8. **A send typed while `selectSession` is still loading** carries `state_id: null` and would be refused. Send is held until `compositionStateLoaded`. Owner: N15.
 
-## 3. Add the app-owned worker and reaper
+## Tasks
 
-**Create:** `src/elspeth/web/sessions/composer_async_worker.py`.
-**Modify:** `src/elspeth/web/app.py`,
-`src/elspeth/web/sessions/routes/_helpers.py`, and the five route modules.
-**Test:** `tests/unit/web/sessions/routes/test_composer_async_operations.py`,
-`tests/unit/web/sessions/routes/test_compose_heartbeat_renewal.py`,
-`tests/unit/web/sessions/routes/test_composer_request_telemetry.py`.
+| # | File | Deliverable | Depends on |
+|---|---|---|---|
+| N00 | [N00](2026-09-20-composer-async-operations/N00.md) | Worktree; measurements M0–M12; gate-2 baseline test; **Appendix A**: every exit of both routes and its owning task (spec §5) | docs commit |
+| N01 | [N01](2026-09-20-composer-async-operations/N01.md) | Six `composer_async_*` settings; `composer_sync_timeout_seconds` for the three synchronous consumers; behaviour-neutral | N00 |
+| N02 | [N02](2026-09-20-composer-async-operations/N02.md) | Shared request normaliser + response hash; receipts delegate; golden vectors committed first; **go/no-go → C** | N00 |
+| N03 | [N03](2026-09-20-composer-async-operations/N03.md) | Owned types, strict + transitional legacy DTOs, wire DTOs, request-JSON bound | N02 |
+| N04 | [N04](2026-09-20-composer-async-operations/N04.md) | `composer_async_operations` table, bundles, transition + delete guards, D8 index, single-authority policy, PG reflection | N03 |
+| N05 | [N05](2026-09-20-composer-async-operations/N05.md) | `ComposerAsyncOperationAuthority` + connection-taking helpers; SQLite + PG races | N04 |
+| N06 | [N06](2026-09-20-composer-async-operations/N06.md) | Composite start + precondition gate (ownership, foreign base, moved base, recompose transcript) | N05 |
+| N07 | [N07](2026-09-20-composer-async-operations/N07.md) | Post-terminal write inventory → positive predicate (Family S + R) → composite terminal | N06 |
+| N08 | [N08](2026-09-20-composer-async-operations/N08.md) | Request lifecycle handle + durable carrier + app-keyed lock registry; both routes behaviour-unchanged | N00 |
+| N09 | [N09](2026-09-20-composer-async-operations/N09.md) | Budget threading (compose, planner, settlement) + D10 | N01 |
+| N10 | [N10](2026-09-20-composer-async-operations/N10.md) | Error projection with real-handler parity | N03 |
+| N11a | [N11a](2026-09-20-composer-async-operations/N11a.md) | `ComposerAppServices`, D6 settlement signatures, the ingress/job binding | N07–N10 |
+| N11b | [N11b](2026-09-20-composer-async-operations/N11b.md) | `run_composer_turn` + observation + retargeted structural pins | N11a |
+| N12 | [N12](2026-09-20-composer-async-operations/N12.md) | Worker, reaper, lifespan, cancellation and lease-loss watcher (spec gate 4) | N11b |
+| N13 | [N13](2026-09-20-composer-async-operations/N13.md) | Poll and cancel routes; test helpers; shared composer fakes | N12 |
+| N14 | [N14](2026-09-20-composer-async-operations/N14.md) | Cutover: 202, ingress DDL + rename, deletions, caller migration (incl. `state_id`), ACA P1 redefinition, spec gate 2 | N13 |
+| N15 | [N15](2026-09-20-composer-async-operations/N15.md) | SPA cutover (spec gate 5), tutorial gating, e2e and transition-ledger boundary | N14 |
+| N16 | [N16](2026-09-20-composer-async-operations/N16.md) | Budget decoupling and deployment mirrors | N14 |
+| N17 | [N17](2026-09-20-composer-async-operations/N17.md) | PostgreSQL crash windows, cross-instance and the new PG proofs (spec gate 3) | N14 |
+| N18 | [N18](2026-09-20-composer-async-operations/N18.md) | Session epoch 72 (re-read first) + doc/website/CHANGELOG sweep | all |
+| N19 | [N19](2026-09-20-composer-async-operations/N19.md) | Full gates (all stages, spec gate 6), lints set diff, local short-idle-proxy browser acceptance | N18 |
 
-1. Start a bounded scanner/worker and reaper in application lifespan, after
-   session-store readiness. Cancel and drain owned tasks during graceful
-   shutdown; leave lease expiry as the unclean-crash backstop. Each instance
-   can claim jobs; no sticky request routing is required.
-2. Build an owned worker context from the strict DTO and authenticated actor.
-   Extract the lease heartbeat, failure marker, metrics, and LLM-call audit
-   handling from `_track_compose_inflight`. The task doing provider work is
-   the task whose cancellation counter and audit-bearing `CancelledError` are
-   examined. It must not retain a FastAPI `Request`, read `request.receive()`,
-   or use `_cancel_on_client_disconnect`.
-3. Move transcript and state checks that require a session lease into the
-   worker. A later 400/404/409/429 is a terminal error envelope, even if no
-   provider was called. Keep authentication, ownership, DTO validation,
-   duplicate-ID binding, and queue-capacity refusal in the short POST.
-4. Give the worker only the time remaining until the admission deadline.
-   Poll failures or browser
-   absence do not cancel the worker. Loss of either server lease cancels the
-   task and fences its writes; metrics and public failure classification name
-   the actual cause.
-5. Decouple `composer_timeout_seconds` from the HTTP transport idle ceiling in
-   `src/elspeth/web/config.py` and
-   `deploy/aws-ecs/terraform/modules/scenario/variables.tf`; update
-   `tests/unit/web/test_config.py` and
-   `tests/unit/deployment/test_aws_ecs_terraform_package.py`. Keep the
-   transport settings and their internal headroom validation because
-   `src/elspeth/web/composer/tutorial_service.py` still uses them for a
-   synchronous run wait. Update the Terraform README and matching deployment
-   text. Prove a compose budget longer than the declared proxy ceiling boots
-   with the async routes, while an invalid transport ceiling/headroom pair
-   still fails.
+Spec verification gates map to tasks as follows:
 
-**Gate:** The reproduction from task 0 now returns 202 while the provider is
-held, and polling yields the exact former result. Heartbeat tests target the
-worker's actual task and still distinguish client Stop, worker lease loss,
-external shutdown, and audit attachment.
+| Gate | Owning tasks |
+|---|---|
+| 1 | N02–N07 |
+| 2 | N14, plus N19 proxy acceptance |
+| 3 | N17 |
+| 4 | N12, plus the N08 lifecycle twins |
+| 5 | N15 |
+| 6 | N19 |
 
-## 4. Expose polling and explicit cancellation
+## Execution notes
 
-**Create or modify:** `src/elspeth/web/sessions/routes/composer/operations.py`,
-`src/elspeth/web/sessions/schemas.py`, and route registration in
-`src/elspeth/web/sessions/routes/composer/__init__.py`.
-
-**Test:** `tests/unit/web/sessions/routes/test_composer_async_operations.py`,
-`tests/testcontainer/web/test_cross_process_composer_postgres.py`.
-
-1. Add ownership-checked GET by exact session and operation ID. Return the
-   closed status union with no-store headers. Do not infer completion from a
-   progress phase, local task map, or `inflight_requests`.
-2. Add an idempotent cancel POST. Persist `cancel_requested_at` under the job
-   row lock. Signal a local owner and let a remote owner observe it at the
-   bounded renewal. Keep the job nonterminal until the task and required
-   audit are settled. A completed result wins if it committed first.
-3. Implement a token-checked reaper for queued-claim expiry, operation deadline,
-   running lease expiry, and cancel/expiry races. Distinguish worker loss from
-   client cancellation; mark audit evidence unproducible explicitly when
-   process death prevents it. A worker finishing after expiry cannot write.
-
-**Gate:** Different app instances can submit, poll, and cancel one job.
-Cancel/completion/expiry races each produce exactly one terminal result and
-no late session mutation.
-
-## 5. Cut over all five HTTP routes
-
-**Modify:** `src/elspeth/web/sessions/routes/messages.py`,
-`src/elspeth/web/sessions/routes/composer/compose.py`,
-`src/elspeth/web/sessions/routes/composer/guided_plan.py`,
-`src/elspeth/web/sessions/routes/composer/guided.py`,
-`src/elspeth/web/sessions/routes/composer/guided_chat_atomic.py`,
-`src/elspeth/web/sessions/schemas.py`.
-
-**Test:** `tests/unit/web/sessions/test_routes.py`,
-`tests/unit/web/sessions/test_recompose_admission_refused.py`,
-`tests/unit/web/sessions/routes/composer/test_guided_plan_terminal_publication.py`,
-`tests/unit/web/sessions/test_guided_chat_integrity.py`, plus the new route
-integration test.
-
-1. Require a strict client `operation_id` on send and recompose. Preserve the
-   existing guided UUID requirement. Each route performs only stable admission,
-   commits/replays a transport job, then returns the same 202 handle.
-2. Move each original handler's turn body into the worker entrypoint with an
-   owned context. Retain the same provider calls, graph validation, result
-   projection, guided transition, and audit paths. No server-authored proposal
-   or tutorial branch may appear.
-3. Remove `_track_compose_inflight` from these five route signatures only
-   after every route uses operation settlement. Keep its other users, if any,
-   measured against the current source. Update old tests for the new HTTP
-   contract without weakening their underlying behavior assertions.
-
-**Gate:** Each route returns 202 before provider release; each terminal poll
-matches its former success or public error DTO; same-ID replay makes one
-provider turn; missing/stale context cannot commit. The five-route inventory
-from task 0 is completely reconciled.
-
-## 6. Cut over the SPA as one operation lifecycle
-
-**Modify:** `src/elspeth/web/frontend/src/api/client.ts`,
-`src/elspeth/web/frontend/src/types/api.ts`,
-`src/elspeth/web/frontend/src/types/guided.ts`,
-`src/elspeth/web/frontend/src/stores/sessionStore.ts`,
-`src/elspeth/web/frontend/src/stores/guidedOperationRetry.ts`,
-`src/elspeth/web/frontend/src/config/composer.ts`,
-`src/elspeth/web/frontend/src/hooks/useComposer.ts`, and
-`src/elspeth/web/frontend/src/components/chat/ChatPanel.tsx`.
-
-**Test:** `src/elspeth/web/frontend/src/api/client.recovery.test.ts`,
-`src/elspeth/web/frontend/src/api/client.guided.test.ts`,
-`src/elspeth/web/frontend/src/stores/sessionStore.test.ts`,
-`src/elspeth/web/frontend/src/stores/sessionStore.guided.test.ts`,
-`src/elspeth/web/frontend/src/hooks/useComposer.test.ts`, and
-`src/elspeth/web/frontend/src/components/chat/ChatPanel.test.tsx`.
-
-1. Mint and durably remember one UUID/body before each action. After a lost
-   202, poll that UUID and retry only the same binding. Reload and session
-   switching reattach without starting another turn.
-2. Decode the five-way success union and public terminal error envelope.
-   Feed successes into existing route-specific reducers so proposals,
-   version-change validation reset, guided state, and interpretation events
-   still update. Progress and in-flight messages remain UX pollers only.
-3. Make Stop call the cancel endpoint and wait for terminal settlement. Change
-   the client deadline to the server operation deadline plus existing grace,
-   followed by explicit cancel if the row remains active;
-   `AbortController` only bounds individual short fetches. Retry transient
-   polling errors with backoff without displaying a false failure.
-
-**Gate:** A lost acknowledgement, page reload, session switch, Stop, deadline,
-poll outage, stale transcript, and all five success DTOs behave correctly.
-No optimistic item is duplicated and no pending indicator clears on 202 alone.
-
-## 7. Integrate and accept
-
-1. Run focused backend and frontend tests as each task lands. Before
-   integration run Ruff, mypy, contracts, the key-free trust-tier comparison,
-   frontend typecheck/lint/build/Vitest, and the canonical full suite on a
-   frozen tip. The global judge-signature CI red is the existing operator
-   signing boundary; do not re-sign or clear it during this feature.
-2. Run `pytest tests/ -m testcontainer -n 0` serially for the schema,
-   transaction, and cross-instance gates. Use unique log files, capture each
-   terminal exit, and read `summary.txt` from
-   `scripts/full-suite-gate.sh --execute --detach`; partial output is not a
-   pass.
-3. Exercise a real browser against an origin with a deliberately short
-   front-end idle timeout: hold a provider longer than that cutoff, observe
-   202 and continuing polls, then a completed result. Repeat Stop and reload.
-   This is local acceptance; live-cloud acceptance remains a separate
-   operator-controlled deployment step.
-4. Recheck the exact release tip, schema epoch, existing users' session-store
-   reset requirement, and `bootstrap-admin` procedure before deployment.
-   Update user-facing API documentation and the legacy issue tracker ticket from measured
-   implementation results. Do not claim the proxy problem fixed merely
-   because a unit suite passed.
-
-**Final acceptance:** One short POST plus durable poll replaces each of the
-five buffered routes. The same operation ID survives lost responses and
-different instances; terminal results preserve the old public success and
-failure meanings; cancellation and worker loss have fenced, auditable
-outcomes; the final-tip gates have recorded exits.
+- **Branch and worktree.** Work on `feat/composer-async-ops` in `.claude/worktrees/composer-async-ops`, cut from the live `release/0.8.1` tip that N00 records. Every command block starts with the task's P0 preamble: an unset `ELSPETH_WORKTREE` silently measures the main checkout.
+- **Docs commit first.** This index, `contract.md`, the panel records, the re-survey findings and the second spec amendment land as one docs commit before N00. The plan folder is untracked until then.
+- **No interim merge from N03 to N15.** N03 introduces the transitional `Legacy*Request` DTOs and N14 deletes them. A branch merged or paused in between would ship that dual path, against the no-old-pathways rule.
+- **Epoch.** N18 is the last code commit. It re-reads `SESSION_SCHEMA_EPOCH` and `_COORDINATION_HARD_CUT_EPOCH` immediately before bumping (72 at plan time) and takes the next free number.
+- **Deployment obligation.** The epoch bump requires the operator to move the served session store aside and restore each local account with `elspeth composer users bootstrap-admin local <user> --note ...` (`docs/runbooks/staging-session-db-recreation.md`). Every deploy or drain settles in-flight freeform turns as 503 `composer_operation_worker_lost` (E17), which the CHANGELOG and runbook say.
+- **Gates.** The trust-tier CI red is the operator's signing boundary. Tasks compare the key-free finding set to N00's baseline and stage additions for the operator; no agent re-signs. Run `scripts/full-suite-gate.sh` with `--stages ruff,mypy,contracts,lints,pytest,testcontainer`.
+- **Stop points.** The plan ends at a locally verified branch. Merging to `release/0.8.1`, pushing and live-cloud acceptance are separate decisions for John.

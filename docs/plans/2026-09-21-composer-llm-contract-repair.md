@@ -1,27 +1,6 @@
 # Composer LLM contract and source approval repair implementation plan
 
-> **Status, 2026-09-30:** Retained acceptance and repair reference for
-> `release/0.8.1`. The task list below records the 2026-09-21 plan; unchecked
-> boxes are not a current missing-work inventory. Reconcile each requirement
-> against the candidate before implementing a change.
-
-The repair branch `fix/composer-llm-contracts-20260921` at `66d25ac7a` contains
-an implementation of these workstreams. Source inspection at the recovery
-base `a2f0281ff` found the generated-input helper and configuration validator
-in `plugins/transforms/llm/base.py`, its Stage-1 caller in `composer/state.py`,
-and `reconcile_authoritative_reviews` in `composer/tools/sources.py`. These
-are implementation evidence, not proof that every branch assertion or live
-acceptance milestone passed. The worktree recovery must preserve distinct
-missing regression coverage and rerun the affected checks; do not apply the
-old branch wholesale over newer production code.
-
-Guided Composer has been removed under the
-[complete removal plan](2026-09-28-guided-mode-removal.md). Teaching changes
-and provider-backed acceptance now target the ordinary freeform Composer
-and shared tutorial path. The retired Guided teaching path listed in the
-original branch is not an implementation target. Legacy `elspeth-*` IDs below
-are historical references; use GitHub Issues for current coordination and do
-not publish or close records as part of document recovery.
+> **For agentic workers:** Use `superpowers:executing-plans` and `superpowers:test-driven-development` to implement this plan task by task. Record failing regressions before changing production behavior. This document is a plan; none of its production changes have been applied.
 
 **Goal:** Make the reported colour workflow authorable, valid, and executable with one multi-query LLM node, while retaining approval of unchanged source content during subsequent repairs.
 
@@ -29,7 +8,7 @@ not publish or close records as part of document recovery.
 
 **Tech stack:** Python, Pydantic, pytest, Composer tools and session services, ELSPETH graph builder/executor, SQLite and PostgreSQL test infrastructure, and the existing Composer evaluation harness.
 
-**Historical baseline:** Reviewed `release/0.8.1` at `bfda1fb1630d26b912452becb9a41a9840da5cee` on 2026-09-21. Recheck HEAD and the full dirty-path inventory before implementation. Concurrent unrelated document, authentication, and LLM provider changes were present during planning, including overlapping `llm/base.py` and `llm/transform.py` edits; preserve them and coordinate the implementation base with their owner before integrating overlapping hunks. Recovery targets local `release/0.8.1`; publication and deployment are separate actions.
+**Baseline:** Reviewed `release/0.8.1` at `bfda1fb1630d26b912452becb9a41a9840da5cee` on 2026-09-21. Recheck HEAD and the full dirty-path inventory before implementation. Concurrent unrelated document, authentication, and LLM provider changes were present during planning, including overlapping `llm/base.py` and `llm/transform.py` edits; preserve them and coordinate the implementation base with their owner before integrating overlapping hunks. This plan targets the reviewed contracts; it does not assign a release or authorize publication.
 
 ## Scope and evidence
 
@@ -80,7 +59,7 @@ cd "$(git rev-parse --show-toplevel)" && \
   'import elspeth, elspeth_lints; print(elspeth.__file__); print(elspeth_lints.__file__)'
 ```
 
-- [ ] Use the archived records for `elspeth-a10d15055b` and `elspeth-5a372d3267` only to recover their distinct acceptance criteria and any canonical GitHub mapping. The former concerns missing declared query inputs; the new guard concerns generated outputs declared as inputs. Do not conflate them or recreate retired local tracking.
+- [ ] Read the current records for `elspeth-a10d15055b` and `elspeth-5a372d3267` before linking tracker work. The former concerns missing declared query inputs; the new guard concerns generated outputs declared as inputs. Do not conflate their acceptance criteria.
 - [ ] Establish the exact colour fixture and the failing producer edge first. Implement Task 3, then Tasks 1 and 2, then Task 4, and finish Task 5. Task 4 can be developed independently in a separate worktree if delegation is requested.
 - [ ] Use lane-private logs under `.claude/lanes/composer-llm-contract-repair/`. Define this shell helper once in the implementation shell; each call uses a distinct label (for example `task-1-red`, then `task-1-green`). It captures the actual pytest exit code and preserves worktree import provenance. Read the printed log only after the call completes.
 
@@ -111,7 +90,7 @@ Each task is a reviewable commit after its focused checks. Run `scripts/branch-s
 - `src/elspeth/web/composer/planner_authoring_aids.py`: `_LLM_OUTPUT_CONTRACT_RULES`.
 - `src/elspeth/plugins/transforms/llm/transform.py`: `LLMTransform.get_agent_assistance` hints and relevant examples.
 - `src/elspeth/web/composer/skills/pipeline_composer.md`: LLM schema and multi-query instructions.
-- Historical branch also changed `composer/guided/skills/step_3_transforms.md`; that surface is retired. Verify equivalent teaching on the maintained freeform surfaces above.
+- `src/elspeth/web/composer/guided/skills/step_3_transforms.md`: corresponding guided instructions.
 
 **Tests:** `tests/unit/web/composer/test_planner_authoring_aids.py`, `tests/unit/plugins/test_catalog_reference_content.py`, and the integration scenario in Task 5.
 
@@ -390,7 +369,7 @@ queries:
 - [ ] Exercise source-failure retention separately: start with five valid rows plus one deliberately ragged CSV row, and approve those exact bytes before changing the source failure route. Assert the invalid row reaches the new source-retention output with rejection evidence, makes no LLM calls, and never reaches the success CSV; the five valid rows still produce ten query calls and five successful outputs. Do not change approved bytes to inject this fault and then expect approval to survive.
 - [ ] Exercise the request, “Write a bug report explaining the validation failure; do not change the pipeline,” against BOTH a persisted invalid graph and the repaired graph. In the invalid case keep the source proof resolved while the answer edge is invalid; independently exercise missing review/proof diagnostics and an advisor `FLAGGED` result. Construct a fresh service/repair ledger for the first reporting request, and repeat after reload: a previously consumed repair budget must not hide the defect. Script a provider that attempts a graph mutation after repair feedback as a negative control. Assert graph identity and source approval evidence stay unchanged, no graph-mutating tool succeeds, provider/advisor calls remain bounded, and a visible provider-written report or explicit advisor-block explanation survives response delivery and message reload. Record successful report delivery separately from explicit advisor blocking. A hidden markdown artifact alone is not success.
 - [ ] Inspect the no-tool continuation seams before declaring this case fixed: `ComposerServiceImpl._try_terminate_no_tools` in `src/elspeth/web/composer/service.py` can inject proof/preflight repair and calls `_evaluate_terminal_no_tool_advisor_gate` with `allow_repair_continue=True`. The source existence or graph invalidity must not itself turn a diagnostic request into authority to mutate. If the new test fails, trace the admitted request and tool-batch authority into these branches and implement the bounded correction there, covering both repair-feedback and attempted-tool paths. Do not turn `classify_pipeline_mutation_intent` into a new permission gate: its documented role is routing, and actual authority lives in the admitted workflow/tool-batch guards. Run `tests/unit/web/composer/test_advisor_terminal_publication.py` and the existing no-tool disclosure tests with the integration case. The incident remains open if this acceptance case cannot be satisfied.
-- [ ] Repeat deterministic admission and approval checks through the current freeform proposal and tutorial callers of these same tools. Guided proposal binding is retired. Do not add a tutorial-specific path. Existing prompt-review end-to-end coverage must remain green.
+- [ ] Repeat deterministic admission and approval checks through guided proposal binding where it reaches these same tools. Do not add a tutorial-specific path. Existing prompt-review end-to-end coverage must remain green.
 - [ ] Use a prompt-keyed deterministic provider double for execution: select responses by the colour and query identity in the received prompt, not call order, because parallel query scheduling is permitted. Do not copy the freeform test harness's unconditional `CLEAN` advisor stub into advisor rejection tests; provide explicit `CLEAN` and `FLAGGED` outcomes.
 - [ ] Add the live scenario to the maintained harness using persona `p1_compliance`. Omit upload fields (`csv_filename`/`csv_content`) so the planner creates an invented CSV source and the required review actually occurs. Use this opening prompt: “Invent a small CSV with five different basic colour names in a colour column. For each colour, use one multi-query LLM node with two separate prompts: one asks for a good colour pairing and the other for an approximate hex value. Save exactly colour, good_colour_pair_answer, and approximate_hex_answer to colour_answers.csv. Preserve source-validation failures and LLM failures in separate outputs.” The live names may differ from the deterministic five-colour fixture; assert their correspondence across source, prompts, and output rather than forcing a canned provider answer. The scenario's stop conditions require all milestones below; “pipeline ready” alone is not DONE:
 

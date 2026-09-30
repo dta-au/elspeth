@@ -6,56 +6,19 @@
 
 **Tech stack:** Python, FastAPI, SQLAlchemy, SQLite/PostgreSQL, React/TypeScript, Zustand, Vitest, Playwright, Docker/nginx.
 
-**Status, 2026-09-30:** Recovered planning reference for local `release/0.8.1` integration. The original review and the diagnostic sheets preserve dated findings and acceptance requirements. They are not a current missing-work inventory. This document does not close findings or establish deployment, signing, or live-provider acceptance.
+**Scope of this delivery:** Planning, committing the supplied review, and retiring its old worktree. Production fixes, store resets, deployment, remote publication, and signing have not been performed by this planning task. This document specifies subsequent implementation; it does not claim tests or fixes passed.
 
-## Current execution context
-
-Recovery began from `release/0.8.1` at `a2f0281ff`. At that source checkpoint,
-Sessions and the coordination hard cut are epoch 71. Do not implement the
-historical epoch-65-to-66 proposal below or reuse a deployed epoch. Any further
-persisted-grammar change requires its own current contract analysis and the
-next applicable epoch, with SQLite and PostgreSQL checks.
-
-The later [complete Guided removal plan](2026-09-28-guided-mode-removal.md)
-supersedes the earlier decision to retain Guided tutorial machinery. Commit
-`7001600fe` removes Guided Composer and retains freeform onboarding. The
-`composer/guided` and frontend chat Guided directories and
-`sessions/_guided_step_chat.py` are absent at the recovery base; the tutorial
-uses `TutorialFreeformShell.tsx`. G1–G6 therefore require removal/surviving-path
-verification, not reconstruction of the retired mode. The
-[guided disposition sheet](2026-09-23-web-review-remediation/guided.md) records
-the remaining acceptance questions without claiming they have passed.
-
-The advisor now admits structured responses through `advisor_output.py` and
-`advisor_checkpoint.py`. R23's former markdown/regex repair is superseded;
-test the current structured boundary rather than adding prose fallback.
-Composer and session service extractions also moved ownership seams. Resolve
-current owners and callers before using the old detail sheets' line references.
-
-GitHub Issues is the shared tracker. Local legacy records and retired code-map
-tools are historical evidence; do not reactivate them or import review IDs
-automatically. The original implementation lanes below are scheduling
-suggestions. The worktree recovery coordinator may combine overlapping
-components after inspecting the current implementation and independent review.
-
-Use the live recovery inventory to distinguish equivalent/cherry-picked work,
-missing code, missing tests, and superseded designs. A finding is complete only
-after current behavior and target-branch inclusion are verified. The sections
-and four diagnostic appendices below retain the 2026-09-23 reasoning; this
-current context takes precedence over their stale paths, epoch literals,
-ownership assumptions, and provisional fixes.
-
-## 1. Historical evidence and planning starting point
+## 1. Evidence and starting point
 
 - Original review pin: `74c0ce0db`; use `git show 74c0ce0db:<path>` for its line references.
 - Source inspected during planning: `1e9cafa9d47df5654926509ef13a2a3e9e4452c8`; review-only commit: `73fc6fc8121183ed628bfc94a2bbcba663ca97ec`. Refresh the integration base at dispatch; do not assume the shared release checkout stopped moving.
 - The review commit contains 81 files: README, findings JSON, and 79 issue reports. Direct JSON/file/link validation returned `Issue files: 79 README issue links: 79 Source findings: 129`, with `confirmed: 109, refuted: 19, disputed: 1`. Every non-refuted finding maps to one listed issue; refuted findings map to none. The ten findings originally high each retain two verdicts.
 - The cleanup script classified the pinned review worktree `REMOVABLE`, then removed it and `review/web-0.8.1-20260923`. Its commit remains an ancestor of release.
-- R02 identified an epoch-65 local-store incompatibility at the planning base: that epoch admitted stores written before the mandatory v2 completion-gate grammar. Published-build reach and local-store reach were separate questions. The current admission question is whether old stores are rejected by the current epoch-71 startup contract.
+- R02 remains a real local-store incompatibility: current epoch 65 admits stores written before the mandatory v2 completion-gate grammar. Published-build reach and local-store reach are separate questions. Do not send another epoch-65 build through release acceptance.
 - R16 is partially addressed by `1809379f6`; current durable retry advice still needs checking/fixing. Do not recreate the old withheld-summary fix or close the whole issue from that commit alone.
 - Later polling changes (`7e52d8afc`, `5f7831412`) do not establish that R38/R48/R49 are fixed. Verify the actual surfaces identified in the issue reports.
 - Existing credential-generation work at `601d6a9a9` is not an ancestor of the planning base. Reconcile its semantic diff and tests with the identity lane before editing credential deletion. An ancestry failure alone is not proof that no equivalent change landed.
-- The original Guided retirement decision retained tutorial machinery and was mapped to GitHub #191. The later complete-removal decision supersedes that design. Neither a migration ticket nor source absence by itself proves the surviving freeform/tutorial acceptance requirements.
+- Guided retirement means removing the user-facing mode while retaining tutorial machinery. It is not evidence that G1–G6 disappeared. The recorded retirement issue was migrated to GitHub #191; a closed migration ticket is not a landed code fix.
 
 The review is the historical source of truth. Record implementation progress in a separate issue ledger; do not rewrite its confirmed/refuted verdicts to represent repair status.
 
@@ -88,7 +51,7 @@ Every issue has exactly one primary lane. Cross-lane review is encouraged; cross
 | K — approval and run UI | R06, R20, R43, R48, R49, R54, R61, R62, R63, R64, R66, R67 | Multi-query review; all Run entry points; live-run attach; decoder/keyboard/layout correctness; actual E2E fixtures | J store/API handoff; E/F prompt contract handoff; H run behavior; G failure taxonomy |
 | L — people/auth UI | R10, R19, R55, R56, R57, R58, R60, R70 | Cross-tab logout; reload-safe deletion recovery; account copy/layout/DTO cleanup; blob error fallback | D authorization/recovery contract; serialize shared api/client.ts edits with K |
 | M — deployment and operator docs | R11, R71, R72, R73 | Trusted proxy/client IP; timeout/rate-limit docs; Docker ingress/firewall guidance | R11 can start early; finalize rate-limit docs after H |
-| N — Guided removal and surviving tutorial paths | G1, G2, G3, G4, G5, G6 | Verify removal and surviving freeform behavior; proposal busy state, source admission, common tutorial path | Use the later complete-removal ruling; no shared-file collision with J/K/E/F |
+| N — retained guided/tutorial paths | G1, G2, G3, G4, G5, G6 | Fix retained behavior or prove removal; busy state, CSV headers, JSON rendering, stale/dead code | Reconcile retirement #191; no shared-file collision with J/K/E/F |
 
 Detail sheets:
 
@@ -96,7 +59,7 @@ Detail sheets:
 - [Azure, prompt contracts, catalog and pricing](2026-09-23-web-review-remediation/contracts.md).
 - [Persistence, identity, interpretation and deployment](2026-09-23-web-review-remediation/persistence.md).
 - [Frontend stores, approvals, account flows and execution controls](2026-09-23-web-review-remediation/frontend.md).
-- [Guided removal and surviving tutorial acceptance](2026-09-23-web-review-remediation/guided.md).
+- [Historical Guided retirement and retained tutorial machinery plan](https://github.com/dta-au/elspeth/blob/5cf32329378de8042a80c449010f9f0039ac9a05/docs/plans/2026-09-23-web-review-remediation/guided.md) — superseded by complete Guided removal; the remaining remediation plan stays active.
 
 These sheets are planning inputs grouped by reviewer expertise; the table above is the authoritative issue assignment. File owners perform shared-file subpatches on behalf of another issue owner: D supplies R19's backend recovery capability; J supplies R39's session-store retry guard and G1's proposal cleanup; K supplies R39's message UI once G finalizes its failure taxonomy. I specifies R36's new interpretation origin; J/K implement its TypeScript type/decoder parity in their reserved files, with A owning enum/CHECK schema integration. Primary owners retain responsibility for complete acceptance. A owns all schema/epoch edits, including D's Landscape event vocabulary. The appendices' alternative batch suggestions do not authorize competing writers.
 
@@ -108,11 +71,11 @@ Particular collision points are `web/sessions/repository.py`, `web/sessions/rout
 
 **Wave 0 — reconcile and reproduce.** Freeze a named integration base under `.claude/worktrees/`. Inventory active branches and tracker ownership. Locate any existing matching work; do not create 79 duplicate tracker issues. Revalidate all findings against the base, preserving the 19 refutations. Add a regression first for each behavioral defect. Record any already-fixed claim with the exact reachable commit plus a passing regression. Record whether each issue is `open`, `partial`, `fixed-and-verified`, or `removed-and-verified`.
 
-**Wave 1 — release blockers.** Start C, D, E, and M's proxy fix if their file reservations are disjoint and current reproductions show missing repairs. Start A's old-store rejection reproduction and B's contract design read-only. Land/review C before B writes shared persistence code. Prioritize R01, R02, R03/R04, R05, R06, and R07–R09 over cosmetic work. The original hold applied to epoch-65 builds; current acceptance must validate the current startup contract rather than ship an old schema.
+**Wave 1 — release blockers.** Start C, D, E, and M's proxy fix if their file reservations are disjoint. Start A's old-store rejection reproduction and B's contract design read-only. Land/review C before B writes shared persistence code. Prioritize R01, R02, R03/R04, R05, R06, and R07–R09 over cosmetic work. A release hold on epoch 65 applies immediately; it does not depend on how quickly other lanes finish.
 
 **Wave 2 — state, prompt and runtime correctness.** Run B after C; run F after E; run H when its config/repository reservations are free. Start D-dependent L and I/J after their contracts are settled. Shared Composer files can force B → F → G → I even where the business behaviors are independent. Use free slots for reviewers and disjoint frontend fixes, not competing writers.
 
-**Wave 3 — UI integration and compatibility sweep.** Complete J/K/L, surviving tutorial/removal verification N, and remaining G/M work. A owns any consolidated session-epoch update after B/I settle new durable shapes. Read the current live epoch and use the next applicable epoch for later incompatible grammar: never reuse a deployed epoch or treat the historical epoch-66 proposal as current. Update current docs/examples/tests, preserving correctly pinned historical incident records.
+**Wave 3 — UI integration and compatibility sweep.** Complete J/K/L, guided retained-path N, and remaining G/M work. A owns the consolidated session-epoch update after B/I settle all durable shapes. If epoch 66 has already been deployed by another owner, use the next epoch for any later incompatible grammar: never reuse a deployed epoch. Update current docs/examples/tests, preserving historical incident records that correctly say 65.
 
 **Wave 4 — assemble and challenge.** Merge reviewed lanes serially into the isolated integration branch. Re-run affected checks on every merge/conflict resolution. Test one combined end-to-end route early (profile-only Azure → multi-query LLM → approval → execution) so integration feedback arrives before the tail of low findings. At the final frozen candidate, run the broad gates and the cross-lane acceptance matrix below. Return findings to the owning lane and repeat only affected checks unless the production tree change requires another broad run.
 
@@ -122,7 +85,7 @@ Do not wait for all 14 lanes before reviewing the first patch. Do not start a fr
 
 **R01/R17/R18: validate the real contract.** A probe may supply construction-only credentials/prompt material, never synthetic pipeline structure or invented field guarantees. Derive Azure input/output requirements from the selected profile and actual plugin contract, including custom field names and closed index pins. Check multi-query deferred markers at every actual prompt site. A genuine missing downstream field must still fail Stage 1. Include no-network validation and real provider-boundary execution tests separately; a stubbed contract test is not live Azure acceptance.
 
-**R02: fail at startup.** Verify old stores are rejected before serving requests and fresh stores at the current live epoch initialize successfully on SQLite and PostgreSQL. Keep strict completion-gate parsing and verify all sentinel/fingerprint/coordination constants. Do not repair persisted Tier-1 rows opportunistically, add a legacy fallback parser, or reinstate the obsolete epoch-66 target. Any operator store reset remains a separate destructive action with an exact store list; preserve auth credentials unless explicitly included.
+**R02: fail at startup.** Reject pre-v2 epoch-65 stores before serving requests; construct fresh epoch-66 SQLite and PostgreSQL stores successfully. Keep strict v2 parsing and verify all sentinel/fingerprint/coordination constants. Do not repair persisted Tier-1 rows opportunistically or add a legacy fallback parser. Any operator store reset remains a separate destructive action with an exact store list; preserve auth credentials unless explicitly included.
 
 **R03/R04/R14: one coherent decision contract.** Preserve immutable composition history and durable advisor decisions. The first B checkpoint maps every proposal/approval binding, including blob custody/effect receipts, and selects atomic rebinding of eligible same-turn proposals to an explicitly review-only successor, or a separate fenced gate-fact persistence mechanism if it is demonstrably smaller and preserves history. Do not mutate an existing composition history row in place. Equality of graph content alone is insufficient authority to rebind a proposal. Give J an explicit refresh signal for changed review facts, preserve facts through every mid-turn head and abort, and retain genuine stale-proposal conflicts. Settle this choice before either writer implements; prove successful acceptance, rejection, recovery, and reload together.
 
@@ -136,7 +99,7 @@ Do not wait for all 14 lanes before reviewing the first patch. Do not start a fr
 
 **R11: trust only the intended proxy.** Configure nginx forwarding and uvicorn trust together. Demonstrate distinct clients remain distinct and direct/untrusted forwarded headers cannot spoof identity or rate-limit attribution. Do not solve this by accepting arbitrary forwarded headers on a publicly reachable app port. Validate Compose bindings and update operational firewall guidance against the actual network path.
 
-**G1–G6: verify removal and surviving requirements.** Complete Guided removal is already the chosen architecture. J/N verify the current proposal-action ownership and stale-session races, source header admission, and ordinary provider-backed tutorial path described in the disposition sheet. Do not rebuild retired Guided turns or schema forms. Preserve user-visible requirements that still apply and record any surviving defect with its current production seam.
+**G1–G6: close defects, not labels.** The recorded retirement decision retains the affected tutorial machinery, so plan bounded fixes for all six. J handles G1 in its exclusive session-store window, testing A→B→A and same-proposal/new-owner cleanup races. N handles the retained components/backend; G2 must return actionable re-upload feedback before persisting an impossible inspection turn, preserving exact observed headers. Removing this machinery would require a separate tutorial-removal/migration decision and caller proof. Never report all six fixed merely because a toggle was removed.
 
 ## 6. Worker and reviewer brief
 
@@ -210,7 +173,7 @@ Read the completed `summary.txt` and `.done` evidence, including the script's li
 | Run controls | Every button/palette/shortcut respects composer busy and attached pending/running runs; cancel-finalization recovery completes and original failures remain diagnosable |
 | Audit | Effective rate settings match approval/config hash/Landscape; planner evidence is atomic and bound to its call; invalid provider prose has defined handling; server interpretation origin is truthful |
 | Network | Distinct external clients produce distinct trusted IPs; untrusted forwarded headers cannot spoof them; ingress and firewall docs match Compose bindings |
-| Tutorial/accessibility | Same provider-backed freeform backend; no retired Guided route/component required; actual empty/nonempty workspace E2E; keyboard scrolling in approvals; narrow-screen controls remain usable |
+| Tutorial/accessibility | Same provider-backed backend; retained guided machinery works; actual empty/nonempty workspace E2E; keyboard scrolling in approvals; narrow-screen controls remain usable |
 
 Use controlled provider doubles for deterministic error cases, with exact limits stated. Real Azure/live deployment acceptance is a separate result, not implied by the local matrix. Arrange any needed endpoint/credentials/operator authorization before live acceptance rather than silently skipping it.
 

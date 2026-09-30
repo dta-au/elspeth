@@ -69,7 +69,7 @@ still says "One component for BOTH directions".
 
 - Fix (D1 ruled: intended, revisit after soft launch): correct the
   `ModeSwitchButton.tsx` header comment; amend
-  `docs/plans/2026-09-20-composer-freeform-default.md` step 2 so the plan
+  [the implemented Freeform default plan](https://github.com/dta-au/elspeth/blob/86c06c621286010ad106fa228dcf209365c2dd61/docs/plans/2026-09-20-composer-freeform-default.md) step 2 so the plan
   matches what shipped; and make the Preferences legend tell a user in a
   Freeform session how to get a guided one ("Default mode for new sessions" is
   there; "start a new session to use it" is not).
