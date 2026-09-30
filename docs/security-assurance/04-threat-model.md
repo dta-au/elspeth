@@ -1,9 +1,9 @@
 # 04 — Threat model
 
 **Status:** product threat model and method complete; deployment decisions and
-risk acceptance open · **Reviewed against:**
-`release/0.8.1` candidate @ `eee4bb941`
-(2026-10-01) · **Owner:** ELSPETH maintainer
+risk acceptance open · **Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:**
+DTA Cloud Engineering
 
 Identifies what is worth protecting, who controls each input, where an
 attacker can act, which controls stand in the way, and how severe a failure

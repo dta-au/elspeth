@@ -42,33 +42,37 @@ declare -a PATTERNS=(
     "High-entropy quoted secret|(secret|api[_-]?key|access[_-]?token|password|passwd|client[_-]?secret)['\"]?\s*[:=]\s*['\"][A-Za-z0-9_/+=-]{30,}['\"]"
 )
 
-# Files to scan: prefer filenames passed as args (pre-commit framework convention).
+# Paths to scan: prefer filenames passed as args (pre-commit framework convention).
 # Fall back to git diff --cached for direct .git/hooks/pre-commit invocation.
-# Always exclude this script itself (its pattern definitions are not credentials).
+# The paths only select index entries: every content read below uses --cached,
+# never the working-tree file. Always exclude this script itself (its pattern
+# definitions are not credentials).
 if [ "$#" -gt 0 ]; then
-    files=$(printf '%s\n' "$@" | grep -v -E '^scripts/git-hooks/pre-commit-secret-scan\.sh$' || true)
+    files=("$@")
 else
-    files=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null \
-        | grep -v -E '^scripts/git-hooks/pre-commit-secret-scan\.sh$' || true)
+    mapfile -d '' -t files < <(git diff --cached --name-only --diff-filter=AMRC -z 2>/dev/null)
 fi
 
-if [ -z "$files" ]; then
+if [ "${#files[@]}" -eq 0 ]; then
     exit 0
 fi
 
 found_count=0
 
-while IFS= read -r file; do
+for file in "${files[@]}"; do
     [ -z "$file" ] && continue
-    [ ! -f "$file" ] && continue
-    # Skip binary files (grep -I flag handles this per-pattern, but cheap to short-circuit)
-    if file --mime "$file" 2>/dev/null | grep -q 'charset=binary'; then continue; fi
+    [ "$file" = "scripts/git-hooks/pre-commit-secret-scan.sh" ] && continue
+    # A caller may supply a path that has no staged blob (for example a
+    # deletion). Only added, modified, renamed, or copied index blobs can add a
+    # secret to this commit.
+    if ! git cat-file -e ":$file" 2>/dev/null; then continue; fi
 
     for pattern_entry in "${PATTERNS[@]}"; do
         name="${pattern_entry%%|*}"
         regex="${pattern_entry#*|}"
-        # -I to skip binary, -n for line numbers, -H always show filename, -E extended regex
-        matches=$(grep -InHE "$regex" "$file" 2>/dev/null || true)
+        # git grep --cached reads the index blob. -I skips binary entries, -n
+        # reports line numbers, and -E selects extended regular expressions.
+        matches=$(git grep --cached -InE "$regex" -- "$file" 2>/dev/null || true)
         if [ -n "$matches" ]; then
             # Filter out lines marked with the per-line allow comment
             filtered=$(echo "$matches" | grep -v 'secret-scan: allow-this-line' || true)
@@ -87,7 +91,7 @@ while IFS= read -r file; do
             fi
         fi
     done
-done <<< "$files"
+done
 
 if [ $found_count -gt 0 ]; then
     cat >&2 <<'EOF'

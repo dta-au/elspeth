@@ -1,8 +1,8 @@
 # 00 — Assurance-pack lifecycle and completion plan
 
-**Status:** maintained lifecycle guide · **Product baseline reviewed against:**
-`release/0.8.1` candidate @ `cb20ed2e2` (2026-09-30) · **Owner:** ELSPETH
-maintainer
+**Status:** maintained lifecycle guide · **Product source reviewed against:**
+`release/0.8.1` @ `487ac85a377f135e012bb206e3769cd65f6fadb8`
+(2026-10-01) · **Owner:** DTA Cloud Engineering
 
 This document defines how to maintain the reusable ELSPETH security-assurance
 baseline and how an individual installation turns that baseline into a
@@ -59,9 +59,10 @@ The product baseline is complete only when all of these conditions hold:
    the named commit.
 2. Every material control or limitation has a source, test, workflow,
    procedure or record in [16](16-evidence-index.md), cited as `[EV-nnn]`.
-3. No generic placeholder remains. Intentional installation blanks use the
-   exact marker `DEPLOYMENT-TODO:` and appear only under a heading containing
-   **Deployment record**.
+3. No generic placeholder remains. Intentional installation form values use
+   the exact marker `DEPLOYMENT-TODO:` and appear only under a heading
+   containing **Deployment record**. Lifecycle and validation instructions
+   may quote the marker outside a form.
 4. Scope, responsibility, threat, privacy, incident, testing and risk methods
    tell a deployment author what a complete record must contain.
 5. Relative links and section anchors resolve, evidence identifiers are unique
@@ -109,9 +110,11 @@ headers.
   classes, safe limitations and stable opaque risk IDs. Put reproduction
   detail, live exposure, likelihood, treatment and acceptance in the
   controlled risk register.
-- **Separate product and deployment facts.** Every variable installation field
-  belongs under **Deployment record** and uses `DEPLOYMENT-TODO:` until the
-  controlled copy is populated.
+- **Separate product, project-operation and deployment facts.** Product source
+  and ELSPETH project-governance facts are populated in the public baseline,
+  with a measurement date and evidence where the state can drift. Every
+  variable installation field belongs under **Deployment record** and uses
+  `DEPLOYMENT-TODO:` until the controlled copy is populated.
 - **Measure at a named commit.** Counts, defaults and inventories come from
   their live source of truth. Record the command, date, commit and relevant
   negative control. Remove volatile counts that do not help an assessor.
@@ -147,8 +150,10 @@ Also perform and retain these direct checks:
 3. Search for generic, temporary and unclassified placeholder forms; the
    result must be empty. Only the deployment marker defined in § 2 is valid.
 4. Run `rg -n 'DEPLOYMENT-TODO:' docs/security-assurance/` and inspect every
-   result. Each must be an installation field under a **Deployment record**
-   heading.
+   result. Each form value must be an installation field under a **Deployment
+   record** heading; occurrences in README and this lifecycle guide must be
+   instructions that quote the marker, not unpopulated product or project
+   facts.
 5. Check that no real installation identifiers, credentials or absolute
    user-home paths appear.
 6. Re-run every command whose result is quoted in a changed document and check

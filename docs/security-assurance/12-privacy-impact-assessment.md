@@ -1,8 +1,9 @@
 # 12 — Privacy impact assessment
 
 **Status:** reusable product assessment complete; deployment record open ·
-**Reviewed against:** `release/0.8.1` candidate @ `eee4bb941` (2026-10-01) ·
-**Owner:** ELSPETH maintainer
+**Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 This document supplies a reusable privacy impact assessment (PIA) method and
 records ELSPETH's product-level data handling. It supports a deployment
@@ -144,7 +145,7 @@ content class.
 |---|---|---|---|---|---|---|---|
 | DEPLOYMENT-TODO: dataset or class | DEPLOYMENT-TODO: affected people | DEPLOYMENT-TODO: source and method | DEPLOYMENT-TODO: purpose and necessity | DEPLOYMENT-TODO: approved classification | DEPLOYMENT-TODO: stores and copies | DEPLOYMENT-TODO: recipients | DEPLOYMENT-TODO: scale and cadence |
 
-### 4.2 Audit-access network-address policy
+### 4.2 Deployment record — audit-access network-address policy
 
 The shipped `audit_access_log` writers store the exact string exposed as
 `request.client.host`; ELSPETH does not truncate or hash it. The value is

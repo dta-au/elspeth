@@ -31,7 +31,6 @@ AUDITED_ADRS = frozenset(
         "021-sources-and-sinks-uniformly-boundary.md",
         "022-shareable-reviews.md",
         "023-custom-python-ci-analyzer.md",
-        "024-delivery-governance-for-single-maintainer-mode.md",
         "025-multi-source-ingestion.md",
         "026-durable-token-scheduler.md",
         "029-journal-is-barrier-buffer-truth.md",

@@ -8,7 +8,7 @@ interface tells the user about a completed session does not match what actually 
 They are recorded together here because they were found together, not because they must be
 fixed together.
 
-Start by reading `docs/analysis/2026-09-15-composer-live-review-investigation.md`. It is
+Start by reading [the historical live-review investigation](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/analysis/2026-09-15-composer-live-review-investigation.md), now preserved in `docs-archive/`. It is
 the specification for this work and contains the observations behind each item below. The
 code is in the composer, under `src/elspeth/web/composer/` and its frontend in
 `src/elspeth/web/frontend/src/components/composer/`.

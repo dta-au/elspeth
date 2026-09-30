@@ -1,8 +1,9 @@
 # Security assurance pack
 
-**Product baseline:** reviewed · **Reviewed against:** `release/0.8.1`
-candidate @ `cb20ed2e2` (2026-09-30) · **Deployment template:** ready · **Deployment
-record:** unpopulated by design · **Owner:** ELSPETH maintainer
+**Product baseline:** reviewed · **Product source reviewed against:**
+`release/0.8.1` @ `487ac85a377f135e012bb206e3769cd65f6fadb8`
+(2026-10-01) · **Deployment template:** ready · **Deployment
+record:** unpopulated by design · **Owner:** DTA Cloud Engineering
 
 This folder is ELSPETH's public, reusable security-assurance baseline. It
 describes the product boundary, data flows, security controls and limitations,
@@ -19,10 +20,11 @@ that any installation is secure.
 
 ## Public baseline and controlled deployment copy
 
-The repository copy contains only facts that are reusable across ELSPETH
-installations. For an assessment, copy the folder to the assessment team's
-controlled repository and complete every **Deployment record** section there.
-Those sections intentionally contain `DEPLOYMENT-TODO:` markers.
+The repository copy contains product facts reusable across installations and
+dated ELSPETH project-operations facts such as governance, repository controls,
+CI and key custody. For an assessment, copy the folder to the assessment
+team's controlled repository and complete every **Deployment record** section
+there. Those sections intentionally contain `DEPLOYMENT-TODO:` markers.
 
 Do not complete those records in this repository for the current device,
 server or another real installation.
@@ -84,9 +86,11 @@ record is deliberately blank.
   instrument before trusting it.
 - **Explicit limits:** state where ELSPETH supplies no control and allocate the
   responsibility in [03](03-shared-responsibility-matrix.md).
-- **Deployment placeholders:** use only `DEPLOYMENT-TODO:` and only under a
-  heading containing **Deployment record**. The public baseline contains no
-  unclassified placeholders or placeholder risk IDs.
+- **Deployment placeholders:** form values use only the literal marker defined
+  in [00](00-documentation-plan.md), and only under a heading containing
+  **Deployment record**. Instructions may quote that marker when explaining
+  how to instantiate or validate the controlled copy. The public baseline
+  contains no unclassified form placeholders or placeholder risk IDs.
 - **Review pins:** document headers identify the product commit reviewed.
   Evidence rows may retain an older commit when they describe a historical
   run or observation; the row must say so.

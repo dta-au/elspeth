@@ -1,8 +1,9 @@
 # 13 — Incident response and continuity
 
 **Status:** generic response and continuity method complete; deployment records
-open · **Reviewed against:** `release/0.8.1` @ `eee4bb941` (2026-10-01) ·
-**Owner:** ELSPETH maintainer
+open · **Product source reviewed against:** `release/0.8.1` @
+`e1075e93a791711a5280821a57e21d9d796b381c` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 This document defines the reusable security-incident and continuity method for
 ELSPETH. Each deploying organisation completes the labelled **Deployment
@@ -434,24 +435,26 @@ objective (RPO). The deploying organisation provides and monitors those
 controls.
 
 The product [backup-and-recovery runbook](../runbooks/backup-and-recovery.md)
-supplies examples for a SQLite online backup of the Landscape and Sessions
-databases, a payload archive, a settings-file copy, a logical PostgreSQL dump
-of one configured database URL, SQLite Landscape/payload restoration and
-basic SQLite/Landscape verification [EV-007]. It does not prove that any
-backup ran or restored successfully. It does not provide a local `auth.db` or
-managed-blob procedure, a PostgreSQL restore procedure, secret/key recovery,
-an atomic snapshot across stores, or full external-output recovery. The
-runbook's payload-retention default is not a backup-retention commitment.
+supplies fail-closed local procedures for self-contained SQLite backups and
+artifact-set restores of Landscape, Sessions and conditional `auth.db`, plus
+location-independent payload and managed-blob archives with manifests. It
+requires separate Landscape and Sessions PostgreSQL dumps while leaving
+provider restore mechanics to the deployment. Its validation sequence separates
+database structure, referenced-content checks and representative behaviour
+from `/api/ready` [EV-007]. It does not prove that a real backup ran or restored
+successfully, provide an atomic cross-store snapshot, choose provider PITR or
+object-store recovery, recover secret/key material, or recover every external
+output. The payload-retention default is not a backup-retention commitment.
 
 ### 8.1 Backup inventory and ownership
 
 | State | Product boundary | Deployment responsibility |
 |---|---|---|
-| Landscape audit database | Product records and can inspect run/audit state; the runbook gives limited SQLite backup/restore and single-URL PostgreSQL dump examples | Back up the actual database, logs and provider metadata; encrypt, monitor and restore it; coordinate its point with dependent stores |
-| Sessions database | Product owns its schema and web state; the runbook gives a SQLite backup example | Back up and restore the actual SQLite or PostgreSQL store and prove schema/release compatibility |
-| Local `auth.db` | Product creates a separate owner-only SQLite credential store when local authentication is used | Include it in a restricted backup and restore design, or record an approved rebuild/re-provision decision |
-| Payload store | Product records hashes/references and the runbook gives filesystem archive/extract examples | Preserve referenced content and metadata with the Landscape recovery point; protect and test the archive or provider backup |
-| Managed blobs | Product uses a separate managed blob directory for web uploads and generated content | Back up and restore it with the Sessions records that reference it; prove file/hash/ownership consistency |
+| Landscape audit database | Product records and can inspect run/audit state; the runbook gives SQLite online backup/artifact-set restore and an explicit PostgreSQL dump boundary | Back up the actual database, logs and provider metadata; encrypt, monitor and restore it; coordinate its point with dependent stores |
+| Sessions database | Product owns its schema and web state; the runbook gives the corresponding SQLite and PostgreSQL procedures | Back up and restore the actual store and prove schema/release compatibility |
+| Local `auth.db` | Product creates a separate owner-only SQLite credential store; the runbook backs it up and restores its complete SQLite artifact set when present | Protect credential backups, restore ownership/mode, and prove the chosen identity recovery decision |
+| Payload store | Product records hashes/references; the runbook stages a configured-root archive and verifies its digest and per-file manifest before publication | Preserve referenced content and metadata with the Landscape recovery point and prove content retrieval/hash agreement |
+| Managed blobs | Product uses a separate managed blob directory; the runbook applies the same staged archive mechanics and requires representative Sessions/hash reconciliation | Back up and restore it with the Sessions records that reference it; supply an enumerating verifier or record the current representative-check limitation |
 | Configuration and release artefacts | Product can be reconstructed from versioned source/images and settings; the runbook gives a settings-file copy example | Retain approved settings, plugin inventory, exact image/package digest and deployment definition |
 | Secrets and recovery key material | Product consumes secret references and keys; some key changes intentionally break old sessions, ciphertext, fingerprints, links or signatures | Provide secret-manager versioning, backup/escrow where approved, revocation and recovery procedures; prove the restored service can decrypt and verify required records |
 | Pipeline outputs and external effects | Product records output lineage and durable sink-effect state for supported sinks | Back up or reconstruct target data according to business policy and reconcile target-side state before retry |
@@ -555,7 +558,9 @@ evidence requirements.
    versions, outputs and exit status.
 8. **Start without user traffic.** Verify process liveness and the complete
    readiness report, including database, schema, data-directory, payload,
-   blob and instance-membership checks [EV-328].
+   blob and instance-membership checks [EV-328]. Readiness proves connectivity,
+   schema and directory writability; it does not enumerate or re-hash restored
+   payload/blob content or establish a cross-store recovery point.
 9. **Validate representative behaviour.** Authenticate through the deployed
    mode; open a representative session; inspect/explain a representative run;
    verify audit access, payload/blob retrieval and an approved output path.

@@ -285,6 +285,15 @@ constraint-dependencies = [
 [tool.uv.sources]
 elspeth-lints = { path = "elspeth-lints", editable = true }
 
+[dependency-groups]
+# Required gate executables run from the reviewed lock. They are separate from
+# the shipped application and developer extras because CI audits those graphs;
+# resolving the auditor itself during the gate would make the verdict mutable.
+audit = [
+    "pip-audit==2.10.1",
+    "pip-licenses==5.5.5",
+]
+
 # === Ruff Configuration ===
 [tool.ruff]
 target-version = "py313"

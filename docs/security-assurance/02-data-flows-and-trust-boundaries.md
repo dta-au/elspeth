@@ -1,8 +1,9 @@
 # 02 — Data flows and trust boundaries
 
 **Status:** product baseline complete; Deployment record required ·
-**Reviewed against:** `release/0.8.1` candidate @ `eee4bb941` (2026-10-01) ·
-**Owner:** ELSPETH maintainer
+**Product source reviewed against:** `release/0.8.1` @
+`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) ·
+**Owner:** DTA Cloud Engineering
 
 This document shows where data enters, moves through and leaves the ELSPETH
 product boundary, and where its level of trust changes. It describes product

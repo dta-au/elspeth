@@ -23,7 +23,7 @@ single-maintainer delivery evidence, read
 ELSPETH currently uses automated gates instead of non-meaningful
 self-approval, and how the project steps up to two-person review when a second
 maintainer is assigned. (That posture was previously recorded in
-[ADR-024](../architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
+[ADR-024](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/architecture/adr/024-delivery-governance-for-single-maintainer-mode.md),
 retired 2026-09-13 as not being an architecture decision.)
 
 ## Rule Taxonomy

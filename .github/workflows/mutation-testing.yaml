@@ -22,7 +22,7 @@ on:
         default: 'src/elspeth/core/canonical.py'
 
 env:
-  UV_VERSION: "0.5"
+  UV_VERSION: "0.10.2"
 
 jobs:
   mutation-test:
@@ -54,10 +54,7 @@ jobs:
           prune-cache: true
 
       - name: Install dependencies
-        run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install -e ".[dev]"
+        run: uv sync --frozen --extra dev
 
       - name: Run mutation testing on canonical.py (critical)
         run: |
@@ -131,10 +128,7 @@ jobs:
           prune-cache: true
 
       - name: Install dependencies
-        run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install -e ".[dev]"
+        run: uv sync --frozen --extra dev
 
       - name: Run mutation testing on landscape package
         run: |

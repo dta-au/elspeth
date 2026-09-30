@@ -9,11 +9,13 @@ claim a completed whole-platform independent assurance assessment.
 
 ## Decision Authority
 
-Until a broader maintainer group is appointed, release authority sits with the
-repository maintainer. Public-release approval should be recorded in the
-relevant release document provenance block, including:
+Project ownership and release authority sit with DTA Cloud Engineering. While
+ELSPETH remains in single-maintainer mode, that authority is exercised by the
+recorded repository maintainer or release approver. Public-release approval
+should be recorded in the relevant release document provenance block,
+including:
 
-- approving maintainer or release approver;
+- approving DTA Cloud Engineering representative or release approver;
 - date;
 - release branch or tag;
 - commit hash;
