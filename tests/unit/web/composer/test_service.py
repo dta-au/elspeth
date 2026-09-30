@@ -85,7 +85,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
@@ -257,6 +257,7 @@ def _session_engine_with_session(*, user_id: str = "test-user") -> tuple[Any, st
     now = datetime.now(UTC)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id=user_id)
+        grant_test_pipeline_user(conn, identity_id=user_id)
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
@@ -5280,6 +5281,7 @@ class TestPluginCrashSessionPersistence:
         self.seeded_at = datetime(2020, 1, 1, tzinfo=UTC)
         with self.engine.begin() as conn:
             ensure_test_identity(conn, identity_id="test-user")
+            grant_test_pipeline_user(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=self.session_id,
@@ -6479,6 +6481,7 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         now = datetime.now(UTC)
         with self.engine.begin() as conn:
             ensure_test_identity(conn, identity_id="test-user")
+            grant_test_pipeline_user(conn, identity_id="test-user")
             conn.execute(
                 sessions_table.insert().values(
                     id=self.session_id,

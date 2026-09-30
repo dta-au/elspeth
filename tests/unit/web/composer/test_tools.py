@@ -57,6 +57,7 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools._common import rejected_component_prefix
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -1808,53 +1809,26 @@ class TestSetSource:
         assert SOURCE_AUTHORING_KEY in result.validation.errors[0].message
 
     def test_set_source_rejects_literal_credential_value_without_mutating_state(self) -> None:
-        """set_source rejects a literal credential *before* it is persisted.
-
-        Regression lock for elspeth-9c54287830. The credential-literal gate
-        on the tool-call path lives in ``_credential_wiring_contract_failure``
-        (not ``_prevalidate_plugin_options`` — that helper only checks
-        secret-ref *placement*), and every mutation tool calls it before
-        writing the option into ``CompositionState``. ``set_source`` was the
-        only guarded mutation tool WITHOUT this regression test (its five
-        siblings — patch_source_options, patch_node_options, set_output,
-        patch_output_options, upsert_node — all have one), so a future
-        refactor could silently drop the guard here and a literal credential
-        would then persist and echo through GET /state.
-
-        Bug-verification protocol (cf.
-        ``test_set_source_rejects_manual_blob_ref_in_options`` above): delete
-        the ``_credential_wiring_contract_failure`` block in
-        ``_execute_set_source`` (src/elspeth/web/composer/tools/sources.py)
-        and confirm this test fails with the source persisted; then restore.
-        This guards against the test passing both pre- and post-guard — test
-        theatre otherwise undetectable until a regression slips through.
-        """
+        """The outer credential boundary refuses before source mutation."""
         state = _empty_state()
         catalog = _mock_catalog()
         literal = "literal-source-key-for-test"
 
-        result = execute_tool(
-            "set_source",
-            {
-                "plugin": "csv",
-                "on_success": "t1",
-                "options": {"path": "/data/in.csv", "api_key": literal},
-                "on_validation_failure": "quarantine",
-            },
-            state,
-            catalog,
-        )
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool(
+                "set_source",
+                {
+                    "plugin": "csv",
+                    "on_success": "t1",
+                    "options": {"path": "/data/in.csv", "api_key": literal},
+                    "on_validation_failure": "quarantine",
+                },
+                state,
+                catalog,
+            )
 
-        _assert_secret_wiring_contract_failure(
-            result,
-            state,
-            literal_value=literal,
-            field="source:api_key",
-        )
-        # Belt-and-suspenders: the source is absent from persisted state, so a
-        # subsequent GET /state cannot echo the literal (the boundary the
-        # original report named).
-        assert "source" not in result.updated_state.sources
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert "source" not in state.sources
 
 
 class TestVfDestinationAdvisory:
@@ -5035,7 +5009,7 @@ class TestBlobTools:
         assert "sk-test-secret" not in str(result.data)
 
     def test_get_blob_metadata_rejects_invalid_blob_id_without_echoing_value(self) -> None:
-        sentinel = "sk-test-secret-not-a-uuid"
+        sentinel = "sensitive-value-not-a-uuid"
 
         result = execute_tool(
             "get_blob_metadata",
@@ -7944,22 +7918,20 @@ class TestPatchSourceOptions:
 
     def test_patch_source_options_rejects_literal_credential_value_without_mutating_state(self) -> None:
         state = self._state_with_source({"path": "/a"})
+        before = state.to_dict()
         catalog = _mock_catalog()
         literal = "literal-source-key-for-test"
 
-        result = execute_tool(
-            "patch_source_options",
-            {"patch": {"api_key": literal}},
-            state,
-            catalog,
-        )
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool(
+                "patch_source_options",
+                {"patch": {"api_key": literal}},
+                state,
+                catalog,
+            )
 
-        _assert_secret_wiring_contract_failure(
-            result,
-            state,
-            literal_value=literal,
-            field="source:api_key",
-        )
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert state.to_dict() == before
 
     def test_patch_source_options_deletes_key(self) -> None:
         state = self._state_with_source({"path": "/a", "encoding": "utf-8"})
@@ -8285,22 +8257,20 @@ class TestPatchNodeOptions:
 
     def test_patch_node_options_rejects_literal_credential_value_without_mutating_state(self) -> None:
         state = self._state_with_node({"schema": {"mode": "observed"}})
+        before = state.to_dict()
         catalog = _mock_catalog()
         literal = "literal-node-key-for-test"
 
-        result = execute_tool(
-            "patch_node_options",
-            {"node_id": "t1", "patch": {"api_key": literal}},
-            state,
-            catalog,
-        )
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool(
+                "patch_node_options",
+                {"node_id": "t1", "patch": {"api_key": literal}},
+                state,
+                catalog,
+            )
 
-        _assert_secret_wiring_contract_failure(
-            result,
-            state,
-            literal_value=literal,
-            field="t1:api_key",
-        )
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert state.to_dict() == before
 
     def test_patch_node_options_rejects_on_error_with_routing_tool_guidance(self) -> None:
         """on_error is a node routing field, not a plugin option patch."""
@@ -8436,22 +8406,20 @@ class TestPatchOutputOptions:
 
     def test_patch_output_options_rejects_literal_credential_value_without_mutating_state(self) -> None:
         state = self._state_with_output({"path": "/old.csv"})
+        before = state.to_dict()
         catalog = _mock_catalog()
         literal = "literal-output-password-for-test"
 
-        result = execute_tool(
-            "patch_output_options",
-            {"sink_name": "main", "patch": {"password": literal}},
-            state,
-            catalog,
-        )
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool(
+                "patch_output_options",
+                {"sink_name": "main", "patch": {"password": literal}},
+                state,
+                catalog,
+            )
 
-        _assert_secret_wiring_contract_failure(
-            result,
-            state,
-            literal_value=literal,
-            field="main:password",
-        )
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert state.to_dict() == before
 
     def test_patch_output_options_unknown_sink_fails(self) -> None:
         state = _empty_state()
@@ -9001,7 +8969,6 @@ class TestTransformProviderConfigPathSecurity:
             ("endpoint", "https://evil.example.com"),
             ("use_managed_identity", True),
             ("client_id", "11111111-2222-3333-4444-555555555555"),
-            ("api_key", "stolen"),
             ("api_version", "2020-06-30"),
         ],
     )
@@ -9027,6 +8994,24 @@ class TestTransformProviderConfigPathSecurity:
         assert option in rendered
         assert "evil.example.com" not in rendered
         assert "stolen" not in rendered
+
+    def test_upsert_node_refuses_an_api_key_before_profile_private_option_validation(self) -> None:
+        view = self._azure_ai_search_profiled_view()
+        state = _empty_state()
+        literal = "stolen"
+
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool(
+                "upsert_node",
+                self._profiled_azure_ai_search_node(api_key=literal),
+                state,
+                view,
+                data_dir="/data",
+                plugin_snapshot=view.snapshot,
+            )
+
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert state.nodes == ()
 
     def test_the_private_option_cases_above_cover_the_whole_private_set(self) -> None:
         from elspeth.contracts.azure_ai_search import AZURE_AI_SEARCH_PRIVATE_BINDING_OPTION_NAMES
@@ -9433,20 +9418,14 @@ def _llm_options_with_forged_resolved_reviews(api_key: Any) -> dict[str, Any]:
     return options
 
 
-def _assert_secret_wiring_contract_failure(
-    result: ToolResult,
-    original_state: CompositionState,
+def _assert_credential_material_refusal(
+    exc: CredentialMaterialRefused,
     *,
     literal_value: str,
-    field: str,
 ) -> None:
-    assert result.success is False
-    assert result.updated_state is original_state
-    assert result.updated_state.version == original_state.version
-    assert result.data is not None
-    assert field in result.data["credential_fields"]
-    assert "list_secret_refs -> validate_secret_ref -> wire_secret_ref" in result.validation.errors[0].message
-    assert literal_value not in repr(result.to_dict())
+    assert exc.surface == "composer_tool_arguments"
+    assert exc.finding.category == "credential_field"
+    assert literal_value not in repr(exc.to_payload())
 
 
 class TestCredentialRejectionAdvertisesInlineForm:
@@ -9523,11 +9502,8 @@ class TestCredentialRejectionAdvertisesInlineForm:
             "wire_secret_ref",
         )
 
-    def test_existing_helper_assertion_still_holds(self) -> None:
-        """The legacy ``_assert_secret_wiring_contract_failure`` helper
-        looks for the post-hoc tool-sequence substring — keep it intact
-        so existing rejection-shape tests continue to lock in the
-        contract from the post-hoc side."""
+    def test_post_hoc_repair_instruction_still_present(self) -> None:
+        """The internal repair result still documents the post-hoc sequence."""
         state = _empty_state()
         result = _credential_wiring_contract_failure(
             state,
@@ -9990,14 +9966,11 @@ class TestSetPipeline:
         }
         args["edges"][0]["to_node"] = "code_themes"
 
-        result = execute_tool("set_pipeline", args, state, catalog)
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool("set_pipeline", args, state, catalog)
 
-        _assert_secret_wiring_contract_failure(
-            result,
-            state,
-            literal_value=literal,
-            field="code_themes:api_key",
-        )
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert state.nodes == ()
 
     def test_set_pipeline_rejects_placeholder_database_table_without_mutating_state(self) -> None:
         state = _empty_state()
@@ -10384,27 +10357,24 @@ class TestSetPipeline:
         catalog = _mock_catalog()
         literal = "literal-upsert-key-for-test"
 
-        result = execute_tool(
-            "upsert_node",
-            {
-                "id": "code_themes",
-                "node_type": "transform",
-                "plugin": "llm",
-                "input": "source_out",
-                "on_success": "main",
-                "on_error": "discard",
-                "options": _llm_options_with_api_key(literal),
-            },
-            state,
-            catalog,
-        )
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool(
+                "upsert_node",
+                {
+                    "id": "code_themes",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "source_out",
+                    "on_success": "main",
+                    "on_error": "discard",
+                    "options": _llm_options_with_api_key(literal),
+                },
+                state,
+                catalog,
+            )
 
-        _assert_secret_wiring_contract_failure(
-            result,
-            state,
-            literal_value=literal,
-            field="code_themes:api_key",
-        )
+        _assert_credential_material_refusal(caught.value, literal_value=literal)
+        assert state.nodes == ()
 
     def test_upsert_node_llm_prevalidation_ignores_review_metadata(self) -> None:
         """LLM plugin validation strips web-only prompt review metadata but keeps it in state."""

@@ -964,7 +964,7 @@ class TestSetSourceFromBlobMode:
                         {
                             "kind": "vague_term",
                             "user_term": "inline_source_data",
-                            "draft": "sk-sensitive-source-review",
+                            "draft": "sensitive-source-review",
                         }
                     ],
                 },
@@ -981,7 +981,7 @@ class TestSetSourceFromBlobMode:
         assert result.success is False
         assert result.updated_state is state
         assert "interpretation_requirements_invalid" in result.validation.errors[0].message
-        assert "sk-sensitive-source-review" not in result.validation.errors[0].message
+        assert "sensitive-source-review" not in result.validation.errors[0].message
 
     def test_set_source_from_blob_emits_explicit_bind_source_mode(self, blob_env: dict[str, Any]) -> None:
         blob = _create_blob(blob_env, filename="input.csv", mime_type="text/csv", content="name\nAda")

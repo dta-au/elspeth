@@ -26,13 +26,14 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.config import WebSettings
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.preferences.routes import create_preferences_router
 from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -63,6 +64,13 @@ def _make_app(
         )
         initialize_session_schema(engine)
     app = FastAPI()
+    app.state.settings = WebSettings(
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=100,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
     app.state.preferences_service = PreferencesService(engine)
     app.state.session_engine = engine
     app.state.rate_limiter = ComposerRateLimiter(limit=rate_limit)
@@ -73,8 +81,7 @@ def _make_app(
     app.state.sessions_telemetry = build_sessions_telemetry()
 
     if user_id is not None:
-        with engine.begin() as conn:
-            ensure_test_identity(conn, identity_id=user_id)
+        wire_test_pipeline_user_authority(app, identity_id=user_id, engine=engine)
         identity = UserIdentity(user_id=user_id, username=user_id)
 
         async def _mock_user() -> UserIdentity:
@@ -338,14 +345,8 @@ def test_db_unavailable_returns_503() -> None:
         async def get_composer_preferences(self, _user_id: str) -> object:
             raise OperationalError("SELECT 1", {}, Exception("connection refused"))
 
-    app = FastAPI()
-    identity = UserIdentity(user_id="alice", username="alice")
-
-    async def _mock_user() -> UserIdentity:
-        return identity
-
+    app = _make_app("alice")
     app.state.preferences_service = _UnavailablePreferencesService()
-    app.dependency_overrides[get_current_user] = _mock_user
 
     # Register the production OperationalError handler — the test app
     # would otherwise let the exception escape as a generic 500.

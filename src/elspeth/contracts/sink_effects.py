@@ -14,11 +14,12 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, NoReturn, cast, final
 from urllib.parse import parse_qsl, urlsplit
 
+from elspeth.contracts.credential_material import CredentialTraversalPolicy, find_credential_material
 from elspeth.contracts.enums import CallType, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, require_int
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.results import ArtifactDescriptor, require_no_artifact_uri_credentials
-from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
@@ -27,6 +28,10 @@ if TYPE_CHECKING:
 
 SINK_EFFECT_PROTOCOL_VERSION: Final = "sink-effect-v1"
 _SINK_EFFECT_EVIDENCE_MAX_BYTES: Final = 64 * 1024
+_SINK_EFFECT_EVIDENCE_CREDENTIAL_POLICY: Final = CredentialTraversalPolicy(
+    max_nodes=_SINK_EFFECT_EVIDENCE_MAX_BYTES,
+    max_width=_SINK_EFFECT_EVIDENCE_MAX_BYTES,
+)
 _AUDIT_EXPORT_MANIFEST_MAX_BYTES: Final = 64 * 1024
 _AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
 _AUDIT_EXPORT_MAX_CHUNK_BYTES: Final = 64 * 1024 * 1024
@@ -277,7 +282,7 @@ def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) ->
     canonical = canonical_json(detached)
     if len(canonical.encode("utf-8")) > _SINK_EFFECT_EVIDENCE_MAX_BYTES:
         raise ValueError(f"{field_name} canonical JSON exceeds the 64 KiB limit")
-    if scrub_payload_for_audit(detached) != detached:
+    if find_credential_material(detached, _SINK_EFFECT_EVIDENCE_CREDENTIAL_POLICY) is not None:
         raise ValueError(f"{field_name} must be credential-free (known secret form detected)")
     return frozen
 

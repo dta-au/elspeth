@@ -252,6 +252,7 @@ _CALLABLE_IMPORTS = {
     "BlobMetadataResponse": "elspeth.web.blobs.schemas",
     "sanitize_filename": "elspeth.web.blobs.service",
     "detect_mime_type": "elspeth.web.blobs.sniff",
+    "require_no_credential_material": "elspeth.web.credential_guard",
 }
 _LOCAL_CALLABLE_AST_SHA256 = {
     "_blob_response": "2e27d8812ee67db3f2a1cfce5b254acfd7c473a5f5ea5a0da3e5738e2fd0485e",
@@ -270,7 +271,7 @@ _ALLOWED_ENDPOINT_DEFINITION_CALLABLES = frozenset({"Depends", "File", "Query"})
 _ROUTER_INITIALIZATION_AST_SHA256 = "fc6a65bb76b72bd5bae7edf46d00830d82f23dba110b4f66f4de075c96cc5a2e"
 _LIST_BLOBS_COMPREHENSION_AST_SHA256 = "d388d724562b89fa61067804798f58e0acd6ed3e1c3aa9367b7573b20513f777"
 _LIST_BLOBS_DECORATOR_AST_SHA256 = "1f1483306e65df8660a48e7366198171f46495342193709bcc4aeab15bf93e46"
-_LIST_BLOBS_DEFINITION_AST_SHA256 = "2eb8a4851834d0e5dc100db418a2e44292caf4e5a7540d4be1d83aec114eed05"
+_LIST_BLOBS_DEFINITION_AST_SHA256 = "637b2e8ecba2dd353951274457c5dc00888906d44accdc7cb194d1d22d402e04"
 _ROUTER_RETURN_AST_SHA256 = "6e2d7fb0f9ddb6700f71c439e8dfef4df255459f5f3519fe369eb92bc43bba4b"
 _EXPECTED_FACTORY_ENDPOINTS = frozenset({*(contract.name for contract in _ENDPOINTS), "list_blobs"})
 _EXPECTED_FACTORY_ENDPOINT_ORDER = (
@@ -284,12 +285,12 @@ _EXPECTED_FACTORY_ENDPOINT_ORDER = (
 )
 _SYNTHETIC_ENDPOINT_PREAMBLE_AST_SHA256 = "f21040d5058a9d53fc68eed0b0c5a1faebcd3cd886e49dbec1c74abe737ce71c"
 _PRODUCTION_ENDPOINT_ARGUMENTS_AST_SHA256 = {
-    "create_blob_upload": "f3ea34f58b88627a1b237badfd3f61899ca7ddca7dce33a24d8e8a834f8b0641",
-    "create_blob_inline": "dd824b4197fba781c0289e3ef122966100fda67f440797213ab85146f45fb97d",
-    "get_blob_metadata": "bb765c163e303a22525f149830e1d10da0e93540f2e7a93b713e661ac98a9d86",
-    "download_blob_content": "bb765c163e303a22525f149830e1d10da0e93540f2e7a93b713e661ac98a9d86",
-    "preview_blob_content": "a4764731afbae25a494ae77244cc4f26dc0f0af46820f3a2835e9de4377af512",
-    "delete_blob": "bb765c163e303a22525f149830e1d10da0e93540f2e7a93b713e661ac98a9d86",
+    "create_blob_upload": "6459534c1a78dd870c71879bd0fc97bf56e91944f4f1704f011cc284ac4442ac",
+    "create_blob_inline": "b77f3e886cfd2d75f46673afb9a2886f56358da1a0cb515e69894ef3d52a653c",
+    "get_blob_metadata": "718a1d0ae0bc0179ad82c08b10ee2e4e50f677c0ac932b04f0cc2a3e71c8ce35",
+    "download_blob_content": "718a1d0ae0bc0179ad82c08b10ee2e4e50f677c0ac932b04f0cc2a3e71c8ce35",
+    "preview_blob_content": "3c324e4be674c37ccbc2eb02d6dc3bdfa0bf267d7a0cbb8f179ea3dc9e4ec88a",
+    "delete_blob": "718a1d0ae0bc0179ad82c08b10ee2e4e50f677c0ac932b04f0cc2a3e71c8ce35",
 }
 _PRODUCTION_ENDPOINT_RETURN_AST_SHA256 = {
     "create_blob_upload": "85730231b5f2dc35943769a2db7e336da38c167cd5a45f266db6d50cfc270426",
@@ -303,16 +304,16 @@ _PRODUCTION_ENDPOINT_PREAMBLE_AST_SHA256 = {
     # create_blob_upload: mainline's binary-document admission
     # (elspeth-0c6a343921) folded into ONE if/else arm so both admission
     # paths converge on the single fenced create (P4-C2).
-    "create_blob_upload": "7104d3c91b30171b7f42bf79074f99712ac240a38faf0f83d8c0d997a92085e3",
+    "create_blob_upload": "90d999c343f392dc8ac0ca7e3486b465f1fc8a35438f82015039e79489ac8909",
     # create_blob_inline: the text-only smuggle rejection precedes the lease.
-    "create_blob_inline": "508bad641c3f5641b0843f41e81c17d6434b5f40310660fb0bf5bc2054761db4",
+    "create_blob_inline": "74d32bbeaa1e285f38b4b71fbf63b40598fd06dff3b1b2d379536c350f70fa43",
     "get_blob_metadata": "4f13d38282606a8945c2055a26b04e48816c1817f3de0f6480c55e703f3c454e",
     "download_blob_content": "7b362d54bb6b80f200f7dc8fa891f31ad124eb4eacc9658120850e6bfff7969f",
     "preview_blob_content": "62e2eb91414beff38eb50d5a5ae452771a343c985eb0fa5667d2ac0d3de5a189",
     # delete_blob: the docstring names the idempotent, cleanup-capable contract.
     "delete_blob": "24bded45619a8b1ff30e436119136e59b1a8e8427fd205cac69cd09d3a96a04e",
 }
-_PRODUCTION_IMPORTS_AST_SHA256 = "7edde4d3577c43fa2859b5284663a6a27b17ba98d5a4f4a9e6a6c68ea862908d"
+_PRODUCTION_IMPORTS_AST_SHA256 = "0d5048d304b1cfb950213080415f2cc5838ab7779b9f7d9a4b3598e7af1cd6d2"
 _SYNTHETIC_IMPORTS_AST_SHA256 = "94033e0618e2844484fe405c1390874e190827ea0928d790784c88ca22422c20"
 _SYNTHETIC_DELETE_IMPORTS_AST_SHA256 = "495d568047a365b64f2ea5b19dc4f628b0a881f9580b622a6b524913ed180b99"
 _ROUTER_FACTORY_SIGNATURE_AST_SHA256 = "6662cca5c620abce45dd4871654fd02fea18f10e2ebfcb15db05f466dd165115"
@@ -349,6 +350,7 @@ _ALLOWED_ROUTE_CALLABLES = {
             "binary_document_signature_matches",
             "detect_binary_document_signature",
             "detect_mime_type",
+            "require_no_credential_material",
             "cast",
             "SessionOperationLease.acquire",
             "blob_service.create_blob",
@@ -363,6 +365,7 @@ _ALLOWED_ROUTE_CALLABLES = {
             "len",
             "HTTPException",
             "detect_binary_document_signature",
+            "require_no_credential_material",
             "SessionOperationLease.acquire",
             "blob_service.create_blob",
             "str",
@@ -817,7 +820,7 @@ def _import_surface_violations(tree: ast.AST) -> list[str]:
     ):
         violations.append("production standalone blob routes require the exact closed canonical import inventory")
     if import_digest != _PRODUCTION_IMPORTS_AST_SHA256:
-        forbidden_synthetic_imports = {"create_blobs_router", "get_current_user", "router"}
+        forbidden_synthetic_imports = {"create_blobs_router", "require_pipeline_user", "router"}
         for statement in imports:
             for alias in statement.names:
                 bound_name = alias.asname or alias.name.partition(".")[0]
@@ -1755,6 +1758,31 @@ def test_standalone_blob_routes_bind_the_exact_renewable_lease() -> None:
     assert not violations, "\n".join(violations)
 
 
+@pytest.mark.parametrize(
+    ("endpoint_name", "guard_statement"),
+    (
+        (
+            "create_blob_upload",
+            '            require_no_credential_material(original_filename, surface="blob_filename")\n',
+        ),
+        (
+            "create_blob_inline",
+            '        require_no_credential_material(body.filename, surface="blob_filename")\n',
+        ),
+    ),
+)
+def test_route_gate_rejects_removed_filename_credential_guard(endpoint_name: str, guard_statement: str) -> None:
+    source = _BLOB_ROUTES.read_text(encoding="utf-8")
+    mutated = source.replace(guard_statement, "", 1)
+    assert mutated != source
+    tree = ast.parse(mutated)
+    contract = next(item for item in _ENDPOINTS if item.name == endpoint_name)
+
+    violations = _route_violations(tree, contract)
+
+    assert any("pre-acquisition statements must match the exact approved preamble" in item for item in violations)
+
+
 def test_production_gate_is_fillable_by_canonical_functional_delete_tail() -> None:
     tree = ast.parse(_BLOB_ROUTES.read_text(encoding="utf-8"))
     endpoint = _endpoint_definitions(tree, "delete_blob")[0]
@@ -1922,7 +1950,8 @@ def test_route_gate_rejects_open_factory_and_definition_surfaces(mutation: str, 
         ("wildcard_import", "must not use wildcard imports"),
         ("side_effect_import", "exact closed canonical import inventory"),
         ("import_factory_rebind", "binding 'create_blobs_router' must not be imported"),
-        ("import_auth_dependency_rebind", "binding 'get_current_user' must not be imported"),
+        ("import_auth_dependency_rebind", "binding 'require_pipeline_user' must not be imported"),
+        ("import_credential_guard_rebind", "protected callable 'require_no_credential_material' has forged import provenance"),
         ("renamed_factory", "require exactly one top-level create_blobs_router factory"),
         ("changed_factory_signature", "signature must match exact canonical factory identity"),
     ),
@@ -1936,7 +1965,9 @@ def test_route_gate_rejects_open_import_and_factory_identity_surfaces(mutation: 
     elif mutation == "import_factory_rebind":
         source += "\nfrom attacker import create_blobs_router\n"
     elif mutation == "import_auth_dependency_rebind":
-        source += "\nfrom attacker import get_current_user\n"
+        source += "\nfrom attacker import require_pipeline_user\n"
+    elif mutation == "import_credential_guard_rebind":
+        source += "\nfrom attacker import require_no_credential_material\n"
     elif mutation == "renamed_factory":
         source = source.replace("def create_blobs_router() -> APIRouter:", "def attacker_factory() -> APIRouter:", 1)
     else:

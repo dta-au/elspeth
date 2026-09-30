@@ -51,7 +51,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.unit.web.composer.conftest import (
     _fake_llm_response as _raw_fake_llm_response,
 )
@@ -157,6 +157,7 @@ def _harness(tmp_path: Path) -> _Harness:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="proposal-prevalidation-user")
+        grant_test_pipeline_user(conn, identity_id="proposal-prevalidation-user")
     sessions = build_test_sessions_service(engine=engine, data_dir=tmp_path)
     session_id = _PROPOSAL_SESSION_ID
     user_message_id = str(uuid4())

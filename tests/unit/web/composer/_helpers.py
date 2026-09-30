@@ -125,6 +125,7 @@ def _composer_service_with_session(catalog: CatalogService, settings: WebSetting
     from elspeth.web.sessions.engine import create_session_engine
     from elspeth.web.sessions.schema import initialize_session_schema
     from elspeth.web.sessions.telemetry import build_sessions_telemetry
+    from tests.fixtures.identities import grant_test_pipeline_user
     from tests.unit.web.conftest import _make_session
     from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -133,6 +134,7 @@ def _composer_service_with_session(catalog: CatalogService, settings: WebSetting
     session_id = str(uuid4())
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id="test-user")
+        grant_test_pipeline_user(conn, identity_id="test-user")
     sessions = FencedSessionServiceHarness(
         engine,
         data_dir=Path(settings.data_dir),

@@ -15,9 +15,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import Connection, Engine, event, select, text, update
 from sqlalchemy.engine import make_url
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 
 from elspeth.contracts.composer_progress import ComposerProgressEvent
+from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
@@ -25,7 +26,7 @@ from elspeth.web.coordination.quota_authority import TokenUsageEntry, record_tok
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identities_table, sessions_table, token_usage_ledger_table
-from elspeth.web.sessions.routes.composer.state import get_current_user, router
+from elspeth.web.sessions.routes.composer.state import router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -76,6 +77,7 @@ def test_progress_http_and_token_settlement_do_not_deadlock(progress_database: t
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key="0" * 64,
     )
+    wire_test_pipeline_user_authority(app, identity_id="owner", engine=writer)
     app.dependency_overrides[get_current_user] = lambda: UserIdentity(user_id="owner", username="owner")
     app.include_router(router, prefix="/api/sessions")
     session_locked = Event()

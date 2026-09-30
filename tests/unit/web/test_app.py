@@ -3418,8 +3418,6 @@ class TestValidationErrorRedaction:
             assert set(error.keys()) <= self._SAFE_KEYS
 
     def test_unknown_credential_shaped_request_key_is_redacted_from_location(self, tmp_path) -> None:
-        from unittest.mock import AsyncMock
-
         from elspeth.web.auth.models import UserIdentity
 
         client = self._authed_client(tmp_path)
@@ -3427,8 +3425,8 @@ class TestValidationErrorRedaction:
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         with (
-            patch("elspeth.web.auth.admin_routes.get_current_user", new=AsyncMock(return_value=identity)),
-            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", new=AsyncMock(return_value=True)),
+            patch("elspeth.web.auth.admin_routes.get_current_user", autospec=True, return_value=identity),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", autospec=True, return_value=True),
         ):
             resp = client.request(
                 "DELETE",
@@ -3441,8 +3439,6 @@ class TestValidationErrorRedaction:
         assert "<redacted-secret>" in resp.text
 
     def test_malformed_url_in_request_is_a_fixed_value_free_refusal(self, tmp_path) -> None:
-        from unittest.mock import AsyncMock
-
         from elspeth.web.auth.models import UserIdentity
 
         client = self._authed_client(tmp_path)
@@ -3450,8 +3446,8 @@ class TestValidationErrorRedaction:
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         with (
-            patch("elspeth.web.auth.admin_routes.get_current_user", new=AsyncMock(return_value=identity)),
-            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", new=AsyncMock(return_value=True)),
+            patch("elspeth.web.auth.admin_routes.get_current_user", autospec=True, return_value=identity),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", autospec=True, return_value=True),
             capture_logs() as logs,
         ):
             resp = client.request(
@@ -3474,6 +3470,9 @@ class TestValidationErrorRedaction:
 
         from elspeth.web.auth.middleware import get_current_user
         from elspeth.web.auth.models import UserIdentity
+
+        with app.state.session_engine.begin() as conn:
+            _ensure_test_user(conn, identity_id="test-user")
 
         async def _mock_user() -> UserIdentity:
             return UserIdentity(user_id="test-user", username="test-user")
@@ -3578,7 +3577,7 @@ class TestSecretsExceptionHandlers:
 
     * ``FingerprintKeyMissingError`` → 503 (deployment misconfigured)
     * ``SecretDecryptionError``     → 409 (re-save required)
-    * ``SQLAlchemyError``            → 503 (database unavailable)
+    * ``OperationalError``           → 503 (database unavailable)
     * ``OSError``                    → 503 (SQLite / filesystem level)
 
     Redaction invariants (from the canonical SQLAlchemy-redaction pattern):
@@ -3594,7 +3593,7 @@ class TestSecretsExceptionHandlers:
 
         app = create_app(_settings(tmp_path))
         with app.state.session_engine.begin() as conn:
-            ensure_test_identity(conn, identity_id="test-user")
+            _ensure_test_user(conn, identity_id="test-user")
         identity = UserIdentity(user_id="test-user", username="test-user")
 
         async def _mock_user() -> UserIdentity:
@@ -3686,7 +3685,7 @@ class TestSecretsExceptionHandlers:
         assert "re-save" in body["detail"].lower()
         assert body["request_id"]
 
-    # -- SQLAlchemyError → 503 ------------------------------------------------
+    # -- OperationalError → 503 -----------------------------------------------
 
     def test_sqlalchemy_error_on_list_returns_503(self, tmp_path, monkeypatch) -> None:
         """Underlying ``OperationalError`` on list must surface as 503 with a redacted body.
@@ -3782,13 +3781,13 @@ class TestSecretsExceptionHandlers:
         DriverFailure.__name__ = "SECRET_CLASS\nforged event"
 
         def fail(*args, **kwargs):
+            monkeypatch.setattr(client.app.state.session_engine, "pool", NullPool(unexpected_checkout))
             raise OperationalError("SECRET_SQL", {}, DriverFailure("SECRET_MESSAGE"))
 
         def unexpected_checkout():
             pytest.fail("diagnostics must never open a database connection")
 
         monkeypatch.setattr(client.app.state.secret_service, "list_refs", fail)
-        monkeypatch.setattr(client.app.state.session_engine, "pool", NullPool(unexpected_checkout))
         with capture_logs() as logs:
             response = client.get("/api/secrets")
         assert response.status_code == 503
@@ -3877,9 +3876,7 @@ class TestSecretsExceptionHandlers:
         @given(name=name_strategy, value=value_strategy)
         def _prop(name: str, value: str) -> None:
             create = client.post("/api/secrets", json={"name": name, "value": value})
-            if create.status_code != 201:
-                # Schema validators may reject some generated names; skip.
-                return
+            assert create.status_code == 201, create.text
             assert "available" not in create.json()
             validate = client.post(f"/api/secrets/{name}/validate")
             assert validate.status_code == 200

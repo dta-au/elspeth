@@ -86,6 +86,30 @@ def test_blob_body_content_remains_outside_control_plane_admission() -> None:
     )
 
 
+def test_wire_secret_ref_scans_the_option_name_without_treating_it_as_a_secret_value() -> None:
+    arguments = {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": "api_key"}
+
+    require_no_credential_material_for_tool("wire_secret_ref", arguments, surface="test_surface")
+
+    assert arguments["option_key"] == "api_key"
+    assert credential_material_tool_arguments_projection("wire_secret_ref", arguments) == {
+        "name": "OPENROUTER_API_KEY",
+        "target": "source",
+        "structural_option_name": "api_key",
+    }
+
+
+def test_wire_secret_ref_rejects_a_credential_embedded_in_the_structural_option_name() -> None:
+    candidate = "sk-" + "a" * 24
+
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_for_tool(
+            "wire_secret_ref",
+            {"name": "OPENROUTER_API_KEY", "target": "source", "option_key": candidate},
+            surface="test_surface",
+        )
+
+
 def test_set_pipeline_wire_projection_excludes_nested_inline_blob_body_only() -> None:
     body_candidate = "sk-" + "a" * 24
     metadata_candidate = "sk-" + "b" * 24

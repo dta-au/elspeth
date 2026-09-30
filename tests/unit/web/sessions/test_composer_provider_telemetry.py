@@ -24,7 +24,7 @@ from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.models import chat_messages_table, quota_provider_attempts_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 
@@ -54,6 +54,7 @@ def _call() -> ComposerLLMCall:
 def _service(engine) -> SessionServiceImpl:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        grant_test_pipeline_user(conn, identity_id="alice")
     return FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),

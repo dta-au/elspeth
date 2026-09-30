@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 import structlog
@@ -69,6 +69,7 @@ from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthor
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.schemas import (
@@ -88,6 +89,7 @@ from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.secrets.service import ScopedSecretResolver, WebSecretService
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import identity_roles_table
@@ -870,8 +872,26 @@ def _make_app(
 
     app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.composer_progress_registry = ComposerProgressRegistry()
-    app.state.scoped_secret_resolver = None
+    empty_secret_service = create_autospec(WebSecretService, instance=True)
+    empty_secret_service.list_refs.return_value = []
+    empty_secret_service.has_ref.return_value = False
+    empty_secret_service.resolve.return_value = None
+    empty_secret_service.resolve_scoped.return_value = None
+    app.state.scoped_secret_resolver = ScopedSecretResolver(
+        empty_secret_service,
+        auth_provider_type=app.state.settings.auth_provider,
+    )
     _install_restricted_plugin_policy(app)
+
+    @app.exception_handler(CredentialMaterialRefused)
+    async def handle_credential_material_refused(
+        _request: object,
+        exc: CredentialMaterialRefused,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": exc.to_payload(), "request_id": None},
+        )
 
     # Minimal stub for execution service — delete_session coordinates with
     # the per-session execution lock and then cleans it up after archiving.
@@ -9672,9 +9692,8 @@ also: *src
         catches this at /validate or runtime-preflight time (after the value
         is already written into CompositionState), pasted YAML has no prior
         tool-call gate, so it would otherwise reach save_composition_state and
-        get echoed back in the response verbatim. The error names the field
-        only, never the value (parity with the runtime-preflight
-        fabricated_secret discipline's audit hygiene)."""
+        get echoed back in the response verbatim. The response carries only
+        the fixed refusal classification and never the field or value."""
         app, service = _make_app(tmp_path)
         client = TestClient(app)
 
@@ -9696,9 +9715,21 @@ sinks:
 
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
 
-        assert resp.status_code == 400
-        detail = resp.json()["detail"]
-        assert "api_key" in detail
+        assert resp.status_code == 422
+        assert resp.json() == {
+            "detail": {
+                "error_type": "credential_material_rejected",
+                "failure_code": "credential_material_rejected",
+                "detail": (
+                    "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
+                ),
+                "category": "credential_field",
+                "surface": "composer_yaml_import",
+                "detector_version": "1",
+            },
+            "request_id": None,
+        }
+        assert "api_key" not in resp.text
         assert secret_value not in resp.text
         # Nothing was persisted -- the session has no composition state at all.
         assert await service.get_current_state(session.id) is None
@@ -9707,17 +9738,18 @@ sinks:
     async def test_post_state_yaml_rejects_plugin_specific_credential_field(self, tmp_path) -> None:
         """Hardening (T-1 review follow-up): the fabricated-secret import gate
         must match plugin-specific credential fields, not just the name/suffix
-        heuristic. The database sink's whole-DSN ``url`` field carries an
-        embedded password but does not end in a secret suffix, so the heuristic
-        predicate alone lets it through -- the import gate feeds
+        heuristic. The database sink's whole-connection ``url`` field does not
+        end in a secret suffix, so the heuristic predicate alone lets an opaque
+        value through -- the import gate feeds
         allowed_secret_ref_fields per component (mirroring the set_output tool
-        gate) so a pasted plaintext DSN is rejected here rather than persisted
-        and echoed back. The error names the field only, never the value."""
+        gate) so pasted connection material is rejected here rather than
+        persisted and echoed back. The response carries only the fixed refusal
+        classification and never the field or value."""
         app, service = _make_app(tmp_path)
         client = TestClient(app)
 
         session = await service.create_session("alice", "Replay", "local")
-        dsn = "postgresql://app:S3cretPw@db.internal/prod"  # secret-scan: allow-this-line (synthetic fixture asserting rejection)
+        connection_value = "opaque-database-connection-material"
         yaml_text = f"""
 sources:
   source:
@@ -9730,17 +9762,28 @@ sinks:
     plugin: database
     on_write_failure: discard
     options:
-      url: {dsn}
+      url: {connection_value}
 """
 
         resp = client.post(f"/api/sessions/{session.id}/state/yaml", json={"yaml": yaml_text})
 
-        assert resp.status_code == 400
-        detail = resp.json()["detail"]
-        assert "url" in detail
-        assert "S3cretPw" not in resp.text
-        assert dsn not in resp.text
-        # Nothing was persisted -- the DSN never reached the DB.
+        assert resp.status_code == 422
+        assert resp.json() == {
+            "detail": {
+                "error_type": "credential_material_rejected",
+                "failure_code": "credential_material_rejected",
+                "detail": (
+                    "This control content appears to contain a credential. Store the value through the secret service and use a secret reference."
+                ),
+                "category": "credential_field",
+                "surface": "composer_yaml_import",
+                "detector_version": "1",
+            },
+            "request_id": None,
+        }
+        assert "url" not in resp.text
+        assert connection_value not in resp.text
+        # Nothing was persisted -- the connection material never reached the DB.
         assert await service.get_current_state(session.id) is None
 
     @pytest.mark.asyncio

@@ -232,7 +232,16 @@ _PASSTHROUGH_HELPERS = frozenset({"redact_source_storage_path"})
 # DERIVED, not trusted: ``test_every_payload_consumer_leaves_the_payload_it_is_handed_unreshaped``
 # re-reads each definition under ``web/composer`` and refuses one that re-shapes a parameter.
 _PAYLOAD_CONSUMERS = frozenset(
-    {"ToolResult", "_discovery_result", "_mutation_result", "redact_source_storage_path", "canonical_json", "replace"}
+    {
+        "ToolResult",
+        "_credential_safe_blob_discovery_result",
+        "_discovery_result",
+        "_mutation_result",
+        "redact_source_storage_path",
+        "require_no_credential_material",
+        "canonical_json",
+        "replace",
+    }
 )
 # A consumer whose no-re-shape guarantee is not readable as a function body under ``web/composer``,
 # named with where the guarantee IS held — the same treatment, and for the same reason, as
@@ -251,6 +260,11 @@ _CONSUMER_GUARANTEES_HELD_ELSEWHERE: dict[str, str] = {
     "canonical_json": (
         "the deterministic encoder (core/canonical.py, contracts/hashing.py): it reads the mapping "
         "to produce a str and returns no reference to it"
+    ),
+    "require_no_credential_material": (
+        "the read-only credential admission boundary in web/credential_guard.py: it traverses the supplied value "
+        "through contracts/credential_material.py and either returns None or raises a value-free refusal; it never "
+        "stores or mutates the supplied mapping"
     ),
 }
 # (file name, enclosing function, local name) -> payload type, ONLY for a local the resolver

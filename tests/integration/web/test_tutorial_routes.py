@@ -36,6 +36,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.integration.web.conftest import (
     _ensure_released_session_operation_fence,
     _make_session,
@@ -93,6 +94,7 @@ def _app(tmp_path: Path) -> FastAPI:
     app.state.preferences_service = PreferencesService(engine)
     app.state.rate_limiter = ComposerRateLimiter(limit=settings.composer_rate_limit_per_minute)
     app.state.execution_service = _FakeExecutionService()
+    wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
 
     identity = UserIdentity(user_id="alice", username="alice")
 

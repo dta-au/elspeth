@@ -43,7 +43,7 @@ from elspeth.web.sessions.routes._helpers import _state_from_record
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
 # --------------------------------------------------------------------------- #
@@ -326,8 +326,6 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     """Build the real production stack with provider and policy controls."""
     engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.sqlite3'}")
     initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="alice")
     sessions = FencedSessionServiceHarness(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -389,6 +387,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     )
 
     app = FastAPI()
+    wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
 
     async def mock_user() -> UserIdentity:
         return UserIdentity(user_id="alice", username="alice")

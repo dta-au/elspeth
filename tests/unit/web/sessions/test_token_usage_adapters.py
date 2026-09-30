@@ -49,7 +49,7 @@ from elspeth.web.sessions.protocol import CompositionStateData, RunDiagnosticsAu
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, seed_token_policies
 from tests.unit.web.conftest import _make_session as _make_session_row
 from tests.unit.web.coordination.test_durable_run_admission import _admission
@@ -92,6 +92,7 @@ def _seed_compose_session(engine: Engine) -> tuple[str, SessionOperationContext]
     context = _compose_context(session_id)
     with engine.begin() as conn:
         _make_session_row(conn, session_id=session_id)
+        grant_test_pipeline_user(conn, identity_id="test_user")
         conn.execute(
             insert(session_operation_fences_table).values(
                 session_id=session_id,
@@ -120,6 +121,7 @@ def _ledger(engine: Engine) -> list[tuple[Any, ...]]:
 def harness(engine: Engine) -> FencedSessionServiceHarness:
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        grant_test_pipeline_user(conn, identity_id="alice")
     return FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
 
 
@@ -457,6 +459,7 @@ def _quota_service(tmp_path: Path, **recorder: Any) -> tuple[Engine, SQLiteLocal
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        grant_test_pipeline_user(conn, identity_id="alice")
         seed_token_policies(conn, identity_id="alice")
     authority = SQLiteLocalSessionOperationAuthority(engine)
     service = SessionServiceImpl(

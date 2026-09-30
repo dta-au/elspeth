@@ -63,6 +63,7 @@ async def governed_app(tmp_path: Path) -> AsyncIterator[GovernedApp]:
             ensure_test_identity(conn, identity_id=identity_id)
         grants = (
             ("alice", "admin"),
+            ("alice", "user"),
             ("erin", "admin"),
             ("bob", "approver"),
             ("carol", "approver"),

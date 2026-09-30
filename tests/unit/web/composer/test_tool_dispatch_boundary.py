@@ -176,7 +176,7 @@ def test_execute_tool_rejects_invalid_set_pipeline_source_selection_before_handl
 def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
     result = execute_tool(
         "get_pipeline_state",
-        {"component": {"secret": "sk-test-secret"}},
+        {"component": {"unexpected": "distinct-schema-canary"}},
         _empty_state(),
         _catalog(),
         tool_arguments_hash="0" * 64,
@@ -186,7 +186,7 @@ def test_execute_tool_rejects_wrong_argument_types_before_handler() -> None:
     assert result.success is False
     assert "Invalid arguments for tool 'get_pipeline_state'" in result.validation.errors[0].message
     assert "type" in result.validation.errors[0].message
-    assert "sk-test-secret" not in result.validation.errors[0].message
+    assert "distinct-schema-canary" not in result.validation.errors[0].message
 
 
 def test_source_path_arguments_require_data_dir_for_s2_confinement() -> None:

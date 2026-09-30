@@ -26,7 +26,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, P
 from elspeth.web.config import WebSettings
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.sessions.protocol import CompositionStateData
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.integration.web.conftest import (
     _TEST_AUTHED_USER_ID,
     _lifespan_test_client,
@@ -58,8 +58,12 @@ def _build_repair_pass_app(tmp_path: Path) -> FastAPI:
         composer_boot_probe_enabled=False,
     )
     app = create_app(settings=settings)
-    with app.state.session_engine.begin() as conn:
-        ensure_test_identity(conn, identity_id=_TEST_AUTHED_USER_ID)
+    wire_test_pipeline_user_authority(
+        app,
+        identity_id=_TEST_AUTHED_USER_ID,
+        provider=settings.auth_provider,
+        engine=app.state.session_engine,
+    )
     identity = UserIdentity(user_id=_TEST_AUTHED_USER_ID, username=_TEST_AUTHED_USER_ID)
 
     async def _mock_user() -> UserIdentity:

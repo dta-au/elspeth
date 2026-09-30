@@ -477,6 +477,11 @@ def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
     for post_pin_section, empty_default in _post_pin_empty_defaults.items():
         if settings.get(post_pin_section) == empty_default:
             settings.pop(post_pin_section, None)
+    landscape = settings.get("landscape")
+    if isinstance(landscape, dict):
+        export = landscape.get("export")
+        if isinstance(export, dict) and export.get("authentication_policy") == "optional":
+            export.pop("authentication_policy")
     for section in ("sources", "sinks"):
         declarations = settings.get(section)
         if not isinstance(declarations, dict):

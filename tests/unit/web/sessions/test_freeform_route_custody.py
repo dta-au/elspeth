@@ -20,7 +20,7 @@ from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.routes._helpers import _join_freeform_owned_task
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 from tests.unit.web.sessions.test_routes import _llm_call, _make_app, _ProgressAwareComposer
 
@@ -41,8 +41,7 @@ def _file_app(tmp_path):
     old_service._engine.dispose()
     engine = create_session_engine(f"sqlite:///{tmp_path / 'freeform-custody.db'}")
     initialize_session_schema(engine)
-    with engine.begin() as conn:
-        ensure_test_identity(conn, identity_id="alice")
+    wire_test_pipeline_user_authority(app, identity_id="alice", engine=engine)
     service = FencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
     app.state.session_service = service
     app.state.session_engine = engine

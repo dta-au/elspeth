@@ -116,6 +116,9 @@ def credential_material_tool_arguments_projection(tool_name: str, arguments: Any
     if type(arguments) is not dict:
         return arguments
     projected = dict(arguments)
+    if tool_name == "wire_secret_ref" and "option_key" in projected:
+        projected["structural_option_name"] = projected.pop("option_key")
+        return projected
     if tool_name in {"create_blob", "update_blob"} and "content" in projected:
         projected["content"] = _OUT_OF_SCOPE_DATA_PLANE_CONTENT
         return projected

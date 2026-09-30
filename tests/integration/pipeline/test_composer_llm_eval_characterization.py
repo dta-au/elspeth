@@ -67,6 +67,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.fixtures.factories import make_context
+from tests.fixtures.identities import grant_test_pipeline_user
 from tests.helpers.session_fences import acquire_compose_context, seed_session_operation_fence
 from tests.integration.web.conftest import _make_session
 
@@ -243,6 +244,7 @@ def _session_service_for_characterization(
     )
     with engine.begin() as conn:
         _make_session(conn, session_id=session_id, user_id=EVAL_USER_ID)
+        grant_test_pipeline_user(conn, identity_id=EVAL_USER_ID)
         # Production sessions are born with their released epoch-1 fence;
         # a hand-inserted row needs the same so the compose lease can be
         # acquired without a repair write (which the commit-failure

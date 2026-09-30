@@ -171,7 +171,7 @@ def test_incremental_rejects_before_options_and_keeps_audit_arguments(monkeypatc
     normalize = create_autospec(transforms_tools._options_with_default_llm_reviews, side_effect=AssertionError("option normalization ran"))
     monkeypatch.setattr(transforms_tools, "_prevalidate_transform_for_context", prevalidate)
     monkeypatch.setattr(transforms_tools, "_options_with_default_llm_reviews", normalize)
-    arguments = _node(options={"api_key": "PRIVATE_OPTION_SENTINEL"})
+    arguments = _node(options={"value_field": "OPTION_SENTINEL"})
     result = execute_tool("upsert_node", arguments, state, context.catalog, plugin_snapshot=context.plugin_snapshot)
     assert not result.success
     assert result.updated_state is state
@@ -189,7 +189,7 @@ def test_incremental_rejects_before_options_and_keeps_audit_arguments(monkeypatc
     admitted = json.loads(persisted["arguments_canonical"])
     assert admitted["output_mode"] == "passthrough"
     assert admitted["expected_output_count"] == 1
-    assert "PRIVATE_OPTION_SENTINEL" not in json.dumps(envelope)
+    assert "OPTION_SENTINEL" not in json.dumps(envelope)
 
 
 @pytest.mark.parametrize("source_kind", ["inline", "reference"])

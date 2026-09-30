@@ -40,7 +40,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.fixtures.audit_hashing import fake_sha256
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.fixtures.mock_audit import mock_audit_authority
 from tests.helpers.fenced_session import seed_token_policies
@@ -66,6 +66,7 @@ async def test_run_admission_keeps_worker_and_lease_until_receipt(tmp_path, monk
     initialize_session_schema(engine)
     with engine.begin() as connection:
         ensure_test_identity(connection, identity_id="alice")
+        grant_test_pipeline_user(connection, identity_id="alice")
         seed_token_policies(connection, identity_id="alice")
     service = SessionServiceImpl(
         engine,
@@ -296,6 +297,7 @@ async def test_committed_run_admission_lost_receipt_is_integrity_failure_without
     initialize_session_schema(engine)
     with engine.begin() as connection:
         ensure_test_identity(connection, identity_id="alice")
+        grant_test_pipeline_user(connection, identity_id="alice")
     service = SessionServiceImpl(
         engine,
         telemetry=build_sessions_telemetry(),
@@ -371,6 +373,7 @@ async def test_run_settlement_lost_receipt_replays_exact_real_landscape_call(tmp
     initialize_session_schema(engine)
     with engine.begin() as connection:
         ensure_test_identity(connection, identity_id="alice")
+        grant_test_pipeline_user(connection, identity_id="alice")
     service = SessionServiceImpl(
         engine,
         telemetry=build_sessions_telemetry(),

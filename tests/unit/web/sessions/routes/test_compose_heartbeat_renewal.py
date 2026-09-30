@@ -35,8 +35,10 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.progress import ComposerRequestLease
+from elspeth.web.config import WebSettings
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, SessionComposerProgressAuthority
 from elspeth.web.sessions.routes import _helpers
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.unit.web.sessions.test_routes import _make_progress_route_app
 
 _INSTANT_FAILURES_TO_CANCEL = 3
@@ -327,6 +329,14 @@ async def test_dependency_teardown_503_reaches_the_http_client(monkeypatch: pyte
     registry = _ScriptedRegistry(script=deque([ComposerRequestLeaseLost("gone")] * (bound + 5)))
     finished = _install(monkeypatch, registry)
     app = FastAPI()
+    app.state.settings = WebSettings(
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    wire_test_pipeline_user_authority(app, identity_id="user")
 
     async def mock_user() -> UserIdentity:
         return UserIdentity(user_id="user", username="user")

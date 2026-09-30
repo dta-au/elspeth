@@ -125,7 +125,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
 
@@ -686,6 +686,7 @@ def result_session_id(composer_service_with_real_sessions: ComposerServiceImpl) 
     assert sessions_service is not None
     with sessions_service._engine.begin() as conn:
         ensure_test_identity(conn, identity_id="phase3-test-user")
+        grant_test_pipeline_user(conn, identity_id="phase3-test-user")
     session = sessions_service.session_operation_authority.create_session_with_initial_fence(
         user_id="phase3-test-user",
         auth_provider_type="local",

@@ -50,6 +50,7 @@ import pytest
 
 from elspeth.web.composer.state import NodeSpec, queue_node_contract_error
 from elspeth.web.composer.tools.transforms import _UpsertNodeArgumentsModel
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from tests.unit.web.composer.test_tools import (
     _empty_state,
     _mock_catalog,
@@ -87,7 +88,6 @@ class TestValidatedBranchesAreReconstructed:
         [
             pytest.param(dict(_BRANCH_MAP), id="plain-dict"),
             pytest.param(MappingProxyType(dict(_BRANCH_MAP)), id="mappingproxy"),
-            pytest.param(_PlainDictSubclass(_BRANCH_MAP), id="dict-subclass"),
         ],
     )
     def test_every_mapping_carrier_validates_to_exactly_dict(self, carrier: Any) -> None:
@@ -148,7 +148,6 @@ class TestBranchesSurviveTheUpsertAsNamedBranches:
         [
             pytest.param(dict(_BRANCH_MAP), id="plain-dict"),
             pytest.param(MappingProxyType(dict(_BRANCH_MAP)), id="mappingproxy"),
-            pytest.param(_PlainDictSubclass(_BRANCH_MAP), id="dict-subclass"),
         ],
     )
     def test_mapping_branches_persist_as_a_mapping_not_a_tuple_of_keys(self, carrier: Any) -> None:
@@ -161,6 +160,16 @@ class TestBranchesSurviveTheUpsertAsNamedBranches:
             "discriminator fell through to tuple(...) and silently dropped the branch names"
         )
         assert dict(node.branches) == _BRANCH_MAP
+
+    def test_public_dispatch_refuses_a_dict_subclass_before_normalisation(self) -> None:
+        state = _empty_state()
+
+        with pytest.raises(CredentialMaterialRefused) as caught:
+            execute_tool("upsert_node", _coalesce_arguments(_PlainDictSubclass(_BRANCH_MAP)), state, _mock_catalog())
+
+        assert caught.value.surface == "composer_tool_arguments"
+        assert caught.value.finding.category == "unsupported_value"
+        assert state.nodes == ()
 
     def test_sequence_branches_persist_as_a_tuple(self) -> None:
         result = execute_tool(

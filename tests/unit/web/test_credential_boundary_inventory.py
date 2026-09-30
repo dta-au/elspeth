@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.tree_gate import iter_gate_sources
+
 ROOT = Path(__file__).resolve().parents[3]
 
 _EXPLICIT_REQUEST_BASES = frozenset({"_Provenance", "CreateInlineBlobRequest"})
@@ -128,9 +130,9 @@ class ExampleResponse(BaseModel):
 
 def test_every_scoped_request_free_text_field_has_a_closed_disposition() -> None:
     observed: set[str] = set()
-    for module in (ROOT / "src/elspeth/web").rglob("*.py"):
-        relative = str(module.relative_to(ROOT))
-        observed.update(_free_text_request_fields(module.read_text(encoding="utf-8"), path=relative))
+    for parsed in iter_gate_sources(ROOT / "src/elspeth/web"):
+        relative = parsed.path.relative_to(ROOT).as_posix()
+        observed.update(_free_text_request_fields(parsed.source, path=relative))
 
     assert observed == set(_FREE_TEXT_DISPOSITIONS)
     assert set(_FREE_TEXT_DISPOSITIONS.values()) == {
@@ -459,7 +461,7 @@ def _constructor_calls(source: str, *, path: str, names: frozenset[str]) -> set[
 
 
 def _llm_audit_sources() -> dict[str, str]:
-    return {path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8") for path in (ROOT / "src/elspeth").rglob("*.py")}
+    return {parsed.path.relative_to(ROOT).as_posix(): parsed.source for parsed in iter_gate_sources(ROOT / "src/elspeth")}
 
 
 def _assert_llm_audit_constructor_inventory(sources: dict[str, str]) -> None:
@@ -658,9 +660,9 @@ def _call_sites(source: str, *, path: str, names: frozenset[str]) -> set[str]:
 def test_state_use_and_publication_inventory_discovers_new_materialization_sites() -> None:
     observed: set[str] = set()
     names = frozenset({"_state_from_record", "composition_state_from_runtime_yaml", "state_from_record"})
-    for module in (ROOT / "src/elspeth/web").rglob("*.py"):
-        relative = str(module.relative_to(ROOT))
-        observed.update(_call_sites(module.read_text(encoding="utf-8"), path=relative, names=names))
+    for parsed in iter_gate_sources(ROOT / "src/elspeth/web"):
+        relative = parsed.path.relative_to(ROOT).as_posix()
+        observed.update(_call_sites(parsed.source, path=relative, names=names))
 
     assert observed == set(_STATE_MATERIALIZATION_DISPOSITIONS)
 
@@ -668,9 +670,9 @@ def test_state_use_and_publication_inventory_discovers_new_materialization_sites
 def test_state_guard_inventory_and_removal_mutation_control() -> None:
     observed: set[str] = set()
     names = frozenset({"require_no_credential_material_in_state"})
-    for module in (ROOT / "src/elspeth").rglob("*.py"):
-        relative = str(module.relative_to(ROOT))
-        observed.update(_call_sites(module.read_text(encoding="utf-8"), path=relative, names=names))
+    for parsed in iter_gate_sources(ROOT / "src/elspeth"):
+        relative = parsed.path.relative_to(ROOT).as_posix()
+        observed.update(_call_sites(parsed.source, path=relative, names=names))
 
     expected = {f"{scope}.require_no_credential_material_in_state" for scope in _STATE_GUARD_DISPOSITIONS}
     assert observed == expected

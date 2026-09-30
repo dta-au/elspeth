@@ -41,7 +41,7 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
-_SENSITIVE_SENTINEL: Final[str] = "sk-sensitive-requirement-value"
+_SENSITIVE_SENTINEL: Final[str] = "sensitive-requirement-value"
 _PLUGIN_NAMES: Final[tuple[str | None, ...]] = (
     "llm",
     "passthrough",

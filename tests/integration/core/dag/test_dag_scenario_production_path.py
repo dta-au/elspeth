@@ -2342,7 +2342,7 @@ def test_exact_corpus_export_rejects_changed_or_missing_compartment_marking(
         corpus_harness.run_scenario_case(scenario, case, tmp_path)
 
 
-def test_semantic_run_settings_keep_auth_v2_and_unset_compartment(tmp_path: Path) -> None:
+def test_semantic_run_settings_normalize_default_authentication_policy_only(tmp_path: Path) -> None:
     _scenario, case = _declared_case("linear", "happy-path")
     settings = corpus_harness.render_settings(case, tmp_path).settings.model_dump(mode="json")
     semantic = corpus_harness._semantic_run_settings(settings)
@@ -2352,6 +2352,20 @@ def test_semantic_run_settings_keep_auth_v2_and_unset_compartment(tmp_path: Path
     assert isinstance(export_settings, dict)
     assert export_settings["exporter_version"] == "landscape-exporter-auth-v2"
     assert export_settings["compartment_id"] is None
+    assert "authentication_policy" not in export_settings
+
+    raw_landscape_settings = settings["landscape"]
+    assert isinstance(raw_landscape_settings, dict)
+    raw_export_settings = raw_landscape_settings["export"]
+    assert isinstance(raw_export_settings, dict)
+    raw_export_settings["authentication_policy"] = "required"
+
+    explicit_semantic = corpus_harness._semantic_run_settings(settings)
+    explicit_landscape_settings = explicit_semantic["landscape"]
+    assert isinstance(explicit_landscape_settings, dict)
+    explicit_export_settings = explicit_landscape_settings["export"]
+    assert isinstance(explicit_export_settings, dict)
+    assert explicit_export_settings["authentication_policy"] == "required"
 
 
 def test_exact_runtime_projection_linear_matches_declared_durable_and_export(

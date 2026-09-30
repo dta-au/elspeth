@@ -34,7 +34,7 @@ from elspeth.web.sessions.models import chat_messages_table, quota_provider_atte
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.fenced_session import IDENTITY_TOKENS_PER_DAY, seed_token_policies
 from tests.unit.web.composer.test_pipeline_planner import _custody, _origin, _plan, _response, _ScriptedCompletion
 
@@ -45,6 +45,7 @@ def quota_service(tmp_path: Path) -> Iterator[tuple[Engine, SessionServiceImpl, 
     initialize_session_schema(engine)
     with engine.begin() as connection:
         ensure_test_identity(connection, identity_id="alice")
+        grant_test_pipeline_user(connection, identity_id="alice")
         seed_token_policies(connection, identity_id="alice")
     refusals: list[QuotaExceeded] = []
     service = SessionServiceImpl(

@@ -158,6 +158,27 @@ def test_catch_order_accepts_admission_refusal_before_supertype(tmp_path: Path, 
     assert _catch_order_findings(tmp_path, source) == []
 
 
+@pytest.mark.parametrize("supertype", ["ComposerAdmissionRefused", "ComposerServiceError", "Exception", "BaseException"])
+def test_catch_order_reports_shadowed_credential_material_refusal(tmp_path: Path, supertype: str) -> None:
+    source = (
+        f"def f():\n    try:\n        pass\n    except {supertype}:\n        pass\n    except CredentialMaterialRefused:\n        pass\n"
+    )
+
+    findings = _catch_order_findings(tmp_path, source)
+
+    assert [finding.rule_id for finding in findings] == ["CCO1"]
+    assert "CredentialMaterialRefused" in findings[0].message
+
+
+@pytest.mark.parametrize("supertype", ["ComposerAdmissionRefused", "ComposerServiceError", "Exception", "BaseException"])
+def test_catch_order_accepts_credential_material_refusal_before_supertype(tmp_path: Path, supertype: str) -> None:
+    source = (
+        f"def f():\n    try:\n        pass\n    except CredentialMaterialRefused:\n        pass\n    except {supertype}:\n        pass\n"
+    )
+
+    assert _catch_order_findings(tmp_path, source) == []
+
+
 def test_catch_order_reports_tuple_handler_shadowing_subclass(tmp_path: Path) -> None:
     source = (
         "def f():\n"
@@ -275,6 +296,7 @@ def test_catch_order_accepts_broad_exception_after_subclass(tmp_path: Path) -> N
 def test_catch_order_declared_map_matches_real_composer_exception_mro() -> None:
     import_module("elspeth.web.composer.protocol")
     import_module("elspeth.web.composer.service")
+    import_module("elspeth.web.credential_guard")
 
     from elspeth.web.composer.protocol import ComposerServiceError
 

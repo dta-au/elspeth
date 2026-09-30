@@ -3,6 +3,7 @@
 import pytest
 from pydantic import SecretBytes
 from sqlalchemy import select, update
+from tests.fixtures.identities import grant_test_pipeline_user
 from typer.testing import CliRunner
 
 from elspeth.cli import app
@@ -64,6 +65,8 @@ def test_cli_quota_policy_is_not_disabled_by_absent_issuance_defaults(tmp_path, 
         with engine.connect() as conn:
             identity_id = conn.execute(select(identities_table.c.identity_id)).scalar_one()
             quota_id = conn.execute(select(quota_policies_table.c.policy_id)).scalar_one_or_none()
+        with engine.begin() as conn:
+            grant_test_pipeline_user(conn, identity_id=identity_id)
         assert (quota_id is not None) is explicit_quota
         authority = SQLiteLocalSessionOperationAuthority(engine)
         session = authority.create_session_with_initial_fence(

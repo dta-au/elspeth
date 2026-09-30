@@ -24,6 +24,7 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -81,6 +82,7 @@ class TestEndToEndPipelineExecution:
             composer_max_composition_turns=15,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
+            composer_boot_probe_enabled=False,
             composer_rate_limit_per_minute=10,
             shareable_link_signing_key=b"\x00" * 32,
         )
@@ -89,6 +91,7 @@ class TestEndToEndPipelineExecution:
         # Create test user via the auth provider directly (no /register endpoint)
         auth_provider = app.state.auth_provider
         auth_provider.create_user("testuser", "testpass123", display_name="Test User")
+        wire_test_pipeline_user_authority(app, identity_id="testuser", engine=app.state.session_engine)
 
         from asgi_lifespan import LifespanManager
 
@@ -275,6 +278,7 @@ class TestGateRoutedPipelineExecution:
             composer_max_composition_turns=15,
             composer_max_discovery_turns=10,
             composer_timeout_seconds=85.0,
+            composer_boot_probe_enabled=False,
             composer_rate_limit_per_minute=10,
             shareable_link_signing_key=b"\x00" * 32,
         )
@@ -282,6 +286,7 @@ class TestGateRoutedPipelineExecution:
 
         auth_provider = app.state.auth_provider
         auth_provider.create_user("gateuser", "gatepass123", display_name="Gate User")
+        wire_test_pipeline_user_authority(app, identity_id="gateuser", engine=app.state.session_engine)
 
         from asgi_lifespan import LifespanManager
 
@@ -476,6 +481,7 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
         composer_max_composition_turns=15,
         composer_max_discovery_turns=10,
         composer_timeout_seconds=85.0,
+        composer_boot_probe_enabled=False,
         composer_rate_limit_per_minute=10,
         secret_key="x" * 32,
         shareable_link_signing_key=b"\x00" * 32,
@@ -492,6 +498,7 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
     app = create_app(settings=settings)
     auth_provider = app.state.auth_provider
     auth_provider.create_user("sourceuser", "testpass123", display_name="Source User")
+    wire_test_pipeline_user_authority(app, identity_id="sourceuser", engine=app.state.session_engine)
 
     unrestricted = PluginAvailabilitySnapshot.for_trained_operator(app.state.catalog_service)
     snapshot = PluginAvailabilitySnapshot.create(

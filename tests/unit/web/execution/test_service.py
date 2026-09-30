@@ -3620,6 +3620,7 @@ landscape:
   export:
     enabled: true
     sink: audit
+    signing_mode: unsigned
     total_record_limit: 10
     total_byte_limit: 1000
     chunk_limit: 2

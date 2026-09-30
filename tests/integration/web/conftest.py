@@ -52,7 +52,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, wire_test_pipeline_user_authority
 from tests.helpers.composer_lease import install_fenced_compose_adapter
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 from tests.unit.web.sessions.session_test_authority import FencedSessionServiceHarness
@@ -278,6 +278,12 @@ def _build_audit_readiness_app(
 
         app.dependency_overrides[get_current_user] = _unauthenticated
     else:
+        wire_test_pipeline_user_authority(
+            app,
+            identity_id=authed_user_id,
+            provider=settings.auth_provider,
+            engine=app.state.session_engine,
+        )
         identity = UserIdentity(user_id=authed_user_id, username=authed_user_id)
 
         async def _mock_user() -> UserIdentity:

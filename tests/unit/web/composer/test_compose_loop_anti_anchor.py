@@ -34,7 +34,7 @@ from elspeth.web.composer.service import (
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.routes._helpers import _composer_chat_history
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.unit.web.composer._helpers import _composer_service_with_session
 
 from .conftest import build_test_sessions_service
@@ -208,6 +208,7 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
     sessions = build_test_sessions_service(data_dir=tmp_path)
     with sessions._engine.begin() as conn:
         ensure_test_identity(conn, identity_id="anti-anchor-user")
+        grant_test_pipeline_user(conn, identity_id="anti-anchor-user")
     session = await sessions.create_session("anti-anchor-user", "Anti-anchor audit", "local")
     service = ComposerServiceImpl.for_trained_operator(
         catalog=catalog,
@@ -275,6 +276,7 @@ async def test_replayed_anti_anchor_user_role_is_not_misattributed_to_the_human(
     sessions = build_test_sessions_service(data_dir=tmp_path)
     with sessions._engine.begin() as conn:
         ensure_test_identity(conn, identity_id="anti-anchor-user")
+        grant_test_pipeline_user(conn, identity_id="anti-anchor-user")
     session = await sessions.create_session("anti-anchor-user", "History custody", "local")
     await sessions.add_message(
         session.id,

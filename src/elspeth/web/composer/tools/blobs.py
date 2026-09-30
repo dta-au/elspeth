@@ -118,7 +118,7 @@ def _credential_safe_blob_discovery_result(
     payload: Any,
     *,
     surface: str,
-) -> ToolResult:
+) -> ToolResult | None:
     """Return a fixed tool refusal when legacy blob output is unsafe."""
     try:
         require_no_credential_material(payload, surface=surface)
@@ -128,7 +128,7 @@ def _credential_safe_blob_discovery_result(
             CREDENTIAL_REFUSAL_DETAIL,
             error_code="credential_material_rejected",
         )
-    return _discovery_result(state, payload)
+    return None
 
 
 class WireBlobInlineRefArgumentsModel(BaseModel):
@@ -574,7 +574,10 @@ def _handle_list_blobs(
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
     blobs = _sync_list_blobs(session_engine, session_id)
-    return _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata")
+    refusal = _credential_safe_blob_discovery_result(state, blobs, surface="composer_blob_metadata")
+    if refusal is not None:
+        return refusal
+    return _discovery_result(state, blobs)
 
 
 _LIST_BLOBS_DECLARATION = ToolDeclaration(
@@ -606,11 +609,15 @@ def _handle_list_composer_blobs(
     session_id = context.session_id
     if session_engine is None or session_id is None:
         return _failure_result(state, "Blob tools require session context.")
-    return _credential_safe_blob_discovery_result(
+    payload = {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)}
+    refusal = _credential_safe_blob_discovery_result(
         state,
-        {"blobs": _sync_list_ready_blob_inline_descriptors(session_engine, session_id)},
+        payload,
         surface="composer_blob_metadata",
     )
+    if refusal is not None:
+        return refusal
+    return _discovery_result(state, payload)
 
 
 _LIST_COMPOSER_BLOBS_DECLARATION = ToolDeclaration(
@@ -651,7 +658,10 @@ def _handle_get_blob_metadata(
         "content_hash": blob["content_hash"],
         "status": blob["status"],
     }
-    return _credential_safe_blob_discovery_result(state, safe_blob, surface="composer_blob_metadata")
+    refusal = _credential_safe_blob_discovery_result(state, safe_blob, surface="composer_blob_metadata")
+    if refusal is not None:
+        return refusal
+    return _discovery_result(state, safe_blob)
 
 
 _GET_BLOB_METADATA_DECLARATION = ToolDeclaration(
@@ -2036,7 +2046,10 @@ def _execute_get_blob_content(
         "created_by": blob["created_by"],
         "creation_modality": blob["creation_modality"],
     }
-    return _credential_safe_blob_discovery_result(state, payload, surface="composer_blob_content")
+    refusal = _credential_safe_blob_discovery_result(state, payload, surface="composer_blob_content")
+    if refusal is not None:
+        return refusal
+    return _discovery_result(state, payload)
 
 
 _GET_BLOB_CONTENT_DECLARATION = ToolDeclaration(

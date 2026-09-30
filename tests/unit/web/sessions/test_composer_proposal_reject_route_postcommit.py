@@ -343,11 +343,11 @@ async def test_cancellation_after_ordinary_accept_commit_drains_lease_cleanup(
 
     with pytest.raises(asyncio.CancelledError):
         await proposal_routes.accept_composition_proposal(
-            UUID(session["id"]),
-            proposal.id,
-            request,
-            None,
-            UserIdentity(user_id="alice", username="alice"),
+            session_id=UUID(session["id"]),
+            proposal_id=proposal.id,
+            request=request,
+            user=UserIdentity(user_id="alice", username="alice"),
+            body=None,
         )
 
     assert close_started.is_set()

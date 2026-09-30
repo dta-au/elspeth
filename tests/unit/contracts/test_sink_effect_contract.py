@@ -13,6 +13,7 @@ from types import MappingProxyType
 import pytest
 
 import elspeth.contracts as contracts
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_protocols import SinkEffectProtocol
 from elspeth.contracts.results import ArtifactDescriptor
@@ -507,6 +508,22 @@ def test_freeze_bounded_evidence_rejects_non_mapping() -> None:
     """Direct trust-boundary characterization for ``_freeze_bounded_evidence``."""
     with pytest.raises(TypeError, match="must be a mapping"):
         _freeze_bounded_evidence(object(), "evidence")  # type: ignore[arg-type]
+
+
+def test_freeze_bounded_evidence_scans_complete_large_ordinal_lists() -> None:
+    accepted_ordinals = list(range(1_000))
+
+    frozen = _freeze_bounded_evidence({"accepted_ordinals": accepted_ordinals}, "evidence")
+
+    assert deep_thaw(frozen) == {"accepted_ordinals": accepted_ordinals}
+
+
+def test_freeze_bounded_evidence_detects_a_credential_after_legacy_scrub_width() -> None:
+    candidate = "sk-" + "a" * 24
+    evidence = {"items": ["ordinary"] * 999 + [candidate]}
+
+    with pytest.raises(ValueError, match="must be credential-free"):
+        _freeze_bounded_evidence(evidence, "evidence")
 
 
 def test_verify_content_bytes_rejects_non_bytes_content() -> None:

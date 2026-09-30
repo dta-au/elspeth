@@ -16,12 +16,14 @@ from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from structlog.testing import capture_logs
 
+from elspeth.contracts.credential_material import CredentialMaterialFinding
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
 from elspeth.web.coordination.repository import SessionOperationConflictError
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.middleware.request_id import MAX_REQUEST_ID_LENGTH
 from elspeth.web.preferences.service import CorruptPreferencesError
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
@@ -597,6 +599,24 @@ _NONLEAKING_HANDLERS: tuple[type[Exception], ...] = (SessionOperationFenceLost, 
 
 
 @pytest.mark.asyncio
+async def test_credential_material_refused_handler_returns_fixed_correlated_422(tmp_path: Path) -> None:
+    app = create_app(_settings(tmp_path))
+    handler = app.exception_handlers[CredentialMaterialRefused]
+    exc = CredentialMaterialRefused(
+        surface="test_surface",
+        finding=CredentialMaterialFinding("credential_field", "mapping_value"),
+    )
+
+    response = await handler(_audit_request("req-credential-1"), exc)
+
+    assert response.status_code == 422
+    assert json.loads(response.body) == {
+        "detail": exc.to_payload(),
+        "request_id": "req-credential-1",
+    }
+
+
+@pytest.mark.asyncio
 async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path) -> None:
     """R2-F16b, stated once as a whole-surface invariant.
 
@@ -633,6 +653,13 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
         (RunAlreadyActiveError, RunAlreadyActiveError("x")),
         (FingerprintKeyMissingError, FingerprintKeyMissingError("x")),
         (SecretDecryptionError, SecretDecryptionError("x")),
+        (
+            CredentialMaterialRefused,
+            CredentialMaterialRefused(
+                surface="test_surface",
+                finding=CredentialMaterialFinding("credential_field", "mapping_value"),
+            ),
+        ),
         (OperationalError, OperationalError("SELECT 1", {}, Exception("db down"))),
         # Only a retryable errno becomes a 503 envelope; anything else is
         # deliberately re-raised as a real 500.
