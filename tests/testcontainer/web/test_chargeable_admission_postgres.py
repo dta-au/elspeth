@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Event
 from time import monotonic, sleep
 from typing import Any
@@ -17,6 +17,7 @@ from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind, StartPermitState
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.run_cancellation_authority import RepositoryRunCancellationAuthority
 from elspeth.web.execution.envelope import RunExecutionInput
@@ -254,6 +255,42 @@ def test_user_role_revoke_first_forces_wait_then_committed_refusal(admission_eng
             refused = future.result(timeout=10)
     finally:
         event.remove(admission_engine, "before_cursor_execute", probe)
+    assert refused.state is StartPermitState.REFUSED
+    assert refused.admission_decision is not None
+    assert refused.admission_decision.refusal_reason is AdmissionRefusalReason.USER_ROLE_REQUIRED
+
+
+def test_user_role_expiring_while_admission_waits_is_refused(admission_engine: Engine) -> None:
+    authority, context, run = _admit(admission_engine)
+    attempted = Event()
+    backend: list[int] = []
+    with admission_engine.begin() as conn:
+        expires_at = database_now(conn) + timedelta(seconds=3)
+        conn.execute(update(identity_roles_table).where(identity_roles_table.c.role_id == "user-role-alice").values(expires_at=expires_at))
+
+    def probe(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _execution_context: Any, _many: bool) -> None:
+        if statement.startswith("SELECT") and "FROM identity_roles" in statement and "FOR UPDATE" in statement:
+            backend.append(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+            attempted.set()
+
+    event.listen(admission_engine, "before_cursor_execute", probe)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with admission_engine.begin() as holder:
+                blocker = holder.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
+                holder.execute(
+                    update(identity_roles_table).where(identity_roles_table.c.role_id == "user-role-alice").values(expires_at=expires_at)
+                )
+                future = workers.submit(_issue, authority, context, run.id)
+                assert attempted.wait(10), "permit never attempted its user-role row lock"
+                _assert_lock_wait(admission_engine, backend[0], blocker)
+                assert database_now(holder) < expires_at
+                holder.exec_driver_sql("SELECT pg_sleep(4)")
+                assert database_now(holder) > expires_at
+            refused = future.result(timeout=10)
+    finally:
+        event.remove(admission_engine, "before_cursor_execute", probe)
+
     assert refused.state is StartPermitState.REFUSED
     assert refused.admission_decision is not None
     assert refused.admission_decision.refusal_reason is AdmissionRefusalReason.USER_ROLE_REQUIRED

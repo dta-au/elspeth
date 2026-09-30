@@ -10,11 +10,12 @@ from threading import Event
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import Engine, text, update
+from sqlalchemy import Engine, select, text, update
 from sqlalchemy.engine import make_url
 
 from elspeth.web.auth.models import IdentityClaims
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.identity_authority import (
     AdminAuthorityRequired,
     IdentityAdminActor,
@@ -23,7 +24,7 @@ from elspeth.web.coordination.identity_authority import (
     RepositoryIdentityAuthority,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import identities_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -94,6 +95,97 @@ def _age(engine: Engine, identity_id: str) -> None:
             .where(identities_table.c.identity_id == identity_id)
             .values(first_seen_at=datetime.now(UTC) - timedelta(days=120))
         )
+
+
+def test_admin_expiring_while_purge_waits_is_refused_without_delete_or_audit(purge_postgres: Engine) -> None:
+    setup = _authority(purge_postgres)
+    admin = setup.bootstrap_admin(
+        claims=IdentityClaims(provider="local", subject="root", username="root"),
+        note="bootstrap",
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        record=lambda _event: None,
+    )
+    actor = IdentityAdminActor(identity_id=admin.record.identity_id, on_behalf_of=None, console_request_id=None)
+    pending = _pending(setup, "expired-while-waiting")
+    _age(purge_postgres, pending)
+    with purge_postgres.begin() as conn:
+        expires_at = database_now(conn) + timedelta(seconds=3)
+        conn.execute(
+            update(identity_roles_table)
+            .where(identity_roles_table.c.identity_id == actor.identity_id, identity_roles_table.c.role == "admin")
+            .values(expires_at=expires_at)
+        )
+
+    waiting_engine = _named_engine(purge_postgres, "expiring-purger")
+    purger = _authority(waiting_engine)
+    events: list[PendingIdentitiesPurged] = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with purge_postgres.begin() as holder:
+                holder.execute(select(identities_table).where(identities_table.c.identity_id == actor.identity_id).with_for_update()).one()
+                future = pool.submit(
+                    purger.purge_stale_pending_identities,
+                    actor=actor,
+                    retention_days=90,
+                    record=events.append,
+                )
+                _wait_for_lock(purge_postgres, "expiring-purger")
+                assert database_now(holder) < expires_at
+                holder.exec_driver_sql("SELECT pg_sleep(4)")
+                assert database_now(holder) > expires_at
+            with pytest.raises(AdminAuthorityRequired):
+                future.result(timeout=10)
+    finally:
+        waiting_engine.dispose()
+
+    assert events == []
+    assert setup.read_identity(identity_id=pending) is not None
+
+
+def test_unexpired_admin_waiting_on_the_same_lock_still_purges_and_audits(purge_postgres: Engine) -> None:
+    setup = _authority(purge_postgres)
+    admin = setup.bootstrap_admin(
+        claims=IdentityClaims(provider="local", subject="root", username="root"),
+        note="bootstrap",
+        quota_tokens_per_day=None,
+        quota_storage_bytes=None,
+        record=lambda _event: None,
+    )
+    actor = IdentityAdminActor(identity_id=admin.record.identity_id, on_behalf_of=None, console_request_id=None)
+    pending = _pending(setup, "unexpired-after-wait")
+    _age(purge_postgres, pending)
+    with purge_postgres.begin() as conn:
+        expires_at = database_now(conn) + timedelta(seconds=30)
+        conn.execute(
+            update(identity_roles_table)
+            .where(identity_roles_table.c.identity_id == actor.identity_id, identity_roles_table.c.role == "admin")
+            .values(expires_at=expires_at)
+        )
+
+    waiting_engine = _named_engine(purge_postgres, "unexpired-purger")
+    purger = _authority(waiting_engine)
+    events: list[PendingIdentitiesPurged] = []
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with purge_postgres.begin() as holder:
+                holder.execute(select(identities_table).where(identities_table.c.identity_id == actor.identity_id).with_for_update()).one()
+                future = pool.submit(
+                    purger.purge_stale_pending_identities,
+                    actor=actor,
+                    retention_days=90,
+                    record=events.append,
+                )
+                _wait_for_lock(purge_postgres, "unexpired-purger")
+                assert not future.done()
+            outcome = future.result(timeout=10)
+    finally:
+        waiting_engine.dispose()
+
+    assert outcome.at < expires_at
+    assert outcome.identity_ids == (pending,)
+    assert events == [outcome]
+    assert setup.read_identity(identity_id=pending) is None
 
 
 def test_activation_and_parallel_purges_linearize_on_actual_deleted_rows(purge_postgres: Engine) -> None:

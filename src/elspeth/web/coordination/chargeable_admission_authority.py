@@ -62,7 +62,6 @@ class RepositoryChargeableAdmissionAuthority:
                     quota_disposition=QuotaDisposition.NOT_ASSESSED, secret_wiring_hash=policy.secret_wiring_hash
                 ),
             )
-        now = database_now(conn)
         user_roles = conn.execute(
             select(identity_roles_table.c.scope, identity_roles_table.c.expires_at, identity_roles_table.c.revoked_at)
             .where(
@@ -71,6 +70,7 @@ class RepositoryChargeableAdmissionAuthority:
             )
             .with_for_update()
         ).all()
+        now = database_now(conn)
         holds_user_role = any(
             row.scope is None and row.revoked_at is None and (row.expires_at is None or _ensure_utc(row.expires_at) > now)
             for row in user_roles

@@ -5,16 +5,19 @@ from __future__ import annotations
 import ast
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from time import sleep
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import SecretBytes
-from sqlalchemy import insert, update
+from sqlalchemy import Connection, event, insert, update
 
 from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.database_clock import database_now
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.sessions.models import identities_table, identity_roles_table
 from tests.fixtures.identities import ensure_test_identity
@@ -265,3 +268,59 @@ async def test_auditor_oversight_scoped_expired_and_service_principals_cannot_au
     with pytest.raises(HTTPException) as caught:
         await require_pipeline_user(request, UserIdentity(user_id="user", username="user"))
     assert caught.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_pipeline_user_expiry_is_checked_after_role_retrieval(engine, tmp_path) -> None:
+    authority = RepositoryIdentityAuthority(engine, lifecycle_effect=lambda _token, _event: None)
+    with engine.begin() as conn:
+        for identity_id in ("expires-during-read", "future-control"):
+            ensure_test_identity(conn, identity_id=identity_id)
+        now = database_now(conn)
+        _grant(conn, identity_id="expires-during-read", role="user", expires_at=now + timedelta(seconds=2))
+        _grant(conn, identity_id="future-control", role="user", expires_at=now + timedelta(seconds=60))
+
+    app = FastAPI()
+    app.state.settings = WebSettings(
+        data_dir=tmp_path,
+        composer_max_composition_turns=15,
+        composer_max_discovery_turns=10,
+        composer_timeout_seconds=85.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=SecretBytes(b"0" * 32),
+    )
+    app.state.identity_authority = authority
+    request = Request({"type": "http", "app": app, "headers": []})
+    role_reads = 0
+
+    def pause_before_role_retrieval(
+        _conn: Connection,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _execution_context: Any,
+        _many: bool,
+    ) -> None:
+        nonlocal role_reads
+        if statement.startswith("SELECT") and "FROM identity_roles" in statement:
+            role_reads += 1
+            sleep(2.2)
+
+    event.listen(engine, "before_cursor_execute", pause_before_role_retrieval)
+    try:
+        with engine.connect() as conn:
+            assert database_now(conn) < now + timedelta(seconds=2)
+        with pytest.raises(HTTPException) as caught:
+            await require_pipeline_user(
+                request,
+                UserIdentity(user_id="expires-during-read", username="expires-during-read"),
+            )
+        assert caught.value.status_code == 403
+        assert caught.value.detail["error_type"] == "user_role_required"
+
+        admitted = await require_pipeline_user(request, UserIdentity(user_id="future-control", username="future-control"))
+        assert admitted.user_id == "future-control"
+    finally:
+        event.remove(engine, "before_cursor_execute", pause_before_role_retrieval)
+
+    assert role_reads == 2

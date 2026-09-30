@@ -2406,11 +2406,11 @@ class RepositoryIdentityAuthority:
         _require_nonblank(identity_id, "identity_id")
         _require_role(role)
         with self._engine.connect() as conn:
-            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             identity = conn.execute(_IDENTITY_BY_ID, {"identity_id": identity_id}).one_or_none()
             if identity is None or identity.kind != "human" or identity.provider != provider or identity.access_state != "active":
                 return False
             rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
         return any(grant.role == role and grant.scope is None for grant in _active_grants(rows, now))
 
     def is_active_human_identity(self, *, identity_id: str, provider: AuthProviderType) -> bool:
@@ -3249,17 +3249,17 @@ class RepositoryIdentityAuthority:
         if type(retention_days) is not int or retention_days < 1:
             raise ValueError("retention_days must be a positive integer")
         with self._engine.begin() as conn:
-            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
             # Match role-revocation lock order: every mutation that can remove
             # admin authority first locks the live human-admin population.
             # The exact actor row/grants are then locked so authorization and
-            # deletion share one linearization point on PostgreSQL.
+            # deletion share one linearization point on PostgreSQL. Sample
+            # database time only after those locks: a grant that expires while
+            # this transaction waits must not authorize the purge.
             conn.execute(_ADMIN_HOLDER_ROWS_FOR_UPDATE).all()
             actor_row = conn.execute(_IDENTITY_BY_ID_FOR_UPDATE, {"identity_id": actor.identity_id}).one_or_none()
-            actor_grants = _active_grants(
-                conn.execute(_ROLES_OF_IDENTITY_FOR_UPDATE, {"identity_id": actor.identity_id}).all(),
-                now,
-            )
+            actor_role_rows = conn.execute(_ROLES_OF_IDENTITY_FOR_UPDATE, {"identity_id": actor.identity_id}).all()
+            now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
+            actor_grants = _active_grants(actor_role_rows, now)
             verified = _verified_actor(actor, actor_row, actor_grants)
             cutoff = now - timedelta(days=retention_days)
             candidates = conn.execute(_PENDING_ROWS_FOR_PURGE).all()
