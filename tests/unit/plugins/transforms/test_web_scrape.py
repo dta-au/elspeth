@@ -2006,7 +2006,10 @@ def test_request_header_field_invalid_value_is_row_error_before_dns(mock_ctx: Pl
 
 
 @respx.mock
-def test_request_headers_static_and_row_fields_reach_get_without_credentials(mock_ctx: PluginContext) -> None:
+def test_request_headers_static_and_row_fields_reach_get_without_credentials(
+    mock_ctx: PluginContext, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
     route = respx.get(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
     options = _make_basic_transform_options()
     options.pop("url_field")
@@ -2059,7 +2062,8 @@ def test_request_header_audit_binds_wire_value_without_recording_plaintext(mock_
 
 
 @respx.mock
-def test_request_headers_reach_post_form(mock_ctx: PluginContext) -> None:
+def test_request_headers_reach_post_form(mock_ctx: PluginContext, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key-for-fingerprinting")
     route = respx.post(f"https://{_TEST_IP}:443/search").mock(return_value=httpx.Response(200, text="<main>Found</main>"))
     options = _make_basic_transform_options()
     options.pop("url_field")

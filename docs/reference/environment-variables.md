@@ -76,6 +76,10 @@ Used to HMAC-sign exported audit records for integrity verification. Only requir
 
 **Development only.** When set to `true`, allows running pipelines without `ELSPETH_FINGERPRINT_KEY` even when configs contain secrets. Secrets will be stored in plain text in the audit trail.
 
+Configured `web_scrape` request headers still require `ELSPETH_FINGERPRINT_KEY`
+in this mode. Their HMAC fingerprints preserve request identity for replay and
+verify without exposing header values through an unkeyed digest.
+
 **Never use in production.** This is intended only for local development and testing.
 
 ### ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS

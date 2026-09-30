@@ -9,6 +9,8 @@ Covers all branches exhaustively per the spec:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 import urllib.parse
 from unittest.mock import patch
@@ -177,26 +179,36 @@ class TestFingerprintHeaders:
         with patch.dict(os.environ, env, clear=True), pytest.raises(FrameworkBugError, match="ELSPETH_FINGERPRINT_KEY"):
             fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
 
-    def test_configured_row_header_hmac_binds_value_without_exposure(self) -> None:
+    @pytest.mark.parametrize("allow_raw", ["false", "true"])
+    def test_configured_row_header_hmac_binds_value_without_exposure(self, allow_raw: str) -> None:
         env = dict(os.environ)
         env["ELSPETH_FINGERPRINT_KEY"] = "test-key-for-fingerprinting"
-        env.pop("ELSPETH_ALLOW_RAW_SECRETS", None)
+        env["ELSPETH_ALLOW_RAW_SECRETS"] = allow_raw
         with patch.dict(os.environ, env, clear=True):
             first = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
             second = fingerprint_headers({"Accept-Language": "en-NZ"}, force_fingerprint_names=frozenset({"accept-language"}))
-        assert first["Accept-Language"].startswith("<fingerprint:")
+            repeated = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+            os.environ["ELSPETH_FINGERPRINT_KEY"] = "different-test-fingerprint-key"
+            changed_key = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
+        expected = hmac.new(b"test-key-for-fingerprinting", b"en-AU", hashlib.sha256).hexdigest()
+        assert first["Accept-Language"] == f"<fingerprint:{expected}>"
+        assert repeated == first
         assert first != second
+        assert first != changed_key
         assert "en-AU" not in str(first)
 
-    def test_configured_row_header_dev_fingerprint_still_binds_value(self) -> None:
+    @pytest.mark.parametrize("key", [None, ""])
+    @pytest.mark.parametrize("value", ["0000", "0001"])
+    @pytest.mark.parametrize("name", ["X-Requested-With", "Authorization"])
+    def test_configured_header_dev_mode_requires_hmac_key(self, key: str | None, value: str, name: str) -> None:
+        """Development mode must not expose enumerable values through an unkeyed hash."""
         env = {k: v for k, v in os.environ.items() if k != "ELSPETH_FINGERPRINT_KEY"}
         env["ELSPETH_ALLOW_RAW_SECRETS"] = "true"
-        with patch.dict(os.environ, env, clear=True):
-            first = fingerprint_headers({"Accept-Language": "en-AU"}, force_fingerprint_names=frozenset({"accept-language"}))
-            second = fingerprint_headers({"Accept-Language": "en-NZ"}, force_fingerprint_names=frozenset({"accept-language"}))
-        assert first["Accept-Language"].startswith("<sha256:")
-        assert first != second
-        assert "en-AU" not in str(first)
+        if key is not None:
+            env["ELSPETH_FINGERPRINT_KEY"] = key
+        with patch.dict(os.environ, env, clear=True), pytest.raises(FrameworkBugError, match="ELSPETH_FINGERPRINT_KEY") as error:
+            fingerprint_headers({name: value}, force_fingerprint_names=frozenset({name.casefold()}))
+        assert value not in str(error.value)
 
 
 class TestFilterResponseHeaders:
