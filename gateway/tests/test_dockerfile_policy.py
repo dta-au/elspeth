@@ -4,10 +4,9 @@ Dockerfile's ``ENTRYPOINT`` names.
 
 The Dockerfile assertions here never invoke a docker daemon: they parse the
 Dockerfile as text, so they run in the same fast, hermetic ``pytest tests``
-pass as everything else. The real proof that the image builds, runs
-non-root, serves traffic, and survives a read-only rootfs is the separate,
-manual container-verification step recorded in the task report -- that step
-needs a docker daemon this suite cannot assume.
+pass as everything else. The required CI gateway job separately proves that
+the image builds, runs non-root, serves traffic, and survives a read-only
+rootfs; this suite cannot perform that daemon-backed qualification itself.
 """
 
 import re
@@ -73,6 +72,34 @@ def test_dockerfile_pins_base_image_by_digest_not_floating_tag():
 
 def test_dockerfile_final_stage_has_no_pip_install():
     assert "pip install" not in _final_stage_text()
+
+
+def test_dockerfile_has_no_dependency_resolving_pip_install_in_any_stage():
+    text = _dockerfile_text()
+
+    assert "/pip install" not in text
+    assert "python -m pip install" not in text
+    wheel_installs = [block for block in text.split("uv pip install") if block.startswith(" ")]
+    assert len(wheel_installs) == 1
+    assert "--no-deps /dist/elspeth_llm_gateway-*.whl" in wheel_installs[0]
+
+
+def test_dockerfile_uses_digest_pinned_uv_and_the_standalone_frozen_lock():
+    text = _dockerfile_text()
+
+    assert re.search(
+        r"COPY --from=ghcr\.io/astral-sh/uv@sha256:[0-9a-f]{64} /uv /usr/local/bin/uv",
+        text,
+    )
+    assert "COPY pyproject.toml uv.lock ./" in text
+    sync_starts = [match.start() for match in re.finditer(r"\buv sync \\", text)]
+    assert len(sync_starts) == 2
+    assert all("--frozen" in text[start : start + 300] for start in sync_starts)
+    assert "--no-install-project" in text
+    assert "--group container-build" in text
+    assert "uv build" in text
+    assert "--no-build-isolation" in text
+    assert "--no-default-groups" in text
 
 
 def test_dockerfile_has_no_add_instruction():

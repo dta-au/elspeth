@@ -878,10 +878,6 @@ jobs:
             --no-emit-package elspeth-lints \
             --format requirements-txt \
             --output-file requirements-audit.txt
-          # CVE-2025-45768 / PYSEC-2025-183 has no fixed PyJWT release;
-          # the disputed weakness is application-selected HMAC key length.
-          # WebSettings enforces a 32-byte secret_key floor on non-loopback hosts.
-          #
           # CVE-2026-45829 has no fixed chromadb release as of 2026-06-03 (the
           # pip-audit "Fix Versions" column is empty). chromadb backs the
           # chroma_sink + rag_retrieval plugins; remove this ignore and bump the
@@ -909,11 +905,31 @@ jobs:
             --requirement requirements-audit.txt \
             --no-deps \
             --disable-pip \
-            --ignore-vuln PYSEC-2025-183 \
             --ignore-vuln CVE-2026-45829 \
             --ignore-vuln CVE-2026-45830 \
             --ignore-vuln CVE-2026-45831 \
             --ignore-vuln CVE-2026-45833 \
+            --progress-spinner=off
+
+      - name: Audit standalone gateway dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv lock --check --project gateway
+          uv export \
+            --project gateway \
+            --quiet \
+            --frozen \
+            --all-extras \
+            --all-groups \
+            --no-emit-project \
+            --format requirements-txt \
+            --output-file gateway-requirements-audit.txt
+          uv run --project gateway --frozen --no-default-groups \
+            --with "pip-audit>=2.9,<3" pip-audit \
+            --strict \
+            --requirement gateway-requirements-audit.txt \
+            --no-deps \
+            --disable-pip \
             --progress-spinner=off
 
       - name: Set up Node.js
@@ -941,13 +957,191 @@ jobs:
             --format=markdown \
             --output-file=python-license-report.md
 
+      - name: Check standalone gateway dependency licenses
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv run --project gateway --frozen --all-extras --all-groups \
+            --with "pip-licenses>=5,<6" pip-licenses \
+            --fail-on "GPL;AGPL" \
+            --format=markdown \
+            --output-file=gateway-python-license-report.md
+
       - name: Upload Python license report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: python-license-report
-          path: ${{ env.CI_CHECKOUT_PATH }}/python-license-report.md
+          path: |
+            ${{ env.CI_CHECKOUT_PATH }}/python-license-report.md
+            ${{ env.CI_CHECKOUT_PATH }}/gateway-python-license-report.md
           retention-days: 30
+
+  # ===========================================================================
+  # Standalone LLM gateway: frozen tests and built-image qualification
+  # ===========================================================================
+  gateway:
+    name: Gateway (locked tests and image)
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    needs: [static-analysis]
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-gateway
+      GATEWAY_CI_IMAGE: elspeth-llm-gateway-ci:${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
+      - name: Install frozen gateway test environment
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv sync --project gateway --frozen --extra test --no-default-groups
+
+      - name: Run gateway tests and in-process conformance
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv run --project gateway --frozen --extra test --no-default-groups \
+            pytest gateway/tests gateway/conformance -q
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c
+
+      - name: Build frozen gateway image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
+        with:
+          context: ${{ env.CI_CHECKOUT_PATH }}/gateway
+          build-args: GATEWAY_REVISION=${{ github.sha }}
+          load: true
+          push: false
+          tags: ${{ env.GATEWAY_CI_IMAGE }}
+
+      - name: Refuse High or Critical gateway image findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.GATEWAY_CI_IMAGE }}
+          format: table
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "1"
+
+      - name: Allocate isolated gateway qualification ports and credentials
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          uv run --project gateway --frozen --extra test --no-default-groups python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from mock.stack import MOCK_CLIENT_ID, MOCK_CLIENT_SECRET, MOCK_INBOUND_BEARER
+
+          base = 20000 + (int(os.environ["GITHUB_RUN_ID"]) % 10000) * 3
+          values = {
+              "GATEWAY_PORT": str(base),
+              "GATEWAY_OAUTH_PORT": str(base + 1),
+              "GATEWAY_UPSTREAM_PORT": str(base + 2),
+              "GATEWAY_CLIENT_ID": MOCK_CLIENT_ID,
+              "GATEWAY_CLIENT_SECRET": MOCK_CLIENT_SECRET,
+              "GATEWAY_INBOUND_BEARER": MOCK_INBOUND_BEARER,
+              "GATEWAY_MODEL_ALIAS": "mock-model",
+              "GATEWAY_CONTAINER": f"gateway-ci-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a", encoding="utf-8") as stream:
+              for key, value in values.items():
+                  stream.write(f"{key}={value}\n")
+          PY
+
+      - name: Start deterministic gateway qualification backends
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          set -euo pipefail
+          uv run --project gateway --frozen --extra test --no-default-groups \
+            python -m mock.backends \
+            --oauth-port "$GATEWAY_OAUTH_PORT" \
+            --upstream-port "$GATEWAY_UPSTREAM_PORT" \
+            >"$RUNNER_TEMP/gateway-mock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/gateway-mock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pid"
+          for port in "$GATEWAY_OAUTH_PORT" "$GATEWAY_UPSTREAM_PORT"; do
+            ready=false
+            for _ in $(seq 1 100); do
+              if curl --silent --output /dev/null "http://127.0.0.1:${port}/"; then
+                ready=true
+                break
+              fi
+              sleep 0.1
+            done
+            test "$ready" = true
+          done
+
+      - name: Start gateway image read-only as its fixed non-root identity
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id "$GATEWAY_CI_IMAGE" -u)" = 65532
+          test "$(docker run --rm --entrypoint id "$GATEWAY_CI_IMAGE" -g)" = 65532
+          test "$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$GATEWAY_CI_IMAGE")" = "$GITHUB_SHA"
+          docker run --detach \
+            --name "$GATEWAY_CONTAINER" \
+            --network host \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --env ELSPETH_LLM_GATEWAY_INBOUND_BEARER="$GATEWAY_INBOUND_BEARER" \
+            --env ELSPETH_LLM_GATEWAY_ADAPTER=reference_v1_invoke \
+            --env ELSPETH_LLM_GATEWAY_UPSTREAM_ORIGIN="http://127.0.0.1:${GATEWAY_UPSTREAM_PORT}" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL="http://127.0.0.1:${GATEWAY_OAUTH_PORT}/token" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID="$GATEWAY_CLIENT_ID" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET="$GATEWAY_CLIENT_SECRET" \
+            --env ELSPETH_LLM_GATEWAY_OAUTH_AUTH_METHOD=client_secret_basic \
+            --env ELSPETH_LLM_GATEWAY_MAX_MESSAGES=50 \
+            --env ELSPETH_LLM_GATEWAY_MAX_TOOLS=10 \
+            --env ELSPETH_LLM_GATEWAY_MAX_STRING_CHARS=10000 \
+            --env ELSPETH_LLM_GATEWAY_MAX_SCHEMA_BYTES=65536 \
+            --env ELSPETH_LLM_GATEWAY_MAX_SCHEMA_DEPTH=10 \
+            --env "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS={\"${GATEWAY_MODEL_ALIAS}\":{\"target\":\"mock-target\"}}" \
+            --entrypoint /venv/bin/python \
+            "$GATEWAY_CI_IMAGE" \
+            -m uvicorn elspeth_llm_gateway.core.app:build \
+            --host 127.0.0.1 --port "$GATEWAY_PORT" --factory \
+            --timeout-graceful-shutdown 30
+          for _ in $(seq 1 100); do
+            if curl --fail --silent "http://127.0.0.1:${GATEWAY_PORT}/healthz" >/dev/null; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+          exit 1
+
+      - name: Run conformance against the read-only gateway image
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          GATEWAY_CONFORMANCE_URL="http://127.0.0.1:${GATEWAY_PORT}" \
+          GATEWAY_CONFORMANCE_BEARER="$GATEWAY_INBOUND_BEARER" \
+          GATEWAY_CONFORMANCE_MODEL_ALIAS="$GATEWAY_MODEL_ALIAS" \
+            uv run --project gateway --frozen --extra test --no-default-groups \
+            pytest gateway/conformance -q
+
+      - name: Stop gateway qualification processes
+        if: always()
+        run: |
+          docker logs "$GATEWAY_CONTAINER" || true
+          docker rm --force "$GATEWAY_CONTAINER" || true
+          pid_file="$RUNNER_TEMP/gateway-mock-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.pid"
+          if [[ -f "$pid_file" ]]; then
+            kill "$(cat "$pid_file")" || true
+          fi
 
   # ===========================================================================
   # Stage 4: Frontend E2E (Playwright)
@@ -1102,6 +1296,7 @@ jobs:
       - supply-chain-audit
       - e2e-frontend
       - frontend-unit
+      - gateway
     if: always()
     steps:
       - name: Check all jobs passed
@@ -1140,6 +1335,10 @@ jobs:
           fi
           if [[ "${{ needs.frontend-unit.result }}" != "success" ]]; then
             echo "Frontend unit (vitest + typecheck) job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.gateway.result }}" != "success" ]]; then
+            echo "Gateway locked tests and image job failed"
             exit 1
           fi
           echo "All CI checks passed!"
