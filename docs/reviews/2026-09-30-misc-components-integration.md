@@ -9,8 +9,8 @@ re-verified after the merge and preservation checks.
 
 ## Recovered components
 
-The [starting inventory](2026-09-30-worktree-release-coverage.md) and its
-companion JSON record the donor comparisons. Valuable changes were reconciled
+The [historical starting inventory](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-30-worktree-release-coverage.md) and its
+[companion JSON](https://github.com/dta-au/elspeth/blob/2308eeccb78f41fcbae3eae3dd7968855f4cedb7/docs/reviews/2026-09-30-worktree-release-coverage.json) record the pre-integration donor comparisons. Both are preserved in `docs-archive/`; this report records the later integration and its remaining limits. Valuable changes were reconciled
 with current successors rather than restoring entire stale files.
 
 - Finite CSV, JSON and JSONL source continuation: strict opt-in, sealed
