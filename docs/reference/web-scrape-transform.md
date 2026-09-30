@@ -89,9 +89,10 @@ framing, authentication, cookies, or ELSPETH's scraping identity are rejected
 at configuration time. Header values must be nonempty ASCII without control
 characters, at most 1,024 bytes each and 4,096 bytes together. Missing or
 invalid row values fail before DNS. Configured header values are sent unchanged;
-the request audit and telemetry contain only a fingerprint of each value. A
-fingerprint key is required in production. Development mode uses a SHA-256
-digest so replay and verify still distinguish different values. Do not put
+the request audit and telemetry contain only an HMAC fingerprint of each value.
+`ELSPETH_FINGERPRINT_KEY` is required for configured headers in every mode,
+including when `ELSPETH_ALLOW_RAW_SECRETS=true`, so replay and verify distinguish
+different values without exposing them through an unkeyed digest. Do not put
 credentials in these headers; authenticated requests will use dedicated
 secret-reference options.
 

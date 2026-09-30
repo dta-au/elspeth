@@ -12,7 +12,6 @@ The fingerprinting logic ensures:
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from collections.abc import Mapping
@@ -165,17 +164,22 @@ def fingerprint_headers(headers: dict[str, str], *, force_fingerprint_names: fro
     3. Replay/verify can distinguish requests by credential identity
 
     In dev mode (ELSPETH_ALLOW_RAW_SECRETS=true), sensitive headers are
-    removed entirely (no fingerprint key required).
+    removed entirely (no fingerprint key required), except for caller-declared
+    forced headers, which require HMAC fingerprints in every mode to preserve
+    request identity without exposing low-entropy values.
 
     Args:
         headers: Full headers dict
+        force_fingerprint_names: Casefolded header names whose values must be
+            included as HMAC fingerprints, including in development mode.
 
     Returns:
         Headers dict with sensitive values fingerprinted (or removed in dev mode)
 
     Raises:
         FrameworkBugError: If sensitive header exists but no fingerprint key
-            is configured and dev mode is not enabled.
+            is configured and dev mode is not enabled, or a forced header exists
+            without a fingerprint key in any mode.
     """
     from elspeth.core.security import get_fingerprint_key, secret_fingerprint
 
@@ -194,10 +198,6 @@ def fingerprint_headers(headers: dict[str, str], *, force_fingerprint_names: fro
         if k.casefold() in force_fingerprint_names:
             if have_key:
                 result[k] = f"<fingerprint:{secret_fingerprint(v)}>"
-            elif allow_raw:
-                # Development mode has no HMAC key. Keep request identity
-                # comparable in replay/verify without exposing the raw value.
-                result[k] = f"<sha256:{hashlib.sha256(v.encode('ascii')).hexdigest()}>"
             else:
                 raise FrameworkBugError("Configured request headers require ELSPETH_FINGERPRINT_KEY")
         elif is_sensitive_header(k):

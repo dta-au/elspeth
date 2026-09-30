@@ -591,21 +591,42 @@ class SinkEffectReservation:
             self._validate_export_snapshot(request, snapshot)
             identity = _export_identity(request, snapshot)
             existing_effects = conn.execute(
-                select(sink_effects_table.c.effect_id).where(
+                select(sink_effects_table).where(
                     sink_effects_table.c.run_id == request.run_id,
                     sink_effects_table.c.input_kind == SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT.value,
                 )
             ).fetchall()
             if any(effect.effect_id != identity.effect_id for effect in existing_effects):
                 raise ValueError("audit export target identity differs from the existing durable effect for this run")
+            self._validate_existing_stream_shape(request, existing_effects, identity.stream_id)
             stream = self._lock_stream(
                 conn,
                 request,
                 identity.stream_id,
-                create=request.replacing_target,
+                create=request.replacing_target and not existing_effects,
             )
             sequence = stream.next_sequence if stream is not None else None
             predecessor = stream.tail_effect_id if stream is not None else None
+            if existing_effects:
+                # A retry compares against the position allocated to the
+                # immutable winner, not the stream's next vacant position.
+                # The source-run lock serializes export reservation and the
+                # exact identity/stream checks above protect this reuse.
+                sequence = existing_effects[0].stream_sequence
+                predecessor = existing_effects[0].predecessor_effect_id
+                if stream is not None:
+                    assert sequence is not None
+                    if stream.next_sequence != sequence + 1 or stream.tail_effect_id != identity.effect_id:
+                        raise ValueError("audit export stream position disagrees with its durable effect winner")
+                    if sequence > 0:
+                        predecessor_sequence = conn.execute(
+                            select(sink_effects_table.c.stream_sequence).where(
+                                sink_effects_table.c.effect_id == predecessor,
+                                sink_effects_table.c.stream_id == stream.stream_id,
+                            )
+                        ).scalar_one_or_none()
+                        if predecessor_sequence != sequence - 1:
+                            raise ValueError("audit export stream predecessor disagrees with its durable effect winner")
             inserted, effect = self._insert_or_compare_effect(
                 conn,
                 request,

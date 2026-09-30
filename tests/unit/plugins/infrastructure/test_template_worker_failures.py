@@ -45,6 +45,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +141,21 @@ def _worker_whose_sandbox_raises_tier1(connection: Any) -> None:
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(templates._LocalSandboxedEnvironment, "getattr", tier1_getattr)
+        templates._template_worker(connection)
+
+
+def _worker_stopped_mid_render(connection: Any, *, stop: signal.Signals, midpoint: Any) -> None:
+    """Send the stop from inside a real row lookup, with the worker's own limits and handlers."""
+    original_getattr = templates._LocalSandboxedEnvironment.getattr
+
+    def stopped_getattr(self: templates._LocalSandboxedEnvironment, obj: object, attribute: str) -> object:
+        value = original_getattr(self, obj, attribute)
+        midpoint.set()
+        os.kill(os.getpid(), stop)
+        return value
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(templates._LocalSandboxedEnvironment, "getattr", stopped_getattr)
         templates._template_worker(connection)
 
 
@@ -737,24 +753,13 @@ def test_a_stop_does_not_end_a_serving_worker(stop: signal.Signals) -> None:
 
 @pytest.mark.parametrize("stop", _STOPS)
 def test_a_stop_mid_render_lets_the_render_finish(stop: signal.Signals) -> None:
-    template = SandboxedTemplate("{% for i in range(row.n) %}{% for j in range(300) %}{{ '' }}{% endfor %}{% endfor %}done")
-    outcome: dict[str, object] = {}
-
-    def render() -> None:
-        try:
-            outcome["result"] = template.render(row={"n": 40000})  # about 0.9 s of CPU
-        except BaseException as exc:
-            outcome["error"] = exc
-
-    with _serving(templates._template_worker) as process:
-        assert template.render(row={"n": 1}) == "done"
-        assert process.pid is not None
-        thread = threading.Thread(target=render)
-        thread.start()
-        time.sleep(0.3)
-        os.kill(process.pid, stop)
-        thread.join(60)
-    assert outcome == {"result": "done"}
+    """A stop arrives during template evaluation, without spending the render's CPU budget."""
+    midpoint = _SPAWN.Event()
+    target = partial(_worker_stopped_mid_render, stop=stop, midpoint=midpoint)
+    with _serving(target) as process:
+        assert SandboxedTemplate("{{ row.q }}").render(row={"q": "done"}) == "done"
+        assert midpoint.is_set(), "the worker reached the row lookup that sends the stop"
+        assert process.exitcode is None
 
 
 @pytest.mark.parametrize("stop", _STOPS)
