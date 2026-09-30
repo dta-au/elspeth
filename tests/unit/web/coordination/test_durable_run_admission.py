@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, insert, select, update
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 
 from elspeth.contracts.chargeable_admission import AdmissionRefusalReason, ChargeableAdmissionPolicy, QuotaDisposition
 from elspeth.contracts.errors import AuditIntegrityError
@@ -86,16 +86,7 @@ def test_pre_restore_assessment_records_refusal_preserving_issued_history(engine
 def _admission(engine):
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
-        conn.execute(
-            insert(identity_roles_table).values(
-                role_id=str(uuid4()),
-                identity_id="alice",
-                role="user",
-                scope=None,
-                granted_by_identity_id="alice",
-                granted_at=datetime.now(UTC),
-            )
-        )
+        grant_test_pipeline_user(conn, identity_id="alice")
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="admission", auth_provider_type="local", owner_instance_id="owner", lease_seconds=30

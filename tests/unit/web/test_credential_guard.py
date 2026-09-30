@@ -9,17 +9,66 @@ import pytest
 
 from elspeth.web.composer import provider_gateway
 from elspeth.web.composer.provider_gateway import ProviderGateway
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
     credential_material_tool_arguments_projection,
     require_no_credential_material,
     require_no_credential_material_for_tool,
+    require_no_credential_material_in_state,
     require_no_credential_material_in_tool_wire,
 )
 from elspeth.web.sessions.routes.workflow.approvals import ApprovalDecisionBody, ApprovalRequestBody
 from elspeth.web.sessions.routes.workflow.library import CurateLibraryEntryRequest, PublishLibraryEntryRequest
 from elspeth.web.sessions.routes.workflow.reviews import AttestBody, RequestReviewBody
 from tests.unit.web.composer._helpers import _make_llm_response, _make_settings
+
+
+@pytest.mark.parametrize("component_type", ["source", "transform", "sink"])
+@pytest.mark.parametrize("plugin", [[], {}], ids=["list", "mapping"])
+@pytest.mark.parametrize("credential", [False, True], ids=["ordinary", "credential"])
+def test_state_guard_scans_components_before_malformed_plugin_admission(component_type: str, plugin: object, credential: bool) -> None:
+    options = {"api_key": "sk-" + "a" * 24} if credential else {}
+    component = {"plugin": plugin, "options": options}
+    state_data: dict[str, Any] = {
+        "sources": {},
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+        "metadata": {"name": "", "description": ""},
+        "version": 1,
+    }
+    if component_type == "source":
+        state_data["sources"] = {"source": {"on_success": "output", "on_validation_failure": "discard", **component}}
+    elif component_type == "transform":
+        state_data["nodes"] = [
+            {"id": "transform", "node_type": "transform", "input": "rows", "on_success": "output", "on_error": "discard", **component}
+        ]
+    else:
+        state_data["outputs"] = [{"name": "output", "on_write_failure": "discard", **component}]
+    state = CompositionState.from_dict(state_data)
+
+    if credential:
+        with pytest.raises(CredentialMaterialRefused):
+            require_no_credential_material_in_state(state, surface="test_surface")
+    else:
+        require_no_credential_material_in_state(state, surface="test_surface")
+
+
+def test_state_guard_still_scans_database_url_as_a_credential_field() -> None:
+    state = CompositionState.from_dict(
+        {
+            "sources": {},
+            "nodes": [],
+            "edges": [],
+            "outputs": [{"name": "output", "plugin": "database", "options": {"url": "low-entropy-secret"}, "on_write_failure": "discard"}],
+            "metadata": {"name": "", "description": ""},
+            "version": 1,
+        }
+    )
+
+    with pytest.raises(CredentialMaterialRefused):
+        require_no_credential_material_in_state(state, surface="test_surface")
 
 
 @pytest.mark.parametrize("pii", ["111-22-3333", "4111 1111 1111 1111"])

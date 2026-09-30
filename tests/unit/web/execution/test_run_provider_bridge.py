@@ -166,6 +166,7 @@ async def test_run_refusal_stops_dispatch_and_records_owner_quota(tmp_path, monk
     initialize_session_schema(engine)
     with engine.begin() as connection:
         ensure_test_identity(connection, identity_id="alice")
+        grant_test_pipeline_user(connection, identity_id="alice")
         seed_token_policies(connection, identity_id="alice")
     refusals = []
     service = SessionServiceImpl(

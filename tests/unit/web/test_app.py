@@ -805,6 +805,9 @@ class TestSystemStatusEndpoint:
         assert app.state.secret_service.user_secrets_enabled is enabled
 
         if not enabled:
+            with app.state.session_engine.begin() as conn:
+                _ensure_test_user(conn, identity_id="alice")
+
             # Through the REAL app: its StarletteHTTPException handler rewrites
             # structured error bodies, so the typed discriminator must survive it.
             async def _mock_user() -> UserIdentity:
