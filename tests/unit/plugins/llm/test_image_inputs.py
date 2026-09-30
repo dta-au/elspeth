@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from elspeth.contracts.chat_parts import ImagePart
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.results import TransformResult
+from elspeth.plugins.transforms.llm import image_inputs
 from elspeth.plugins.transforms.llm.image_inputs import ImageInputConfig, resolve_image_parts
 from elspeth.testing import make_pipeline_row
 from tests.unit.contracts.test_chat_parts import JPEG_BYTES, PNG_BYTES
@@ -287,6 +288,51 @@ class TestErrorVocabulary:
         assert isinstance(result, TransformResult)
         assert result.reason == {"reason": "too_many_images", "max_images": 2, "actual": "3"}
         assert result.retryable is False
+        assert store.retrieve_calls == []
+
+    def test_duplicate_refs_are_retrieved_once(self) -> None:
+        store = FakePayloadStore({PNG_SHA256: PNG_BYTES})
+        row = make_pipeline_row({"pictures": [PNG_SHA256, PNG_SHA256]})
+        spec = ImageInputConfig(field="pictures", format="png")
+
+        result = _resolve(row, [spec], store=store, max_images_per_call=2)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert store.retrieve_calls == [PNG_SHA256]
+
+    def test_aggregate_decoded_and_wire_budget_rejects_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = FakePayloadStore({PNG_SHA256: PNG_BYTES})
+        row = make_pipeline_row({"picture": PNG_SHA256})
+        spec = ImageInputConfig(field="picture", format="png")
+        monkeypatch.setattr(image_inputs, "MAX_IMAGE_EXPANDED_BYTES", len(PNG_BYTES))
+
+        result = _resolve(row, [spec], store=store)
+
+        assert isinstance(result, TransformResult)
+        assert result.reason is not None
+        assert result.reason["error_type"] == "image_payload_budget_exceeded"
+        assert result.reason["max_image_bytes_total"] == len(PNG_BYTES)
+
+    def test_aggregate_budget_accounts_for_parallel_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = FakePayloadStore({PNG_SHA256: PNG_BYTES})
+        row = make_pipeline_row({"picture": PNG_SHA256})
+        spec = ImageInputConfig(field="picture", format="png")
+        single_expansion = len(PNG_BYTES) + 4 * ((len(PNG_BYTES) + 2) // 3)
+        monkeypatch.setattr(image_inputs, "MAX_IMAGE_EXPANDED_BYTES", single_expansion)
+
+        result = resolve_image_parts(
+            row,
+            payload_store=store,
+            specs=[spec],
+            max_image_bytes=10_000_000,
+            max_images_per_call=20,
+            expansion_factor=2,
+        )
+
+        assert isinstance(result, TransformResult)
+        assert result.reason is not None
+        assert result.reason["projected_image_bytes"] == single_expansion * 2
 
 
 # ---------------------------------------------------------------------------

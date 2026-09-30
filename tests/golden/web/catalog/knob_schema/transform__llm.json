@@ -310,7 +310,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
@@ -823,7 +823,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
@@ -1324,7 +1324,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
@@ -1798,7 +1798,7 @@
       },
       {
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "kind": "number-int",
         "label": "Max Images Per Call",
         "name": "max_images_per_call",
