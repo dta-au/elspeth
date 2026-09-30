@@ -45,7 +45,7 @@ from elspeth.web.composer.llm_response_parsing import safe_response_model, token
 from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_gateway import _apply_endpoint_kwargs
 from elspeth.web.coordination.quota_authority import TokenUsageEntry
-from elspeth.web.validation import _redact_sensitive_content, reject_credential_shaped_content
+from elspeth.web.validation import _redact_sensitive_content, _warn_pii_shaped_content, reject_credential_shaped_content
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -250,6 +250,11 @@ def _admit_title_candidate(raw: str) -> str | _RejectedTitle:
         # this layer is not redundant with the allowlist. The title
         # reaches document.title — browser history, window managers,
         # screen shares — so it must never carry a pasted secret.
+        return _RejectedTitle(rejection_class="credential")
+    if any(_warn_pii_shaped_content(title)):
+        # Title metadata has a narrower UI privacy policy than the shared
+        # credential detector. Keep PII handling separate from the product's
+        # credential-material claim.
         return _RejectedTitle(rejection_class="credential")
     return title
 

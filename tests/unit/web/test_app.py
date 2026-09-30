@@ -3403,6 +3403,55 @@ class TestValidationErrorRedaction:
         for error in body["detail"]:
             assert set(error.keys()) <= self._SAFE_KEYS
 
+    def test_unknown_credential_shaped_request_key_is_redacted_from_location(self, tmp_path) -> None:
+        from unittest.mock import AsyncMock
+
+        from elspeth.web.auth.models import UserIdentity
+
+        client = self._authed_client(tmp_path)
+        candidate = "ghp_" + "a" * 36
+        identity = UserIdentity(user_id="test-user", username="test-user")
+
+        with (
+            patch("elspeth.web.auth.admin_routes.get_current_user", new=AsyncMock(return_value=identity)),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", new=AsyncMock(return_value=True)),
+        ):
+            resp = client.request(
+                "DELETE",
+                "/api/auth/admin/users/another-user",
+                json={"reason": "ordinary", candidate: "ordinary"},
+            )
+
+        assert resp.status_code == 422
+        assert candidate not in resp.text
+        assert "<redacted-secret>" in resp.text
+
+    def test_malformed_url_in_request_is_a_fixed_value_free_refusal(self, tmp_path) -> None:
+        from unittest.mock import AsyncMock
+
+        from elspeth.web.auth.models import UserIdentity
+
+        client = self._authed_client(tmp_path)
+        candidate = "http://["
+        identity = UserIdentity(user_id="test-user", username="test-user")
+
+        with (
+            patch("elspeth.web.auth.admin_routes.get_current_user", new=AsyncMock(return_value=identity)),
+            patch("elspeth.web.auth.admin_routes.can_manage_local_accounts", new=AsyncMock(return_value=True)),
+            capture_logs() as logs,
+        ):
+            resp = client.request(
+                "DELETE",
+                "/api/auth/admin/users/another-user",
+                headers={"X-Request-ID": "malformed-url-refusal"},
+                json={"reason": candidate},
+            )
+
+        assert resp.status_code == 422
+        assert candidate not in resp.text
+        assert candidate not in repr(logs)
+        assert "credential" in resp.text
+
     def test_validation_response_survives_a_warning_sink_failure(self, tmp_path: Path) -> None:
         """Operational correlation logging cannot replace the primary 422."""
         with patch("elspeth.web.app.structlog.get_logger") as get_logger:

@@ -33,6 +33,7 @@ from elspeth.web.composer.provider_errors import classify_provider_failure
 from elspeth.web.composer.provider_quota import admit_provider_attempt, quota_provider_calls
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
+from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_tool_wire
 
 _COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
 
@@ -353,6 +354,10 @@ async def _litellm_acompletion(*, on_provider_dispatch: Callable[[], None] | Non
     """
     import litellm
 
+    # Endpoint credentials are purpose-specific transport configuration and
+    # intentionally excluded.  The dynamic messages are the Web/Composer
+    # control content that crosses the provider boundary.
+    require_no_credential_material(kwargs["messages"], surface="composer_provider_request")
     _apply_openrouter_app_identity(kwargs)
     _apply_openrouter_usage_accounting(kwargs)
     await admit_provider_attempt(model=kwargs["model"])
@@ -405,7 +410,27 @@ class ProviderGateway:
                 provider_detail=str(exc) or None,
                 provider_status_code=exc.status_code,
             ) from exc
-        return _admit_composer_llm_completion(response, pricing_model=self._settings.composer_pricing_model or self._model)
+        completion = _admit_composer_llm_completion(
+            response,
+            pricing_model=self._settings.composer_pricing_model or self._model,
+        )
+        for call in completion.tool_batch.calls:
+            require_no_credential_material_in_tool_wire(
+                call.function.name,
+                call.function.arguments,
+                surface="composer_provider_response",
+            )
+        require_no_credential_material(
+            {
+                "content": completion.message.content,
+                "tool_calls": [{"id": call.id, "name": call.function.name} for call in completion.tool_batch.calls],
+                "reasoning_content": completion.provider_metadata.reasoning_content,
+                "reasoning_details": completion.provider_metadata.reasoning_details,
+                "thinking_blocks": completion.provider_metadata.thinking_blocks,
+            },
+            surface="composer_provider_response",
+        )
+        return completion
 
     async def _call_text_llm(self, messages: list[dict[str, str]]) -> Any:
         """Call the LLM for non-tool text generation."""
@@ -434,6 +459,21 @@ class ProviderGateway:
                     response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
                 ),
             )
+        response_metadata = admit_llm_provider_metadata(
+            response,
+            choice=response.choices[0],
+            message=response.choices[0].message,
+            pricing_model=self._settings.composer_pricing_model or self._model,
+        )
+        require_no_credential_material(
+            {
+                "content": response.choices[0].message.content,
+                "reasoning_content": response_metadata.reasoning_content,
+                "reasoning_details": response_metadata.reasoning_details,
+                "thinking_blocks": response_metadata.thinking_blocks,
+            },
+            surface="composer_provider_response",
+        )
         return response
 
     @quota_provider_calls

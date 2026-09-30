@@ -76,6 +76,7 @@ from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_VALUES,
 )
+from elspeth.web.credential_guard import require_no_credential_material_for_tool
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority
@@ -897,6 +898,7 @@ def execute_tool(
             proposal revalidation seam. It is not a declared tool argument
             and must remain false for public LLM/MCP dispatch.
     """
+    require_no_credential_material_for_tool(tool_name, arguments, surface="composer_tool_arguments")
     if catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
 

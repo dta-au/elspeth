@@ -11,7 +11,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import canonical_json
@@ -35,6 +35,7 @@ from elspeth.web.coordination.review_authority import (
 )
 from elspeth.web.sessions.protocol import CompositionStateRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _verify_session_ownership
+from elspeth.web.validation import reject_credential_material
 
 
 class RequestReviewBody(BaseModel):
@@ -44,12 +45,26 @@ class RequestReviewBody(BaseModel):
     reviewer_identity_id: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     note: str | None = Field(default=None, max_length=MAX_REVIEW_NOTE_BYTES)
 
+    @field_validator("note")
+    @classmethod
+    def _reject_credential_note(cls, value: str | None) -> str | None:
+        if value is not None:
+            reject_credential_material(value)
+        return value
+
 
 class AttestBody(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid")
 
     verdict: ReviewVerdict
     note: str | None = Field(default=None, max_length=MAX_REVIEW_NOTE_BYTES)
+
+    @field_validator("note")
+    @classmethod
+    def _reject_credential_note(cls, value: str | None) -> str | None:
+        if value is not None:
+            reject_credential_material(value)
+        return value
 
 
 class ReviewRequestView(BaseModel):

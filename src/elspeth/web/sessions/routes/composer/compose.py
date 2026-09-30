@@ -9,6 +9,7 @@ from elspeth.web.compartments import compartment_ingress_record
 from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE, ComposerAdmissionRefused, ComposerResult
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.completion_gates import completion_gate_decision_changes, parse_completion_gates
 from elspeth.web.sessions.schemas import RecomposeRequest
 
@@ -616,6 +617,8 @@ async def recompose(
                         reason="admission_refused",
                     ),
                 )
+                if isinstance(exc, CredentialMaterialRefused):
+                    raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
                 raise HTTPException(
                     status_code=403,
                     detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},

@@ -30,6 +30,7 @@ from elspeth.web.coordination.contracts import (
     SessionOperationKind,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.sessions.fork_custody import _free_text_embeds_parent_blob, _value_references_parent_blob
 from elspeth.web.sessions.operation_receipts import operation_receipt_response_hash
 from elspeth.web.sessions.protocol import (
@@ -688,6 +689,11 @@ def register_session_routes(router: APIRouter) -> None:
         service = request.app.state.session_service
         settings = request.app.state.settings
         title = body.title
+        if title is not None:
+            try:
+                require_no_credential_material(title, surface="session_title")
+            except CredentialMaterialRefused as exc:
+                raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
         if title is None:
             # Mint the app-wide default title server-side (one convention,
             # elspeth-ef8c18a6cb). Archived sessions are included in the
@@ -798,6 +804,10 @@ def register_session_routes(router: APIRouter) -> None:
         same COMPOSE operation the message writers hold, so a concurrent
         compose, fork or archive is serialised against it rather than raced.
         """
+        try:
+            require_no_credential_material(body.title, surface="session_title")
+        except CredentialMaterialRefused as exc:
+            raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
         session = await _verify_session_ownership(session_id, user, request)
         service = request.app.state.session_service
         async with (
@@ -876,6 +886,10 @@ def register_session_routes(router: APIRouter) -> None:
         the fork point, with the edited message replacing the original.
         The original session is never mutated.
         """
+        try:
+            require_no_credential_material(body.new_message_content, surface="web_fork_message_ingress")
+        except CredentialMaterialRefused as exc:
+            raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
         await _verify_session_ownership(session_id, user, request)
         service: SessionServiceProtocol = request.app.state.session_service
         blob_service: BlobServiceProtocol = request.app.state.blob_service

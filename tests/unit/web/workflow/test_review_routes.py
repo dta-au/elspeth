@@ -162,6 +162,21 @@ def test_audit_failure_prevents_request_response_and_rolls_back_row(app: Any) ->
         assert conn.execute(select(review_requests_table)).all() == []
 
 
+def test_credential_note_refuses_before_review_persistence_or_audit(app: Any) -> None:
+    candidate = "sk-" + "a" * 24
+    _as(app, "alice")
+
+    response = app.post(
+        f"/api/sessions/{SESSION}/reviews",
+        json={"state_id": STATE, "reviewer_identity_id": "bob", "note": candidate},
+    )
+
+    assert response.status_code == 422
+    assert app.app.state.auth_audit_recorder.calls == []
+    with app.app.state.phase3_engine.connect() as conn:
+        assert conn.execute(select(review_requests_table)).all() == []
+
+
 def test_missing_authorizing_request_id_refuses_before_audit_and_rolls_back(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     request_id = _request(app).json()["request_id"]
     original_attest = RepositoryReviewAuthority.attest

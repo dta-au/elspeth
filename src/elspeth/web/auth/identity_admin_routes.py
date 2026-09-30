@@ -50,7 +50,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from elspeth.contracts.auth import (
     ActivationRole,
@@ -82,6 +82,7 @@ from elspeth.web.coordination.identity_authority import (
     RoleGrant,
     RoleNotFound,
 )
+from elspeth.web.validation import reject_credential_material
 
 MAX_PAGE_SIZE = 200
 """Upper bound on one page of identities, roles or relationships."""
@@ -107,6 +108,11 @@ class _Provenance(_StrictModel):
 
     on_behalf_of: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     console_request_id: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
+
+    @model_validator(mode="after")
+    def _reject_credential_material(self) -> _Provenance:
+        reject_credential_material(self.model_dump(mode="json"))
+        return self
 
 
 class ActivateIdentityRequest(_Provenance):

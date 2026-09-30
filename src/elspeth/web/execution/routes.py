@@ -46,6 +46,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import parse_completion_gates
 from elspeth.web.execution.diagnostics import (
@@ -1492,6 +1493,8 @@ def create_execution_router() -> APIRouter:
                 ),
             ) from exc
         except ComposerAdmissionRefused as exc:
+            if isinstance(exc, CredentialMaterialRefused):
+                raise HTTPException(status_code=422, detail=exc.to_payload()) from exc
             raise HTTPException(
                 status_code=403,
                 detail={"error_type": "composer_admission_refused", "failure_code": "admission_refused", "detail": str(exc)},

@@ -155,6 +155,7 @@ from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
+from elspeth.web.credential_guard import require_no_credential_material_in_tool_wire
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -812,6 +813,16 @@ async def run_tool_batch(
     raw_assistant_content = assistant_message.content
     admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
+    # Scan the complete batch before progress, history, audit, proposal, blob,
+    # or state effects. Internal adapters can supply an already-admitted batch
+    # without passing through ProviderGateway, so this common owner must keep
+    # mixed batches all-or-nothing as well.
+    for tool_call in assistant_tool_calls:
+        require_no_credential_material_in_tool_wire(
+            tool_call.function.name,
+            tool_call.function.arguments,
+            surface="composer_tool_wire",
+        )
     provider_model_version = completion.provider_metadata.model_returned or ctx.provenance.model_identifier
     if (
         turn_sessions_service is not None

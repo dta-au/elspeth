@@ -214,6 +214,23 @@ def test_invalid_execution_readiness_refuses_approval_request_without_a_row(clos
         assert conn.execute(select(approvals_table.c.approval_id)).all() == []
 
 
+def test_credential_note_refuses_before_approval_persistence_or_audit(closed_local_app: TestClient) -> None:
+    client = closed_local_app
+    session_id, state_id, audit, compiled = _seed(client)
+    candidate = "sk-" + "a" * 24
+
+    response = client.post(
+        f"/api/sessions/{session_id}/approvals",
+        json={"state_id": state_id, "approver_identity_id": "addressed", "note": candidate},
+    )
+
+    assert response.status_code == 422
+    assert audit.requested == []
+    assert compiled.calls == []
+    with client.app.state.phase3_engine.connect() as conn:
+        assert conn.execute(select(approvals_table.c.approval_id)).all() == []
+
+
 def test_blob_source_path_drift_does_not_disclose_paths_in_approval_response(closed_local_app: TestClient) -> None:
     client = closed_local_app
     session_id, state_id, audit, compiled = _seed(client)

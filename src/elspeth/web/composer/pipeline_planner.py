@@ -150,6 +150,12 @@ from elspeth.web.composer.tools.wire_projection import (
     stamp_planner_terminal,
     wire_tool_definitions,
 )
+from elspeth.web.credential_guard import (
+    CredentialMaterialRefused,
+    require_no_credential_material,
+    require_no_credential_material_for_tool,
+    require_no_credential_material_in_tool_wire,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
 from elspeth.web.sessions.protocol import SessionOperationAuthority
@@ -1549,6 +1555,9 @@ def _parse_response_tool_calls(
     message = _provider_field(choices[0], "message")
     if message is None:
         raise PipelinePlannerError("planner response choice is missing its message", code="MALFORMED_RESPONSE")
+    content = _provider_field(message, "content")
+    if content is not None:
+        require_no_credential_material(content, surface="composer_planner_response")
     raw_calls = _provider_field(message, "tool_calls")
     if type(raw_calls) not in {list, tuple} or not raw_calls:
         content = _provider_field(message, "content")
@@ -1591,6 +1600,7 @@ def _parse_response_tool_calls(
         if call_id in seen_call_ids:
             raise PipelinePlannerError("planner response contains duplicate tool call ids", code="MALFORMED_RESPONSE")
         seen_call_ids.add(call_id)
+        require_no_credential_material_in_tool_wire(name, raw_arguments, surface="composer_planner_response")
         arguments = _parse_json_object(raw_arguments, label=f"{name} arguments")
         strict_sent: bool | None = None
         wire_conformant: bool | None = None
@@ -1608,6 +1618,7 @@ def _parse_response_tool_calls(
             else:
                 arguments = decoded.semantic
                 wire_conformant = decoded.wire_conformant
+        require_no_credential_material_for_tool(name, arguments, surface="composer_planner_response")
         parsed.append(
             _ParsedToolCall(
                 call_id,
@@ -3466,6 +3477,29 @@ async def _plan_pipeline_inner(
                 planner_call_ordinal=ordinal,
             )
             try:
+                require_no_credential_material(
+                    {
+                        "reasoning_content": call.reasoning_content,
+                        "reasoning_details": call.reasoning_details,
+                        "thinking_blocks": call.thinking_blocks,
+                    },
+                    surface="composer_planner_response",
+                )
+            except CredentialMaterialRefused as exc:
+                refused_call = replace(
+                    call,
+                    status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
+                    reasoning_content=None,
+                    reasoning_details=None,
+                    thinking_blocks=None,
+                    error_class=type(exc).__name__,
+                    error_message="credential_material_rejected",
+                )
+                _assert_planner_call_matches_manifest(refused_call, manifest, recorder)
+                recorder.record_llm_call(refused_call)
+                begin_response_attempt(refused_call)
+                raise
+            try:
                 _assert_planner_call_matches_manifest(call, manifest, recorder)
             except AuditIntegrityError:
                 begin_response_attempt(call)
@@ -3512,6 +3546,19 @@ async def _plan_pipeline_inner(
                     dialect=effective_dialect,
                     sent_tool_names=frozenset(tool["function"]["name"] for tool in active_tools),
                 )
+            except CredentialMaterialRefused as exc:
+                refused_call = replace(
+                    call,
+                    status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
+                    reasoning_content=None,
+                    reasoning_details=None,
+                    thinking_blocks=None,
+                    error_class=type(exc).__name__,
+                    error_message="credential_material_rejected",
+                )
+                recorder.record_llm_call(refused_call)
+                begin_response_attempt(refused_call)
+                raise
             except PipelinePlannerError as exc:
                 if exc.code == "TOOL_CALLS_EXHAUSTED":
                     # The provider call completed and is audited like the

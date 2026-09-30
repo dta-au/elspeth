@@ -35,6 +35,7 @@ from elspeth.web.composer.service import ComposerServiceImpl, _ComposeLoopDiagno
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.credential_guard import CredentialMaterialRefused
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
@@ -222,6 +223,71 @@ def _assert_no_blob_side_effects(
         assert conn.execute(select(blobs_table.c.id).where(blobs_table.c.session_id == session_id)).fetchall() == []
     blob_dir = tmp_path / "blobs" / session_id
     assert not blob_dir.exists() or list(blob_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_internal_tool_batch_refuses_atomically_before_any_handler_or_persistence(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = "sk-" + "a" * 24
+    completion = _admit_composer_llm_completion(
+        _tool_batch_response(
+            (
+                "call_clean_blob",
+                "create_blob",
+                {"filename": "must-not-exist.txt", "mime_type": "text/plain", "content": "ordinary"},
+            ),
+            ("call_credential", "set_metadata", {"patch": {"description": candidate}}),
+        )
+    )
+
+    async def _internal_completion(_messages: Any, _tools: Any) -> _AdmittedLLMCompletion:
+        return completion
+
+    handler_calls = _record_real_tool_handlers(monkeypatch)
+    sessions_service = composer_service_with_real_sessions._sessions_service
+    assert sessions_service is not None
+    before_messages = await sessions_service.get_messages(UUID(result_session_id))
+    before_state = await sessions_service.get_current_state(UUID(result_session_id))
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_internal_completion,
+            session_id=result_session_id,
+        )
+
+    assert caught.value.surface == "composer_tool_wire"
+    assert candidate not in repr(caught.value.to_payload())
+    assert handler_calls == []
+    _assert_no_blob_side_effects(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        tmp_path=tmp_path,
+    )
+    assert await sessions_service.get_current_state(UUID(result_session_id)) == before_state
+    after_messages = await sessions_service.get_messages(UUID(result_session_id))
+    assert after_messages == before_messages
+    assert candidate not in repr(after_messages)
+    with cast(Any, sessions_service)._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == result_session_id)
+            ).all()
+            == []
+        )
+        assert conn.execute(select(proposal_events_table.c.id).where(proposal_events_table.c.session_id == result_session_id)).all() == []
+        assert (
+            conn.execute(
+                select(chat_messages_table.c.id)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+            ).all()
+            == []
+        )
 
 
 def _interpretation_review_node() -> dict[str, Any]:

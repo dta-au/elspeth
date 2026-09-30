@@ -82,6 +82,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ADVISOR_TRIGGER_DETERMINISTIC_EARLY, ADVISOR_TRIGGER_DETERMINISTIC_END
 from elspeth.web.composer.tools._dispatch import require_schema_valid_arguments
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel
+from elspeth.web.credential_guard import CredentialMaterialRefused, require_no_credential_material
 from elspeth.web.execution.completion_gates import completion_gate_fingerprint
 from elspeth.web.execution.schemas import ValidationResult
 
@@ -409,6 +410,12 @@ class AdvisorCheckpointOwner:
                             pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
                         ),
                     ) from None
+                response_metadata = admit_llm_provider_metadata(
+                    response,
+                    choice=response.choices[0],
+                    message=response.choices[0].message,
+                    pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
+                )
             # elspeth-b6be9e991f: exact runtime type check, mirroring the
             # diagnostics path. The earlier ``str(raw_content).strip()``
             # emptiness probe let a non-string content object (list/dict/int
@@ -421,6 +428,17 @@ class AdvisorCheckpointOwner:
                         response, choice=None, message=None, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
                     ),
                 )
+            if response_metadata is None:
+                raise AuditIntegrityError("Advisor response metadata was not captured")
+            require_no_credential_material(
+                {
+                    "content": raw_content,
+                    "reasoning_content": response_metadata.reasoning_content,
+                    "reasoning_details": response_metadata.reasoning_details,
+                    "thinking_blocks": response_metadata.thinking_blocks,
+                },
+                surface="composer_advisor_response",
+            )
             guidance = raw_content
             status = ComposerLLMCallStatus.SUCCESS
             usage = token_usage_from_response(response)
@@ -453,6 +471,20 @@ class AdvisorCheckpointOwner:
             response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
             error_message = "malformed_response"
+            raise
+        except CredentialMaterialRefused as exc:
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+            if response_metadata is not None:
+                response_metadata = replace(
+                    response_metadata,
+                    reasoning_content=None,
+                    reasoning_details=None,
+                    thinking_blocks=None,
+                )
+            else:
+                response = None
+            error_class = type(exc).__name__
+            error_message = "credential_material_rejected"
             raise
         except Exception as exc:
             # F5: catch-all so the inner ComposerLLMCall record always

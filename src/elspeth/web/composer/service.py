@@ -141,6 +141,7 @@ from elspeth.web.composer.strict_transport import (
 )
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.credential_guard import require_no_credential_material_in_state
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
 )
@@ -938,6 +939,17 @@ class ComposerServiceImpl:
                 raise ValueError("composer custody requires COMPOSE session authority")
             if session_id is None or session_operation_context.fence.session_id != session_id:
                 raise AuditIntegrityError("Composer session authority targets a different session")
+
+        env_ref_names = (
+            frozenset(item.name for item in self._secret_service.list_refs(user_id))
+            if self._secret_service is not None and user_id is not None
+            else frozenset()
+        )
+        require_no_credential_material_in_state(
+            state,
+            surface="composer_state_before_provider",
+            env_ref_names=env_ref_names,
+        )
 
         await self._chargeable_admission.require(session_operation_context)
         with composer_quota_scope(self._require_sessions_service(), session_operation_context):

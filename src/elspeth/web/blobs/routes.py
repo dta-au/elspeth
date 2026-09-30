@@ -44,6 +44,7 @@ from elspeth.web.blobs.service import BlobServiceImpl, sanitize_filename
 from elspeth.web.blobs.sniff import detect_mime_type
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.credential_guard import require_no_credential_material
 
 
 def _blob_response(record: BlobRecord) -> BlobMetadataResponse:
@@ -159,6 +160,7 @@ def create_blobs_router() -> APIRouter:
         # from sanitize_filename() deeper in the service layer.
         try:
             original_filename = sanitize_filename(file.filename or "upload")
+            require_no_credential_material(original_filename, surface="blob_filename")
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from None
         chunks: list[bytes] = []
@@ -288,6 +290,7 @@ def create_blobs_router() -> APIRouter:
         This route only enforces size and persistence-layer concerns.
         """
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
+        require_no_credential_material(body.filename, surface="blob_filename")
         session_service = request.app.state.session_service
 
         settings = request.app.state.settings
