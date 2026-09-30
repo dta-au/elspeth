@@ -197,6 +197,17 @@ def test_codeql_security_suites_do_not_filter_by_problem_severity() -> None:
         assert "problem.severity" not in exclude
 
 
+def test_codeql_analysis_relativizes_results_to_the_isolated_checkout() -> None:
+    """Uploaded findings must use repository paths rather than the run directory."""
+    job = _workflow(CODEQL_WORKFLOW)["jobs"]["analyze"]
+    checkout = _step(job, "Checkout code")["with"]["path"]
+    init = _step(job, "Initialize CodeQL")["with"]
+    analyze = _step(job, "Perform CodeQL analysis")["with"]
+
+    assert init["source-root"] == checkout
+    assert analyze["checkout_path"] == f"${{{{ github.workspace }}}}/{checkout}"
+
+
 def test_override_rate_workflow_pins_threshold_policy() -> None:
     """C3 threshold is CI policy and must be explicit in workflow YAML."""
     judge_workflow = _workflow(JUDGE_GATES_WORKFLOW)
