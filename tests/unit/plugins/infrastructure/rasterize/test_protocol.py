@@ -21,6 +21,7 @@ def test_messages_round_trip_through_pickle() -> None:
         max_pages=1,
         max_page_pixels=10,
         max_page_bytes=10,
+        max_total_bytes=100,
         output_dir=Path("/tmp/x"),
         extract_text=True,
         max_page_text_bytes=1024 * 1024,

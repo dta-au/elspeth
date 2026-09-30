@@ -23,6 +23,7 @@ def _request(pdf: bytes, tmp_path: Path, **overrides: int | bool) -> RasterizeRe
         "max_pages": 10,
         "max_page_pixels": 1_000_000,
         "max_page_bytes": 5 * 1024 * 1024,
+        "max_total_bytes": 50 * 1024 * 1024,
         "extract_text": True,
         "max_page_text_bytes": 1024 * 1024,
     }
@@ -138,6 +139,21 @@ def test_oversize_png_is_refused_and_its_file_removed(tmp_path: Path) -> None:
     assert type(result) is RasterizeResponse
     assert result.rendered == ()
     assert result.refused[0].kind is PageRefusalKind.OVERSIZE_BYTES
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_total_output_cap_refuses_document_and_removes_partial_files(tmp_path: Path) -> None:
+    single_page = rasterize_document(_request(minimal_pdf(1), tmp_path))
+    assert type(single_page) is RasterizeResponse
+    page_bytes = single_page.rendered[0].size_bytes
+    single_page.rendered[0].png_path.unlink()
+
+    result = rasterize_document(_request(minimal_pdf(3), tmp_path, max_total_bytes=page_bytes + 1))
+
+    assert type(result) is DocumentRefusal
+    assert result.kind is DocumentRefusalKind.OVERSIZE_OUTPUT
+    assert result.page_count == 3
+    assert "page 2" in result.detail
     assert list(tmp_path.iterdir()) == []
 
 

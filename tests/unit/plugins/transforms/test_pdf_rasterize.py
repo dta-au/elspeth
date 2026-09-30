@@ -289,6 +289,10 @@ def test_encrypted_document_is_a_typed_row_error_not_a_crash(store: FilesystemPa
     ("refusal", "reason"),
     [
         (DocumentRefusal(kind=DocumentRefusalKind.MALFORMED, detail="Data format error"), "pdf_malformed"),
+        (
+            DocumentRefusal(kind=DocumentRefusalKind.OVERSIZE_OUTPUT, detail="rendered output too large", page_count=2),
+            "pdf_output_too_large",
+        ),
         (DocumentRefusal(kind=DocumentRefusalKind.TOO_MANY_PAGES, detail="900 pages", page_count=900), "too_many_rows"),
         (RenderTimedOut(timeout_seconds=120), "render_timeout"),
     ],
@@ -493,7 +497,14 @@ class TestConfig:
 
     @pytest.mark.parametrize(
         ("option", "value"),
-        [("dpi", 301), ("dpi", 35), ("max_page_bytes", 5 * 1024 * 1024 + 1), ("max_pages", 2001), ("on_page_failure", "ignore")],
+        [
+            ("dpi", 301),
+            ("dpi", 35),
+            ("max_page_bytes", 5 * 1024 * 1024 + 1),
+            ("max_total_bytes", 500 * 1024 * 1024 + 1),
+            ("max_pages", 2001),
+            ("on_page_failure", "ignore"),
+        ],
     )
     def test_ceilings_are_hard(self, option: str, value: Any) -> None:
         with pytest.raises(PluginConfigError):

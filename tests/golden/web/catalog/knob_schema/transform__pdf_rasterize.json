@@ -183,6 +183,16 @@
         "tier": "common"
       },
       {
+        "default": 104857600,
+        "description": "Refuse the whole document and immediately delete partial output when cumulative encoded PNG bytes exceed this limit. May be reduced but never raised above 500 MiB.",
+        "kind": "number-int",
+        "label": "Maximum total rendered bytes",
+        "name": "max_total_bytes",
+        "nullable": false,
+        "required": false,
+        "tier": "common"
+      },
+      {
         "default": 120,
         "description": "Wall-clock and CPU budget for rendering one document in the worker subprocess.",
         "kind": "number-int",

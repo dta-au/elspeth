@@ -17,6 +17,7 @@ def _limits(**overrides: int | bool) -> RenderLimits:
         "max_pages": 10,
         "max_page_pixels": 1_000_000,
         "max_page_bytes": 5 * 1024 * 1024,
+        "max_total_bytes": 50 * 1024 * 1024,
         "render_timeout_seconds": 20,
         "worker_memory_limit_bytes": 2 * 1024**3,
         "extract_text": True,

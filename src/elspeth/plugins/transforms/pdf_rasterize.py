@@ -54,6 +54,8 @@ MIN_DPI = 36
 MAX_DPI = 300
 DEFAULT_MAX_INPUT_BYTES = 50 * 1024 * 1024
 HARD_MAX_INPUT_BYTES = 200 * 1024 * 1024
+DEFAULT_MAX_TOTAL_BYTES = 100 * 1024 * 1024
+HARD_MAX_TOTAL_BYTES = 500 * 1024 * 1024
 DEFAULT_MAX_PAGES = 200
 HARD_MAX_PAGES = 2_000
 DEFAULT_MAX_PAGE_PIXELS = 25_000_000
@@ -233,6 +235,16 @@ class PDFRasterizeConfig(TransformDataConfig):
         title="Maximum page bytes",
         description="Maximum encoded PNG bytes per page; may be reduced but never raised above the 5 MiB downstream provider bound.",
     )
+    max_total_bytes: int = Field(
+        default=DEFAULT_MAX_TOTAL_BYTES,
+        gt=0,
+        le=HARD_MAX_TOTAL_BYTES,
+        title="Maximum total rendered bytes",
+        description=(
+            "Refuse the whole document and immediately delete partial output when cumulative encoded PNG bytes "
+            "exceed this limit. May be reduced but never raised above 500 MiB."
+        ),
+    )
     render_timeout_seconds: int = Field(
         default=DEFAULT_RENDER_TIMEOUT_SECONDS,
         gt=0,
@@ -381,7 +393,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:184aa56ff5f95e44"
+    source_file_hash: str | None = "sha256:9b7b6e83cb9679ba"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -434,6 +446,7 @@ class PDFRasterize(BaseTransform):
             max_pages=cfg.max_pages,
             max_page_pixels=cfg.max_page_pixels,
             max_page_bytes=cfg.max_page_bytes,
+            max_total_bytes=cfg.max_total_bytes,
             render_timeout_seconds=cfg.render_timeout_seconds,
             worker_memory_limit_bytes=cfg.worker_memory_limit_bytes,
             extract_text=cfg.extract_text,
@@ -879,6 +892,21 @@ class PDFRasterize(BaseTransform):
         if result.kind is DocumentRefusalKind.MALFORMED:
             return TransformResult.error(
                 {"reason": "pdf_malformed", "field": field_name, "blob_ref": blob_ref, "detail": result.detail},
+                retryable=False,
+            )
+        if result.kind is DocumentRefusalKind.OVERSIZE_OUTPUT:
+            # The worker refuses aggregate output only after opening the
+            # document, so a missing page count is a broken worker protocol.
+            if result.page_count is None:
+                raise FrameworkBugError("pdf_rasterize worker refused aggregate output without a page count")
+            return TransformResult.error(
+                {
+                    "reason": "pdf_output_too_large",
+                    "field": field_name,
+                    "blob_ref": blob_ref,
+                    "detail": result.detail,
+                    "page_count": result.page_count,
+                },
                 retryable=False,
             )
         # DocumentRefusalKind.TOO_MANY_PAGES

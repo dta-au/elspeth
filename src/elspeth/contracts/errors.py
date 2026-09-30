@@ -543,6 +543,7 @@ TransformErrorCategory = Literal[
     # on_page_failure=fail_document, and unconditionally when zero pages survive regardless of on_page_failure
     "pdf_page_too_large",  # a page exceeded max_page_pixels or max_page_bytes; fires under on_page_failure=fail_document,
     # and unconditionally when zero pages survive regardless of on_page_failure
+    "pdf_output_too_large",  # cumulative encoded page bytes exceeded max_total_bytes; the whole document is refused
     "render_timeout",  # the document exceeded render_timeout_seconds (wall clock or CPU budget)
     # Template errors
     "template_rendering_failed",
