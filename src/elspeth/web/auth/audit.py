@@ -38,6 +38,7 @@ from elspeth.web.schema_probe import postgres_engine_kwargs
 if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
     from elspeth.web.coordination.approval_authority import ApprovalRecord, ApprovalSupersession
+    from elspeth.web.coordination.identity_authority import PendingIdentitiesPurged
     from elspeth.web.coordination.quota_authority import QuotaExceeded
     from elspeth.web.coordination.quota_policy_authority import QuotaPolicyChange
 
@@ -403,6 +404,14 @@ class AuthAuditWriter(Protocol):
         console_request_id: str | None,
     ) -> None: ...
 
+    def record_pending_identities_purged(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        outcome: PendingIdentitiesPurged,
+    ) -> None: ...
+
     # R13/R14 (identity sprint Tasks I1, I2): no ``request``. A quota refusal
     # is decided inside an admission transaction, below every HTTP handler,
     # and the row is written before that transaction commits (R4).
@@ -571,6 +580,7 @@ class AuthAuditOperation(StrEnum):
     IDENTITY_DISABLED = "identity_disabled"
     ROLE_CHANGED = "role_changed"
     RELATIONSHIP_CHANGED = "relationship_changed"
+    PENDING_IDENTITIES_PURGED = "pending_identities_purged"
     QUOTA_EXCEEDED = "quota_exceeded"
     QUOTA_SET = "quota_set"
     APPROVAL_REQUESTED = "approval_requested"
@@ -1475,6 +1485,63 @@ class AuthAuditRecorder:
                 },
                 **provenance.request_columns,
             )
+
+    def record_pending_identities_purged(
+        self,
+        request: Request | None,
+        *,
+        provider: AuthProviderType,
+        outcome: PendingIdentitiesPurged,
+    ) -> None:
+        """Record one bounded batch summary plus one row for every identity actually deleted."""
+        provenance = _admin_provenance(
+            request,
+            actor_identity_id=outcome.actor_identity_id,
+            on_behalf_of=outcome.on_behalf_of,
+            console_request_id=outcome.console_request_id,
+        )
+        events = [
+            AuthAuditEventInput(
+                event_type="pending_identities_purged",
+                outcome="success",
+                provider=provider,
+                identity_id=None,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "batch_id": outcome.batch_id,
+                    "retention_days": outcome.retention_days,
+                    "scope": "batch",
+                    "deleted_count": len(outcome.identity_ids),
+                    "deleted_identity_ids": list(outcome.identity_ids),
+                    "has_more": outcome.has_more,
+                },
+                **provenance.request_columns,
+            )
+        ]
+        events.extend(
+            AuthAuditEventInput(
+                event_type="pending_identities_purged",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=None,
+                username=None,
+                failure_category=None,
+                metadata={
+                    **provenance.metadata,
+                    "batch_id": outcome.batch_id,
+                    "retention_days": outcome.retention_days,
+                    "scope": "identity",
+                },
+                **provenance.request_columns,
+            )
+            for identity_id in outcome.identity_ids
+        )
+        with self._open_landscape(AuthAuditOperation.PENDING_IDENTITIES_PURGED) as db:
+            self._auth_audit(db).record_auth_events(tuple(events))
 
     def record_approval_requested(self, request: Request | None, *, provider: AuthProviderType, approval: ApprovalRecord) -> None:
         metadata = _request_metadata(request) if request is not None else {}

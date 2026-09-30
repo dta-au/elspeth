@@ -20,6 +20,7 @@ class AdmissionRefusalReason(StrEnum):
     IDENTITY_DISABLED = "identity_disabled"
     IDENTITY_PENDING = "identity_pending"
     IDENTITY_MISSING = "identity_missing"
+    USER_ROLE_REQUIRED = "user_role_required"
     QUOTA_POLICY_MISSING = "quota_policy_missing"
     TOKEN_ACCOUNTING_UNAVAILABLE = "token_accounting_unavailable"
     QUOTA_EXCEEDED = "quota_exceeded"
@@ -146,6 +147,7 @@ class ChargeableAdmissionDecision(BaseModel):
                 AdmissionRefusalReason.IDENTITY_DISABLED: QuotaDisposition.NOT_ASSESSED,
                 AdmissionRefusalReason.IDENTITY_PENDING: QuotaDisposition.NOT_ASSESSED,
                 AdmissionRefusalReason.IDENTITY_MISSING: QuotaDisposition.NOT_ASSESSED,
+                AdmissionRefusalReason.USER_ROLE_REQUIRED: QuotaDisposition.NOT_ASSESSED,
                 AdmissionRefusalReason.POLICY_GENERATION_CHANGED: QuotaDisposition.NOT_ASSESSED,
                 AdmissionRefusalReason.QUOTA_POLICY_MISSING: QuotaDisposition.POLICY_MISSING,
                 AdmissionRefusalReason.TOKEN_ACCOUNTING_UNAVAILABLE: QuotaDisposition.ACCOUNTING_UNAVAILABLE,

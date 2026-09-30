@@ -74,6 +74,7 @@ from elspeth.web.coordination.identity_authority import (
     IdentityEnabled,
     IdentityNotFound,
     IdentitySummary,
+    PendingIdentitiesPurged,
     RelationshipChanged,
     RelationshipEdge,
     RelationshipNotFound,
@@ -158,6 +159,10 @@ class AssertRelationshipRequest(_Provenance):
     effective_from: AwareDatetime | None = Field(default=None, strict=False)
     effective_until: AwareDatetime | None = Field(default=None, strict=False)
     note: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
+
+
+class PurgePendingIdentitiesRequest(_Provenance):
+    """The retention window is deployment configuration, never request input."""
 
 
 class IdentityView(_StrictModel):
@@ -247,6 +252,14 @@ class ActivationResponse(_StrictModel):
 class DisableResponse(_StrictModel):
     identity: IdentityView
     revoked_relationship_ids: list[str]
+
+
+class PurgePendingIdentitiesResponse(_StrictModel):
+    batch_id: str
+    retention_days: int
+    deleted_identity_ids: list[str]
+    deleted_count: int
+    has_more: bool
 
 
 # ── Projections ──────────────────────────────────────────────────────────
@@ -416,7 +429,7 @@ def create_identity_admin_router() -> APIRouter:
     async def list_identities(
         request: Request,
         response: Response,
-        admin: UserIdentity = Depends(_require_identity_admin),  # noqa: B008
+        admin: Annotated[UserIdentity, Depends(_require_identity_admin)],
         access_state: Annotated[IdentityAccessState, Query()] = "pending",
         limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -466,6 +479,39 @@ def create_identity_admin_router() -> APIRouter:
             raise _refused(exc) from exc
         _uncacheable(response)
         return await _activation_response(request, event)
+
+    @router.post("/identities/purge-pending", response_model=PurgePendingIdentitiesResponse)
+    async def purge_pending_identities(
+        request: Request,
+        response: Response,
+        body: PurgePendingIdentitiesRequest,
+        admin: Annotated[UserIdentity, Depends(_require_identity_admin)],
+    ) -> PurgePendingIdentitiesResponse:
+        """Delete one bounded batch of never-activated identities past configured retention."""
+        settings: WebSettings = request.app.state.settings
+        provider = _provider(request)
+        recorder = _recorder(request)
+
+        def record(outcome: PendingIdentitiesPurged) -> None:
+            recorder.record_pending_identities_purged(request, provider=provider, outcome=outcome)
+
+        try:
+            outcome = await run_sync_in_worker(
+                _authority(request).purge_stale_pending_identities,
+                actor=_actor(admin, body),
+                retention_days=settings.identity_pending_retention_days,
+                record=record,
+            )
+        except IdentityAuthorityRefusal as exc:
+            raise _refused(exc) from exc
+        _uncacheable(response)
+        return PurgePendingIdentitiesResponse(
+            batch_id=outcome.batch_id,
+            retention_days=outcome.retention_days,
+            deleted_identity_ids=list(outcome.identity_ids),
+            deleted_count=len(outcome.identity_ids),
+            has_more=outcome.has_more,
+        )
 
     @router.post("/identities/{identity_id}/activate", response_model=ActivationResponse)
     async def activate_identity(

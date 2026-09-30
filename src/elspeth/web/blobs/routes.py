@@ -7,7 +7,7 @@ belong to the authenticated user's session.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import Annotated, cast
 from urllib.parse import quote
 from uuid import UUID
 
@@ -21,7 +21,7 @@ from elspeth.contracts.binary_documents import (
     binary_document_signature_matches,
     detect_binary_document_signature,
 )
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     ALLOWED_MIME_TYPES,
@@ -139,8 +139,8 @@ def create_blobs_router() -> APIRouter:
     async def create_blob_upload(
         session_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         file: UploadFile = File(...),  # noqa: B008
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
     ) -> BlobMetadataResponse:
         """Create a blob from a multipart file upload."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
@@ -278,7 +278,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         body: CreateInlineBlobRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> BlobMetadataResponse:
         """Create a blob from inline text/JSON content.
 
@@ -354,7 +354,7 @@ def create_blobs_router() -> APIRouter:
     async def list_blobs(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> list[BlobMetadataResponse]:
@@ -368,7 +368,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> BlobMetadataResponse:
         """Get blob metadata."""
         blob_service = await _verify_session_and_get_blob_service(session_id, user, request)
@@ -396,7 +396,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> Response:
         """Download blob content.
 
@@ -453,7 +453,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(5000, ge=1, le=50_000),
     ) -> Response:
         """Return a bounded prefix for inline blob preview."""
@@ -503,7 +503,7 @@ def create_blobs_router() -> APIRouter:
         session_id: UUID,
         blob_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> None:
         """Delete a blob and its backing file.
 

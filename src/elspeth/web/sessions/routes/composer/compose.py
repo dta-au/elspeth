@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace as _replace_dataclass
+from typing import Annotated
 
 from elspeth.contracts.chargeable_admission import ChargeableAdmissionRefused
 from elspeth.contracts.session_operation import SessionOperationKind
@@ -77,9 +78,9 @@ from .._helpers import (
     client_cancelled_progress_event,
     composer_turn_end_assistant_row,
     convergence_progress_event,
-    get_current_user,
     get_rate_limiter,
     merge_composer_meta_updates,
+    require_pipeline_user,
     slog,
 )
 from .pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
@@ -95,7 +96,7 @@ async def recompose(
     session_id: UUID,
     body: RecomposeRequest,
     request: Request,
-    user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     # In-flight compose tally for the SPA's post-abort settlement signal
     # (elspeth-06a23adfcc); decrements only after the route fully unwinds.

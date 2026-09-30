@@ -56,7 +56,8 @@ def test_epoch_is_forty_seven() -> None:
     # Epoch 47 gives verification reads indexed run ordering and parent checks.
     # Epoch 48 gives source quarantine a durable PENDING_SINK handoff, deletes
     # source-row replay, and admits the resume_refused coordination event.
-    assert SQLITE_SCHEMA_EPOCH == 48
+    # Epoch 49 adds the pending-identity purge event to the closed auth trail.
+    assert SQLITE_SCHEMA_EPOCH == 49
     assert ("rows", "source_contract_json") in set(_REQUIRED_COLUMNS)
     assert ("node_states", "ix_node_states_run") in set(_REQUIRED_INDEXES)
     index = next(index for index in call_verifications_table.indexes if index.name == "ix_call_verifications_run")

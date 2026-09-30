@@ -99,7 +99,7 @@ Audit and Graduation steps.
 Session epoch 71 removes mode-specific operation state and adds mode-neutral
 durable receipts for session fork and state revert. Earlier Sessions stores
 must be recreated; there is no compatibility reader or in-place migration.
-Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 48 for immutable web
+Landscape `SQLITE_SCHEMA_EPOCH` advances from 38 to 49 for immutable web
 run-start permit binding, recoverable pre-effect admission, nullable LLM token
 usage, the quota-policy/secret-wiring evidence used at admission, and the matching
 approved prompt artifact link on LLM calls. The artifact identifies effective

@@ -5,7 +5,7 @@ import sys
 from collections.abc import Awaitable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 from elspeth.contracts import errors as contract_errors
@@ -75,7 +75,7 @@ from ._helpers import (
     _session_response,
     _verify_session_ownership,
     deep_thaw,
-    get_current_user,
+    require_pipeline_user,
     slog,
 )
 
@@ -682,7 +682,7 @@ def register_session_routes(router: APIRouter) -> None:
     async def create_session(
         body: CreateSessionRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> SessionResponse:
         """Create a new session for the authenticated user."""
         service = request.app.state.session_service
@@ -715,7 +715,7 @@ def register_session_routes(router: APIRouter) -> None:
     @router.get("", response_model=list[SessionResponse])
     async def list_sessions(
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=200),
         offset: int = Query(0, ge=0),
         include_archived: bool = Query(False),
@@ -740,7 +740,7 @@ def register_session_routes(router: APIRouter) -> None:
     @router.get("/_active", response_model=list[ComposerProgressSnapshot])
     async def list_active_composer_requests(
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> list[ComposerProgressSnapshot]:
         """List in-flight composer requests for the authenticated user.
 
@@ -779,7 +779,7 @@ def register_session_routes(router: APIRouter) -> None:
     async def get_session(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> SessionResponse:
         """Get a single session. IDOR-protected."""
         session = await _verify_session_ownership(session_id, user, request)
@@ -790,7 +790,7 @@ def register_session_routes(router: APIRouter) -> None:
         session_id: UUID,
         body: UpdateSessionRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> SessionResponse:
         """Update a session's user-visible metadata. IDOR-protected.
 
@@ -820,7 +820,7 @@ def register_session_routes(router: APIRouter) -> None:
     async def delete_session(
         session_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> None:
         """Archive (delete) a session and all associated data.
 
@@ -868,7 +868,7 @@ def register_session_routes(router: APIRouter) -> None:
         session_id: UUID,
         body: ForkSessionRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ForkSessionResponse:
         """Fork a session from a specific user message.
 

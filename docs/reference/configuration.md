@@ -567,7 +567,7 @@ stating it can still break the glass.
 | `quota_container_tokens_per_day` | int | No | - | Optional container-wide token ceiling, distinct from the per-identity default. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Enforced for every chargeable LLM operation when configured |
 | `quota_container_storage_bytes` | int | No | - | Optional container-wide storage ceiling. Must be greater than 0. Configuring it turns the quota system on, so both `quota_default_*` settings are then required. Validated only; no runtime path reads it in this release |
 | `identity_dormancy_days` | int | No | `90` | Dormancy window for an activated identity (R9). A login by an `active` identity whose previous login is **older than** this many days drops it back to `pending` with `disable_reason='dormant'`, writes an `identity_disabled` audit row, and refuses the login at the admission gate; an administrator must re-activate it. A re-pend takes the identity's **admission**, not its roles, quota or org-tree edges — the same posture R3's rebound disable takes — so re-activating it restores the access it already held, whichever role the administrator picks (including `none`), and the `identity_activated` audit row names those retained roles in its metadata. Use `POST /api/auth/admin/roles/{role_id}/revoke` to remove one; activation is not a way to strip authority. Exactly this many days is still admitted. An identity that has never logged in (`last_login_at` is NULL — a pre-provisioned row) is not dormant, and becomes measurable from its second login. The **last active human administrator is exempt** (D34): they are not re-pended and their login proceeds, so a single-admin container cannot walk itself to zero administrators by being left alone; the exemption writes its own `auth_events` row (`identity_disabled` with `outcome='failure'` and `failure_category='dormancy_last_admin_exempt'`). Must be greater than 0 |
-| `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
+| `identity_pending_retention_days` | int | No | `90` | Retention for a never-activated pending identity. `POST /api/auth/admin/identities/purge-pending` reads this configured value, deletes at most 200 rows strictly older than the database-time cutoff, and records the exact deleted identities in the authentication audit trail. The request cannot override the setting. Must be greater than 0 |
 
 Dormancy applies to both local and SSO identities. Administrator reactivation
 starts a fresh dormancy window: the later of the previous login and activation
@@ -2472,7 +2472,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 48
+### Landscape schema epoch 49
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -2551,14 +2551,18 @@ like every other sink-bound token and never re-derives a source row. The
 `run_coordination_events.event_type` CHECK admits `resume_refused`, the
 value-free record of a resume refused because an undecided token has no
 covering scheduler work. Epoch-47 stores must be recreated.
+Epoch 49 admits `pending_identities_purged` to the closed authentication audit
+event vocabulary. The explicit administrator purge records the configured
+retention window and the exact identities deleted in each bounded batch.
+Epoch-48 stores must be recreated.
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-48, either automatically at startup or through an operator migration command.
+49, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-48 database.
+an older epoch must not be rolled back over an epoch-49 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

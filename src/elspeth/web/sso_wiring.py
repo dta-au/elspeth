@@ -137,9 +137,7 @@ def build_sso_wiring(
     provider = settings.auth_provider
 
     def _principal_is_active(identity_id: str) -> bool:
-        record = identity_authority.read_identity(identity_id=identity_id)
-        # An absent row is never an implicit grant.
-        return record is not None and record.is_active
+        return identity_authority.is_active_human_identity(identity_id=identity_id, provider=provider)
 
     def _record_admission(identity_id: str, username: str, quota_written: bool) -> None:
         # Runs INSIDE ensure_identity's transaction: a failed audit rolls

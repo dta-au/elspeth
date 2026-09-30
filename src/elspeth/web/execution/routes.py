@@ -21,7 +21,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, cast
 from urllib.parse import quote
 from uuid import UUID
 
@@ -36,7 +36,7 @@ from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import BlobNotFoundError
 from elspeth.web.composer.audit import BufferingRecorder
@@ -44,6 +44,7 @@ from elspeth.web.composer.protocol import ComposerAdmissionRefused, ComposerServ
 from elspeth.web.composer.provider_gateway import _BadRequestLLMError
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
@@ -936,8 +937,8 @@ def create_execution_router() -> APIRouter:
     async def validate_session_pipeline(
         session_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         state_id: UUID | None = None,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
         session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> ValidationResult:
@@ -1013,9 +1014,9 @@ def create_execution_router() -> APIRouter:
     async def execute_pipeline(
         session_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         state_id: UUID | None = None,
         execute_request: ExecuteRequest | None = Body(default=None),  # noqa: B008
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
         session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> dict[str, str]:
@@ -1313,7 +1314,7 @@ def create_execution_router() -> APIRouter:
     async def get_run_status(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunStatusResponse:
         """Return current run status."""
@@ -1349,8 +1350,8 @@ def create_execution_router() -> APIRouter:
     async def get_run_diagnostics(
         run_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=100),
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunDiagnosticsResponse:
         """Return a bounded Landscape diagnostics snapshot for a run."""
@@ -1393,8 +1394,8 @@ def create_execution_router() -> APIRouter:
     async def evaluate_run_diagnostics(
         run_id: UUID,
         request: Request,
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         limit: int = Query(50, ge=1, le=100),
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunDiagnosticsEvaluationResponse:
         """Ask the configured LLM to explain the current diagnostics snapshot."""
@@ -1534,7 +1535,7 @@ def create_execution_router() -> APIRouter:
     async def cancel_run(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> dict[str, str | bool]:
         """Cancel a run. Idempotent on terminal runs."""
@@ -1555,7 +1556,7 @@ def create_execution_router() -> APIRouter:
     async def get_run_results(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunResultsResponse:
         """Return final run results. 409 if run is not terminal."""
@@ -1637,6 +1638,17 @@ def create_execution_router() -> APIRouter:
         user = await run_sync_in_worker(store.consume, ticket=ticket, run_id=run_id)
         if user is None:
             await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="Invalid or expired WebSocket ticket")
+            return
+        identity_authority = cast(RepositoryIdentityAuthority, websocket.app.state.identity_authority)
+        settings: WebSettings = websocket.app.state.settings
+        user_authorized = await run_sync_in_worker(
+            identity_authority.holds_active_human_role,
+            identity_id=user.user_id,
+            provider=settings.auth_provider,
+            role="user",
+        )
+        if not user_authorized:
+            await websocket.close(code=RunStreamCloseCode.AUTH_FAILED, reason="User role is no longer active")
             return
 
         await websocket.accept()
@@ -1842,7 +1854,7 @@ def create_execution_router() -> APIRouter:
     async def get_run_outputs(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunOutputsResponse:
         """Return the FULL manifest of sink-write artefacts for a run.
@@ -1884,7 +1896,7 @@ def create_execution_router() -> APIRouter:
         run_id: UUID,
         artifact_id: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> Any:
         """Stream the bytes of one artefact written by a run.
@@ -1987,7 +1999,7 @@ def create_execution_router() -> APIRouter:
         run_id: UUID,
         artifact_id: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
     ) -> RunOutputArtifactPreview:
         """Return a bounded head-of-file preview of one sink-write artefact.
@@ -2065,7 +2077,7 @@ def create_execution_router() -> APIRouter:
     async def create_run_websocket_ticket(
         run_id: UUID,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> WebSocketTicketResponse:
         """Issue a short-lived one-use credential for the progress WebSocket."""
         await _verify_run_ownership(run_id, user, request)

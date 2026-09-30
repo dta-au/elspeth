@@ -19,6 +19,7 @@ from elspeth.web.secrets.wiring_policy import EMPTY_SECRET_WIRING_POLICY
 from elspeth.web.sessions.models import (
     composition_states_table,
     identities_table,
+    identity_roles_table,
     quota_policies_table,
     run_events_table,
     run_execution_inputs_table,
@@ -85,6 +86,16 @@ def test_pre_restore_assessment_records_refusal_preserving_issued_history(engine
 def _admission(engine):
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        conn.execute(
+            insert(identity_roles_table).values(
+                role_id=str(uuid4()),
+                identity_id="alice",
+                role="user",
+                scope=None,
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
     authority = SQLiteLocalSessionOperationAuthority(engine)
     session = authority.create_session_with_initial_fence(
         user_id="alice", title="admission", auth_provider_type="local", owner_instance_id="owner", lease_seconds=30
@@ -127,6 +138,22 @@ def _admission(engine):
 
     run = authority.mutate(context, admit)
     return authority, context, run, envelope
+
+
+def test_live_user_role_is_reproved_inside_run_start_admission(engine):
+    authority, context, run, _ = _admission(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            update(identity_roles_table)
+            .where(identity_roles_table.c.identity_id == "alice", identity_roles_table.c.role == "user")
+            .values(revoked_at=datetime.now(UTC))
+        )
+
+    refused = authority.mutate(context, lambda tx: tx.runs.issue_start_permit(run_id=run.id, policy=NO_QUOTA_POLICY))
+
+    assert refused.state is StartPermitState.REFUSED
+    assert refused.admission_decision.refusal_reason is AdmissionRefusalReason.USER_ROLE_REQUIRED
+    assert refused.permit_id is None
 
 
 def test_atomic_admission_has_one_envelope_permit_and_owner(engine):

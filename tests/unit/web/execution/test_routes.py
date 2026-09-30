@@ -61,6 +61,7 @@ from elspeth.web.sessions.protocol import (
     SessionRecord,
     SessionServiceProtocol,
 )
+from tests.fixtures.identities import wire_test_pipeline_user_authority
 from tests.helpers.session_fences import RecordingSessionOperationAuthority
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -242,6 +243,7 @@ def _create_test_app(
 
     # Mock settings for ownership checks
     app.state.settings = _FakeWebSettings()
+    wire_test_pipeline_user_authority(app, identity_id=_TEST_USER_ID)
 
     fake_user = UserIdentity(user_id=_TEST_USER_ID, username="testuser")
 

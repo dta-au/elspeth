@@ -13,10 +13,12 @@ POST   /api/secrets/{name}/validate -- check whether a secret ref is resolvable
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from elspeth.web.async_workers import run_sync_in_worker
-from elspeth.web.auth.middleware import get_current_user
+from elspeth.web.auth.middleware import require_pipeline_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
 from elspeth.web.secrets.schemas import (
@@ -68,7 +70,7 @@ def create_secrets_router() -> APIRouter:
     @router.get("", response_model=list[SecretInventoryResponse])
     async def list_secrets(
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> list[SecretInventoryResponse]:
         """List all visible secret references (user + server scopes).
 
@@ -92,7 +94,7 @@ def create_secrets_router() -> APIRouter:
     async def create_secret(
         body: CreateSecretRequest,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> CreateSecretResponse:
         """Create or update a user-scoped secret.
 
@@ -130,7 +132,7 @@ def create_secrets_router() -> APIRouter:
     async def delete_secret(
         name: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> None:
         """Delete a user-scoped secret.
 
@@ -153,7 +155,7 @@ def create_secrets_router() -> APIRouter:
     async def validate_secret(
         name: str,
         request: Request,
-        user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        user: Annotated[UserIdentity, Depends(require_pipeline_user)],
     ) -> ValidateSecretResponse:
         """Check whether a named secret reference is resolvable.
 

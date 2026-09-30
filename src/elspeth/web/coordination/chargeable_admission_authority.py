@@ -14,9 +14,10 @@ from elspeth.contracts.chargeable_admission import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.coordination.database_clock import database_now
+from elspeth.web.coordination.membership_authority import _ensure_utc
 from elspeth.web.coordination.mutation_connection_registry import _resolve_mutation_connection
 from elspeth.web.coordination.quota_authority import RepositoryQuotaAuthority, utc_day_start
-from elspeth.web.sessions.models import identities_table, quota_policies_table, sessions_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table, quota_policies_table, sessions_table
 
 
 class RepositoryChargeableAdmissionAuthority:
@@ -37,7 +38,7 @@ class RepositoryChargeableAdmissionAuthority:
             select(sessions_table.c.user_id, sessions_table.c.auth_provider_type).where(sessions_table.c.id == session_id)
         ).one()
         identity = conn.execute(
-            select(identities_table.c.access_state, identities_table.c.provider)
+            select(identities_table.c.access_state, identities_table.c.provider, identities_table.c.kind)
             .where(identities_table.c.identity_id == session.user_id)
             .with_for_update()
         ).one_or_none()
@@ -52,11 +53,34 @@ class RepositoryChargeableAdmissionAuthority:
             identity_refusal = AdmissionRefusalReason.IDENTITY_PENDING
         elif identity.access_state != "active":
             raise AuditIntegrityError("Stored identity has an unknown access state")
+        elif identity.kind != "human":
+            identity_refusal = AdmissionRefusalReason.USER_ROLE_REQUIRED
         if identity_refusal is not None:
             return ChargeableAdmissionDecision(
                 refusal_reason=identity_refusal,
                 evidence=AdmissionPolicyEvidence(
                     quota_disposition=QuotaDisposition.NOT_ASSESSED, secret_wiring_hash=policy.secret_wiring_hash
+                ),
+            )
+        user_roles = conn.execute(
+            select(identity_roles_table.c.scope, identity_roles_table.c.expires_at, identity_roles_table.c.revoked_at)
+            .where(
+                identity_roles_table.c.identity_id == session.user_id,
+                identity_roles_table.c.role == "user",
+            )
+            .with_for_update()
+        ).all()
+        now = database_now(conn)
+        holds_user_role = any(
+            row.scope is None and row.revoked_at is None and (row.expires_at is None or _ensure_utc(row.expires_at) > now)
+            for row in user_roles
+        )
+        if not holds_user_role:
+            return ChargeableAdmissionDecision(
+                refusal_reason=AdmissionRefusalReason.USER_ROLE_REQUIRED,
+                evidence=AdmissionPolicyEvidence(
+                    quota_disposition=QuotaDisposition.NOT_ASSESSED,
+                    secret_wiring_hash=policy.secret_wiring_hash,
                 ),
             )
         policies = RepositoryQuotaAuthority.active_policy(connection_token, identity_id=session.user_id)
@@ -99,7 +123,7 @@ class RepositoryChargeableAdmissionAuthority:
                     secret_wiring_hash=policy.secret_wiring_hash,
                 ),
             )
-        day_start_utc = utc_day_start(database_now(conn))
+        day_start_utc = utc_day_start(now)
         identity_usage = (
             RepositoryQuotaAuthority.daily_token_total(
                 connection_token,

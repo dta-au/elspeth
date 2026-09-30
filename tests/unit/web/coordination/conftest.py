@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from tests.fixtures.identities import ensure_test_identity
@@ -16,6 +18,7 @@ from elspeth.web.coordination.mutation_connection_registry import (
 )
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identity_roles_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -26,6 +29,16 @@ def fenced_session(tmp_path: Path) -> Iterator[FencedSession]:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        conn.execute(
+            identity_roles_table.insert().values(
+                role_id=str(uuid4()),
+                identity_id="alice",
+                role="user",
+                scope=None,
+                granted_by_identity_id="alice",
+                granted_at=datetime.now(UTC),
+            )
+        )
     session = SQLiteLocalSessionOperationAuthority(engine).create_session_with_initial_fence(
         user_id="alice", title="fenced", auth_provider_type="local", owner_instance_id="owner", lease_seconds=30
     )

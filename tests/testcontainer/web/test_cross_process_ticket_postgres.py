@@ -18,7 +18,7 @@ from tests.unit.web.execution.test_durable_websocket_ticket import seed_ticket_r
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import identities_table, sessions_table, websocket_tickets_table
+from elspeth.web.sessions.models import identities_table, identity_roles_table, sessions_table, websocket_tickets_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 pytestmark = pytest.mark.testcontainer
@@ -149,6 +149,40 @@ def test_identity_revocation_committed_while_consumer_waits_refuses(ticket_postg
             parent.send("consume")
             _await_consumer_lock(ticket_postgres, run_id)
             conn.execute(update(identities_table).where(identities_table.c.identity_id == user.user_id).values(access_state="disabled"))
+        assert parent.poll(30)
+        assert parent.recv() is None
+        process.join(30)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+        process.join(30)
+        parent.close()
+
+
+def test_user_role_revocation_committed_while_consumer_waits_refuses(ticket_postgres: Engine) -> None:
+    """A ticket minted before workload-role revocation cannot open the stream afterwards."""
+    _, run_id, user = seed_ticket_run(ticket_postgres)
+    ticket = RepositorySessionWebsocketTicketAuthority(ticket_postgres).issue(run_id=run_id, user=user)
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(
+        target=_consume_process, args=(ticket_postgres.url.render_as_string(hide_password=False), run_id, ticket.ticket, child)
+    )
+    try:
+        with ticket_postgres.begin() as conn:
+            conn.execute(select(identity_roles_table).where(identity_roles_table.c.identity_id == user.user_id).with_for_update()).one()
+            process.start()
+            child.close()
+            assert parent.poll(30)
+            assert parent.recv() == "ready"
+            parent.send("consume")
+            _await_consumer_lock(ticket_postgres, run_id)
+            conn.execute(
+                update(identity_roles_table)
+                .where(identity_roles_table.c.identity_id == user.user_id)
+                .values(revoked_at=text("clock_timestamp()"))
+            )
         assert parent.poll(30)
         assert parent.recv() is None
         process.join(30)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
@@ -20,6 +21,7 @@ from elspeth.web.auth import audit as audit_module
 from elspeth.web.auth.audit import AuthAuditRecorder, classify_authentication_failure
 from elspeth.web.auth.models import AccessPending, AuthenticationError, AuthProviderUnavailable, IdentityDisabled
 from elspeth.web.auth.sso import SSO_FAILURE_CATEGORIES, SsoIdpError, SsoLoginError, SsoStateMismatch
+from elspeth.web.coordination.identity_authority import PendingIdentitiesPurged
 from elspeth.web.schema_probe import EXTERNAL_POSTGRES_POOL_KWARGS
 
 _STATE_POLICY_MATRIX = [
@@ -794,6 +796,32 @@ def test_activation_writes_identity_role_and_quota_rows_in_order_with_the_reques
     assert _metadata(rows[0])["cause"] == "admin_activation" and _metadata(rows[0])["note"] == "approved"
     assert _metadata(rows[1])["role"] == "user" and _metadata(rows[1])["role_id"] == "role-1"
     assert (_metadata(rows[2])["tokens_per_day"], _metadata(rows[2])["storage_bytes"]) == (1000, 2000)
+
+
+def test_pending_purge_audit_names_the_exact_deleted_rows_and_batch(tmp_path: Any) -> None:
+    recorder, url = _durable_recorder(tmp_path)
+    outcome = PendingIdentitiesPurged(
+        identity_ids=("pending-1", "pending-2"),
+        batch_id="batch-1",
+        has_more=True,
+        actor_identity_id="identity-admin",
+        retention_days=90,
+        at=datetime.now(UTC),
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+
+    recorder.record_pending_identities_purged(_request(), provider="local", outcome=outcome)
+
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["pending_identities_purged"] * 3
+    assert [row.identity_id for row in rows] == [None, "pending-1", "pending-2"]
+    summary = _metadata(rows[0])
+    assert summary["batch_id"] == "batch-1"
+    assert summary["deleted_count"] == 2
+    assert summary["deleted_identity_ids"] == ["pending-1", "pending-2"]
+    assert summary["has_more"] is True
+    assert all(_metadata(row)["retention_days"] == 90 for row in rows)
 
 
 def test_an_activation_that_granted_nothing_records_the_access_the_identity_kept(tmp_path: Any) -> None:

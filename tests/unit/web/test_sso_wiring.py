@@ -12,20 +12,24 @@ from the profile rather than from a per-provider branch.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from pydantic import SecretBytes
+from sqlalchemy import insert
 
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.claims import IdTokenClaims
+from elspeth.web.auth.models import AuthenticationError
 from elspeth.web.auth.sso import SsoRuntime
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
 from elspeth.web.coordination.identity_authority import RepositoryIdentityAuthority
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import identities_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sso_wiring import build_sso_wiring, resolve_sso_runtime, sso_missing_settings
 from tests.helpers.fake_idp import FakeIdP
@@ -123,6 +127,35 @@ def test_local_and_unwired_deployments_build_nothing(tmp_path: Path, substrate, 
         build_sso_wiring(_oidc_unconfigured(tmp_path), session_engine=engine, identity_authority=authority, audit_recorder=audit_recorder)
         is None
     )
+
+
+def test_sso_browser_token_cannot_authenticate_reserved_service_identity(tmp_path: Path, substrate, audit_recorder) -> None:
+    engine, authority = substrate
+    wiring = build_sso_wiring(
+        _oidc_wired(tmp_path, FakeIdP()),
+        session_engine=engine,
+        identity_authority=authority,
+        audit_recorder=audit_recorder,
+    )
+    assert wiring is not None
+    now = datetime.now(UTC)
+    with engine.begin() as conn:
+        conn.execute(
+            insert(identities_table).values(
+                identity_id="service-principal",
+                provider="service",
+                kind="service",
+                subject="service-principal",
+                username="service-principal",
+                first_seen_at=now,
+                access_state="active",
+                activated_at=now,
+            )
+        )
+    token = wiring.token_issuer.mint(identity_id="service-principal", username="service-principal")
+
+    with pytest.raises(AuthenticationError, match="Invalid token"):
+        wiring.token_issuer.authenticate(token)
 
 
 @pytest.mark.asyncio
