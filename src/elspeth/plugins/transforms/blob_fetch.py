@@ -36,7 +36,7 @@ from elspeth.core.security.web import (
 from elspeth.core.security.web import NetworkError as SSRFNetworkError
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.fingerprinting import fingerprint_headers, fingerprint_url
-from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError
+from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient, HTTPResponseBodyTooLargeError, HTTPResponseEncodingLimitError
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -332,7 +332,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:72d46ee06d8794da"
+    source_file_hash: str | None = "sha256:9c75f8515498a8a4"
     config_model = BlobFetchConfig
     passes_through_input = True
     fetches_http = True
@@ -598,6 +598,10 @@ class BlobFetch(BaseTransform):
                     "body_size": exc.body_size,
                     "max_body_bytes": exc.max_body_bytes,
                 }
+            )
+        except HTTPResponseEncodingLimitError as exc:
+            return TransformResult.error(
+                {"reason": "body_too_large", "error": "response encoding limit exceeded", "error_type": exc.reason}
             )
         except WebScrapeError as exc:
             if exc.retryable:

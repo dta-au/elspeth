@@ -267,7 +267,8 @@ def update_grade_after_purge(
     Args:
         db: LandscapeDB instance
         coordination_token: Current authority for the run to potentially degrade.
-        deleted_refs: Payload refs actually removed by the purge operation.
+        deleted_refs: Payload refs confirmed absent by the purge operation,
+            including refs already removed by an earlier attempt.
     """
     run_id = coordination_token.run_id
     with fenced_leader_transaction(
@@ -309,7 +310,8 @@ def update_grade_after_purge(
 
         # In the real purge path, refs are intentionally retained and the
         # payload-store blobs are deleted. The deleted_refs argument is the
-        # authoritative evidence of that deletion. The response_ref IS NULL
+        # authoritative evidence of absence, including an idempotent retry
+        # after unlink succeeded but the grade update failed. The response_ref IS NULL
         # fallback preserves compatibility with older callers/tests that mark
         # purged call responses by nulling refs.
 

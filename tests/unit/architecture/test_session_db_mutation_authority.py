@@ -4627,7 +4627,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "fb67c26da4e42b98",
         1,
         None,
-        line=1676,
+        line=1692,
     ),
     # src/elspeth/web/secrets/user_store.py (read-only blocks, family R)
     WriterIdentity(

@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
@@ -152,16 +152,18 @@ class AzureContentSafety(BaseAzureSafetyTransform):
         if not super().is_effective_blocking_control(capability=capability, role=role, options=options):
             return False
         thresholds = options.get("thresholds")
-        if not isinstance(thresholds, Mapping):
-            return True
-        values = tuple(thresholds.get(category) for category in ("hate", "violence", "sexual", "self_harm"))
+        try:
+            validated = ContentSafetyThresholds.model_validate(thresholds)
+        except ValidationError:
+            return False
         # Runtime flags only severities strictly above the configured threshold;
-        # Azure's closed 0..6 response range makes four sixes a no-op.
-        return not all(type(value) is int and value >= 6 for value in values)
+        # evaluate the same admitted values, including config coercion. Azure's
+        # closed 0..6 response range makes four sixes a no-op.
+        return any(value < 6 for value in (validated.hate, validated.violence, validated.sexual, validated.self_harm))
 
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0827e5ac9b06e1df"
+    source_file_hash: str | None = "sha256:6869d9e7a5f59d57"
     config_model = AzureContentSafetyConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("azure", "content-safety", "moderation")

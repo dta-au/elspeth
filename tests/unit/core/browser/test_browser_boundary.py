@@ -31,6 +31,27 @@ def _job() -> BrowserJob:
     )
 
 
+def test_unicode_request_origin_remains_replayable_after_admission() -> None:
+    job = BrowserJob(job_id="unicode-row", start_url="https://bücher.example/page", allowed_origins=("https://bücher.example",))
+    journal = _Journal()
+    store = _Store(b"dom")
+    gateway = BrowserGatewayAdmission(job, journal)
+    gateway.admit(BrowserRequest(request_id="first", index=0, parent_request_id=None, url=job.start_url, method="GET"))
+    evidence = gateway.finish_response("first", b"dom", status=200, payload_store=store)
+    assert evidence.request.origin == ("https", "xn--bcher-kva.example", 443)
+    archive = BrowserArchive(
+        version=1,
+        job_sha256=browser_job_sha256(job),
+        requests=(evidence,),
+        output_sha256=hashlib.sha256(b"dom").hexdigest(),
+        output_size=3,
+    )
+    output = replay_browser_archive(job, archive, expected_archive_sha256=browser_archive_sha256(archive), payload_store=store)
+    assert output == b"dom"
+    assert journal.events == [("admitted", 0)]
+    assert journal.responses == [evidence]
+
+
 def _request(index: int = 0, url: str = "https://search.example.gov.au/results") -> BrowserRequest:
     return BrowserRequest(request_id=f"r-{index}", index=index, parent_request_id=None, url=url, method="GET")
 

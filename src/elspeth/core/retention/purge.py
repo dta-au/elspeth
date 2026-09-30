@@ -574,7 +574,8 @@ class PurgeManager:
         - FULL_REPRODUCIBLE -> unchanged (doesn't depend on payloads)
         - ATTRIBUTABLE_ONLY -> unchanged (already at lowest grade)
 
-        Grade updates only occur for runs whose payloads were actually deleted.
+        Grade updates reconcile runs whose payloads were deleted or already
+        absent, including retries after an earlier grade update failed.
         Runs that only had failed deletions retain their grade (payloads still exist).
 
         Args:
@@ -616,11 +617,11 @@ class PurgeManager:
         except CycleError as exc:
             raise ValueError("Cannot purge cyclic source-output payload dependencies safely") from exc
 
-        # Step 1: Delete the payloads, tracking which refs were actually deleted
+        # Step 1: Delete the payloads and retain proof of absence for grade repair.
         deleted_count = 0
         skipped_count = 0
         failed_refs: list[str] = []
-        deleted_refs: list[str] = []
+        absent_refs: list[str] = []
         failed_deletions: set[str] = set()
 
         for ref in refs:
@@ -643,15 +644,16 @@ class PurgeManager:
 
             if deleted:
                 deleted_count += 1
-                deleted_refs.append(ref)
             else:
                 # Ref doesn't exist - already purged or never stored
-                # This is not a failure, just skip it
+                # Keep the skip accounting while retrying any failed grade update.
                 skipped_count += 1
+            absent_refs.append(ref)
 
-        # Step 2: Find runs affected by ONLY the successfully deleted refs
-        # Runs with only failed refs still have their payloads and should not be downgraded
-        affected_run_ids = self._find_affected_run_ids(deleted_refs)
+        # Step 2: Find runs whose durable refs now point to absent payloads.
+        # An earlier unlink may have succeeded before its grade update failed.
+        # Failed deletions and dependency-held refs have no proof of absence.
+        affected_run_ids = self._find_affected_run_ids(absent_refs)
 
         # Step 3: Update reproducibility grades for affected runs
         # This degrades REPLAY_REPRODUCIBLE -> ATTRIBUTABLE_ONLY since
@@ -677,7 +679,7 @@ class PurgeManager:
                     window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 )
                 try:
-                    update_grade_after_purge(self._db, coordination_token=authority, deleted_refs=deleted_refs)
+                    update_grade_after_purge(self._db, coordination_token=authority, deleted_refs=absent_refs)
                 except BaseException as mutation_error:
                     try:
                         coordination.release_seat(token=authority)

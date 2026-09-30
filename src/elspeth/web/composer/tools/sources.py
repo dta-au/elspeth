@@ -1118,7 +1118,15 @@ def _execute_set_source(
         on_validation_failure=on_vf,
         description=validated.description,
     )
-    new_state = state.with_named_source(source_name, source)
+    proposed_state = state.with_named_source(source_name, source)
+    try:
+        new_state = reconcile_authoritative_reviews(state, proposed_state)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _failure_result(
+            state,
+            review_reconciliation_failure_message(exc, retry_hint="Re-inspect the pipeline and retry."),
+            error_code="review_reconciliation_failed",
+        )
     affected = (_source_component_id(source_name),)
     echo_note = _echoed_metadata_note(requirement_echo=requirement_echo, authoring_echo=authoring_echo)
     data = {"server_owned_metadata_note": echo_note} if echo_note is not None else None

@@ -195,12 +195,15 @@ def _safety(
     fields: tuple[str, ...] = ("llm_response",),
     plugin: str = "azure_content_safety",
 ) -> NodeSpec:
+    options: dict[str, object] = {"detect_only": detect_only, "fields": list(fields)}
+    if plugin == "azure_content_safety":
+        options["thresholds"] = {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}
     return _node(
         node_id,
         plugin,
         input_stream,
         on_success,
-        options={"detect_only": detect_only, "fields": list(fields)},
+        options=options,
     )
 
 
@@ -1749,7 +1752,13 @@ def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
     """The ``all`` shortcut is role-agnostic: it dominates any protected set."""
     state = _authorable_state(
         _llm(on_success="safe_in"),
-        _node("safety", "azure_content_safety", "safe_in", "main", options={"detect_only": False, "fields": "all"}),
+        _node(
+            "safety",
+            "azure_content_safety",
+            "safe_in",
+            "main",
+            options={"detect_only": False, "fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
+        ),
     )
 
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
@@ -1807,7 +1816,15 @@ def _self_publishing_state(node_type: str, *, guarded: bool) -> CompositionState
 
     nodes = [_llm(on_success=producer_target), node]
     if guarded:
-        nodes.append(_node("safety", "azure_content_safety", node_id, "main", options={"detect_only": False, "fields": "all"}))
+        nodes.append(
+            _node(
+                "safety",
+                "azure_content_safety",
+                node_id,
+                "main",
+                options={"detect_only": False, "fields": "all", "thresholds": {"hate": 4, "violence": 4, "sexual": 4, "self_harm": 4}},
+            )
+        )
     return _state(*nodes)
 
 

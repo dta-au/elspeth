@@ -313,6 +313,8 @@ class _ControlledStore(MockPayloadStore):
         if content_hash in self._fail_delete_for:
             raise OSError("delete failed")
         if content_hash in self._false_delete_for:
+            # Simulate another purge removing it before this unlink attempt.
+            super().delete(content_hash)
             return False
         return super().delete(content_hash)
 
@@ -1330,6 +1332,67 @@ class TestFindExpiredPayloadRefs:
 
 
 class TestPurgePayloads:
+    @pytest.mark.parametrize("fail_first", [False, True])
+    def test_repeated_purge_reconciles_grade_after_a_missing_payload(
+        self, db: LandscapeDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_first: bool
+    ) -> None:
+        from elspeth.core.landscape.reproducibility import update_grade_after_purge
+
+        store = FilesystemPayloadStore(tmp_path / "payloads")
+        response_ref = store.store(b'{"answer":42}')
+        manager = PurgeManager(db, store)
+        with db.write_connection() as conn:
+            _create_run(conn, "run-retry-grade", status=RunStatus.COMPLETED, completed_at=datetime(2026, 1, 1, tzinfo=UTC))
+            _create_node(conn, "run-retry-grade", "node-retry-grade", determinism=Determinism.NON_DETERMINISTIC)
+            _create_row(conn, "run-retry-grade", "node-retry-grade", "row-retry-grade", row_index=0, source_data_ref=None)
+            _create_token(conn, "run-retry-grade", "row-retry-grade", "token-retry-grade")
+            _create_node_state(
+                conn,
+                state_id="state-retry-grade",
+                token_id="token-retry-grade",
+                run_id="run-retry-grade",
+                node_id="node-retry-grade",
+            )
+            _create_call_for_state(
+                conn, call_id="call-retry-grade", state_id="state-retry-grade", request_ref=None, response_ref=response_ref
+            )
+
+        calls: list[str] = []
+
+        def _transient_grade_failure(
+            db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
+        ) -> None:
+            calls.append(coordination_token.run_id)
+            if fail_first and len(calls) == 1:
+                raise OperationalError("transient grade failure", {}, Exception("locked"))
+            update_grade_after_purge(db_obj, coordination_token=coordination_token, deleted_refs=deleted_refs)
+
+        monkeypatch.setattr("elspeth.core.retention.purge.update_grade_after_purge", _transient_grade_failure)
+        first = manager.purge_payloads([response_ref])
+        assert first.deleted_count == 1
+        assert first.grade_update_failures == (("run-retry-grade",) if fail_first else ())
+        assert not store.exists(response_ref)
+        with db.connection() as conn:
+            row = conn.execute(runs_table.select().where(runs_table.c.run_id == "run-retry-grade")).one()
+        assert row.reproducibility_grade == (
+            ReproducibilityGrade.REPLAY_REPRODUCIBLE if fail_first else ReproducibilityGrade.ATTRIBUTABLE_ONLY
+        )
+
+        refs = manager.find_expired_payload_refs(retention_days=30, as_of=datetime(2026, 3, 1, tzinfo=UTC))
+        assert refs == [response_ref]
+        for _ in range(2):
+            retry = manager.purge_payloads(refs)
+            assert retry.deleted_count == 0
+            assert retry.skipped_count == 1
+            assert retry.failed_refs == ()
+            assert retry.grade_update_failures == ()
+            with db.connection() as conn:
+                run = conn.execute(runs_table.select().where(runs_table.c.run_id == "run-retry-grade")).one()
+                seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "run-retry-grade")).one()
+            assert run.reproducibility_grade == ReproducibilityGrade.ATTRIBUTABLE_ONLY
+            assert seat.leader_worker_id is None
+        assert set(calls) == {"run-retry-grade"}
+
     def test_purge_payloads_downgrades_replay_run_when_deleted_ref_is_replay_critical(self, db: LandscapeDB) -> None:
         """A real blob purge must downgrade replay-only runs that need that response."""
         store = MockPayloadStore()
@@ -1432,7 +1495,7 @@ class TestPurgePayloads:
         assert result.deleted_count == 0
         assert result.skipped_count == 1
         assert result.failed_refs == ()
-        assert affected_lookup_inputs == [[]]
+        assert affected_lookup_inputs == [[stale_ref]]
 
     def test_purge_payloads_tracks_deleted_skipped_and_failures(self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
         store = _ControlledStore()
@@ -1456,7 +1519,7 @@ class TestPurgePayloads:
             db_obj: LandscapeDB, *, coordination_token: CoordinationToken, deleted_refs: list[str] | None = None
         ) -> None:
             del db_obj
-            assert deleted_refs == [ok_ref, exists_error_ref]
+            assert deleted_refs == [ok_ref, "missing-ref", false_ref, exists_error_ref]
             grade_updates.append(coordination_token.run_id)
 
         monkeypatch.setattr("elspeth.core.retention.purge.update_grade_after_purge", _record_grade_update)
@@ -1472,11 +1535,15 @@ class TestPurgePayloads:
         assert result.duration_seconds == 3.25
         assert grade_updates == ["run-affected"]
 
-    def test_purge_payloads_only_passes_deleted_refs_to_affected_run_lookup(self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_purge_payloads_only_passes_confirmed_absent_refs_to_affected_run_lookup(
+        self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         store = _ControlledStore()
         deleted_ref = store.store(b"deleted")
+        absent_ref = store.store(b"already absent")
         failed_ref = store.store(b"failed")
-        store._false_delete_for.add(failed_ref)
+        store._false_delete_for.add(absent_ref)
+        store._fail_delete_for.add(failed_ref)
 
         manager = PurgeManager(db, store)
 
@@ -1492,12 +1559,12 @@ class TestPurgePayloads:
             lambda db_obj, run_id, *, deleted_refs=None: None,
         )
 
-        result = manager.purge_payloads([deleted_ref, failed_ref])
+        result = manager.purge_payloads([deleted_ref, absent_ref, failed_ref])
 
         assert result.deleted_count == 1
         assert result.skipped_count == 1
-        assert result.failed_refs == ()
-        assert captured_refs == [deleted_ref]
+        assert result.failed_refs == (failed_ref,)
+        assert captured_refs == [deleted_ref, absent_ref]
 
     def test_purge_payloads_empty_input(self, db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
         manager = PurgeManager(db, MockPayloadStore())
@@ -1524,7 +1591,7 @@ class TestPurgePayloads:
 
         Verify:
           1. deleted_count + skipped_count + len(failed_refs) == 7
-          2. Grade updates run only for runs linked to deleted refs
+          2. Grade updates run for runs linked to deleted or already absent refs
           3. Failed refs don't trigger grade updates
         """
         store = _ControlledStore()
@@ -1542,9 +1609,8 @@ class TestPurgePayloads:
 
         manager = PurgeManager(db, store)
 
-        # Map deleted refs → affected run IDs
+        # Map confirmed absent refs → affected run IDs
         def _mock_affected(refs: list[str]) -> set[str]:
-            # Only deleted refs should arrive here
             affected = set()
             if ok_ref_1 in refs:
                 affected.add("run-alpha")
@@ -1552,15 +1618,17 @@ class TestPurgePayloads:
                 affected.add("run-beta")
             if exists_check_irrelevant_ref in refs:
                 affected.add("run-gamma")
-            # Failed/skipped refs must NOT appear
+            if false_delete_ref in refs:
+                affected.add("run-already-absent")
+            # Failed refs have no evidence of absence; skipped refs do.
             assert delete_fail_ref not in refs
-            assert false_delete_ref not in refs
-            assert "missing-ref-1" not in refs
-            assert "missing-ref-2" not in refs
+            assert false_delete_ref in refs
+            assert "missing-ref-1" in refs
+            assert "missing-ref-2" in refs
             return affected
 
         monkeypatch.setattr(manager, "_find_affected_run_ids", _mock_affected)
-        _create_purge_runs(db, "run-alpha", "run-beta", "run-gamma")
+        _create_purge_runs(db, "run-alpha", "run-beta", "run-gamma", "run-already-absent")
 
         grade_updates: list[str] = []
         monkeypatch.setattr(
@@ -1589,8 +1657,8 @@ class TestPurgePayloads:
         # Failed refs are only hard delete failures.
         assert set(result.failed_refs) == {delete_fail_ref}
 
-        # Grade updates ran for all runs linked to successful deletions
-        assert set(grade_updates) == {"run-alpha", "run-beta", "run-gamma"}
+        # Grade updates reconcile every run linked to confirmed absence.
+        assert set(grade_updates) == {"run-alpha", "run-beta", "run-gamma", "run-already-absent"}
 
         # No grade update failures (all mocked to succeed)
         assert result.grade_update_failures == ()

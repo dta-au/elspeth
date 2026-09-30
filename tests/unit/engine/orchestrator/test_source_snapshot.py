@@ -19,6 +19,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator.source_snapshot import decode_source_snapshot, encode_source_snapshot, load_committed_source_snapshot
+from tests.fixtures.landscape import make_recorder_with_run
 
 
 def test_snapshot_round_trip_preserves_sparse_source_indexes_and_contracts() -> None:
@@ -130,3 +131,72 @@ def test_snapshot_operation_requires_exact_integer_version(tmp_path: Path, versi
     else:
         with pytest.raises(AuditIntegrityError, match="invalid version"):
             load_committed_source_snapshot(factory, store, run_id="run-source", source_id="source", source_name="primary")
+
+
+@pytest.mark.parametrize(
+    ("error", "destination"),
+    [("retained failure", None), (None, "quarantine"), ("retained failure", "quarantine")],
+)
+def test_committed_snapshot_refuses_quarantine_facts_on_an_ordinary_row(tmp_path: Path, error: str | None, destination: str | None) -> None:
+    store = FilesystemPayloadStore(tmp_path / "payloads")
+    setup = make_recorder_with_run(payload_store=store)
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(FieldContract(normalized_name="query", original_name="query", python_type=str, required=False, source="inferred"),),
+        locked=True,
+    )
+    row = SourceRow.valid({"query": "Alpha"}, contract=contract, source_row_index=0)
+    header, row_line = encode_source_snapshot((row,), source_name="primary", max_bytes=4096).decode().splitlines()
+    record = checkpoint_loads(row_line)
+    record["quarantine_error"] = error
+    record["quarantine_destination"] = destination
+    content = f"{header}\n{checkpoint_dumps(record)}\n".encode()
+    snapshot_ref = store.store(content)
+    operation = setup.factory.execution.begin_operation(setup.source_node_id, "source_load", coordination_token=setup.coordination_token)
+    setup.factory.execution.complete_operation(
+        operation.operation_id,
+        "completed",
+        coordination_token=setup.coordination_token,
+        output_data={"source_snapshot_ref": snapshot_ref, "source_snapshot_version": 1},
+        duration_ms=0,
+    )
+    before = setup.factory.execution.get_operations_for_run(setup.run_id)
+
+    with pytest.raises(AuditIntegrityError, match="quarantine metadata"):
+        load_committed_source_snapshot(setup.factory, store, run_id=setup.run_id, source_id=setup.source_node_id, source_name="primary")
+
+    assert setup.factory.execution.get_operations_for_run(setup.run_id) == before
+    assert store.retrieve(snapshot_ref) == content
+
+
+@pytest.mark.parametrize("is_quarantined", [False, True])
+def test_committed_snapshot_preserves_each_valid_source_decision(tmp_path: Path, is_quarantined: bool) -> None:
+    store = FilesystemPayloadStore(tmp_path / "payloads")
+    setup = make_recorder_with_run(payload_store=store)
+    contract = SchemaContract(
+        mode="OBSERVED",
+        fields=(FieldContract(normalized_name="query", original_name="query", python_type=str, required=False, source="inferred"),),
+        locked=True,
+    )
+    row = (
+        SourceRow.quarantined(123, error="invalid object", destination="quarantine", source_row_index=0, validation_error_id="error-first")
+        if is_quarantined
+        else SourceRow.valid({"query": "Alpha"}, contract=contract, source_row_index=0)
+    )
+    content = encode_source_snapshot((row,), source_name="primary", max_bytes=4096)
+    snapshot_ref = store.store(content)
+    operation = setup.factory.execution.begin_operation(setup.source_node_id, "source_load", coordination_token=setup.coordination_token)
+    setup.factory.execution.complete_operation(
+        operation.operation_id,
+        "completed",
+        coordination_token=setup.coordination_token,
+        output_data={"source_snapshot_ref": snapshot_ref, "source_snapshot_version": 1},
+        duration_ms=0,
+    )
+    before = setup.factory.execution.get_operations_for_run(setup.run_id)
+
+    assert load_committed_source_snapshot(
+        setup.factory, store, run_id=setup.run_id, source_id=setup.source_node_id, source_name="primary"
+    ) == (row,)
+    assert setup.factory.execution.get_operations_for_run(setup.run_id) == before
+    assert store.retrieve(snapshot_ref) == content

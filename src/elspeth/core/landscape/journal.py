@@ -460,7 +460,9 @@ class LandscapeJournal:
             if not required_metadata <= set(raw_record):
                 raise AuditIntegrityError(f"sidecar journal outbox batch {batch_id!r} metadata is inconsistent")
             if (
-                raw_record["journal_batch_id"] != batch_id
+                type(raw_record["journal_batch_ordinal"]) is not int
+                or type(raw_record["journal_batch_size"]) is not int
+                or raw_record["journal_batch_id"] != batch_id
                 or raw_record["journal_batch_ordinal"] != ordinal
                 or raw_record["journal_batch_size"] != expected_size
             ):

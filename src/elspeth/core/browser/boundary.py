@@ -144,8 +144,7 @@ def _request_record(request: BrowserRequest, *, admitted: bool) -> BrowserReques
     origin: HTTPOrigin | None = None
     if admitted:
         parsed = urlsplit(request.url)
-        scheme = parsed.scheme.lower()
-        origin = (scheme, parsed.hostname or "", parsed.port or (443 if scheme == "https" else 80))
+        origin = parse_http_origin(f"{parsed.scheme}://{parsed.netloc}")
     # Denials must remain journalable even when the URL has invalid Unicode.
     digest = hashlib.sha256(request.url.encode("utf-8", errors="surrogatepass")).hexdigest() if type(request.url) is str else "0" * 64
     return BrowserRequestRecord(request.request_id, request.index, request.parent_request_id, origin, digest, request.method)

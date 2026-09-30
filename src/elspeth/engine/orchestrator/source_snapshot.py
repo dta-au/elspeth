@@ -174,6 +174,8 @@ def decode_source_snapshot(content: bytes, *, source_name: str) -> tuple[SourceR
                     validation_error_id=record["validation_error_id"],
                 )
             elif record["is_quarantined"] is False:
+                if record["quarantine_error"] is not None or record["quarantine_destination"] is not None:
+                    raise AuditIntegrityError("valid source snapshot row has quarantine metadata")
                 if record["validation_error_id"] is not None:
                     raise AuditIntegrityError("valid source snapshot row has validation error identity")
                 contract_data = record["contract"]

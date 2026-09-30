@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -20,10 +21,11 @@ from elspeth.web.composer.source_demand import (
     source_data_contract_artifact_hash,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
-from elspeth.web.composer.tools import ToolContext
+from elspeth.web.composer.tools import ToolContext, execute_tool
 from elspeth.web.composer.tools.sessions import _execute_get_pipeline_state, _execute_set_pipeline
 from elspeth.web.composer.tools.sources import _execute_patch_source_options
 from elspeth.web.composer.tools.transforms import _execute_patch_node_options, _execute_upsert_node
+from elspeth.web.composer.turn_audit import _state_payload_for_compose_turn
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -567,6 +569,102 @@ def test_resolved_source_contract_survives_unrelated_source_patch() -> None:
     carried = source.options[INTERPRETATION_REQUIREMENTS_KEY][0]
     assert carried["status"] == "resolved"
     assert carried["accepted_artifact_hash"] == source_data_contract_artifact_hash(["colour"])
+
+
+@pytest.mark.parametrize("compact_shell", [False, True])
+@pytest.mark.parametrize("skip_rows", [0, 1])
+def test_public_set_source_preserves_unchanged_acknowledgement(tmp_path: Path, compact_shell: bool, skip_rows: int) -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options["path"] = str(tmp_path / "blobs" / "session" / "rows.csv")
+    previous = previous.with_named_source("source", replace(source, options=options))
+    acknowledged = dict(options[INTERPRETATION_REQUIREMENTS_KEY][0])
+    supplied = deep_thaw(options)
+    supplied["skip_rows"] = skip_rows
+    if compact_shell:
+        supplied[INTERPRETATION_REQUIREMENTS_KEY] = [{key: acknowledged[key] for key in ("kind", "user_term", "draft")}]
+    context = _trained_context()
+
+    result = execute_tool(
+        "set_source",
+        {"plugin": "csv", "options": supplied, "on_success": "in", "on_validation_failure": "discard"},
+        previous,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_id="session",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+    )
+
+    assert result.success, result.data
+    carried = deep_thaw(result.updated_state.sources["source"].options)[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert carried == acknowledged
+    assert result.updated_state.sources["source"].options["skip_rows"] == skip_rows
+    persisted = _state_payload_for_compose_turn(result).data
+    assert persisted.sources["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0]["event_id"] == "event-1"
+    assert persisted.sources["source"]["options"][INTERPRETATION_REQUIREMENTS_KEY][0][
+        "accepted_artifact_hash"
+    ] == source_data_contract_artifact_hash(["colour"])
+
+
+def test_public_set_source_cannot_erase_blocking_corrupt_acknowledgement(tmp_path: Path) -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options["path"] = str(tmp_path / "blobs" / "session" / "rows.csv")
+    options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_artifact_hash"] = "a" * 64
+    previous = previous.with_named_source("source", replace(source, options=options))
+    assert len(interpretation_sites(previous)) == 1
+    context = _trained_context()
+
+    result = execute_tool(
+        "set_source",
+        {"plugin": "csv", "options": options, "on_success": "in", "on_validation_failure": "discard"},
+        previous,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_id="session",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+    )
+
+    assert not result.success
+    assert result.updated_state is previous
+    assert result.validation.errors[0].error_code == "review_reconciliation_failed"
+    assert len(interpretation_sites(result.updated_state)) == 1
+
+
+def test_public_set_source_reopens_acknowledgement_when_guarantee_is_removed(tmp_path: Path) -> None:
+    previous = _resolved_source_contract_state(required_fields=["colour"])
+    source = previous.sources["source"]
+    options = deep_thaw(source.options)
+    options["path"] = str(tmp_path / "blobs" / "session" / "rows.csv")
+    previous = previous.with_named_source("source", replace(source, options=options))
+    supplied = deep_thaw(options)
+    supplied["schema"] = {"mode": "observed"}
+    context = _trained_context()
+
+    result = execute_tool(
+        "set_source",
+        {"plugin": "csv", "options": supplied, "on_success": "in", "on_validation_failure": "discard"},
+        previous,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_id="session",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+    )
+
+    assert result.success, result.data
+    reopened = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
+    assert reopened["status"] == "pending"
+    assert reopened["event_id"] is None
+    assert reopened["accepted_artifact_hash"] is None
+    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
 
 
 def test_planner_widening_of_acknowledged_guarantee_is_rejected() -> None:

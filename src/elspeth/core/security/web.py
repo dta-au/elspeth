@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from ipaddress import IPv4Network, IPv6Network
 from typing import Literal
 
+import httpx
+
 from elspeth.contracts.call_mode import ReplaySSRFRequest
 
 SSRFRefusalKind = Literal[
@@ -190,8 +192,14 @@ def _parse_url_for_validation(url: str) -> urllib.parse.ParseResult:
 
 def _validated_url_hostname(url: str, parsed: urllib.parse.ParseResult) -> str | None:
     try:
-        return parsed.hostname
-    except ValueError:
+        hostname = parsed.hostname
+        if hostname is not None and not hostname.isascii():
+            # Resolve the same IDNA hostname HTTPX uses on the wire. Keeping
+            # Unicode here makes Host unencodable and can make the resolver's
+            # IDNA codec select a different name from HTTPX's URL codec.
+            hostname = httpx.URL(scheme=parsed.scheme, host=hostname).raw_host.decode("ascii")
+        return hostname
+    except (ValueError, httpx.InvalidURL):
         pass
     raise SSRFBlockedError(f"Malformed URL; {_safe_url_diagnostic(url, parsed)}.", kind="malformed_url")
 
