@@ -15,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from elspeth.web.sessions.models import rate_limit_buckets_table, rate_limit_events_table
 
-RateLimitScope = Literal["composer", "write", "auth"]
+RateLimitScope = Literal["composer", "write", "auth", "audit_readiness"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +73,7 @@ class RepositoryRateLimitAuthority:
 
     def admit(self, *, scope: RateLimitScope, subject: str, limit: int, window_seconds: int = 60) -> RateLimitDecision:
         """Atomically prune, count and admit against fresh post-lock database time."""
-        if scope not in {"composer", "write", "auth"}:
+        if scope not in {"composer", "write", "auth", "audit_readiness"}:
             raise ValueError("Unknown rate limit scope")
         if type(subject) is not str or not subject:
             raise ValueError("Rate limit subject must be a nonempty string")

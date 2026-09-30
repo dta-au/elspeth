@@ -8,12 +8,10 @@ must reflect the current composition_version on every render), require
 authentication, and translate the service's ``LookupError`` /
 ``record is None`` outcomes into HTTP 404.
 
-Neither route checks the per-user composer rate limiter: reads are
-intentionally unguarded (idempotent, no write amplification — same
-policy as the preferences GET). They previously shared the composer
-message bucket, which in deployment is sized for LLM-backed compose
-calls; the audit panel's polling during the tutorial endgame exhausted
-it and 429'd the tutorial-completion preference write.
+The snapshot route uses a dedicated per-user rate-limit bucket because it
+runs canonical validation in the process-wide worker pool. The inexpensive
+explain route remains unguarded. Neither consumes the composer bucket, which
+is sized for LLM-backed calls.
 
 Layer: L3 (application). Imports only L3 peers (sessions, execution
 schemas, composer state, auth).
@@ -21,6 +19,7 @@ schemas, composer state, auth).
 
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -42,6 +41,10 @@ from elspeth.web.composer.telemetry_phase8 import record_audit_fetch_failure
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.middleware.rate_limit import (
+    WebRateLimiter,
+    get_audit_readiness_rate_limiter,
+)
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -61,10 +64,12 @@ def create_audit_readiness_router() -> APIRouter:
     async def snapshot(
         session_id: UUID,
         request: Request,
+        rate_limiter: Annotated[WebRateLimiter, Depends(get_audit_readiness_rate_limiter)],
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
     ) -> JSONResponse:
         """Return the six-row audit-readiness snapshot for ``session_id``."""
         await verify_session_ownership(session_id, user, request)
+        await rate_limiter.check(user.user_id)
         service: ReadinessService = request.app.state.readiness_service
         session_service: SessionServiceProtocol = request.app.state.session_service
         lease = await SessionOperationLease.acquire(

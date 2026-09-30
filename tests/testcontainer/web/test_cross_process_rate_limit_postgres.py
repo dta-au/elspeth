@@ -260,3 +260,17 @@ def test_postgres_readonly_refusal_never_uses_local_budget(rate_url: str) -> Non
         assert after == before
     finally:
         engine.dispose()
+
+
+def test_audit_readiness_scope_is_admitted_and_independent_of_composer(rate_url: str) -> None:
+    """The audit-readiness snapshot bucket is its own scope: exhausting it
+    leaves the same user's composer budget untouched (and vice versa)."""
+    engine = create_engine(rate_url)
+    try:
+        authority = RepositoryRateLimitAuthority(engine, signing_key=_KEY)
+        subject = str(uuid4())
+        assert authority.admit(scope="audit_readiness", subject=subject, limit=1).allowed
+        assert not authority.admit(scope="audit_readiness", subject=subject, limit=1).allowed
+        assert authority.admit(scope="composer", subject=subject, limit=1).allowed
+    finally:
+        engine.dispose()

@@ -1925,6 +1925,12 @@ def _create_app(
         app.state.write_rate_limiter = SharedRateLimiter(
             settings.write_rate_limit_per_minute, authority=rate_limit_authority, scope="write"
         )
+        # Audit-readiness snapshots run canonical validation in the shared
+        # worker pool; their own per-user bucket keeps them off the LLM-call
+        # budget while stopping one user monopolising that capacity.
+        app.state.audit_readiness_rate_limiter = SharedRateLimiter(
+            settings.audit_readiness_rate_limit_per_minute, authority=rate_limit_authority, scope="audit_readiness"
+        )
         app.state.auth_rate_limiter = SharedRateLimiter(settings.auth_rate_limit_per_minute, authority=rate_limit_authority, scope="auth")
     else:
         app.state.composer_progress_registry = ComposerProgressRegistry()
@@ -1932,6 +1938,7 @@ def _create_app(
         app.state.run_progress_reader = None
         app.state.rate_limiter = ComposerRateLimiter(settings.composer_rate_limit_per_minute)
         app.state.write_rate_limiter = ComposerRateLimiter(settings.write_rate_limit_per_minute)
+        app.state.audit_readiness_rate_limiter = ComposerRateLimiter(settings.audit_readiness_rate_limit_per_minute)
         app.state.auth_rate_limiter = ComposerRateLimiter(settings.auth_rate_limit_per_minute)
 
     # --- Multi-worker enforcement (W10 -> R6) ---

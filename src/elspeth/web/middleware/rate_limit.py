@@ -188,6 +188,12 @@ async def get_write_rate_limiter(request: Request) -> WebRateLimiter:
     return limiter
 
 
+async def get_audit_readiness_rate_limiter(request: Request) -> WebRateLimiter:
+    """FastAPI dependency for expensive audit-readiness snapshots."""
+    limiter: WebRateLimiter = request.app.state.audit_readiness_rate_limiter
+    return limiter
+
+
 async def check_auth_rate_limit(request: Request) -> None:
     """Rate-limit auth endpoints by client IP.
 
