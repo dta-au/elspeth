@@ -17,7 +17,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from starlette.websockets import WebSocketDisconnect
-from tests.unit.web.execution.test_websocket import FakeBroadcaster
+from tests.fixtures.identities import grant_test_pipeline_user
+from tests.unit.web.execution.test_websocket import FakeBroadcaster, FakeSettings
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.models import IdentityClaims, UserIdentity
@@ -189,6 +190,11 @@ def _websocket_route_process(url: str, identity_id: str, run_id: str, pipe: Conn
         log=structlog.get_logger("test.pg-progress-route"),
         owner_instance_id=f"progress-route-{uuid4()}",
     )
+    app.state.identity_authority = RepositoryIdentityAuthority(
+        engine,
+        lifecycle_effect=RepositoryApprovalLifecycleAuthority().apply,
+    )
+    app.state.settings = FakeSettings(auth_provider="vanguard")
     app.state.websocket_ticket_store = WebSocketTicketStore()
     app.include_router(create_execution_router())
     ticket = app.state.websocket_ticket_store.issue(run_id=run_id, user=UserIdentity(user_id=identity_id, username=identity_id)).ticket
@@ -243,6 +249,8 @@ def progress_identity(external_deployment_postgres_url: str) -> Iterator[tuple[s
         record_rebound=_noop,
         record_dormant=_noop,
     )
+    with engine.begin() as conn:
+        grant_test_pipeline_user(conn, identity_id=outcome.record.identity_id)
     try:
         yield outcome.record.identity_id, subject
     finally:

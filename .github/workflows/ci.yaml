@@ -995,7 +995,7 @@ jobs:
           # chroma_sink + rag_retrieval plugins; remove this ignore and bump the
           # pin once an upstream fix ships. PyJWT advisories PYSEC-2026-175/177/
           # 178/179 and CVE-2026-102274 are NOT ignored — the authored floor
-          # and uv.lock select PyJWT 2.14.0 or newer.
+          # and uv.lock select PyJWT 2.15.0 or newer.
           #
           # CVE-2026-45830 / CVE-2026-45831 / CVE-2026-45833 (added 2026-09-10)
           # likewise have no fixed chromadb release. All three are defects in the

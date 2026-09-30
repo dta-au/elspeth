@@ -19,7 +19,7 @@ import pytest
 import structlog
 from sqlalchemy import insert, select, text
 from sqlalchemy.engine import make_url
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.fenced_session import CONTAINER_TOKENS_PER_DAY, IDENTITY_TOKENS_PER_DAY, FencedSession, seed_token_policies
 
 from elspeth.contracts.blobs import IdentityStorageQuotaExceededError
@@ -81,6 +81,7 @@ def pg_fenced(external_deployment_postgres_url: str) -> Iterator[FencedSession]:
         initialize_session_schema(engine)
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
+            grant_test_pipeline_user(conn, identity_id="alice")
         session = PostgresSessionOperationRepository(engine).create_session_with_initial_fence(
             user_id="alice", title="fenced", auth_provider_type="local", owner_instance_id="owner", lease_seconds=120
         )

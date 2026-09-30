@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import func, select, update
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.testcontainer.web.test_cross_process_run_reconciliation_postgres import (
     _expire_dead_owner,
     _process,
@@ -86,6 +86,7 @@ def _die_during_web_dispatch(session_url, landscape_url, data_dir, seam, connect
             pass
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
+            grant_test_pipeline_user(conn, identity_id="alice")
         session = await sessions.create_session("alice", "durable CSV admission", "local")
         source_path = root / "blobs" / str(session.id) / "input.csv"
         output_path = root / "outputs" / str(session.id) / "result.csv"

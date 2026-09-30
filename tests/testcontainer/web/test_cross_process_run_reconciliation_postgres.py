@@ -15,7 +15,7 @@ import structlog
 from psycopg import sql
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.fixtures.landscape import leader_coordination_token, register_test_node
 from tests.testcontainer.web.test_cross_process_run_control_postgres import _envelope
 from tests.testcontainer.web.test_global_run_recovery_postgres import _expire_fence, _expire_instance, _register_live_instance
@@ -85,6 +85,7 @@ def _die_after_engine_result(session_url, landscape_url, data_dir, terminal, con
         initialize_session_schema(engine)
         with engine.begin() as conn:
             ensure_test_identity(conn, identity_id="alice")
+            grant_test_pipeline_user(conn, identity_id="alice")
         owner = f"crashed-admitter-{uuid4()}"
         sessions = _service(engine, owner)
         session = await sessions.create_session("alice", "crash handoff", "local")

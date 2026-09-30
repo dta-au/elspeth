@@ -59,7 +59,10 @@ async def _serve_lifecycle_commands(url: str, session_id: str, user_id: str, pip
         shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )
     app.state.composer_progress_registry = registry
-    app.dependency_overrides[_helpers.get_current_user] = lambda: UserIdentity(user_id=user_id, username="composer-pg-user")
+    app.dependency_overrides[_helpers.require_pipeline_user] = lambda: UserIdentity(
+        user_id=user_id,
+        username="composer-pg-user",
+    )
     app.include_router(state.router)
     entered: dict[str, asyncio.Event] = {}
     requests: dict[str, asyncio.Task[Response]] = {}
