@@ -55,8 +55,8 @@ release, website and mutation-testing jobs use the local labels
 Manual live-provider acceptance retains its specialized self-hosted cloud
 runners because it proves ECS execution and managed-identity behavior.
 Pull requests from repository branches run locally. Fork pull requests skip
-jobs that check out code and fail the
-required `CI Success` and `Judge gates success` checks. A maintainer must
+jobs that check out code and fail the required `CI Success` check and the
+additional advisory `Judge gates success` status. A maintainer must
 review a fork's code and workflow changes before admitting them onto a
 repository branch. Repository Actions settings must require approval for
 all outside contributors (`all_external_contributors`): a fork can change
