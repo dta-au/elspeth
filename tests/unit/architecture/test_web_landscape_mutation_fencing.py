@@ -7925,7 +7925,10 @@ _REVIEWED_REGISTRY_MODULES = {
     "src/elspeth/core/landscape/database_clock.py": "e9c23dc544de396b4dab3421dba030908898eda27da4685b82c7b042ec909e65",
     # Guard registration after serialization/outbox INSERT; precommit failure
     # cleanup, transitive serialization helpers, and postcommit drain ordering.
-    "src/elspeth/core/landscape/journal.py": "96162bebbae30b8eaf5d26a2b9ae1ce48101e0cbc5983468af8824ab958e4ddc",
+    # 96162beb… -> the value below: _deserialize_outbox_records rejects bool
+    # and float batch ordinals/sizes before publication or acknowledgement.
+    # Reviewed against 44bb3fb02; guard/event/rollback ordering is unchanged.
+    "src/elspeth/core/landscape/journal.py": "a6056891cb8e7a3a748e638cb8475521d0701b29cc11ee80d031a1a71b991d1d",
     # Installation in both engine constructors and bare-engine begin_write;
     # transaction ownership and engine/Connection event setup are also bound.
     # a41206e2… -> d9712b63… on the first 0.8.0 integration: release 9768ede9d
