@@ -2,7 +2,7 @@
 
 **Status:** product process baseline complete; independent assessment and
 deployment change control open · **Reviewed against:** `release/0.8.1` @
-`004c0eee0` (2026-09-30) · **Owner:** ELSPETH maintainer
+`e59a799fe` (2026-10-01) · **Owner:** ELSPETH maintainer
 
 Shows how code is written, reviewed, tested and gated before it reaches a
 release. For each gate it records what the gate checks, where it runs, and
@@ -124,7 +124,18 @@ corresponding governance and repository-setting risks are handled through the
 - **Pinned tool downloads.** actionlint, Terraform and Bicep are downloaded by
   fixed version and checked against a SHA-256 before use. Python dependencies
   install with `uv sync --frozen` (the lockfile), frontend dependencies with
-  `npm ci` [EV-604].
+  `npm ci`. Every `setup-uv` step selects exact version `0.10.2`; the Python
+  job containers use tag-plus-digest references; the audit executables are
+  exact locked dependency-group members; and mutation jobs use the frozen root
+  lock rather than an unlocked editable install [EV-604] [EV-707] [EV-723].
+- **Persistent-runner boundary.** Unique per-run/job checkout paths prevent
+  ordinary workspace collision. Repository source does not prove runner
+  ownership, host reimaging, service-account separation, process cleanup,
+  Docker daemon/cache/volume/network isolation, secret scrubbing, or separation
+  from concurrent jobs. Those are open deployment evidence requirements in
+  [10 § 6.7](10-vulnerability-and-supply-chain.md#67-deployment-record--cicd);
+  the `nyx-ci, trusted` label is an admission label, not evidence that those
+  controls operate [EV-604].
 - **Secrets.** Which workflow references which secret is set out in
   [07 § 5.2](07-secrets-and-key-management.md#52-ci-secrets). No workflow
   holds the judge-metadata signing key
@@ -298,6 +309,7 @@ editing YAML without a test failing [EV-617]:
 | `tests/unit/test_ci_workflow_xdist.py` | Concurrency policy shared by the three push workflows; additional judge-workflow check name; CodeQL suites not filtered by severity; integration job fails closed; no workflow references the operator HMAC key |
 | `tests/unit/test_build_push_release_checks.py` | Required-check verification before build; OCI revision label bound to the image commit; tags promoted only after smoke tests; Dockerfile inputs and runtime contract |
 | `tests/unit/cicd/test_gateway_supply_chain.py` | Gateway lock freshness and a stale-metadata negative control; exact dependency-audit exceptions; CI aggregation; image qualification; exact-digest gateway publication, evidence and promotion contracts |
+| `tests/unit/cicd/test_workflow_supply_chain_closure.py` | Main-image scans precede signing; scan evidence retention; job-container digest pins; one exact `uv` version; locked audit tools; frozen mutation installs, each with a mutation control that must fail |
 | `tests/unit/elspeth_lints/test_meta_ci_never_signs.py` | CI never signs judge metadata |
 | `tests/unit/cicd/` | Trust-tier ratchet, state-engine CI selection, live-provider workflow |
 | `tests/unit/web/composer/test_label_gate_direction.py` | The four label and direction combinations of the redaction gate, through the real scripts |
@@ -505,8 +517,12 @@ The workflow then performs the following sequence [EV-626]:
    source commit.
 3. When both registries are selected, ACR receives a digest-preserving copy
    of the GHCR image, and the workflow asserts the two digests are equal.
-4. Each main-image digest is signed (§ 6.3). The exact gateway digest is
-   scanned per platform, signed and verified under the workflow identity.
+4. The exact main-image digest is scanned for High/Critical vulnerabilities on
+   amd64 and arm64 before signing. GHCR and ACR-only builds are scanned at
+   their registry digest; a digest-preserving GHCR-to-ACR copy reuses the
+   already scanned bytes. The reports are retained for 90 days. The exact
+   gateway digest is likewise scanned per platform, signed and verified under
+   the workflow identity.
 5. The smoke-test job pulls the main image by digest and checks the non-root
    runtime identity, data directories, database drivers and trust root, runs
    the CLI, and runs example pipelines whose outputs it checks [EV-712]. When
@@ -534,6 +550,11 @@ The workflow then performs the following sequence [EV-626]:
   files for 90 days [EV-709] [EV-722]. These are source-enforced workflow
   contracts. A successful GitHub run remains required to prove that a
   particular gateway digest and its evidence exist in the registry.
+- **Main-image scan evidence.** Before either registry digest is signed, Trivy
+  scans its amd64 and arm64 platform images with a zero High/Critical threshold
+  and retains the available registry reports for 90 days [EV-709] [EV-723]. A
+  successful publication run remains required to prove that a particular
+  digest passed those source-enforced gates.
 
 ### 6.4 How a deployer verifies an image
 
@@ -577,6 +598,7 @@ another registry does not copy its signature unless that copy was signed too.
 | Output of `cosign verify` with the exact certificate identity | DEPLOYMENT-TODO: |
 | `build-push.yaml` run that produced the digest, and its required-check verification step | DEPLOYMENT-TODO: |
 | OCI revision label matches the assessed commit | DEPLOYMENT-TODO: |
+| Main-image amd64 and arm64 Trivy reports, bound to the exact signed digest | DEPLOYMENT-TODO: first successful publication run containing this gate |
 | Reference gateway exact GHCR digest and publication run | DEPLOYMENT-TODO: first successful GitHub publication run |
 | Reference gateway SPDX SBOM and maximum-provenance files, bound to the source commit and digest | DEPLOYMENT-TODO: |
 | Reference gateway amd64 and arm64 Trivy results at zero High/Critical | DEPLOYMENT-TODO: |

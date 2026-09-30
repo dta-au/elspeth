@@ -2,7 +2,7 @@
 
 **Status:** product control baseline complete; deployment storage, custody and
 rotation records open · **Reviewed against:** `release/0.8.1` candidate @
-`cb20ed2e2` (2026-09-30) ·
+`e59a799fe` (2026-10-01) ·
 **Owner:** ELSPETH maintainer
 
 Describes which secrets and keys ELSPETH uses, how they reach the
@@ -424,14 +424,18 @@ its key-strength and generation controls in § 7.1.
 
 - **Pre-commit secret scanner.** `scripts/git-hooks/pre-commit-secret-scan.sh`,
   registered as the `secret-scan` hook in `.pre-commit-config.yaml`, scans
-  every staged text file for credential-shaped strings matching a fixed
-  pattern list: JWTs, OpenAI (`sk-` followed by an unbroken alphanumeric run)
+  the Git index bytes for every staged text file, independently of any
+  different unstaged working-tree bytes, for credential-shaped strings
+  matching a fixed pattern list: JWTs, OpenAI (`sk-` followed by an unbroken alphanumeric run)
   and Anthropic keys, Slack, AWS, Google and GitHub tokens, high-entropy bearer
   tokens, private-key blocks, connection strings with passwords, and quoted
   high-entropy values assigned to secret-like names. A match blocks the
   commit. The only per-line exception is the explicit marker
   `# secret-scan: allow-this-line`; project rules forbid bypassing the hook
-  with `--no-verify` ([AGENTS.md](../../AGENTS.md#gotchas)) [EV-219].
+  with `--no-verify` ([AGENTS.md](../../AGENTS.md#gotchas)). Regression controls
+  prove that a staged secret is rejected after the working copy is cleaned and
+  that an unstaged-only secret does not contaminate a clean staged blob
+  [EV-219].
 - **Ignored environment files.** Real environment files and their backups
   under `deploy/` are excluded by `.gitignore`; only `*.example` files are
   tracked.
