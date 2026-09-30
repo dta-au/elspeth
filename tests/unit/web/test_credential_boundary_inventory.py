@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 
 _EXPLICIT_REQUEST_BASES = frozenset({"_Provenance", "CreateInlineBlobRequest"})
@@ -330,16 +332,16 @@ _PROVIDER_GUARD_OWNERS = {
     "src/elspeth/web/composer/pipeline_planner.py:_plan_pipeline_inner.call_model.completion": (
         ("_parse_response_tool_calls", "require_no_credential_material"),
         ("_parse_response_tool_calls", "require_no_credential_material_in_tool_wire"),
-        ("_plan_pipeline_inner", "require_no_credential_material"),
+        ("_plan_pipeline_inner", "build_llm_call_record"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_llm._litellm_acompletion": (
         ("ProviderGateway._call_llm", "require_no_credential_material_in_tool_wire"),
         ("ProviderGateway._call_llm", "_require_no_credential_material_in_completion"),
         ("ProviderGateway._call_llm_with_audit", "_require_no_credential_material_in_completion"),
-        ("_require_no_credential_material_in_completion_fields", "require_no_credential_material"),
+        ("_require_no_credential_material_in_completion_fields", "require_no_credential_material_in_llm_metadata"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:ProviderGateway._call_text_llm._litellm_acompletion": (
-        ("ProviderGateway._call_text_llm", "require_no_credential_material"),
+        ("ProviderGateway._call_text_llm", "_require_no_credential_material_in_completion_fields"),
     ),
     "src/elspeth/web/composer/provider_gateway.py:_litellm_acompletion.acompletion": (
         ("_litellm_acompletion", "require_no_credential_material"),
@@ -422,6 +424,97 @@ def _scoped_calls(source: str) -> dict[str, set[str]]:
     return visitor.calls
 
 
+class _ConstructorCallVisitor(ast.NodeVisitor):
+    def __init__(self, *, path: str, constructor_names: frozenset[str]) -> None:
+        self.path = path
+        self.constructor_names = constructor_names
+        self.scopes: list[str] = []
+        self.found: set[str] = set()
+
+    def _visit_scope(self, node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.scopes.append(node.name)
+        self.generic_visit(node)
+        self.scopes.pop()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._visit_scope(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_scope(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_scope(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        call_name = _call_name(node)
+        if call_name in self.constructor_names:
+            self.found.add(f"{self.path}:{'.'.join(self.scopes)}.{call_name}")
+        self.generic_visit(node)
+
+
+def _constructor_calls(source: str, *, path: str, names: frozenset[str]) -> set[str]:
+    visitor = _ConstructorCallVisitor(path=path, constructor_names=names)
+    visitor.visit(ast.parse(source))
+    return visitor.found
+
+
+def _llm_audit_sources() -> dict[str, str]:
+    return {path.relative_to(ROOT).as_posix(): path.read_text(encoding="utf-8") for path in (ROOT / "src/elspeth").rglob("*.py")}
+
+
+def _assert_llm_audit_constructor_inventory(sources: dict[str, str]) -> None:
+    direct_record_sites: set[str] = set()
+    malformed_sites: set[str] = set()
+    for path, source in sources.items():
+        direct_record_sites.update(_constructor_calls(source, path=path, names=frozenset({"ComposerLLMCall"})))
+        malformed_sites.update(_constructor_calls(source, path=path, names=frozenset({"_MalformedLLMResponseError"})))
+
+    parsing_path = "src/elspeth/web/composer/llm_response_parsing.py"
+    provider_path = "src/elspeth/web/composer/provider_gateway.py"
+    assert direct_record_sites == {f"{parsing_path}:build_llm_call_record.ComposerLLMCall"}
+    assert malformed_sites
+    parsing_calls = _scoped_calls(sources[parsing_path])
+    provider_calls = _scoped_calls(sources[provider_path])
+    assert "require_no_credential_material_in_llm_metadata" in parsing_calls["build_llm_call_record"]
+    assert "_require_no_credential_material_in_completion_fields" in provider_calls["_MalformedLLMResponseError.__init__"]
+    assert "require_no_credential_material_in_llm_metadata" in provider_calls["_require_no_credential_material_in_completion_fields"]
+
+
+def test_llm_audit_constructors_are_behind_the_common_metadata_guard() -> None:
+    _assert_llm_audit_constructor_inventory(_llm_audit_sources())
+
+
+def test_llm_audit_constructor_inventory_detects_new_bypass_and_guard_removal() -> None:
+    sources = _llm_audit_sources()
+    direct_bypass = dict(sources)
+    direct_bypass["src/elspeth/web/composer/new_audit_path.py"] = """
+def bypass():
+    return ComposerLLMCall()
+"""
+    with pytest.raises(AssertionError):
+        _assert_llm_audit_constructor_inventory(direct_bypass)
+
+    record_guard_removed = dict(sources)
+    parsing_path = "src/elspeth/web/composer/llm_response_parsing.py"
+    record_guard_removed[parsing_path] = record_guard_removed[parsing_path].replace(
+        "require_no_credential_material_in_llm_metadata(",
+        "removed_credential_guard(",
+        1,
+    )
+    with pytest.raises(AssertionError):
+        _assert_llm_audit_constructor_inventory(record_guard_removed)
+
+    malformed_guard_removed = dict(sources)
+    provider_path = "src/elspeth/web/composer/provider_gateway.py"
+    malformed_guard_removed[provider_path] = malformed_guard_removed[provider_path].replace(
+        "_require_no_credential_material_in_completion_fields(",
+        "removed_credential_guard(",
+        1,
+    )
+    with pytest.raises(AssertionError):
+        _assert_llm_audit_constructor_inventory(malformed_guard_removed)
+
+
 def test_provider_inventory_scanner_has_positive_and_negative_controls() -> None:
     source = """
 async def guarded():
@@ -471,6 +564,7 @@ def test_common_tool_owners_hold_the_guard_for_new_tools_automatically() -> None
         "src/elspeth/web/composer/tools/_dispatch.py": ("require_no_credential_material_for_tool",),
         "src/elspeth/web/composer/tool_batch.py": (
             "require_no_credential_material",
+            "require_no_credential_material_in_llm_metadata",
             "require_no_credential_material_in_tool_wire",
         ),
         "src/elspeth/composer_mcp/server.py": ("require_no_credential_material_for_tool",),

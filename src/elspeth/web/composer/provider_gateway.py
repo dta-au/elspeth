@@ -36,6 +36,7 @@ from elspeth.web.composer.tools.wire_projection import wire_tool_definitions
 from elspeth.web.credential_guard import (
     CredentialMaterialRefused,
     require_no_credential_material,
+    require_no_credential_material_in_llm_metadata,
     require_no_credential_material_in_tool_wire,
 )
 
@@ -45,7 +46,20 @@ _COMPOSER_LLM_SEED_PARAM: Final[str] = "seed"
 class _MalformedLLMResponseError(ComposerServiceError):
     """Malformed completion with only already-admitted provider facts."""
 
-    def __init__(self, message: str, *, provider_metadata: _AdmittedLLMProviderMetadata, text_received: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_metadata: _AdmittedLLMProviderMetadata,
+        text_received: bool = False,
+        credential_surface: str = "composer_provider_response",
+    ) -> None:
+        _require_no_credential_material_in_completion_fields(
+            content=None,
+            tool_calls=(),
+            provider_metadata=provider_metadata,
+            surface=credential_surface,
+        )
         super().__init__(message)
         self.provider_metadata = provider_metadata
         self.text_received = text_received
@@ -89,7 +103,8 @@ def advisor_provider_failure_types() -> tuple[type[Exception], ...]:
     suppresses=("R5",),
     invariant=(
         "raises _MalformedLLMResponseError (carrying only already-admitted provider facts) on any "
-        "malformed choices/message/content/tool_calls surface; never coerces or fabricates a field"
+        "malformed choices/message/content/tool_calls surface; an explicitly optional absent tool_calls field is empty; "
+        "never coerces or fabricates a field"
     ),
     test_ref="tests/unit/web/composer/test_capture_llm_completion_boundary.py::test_malformed_choices_raises_malformed_llm_response_error",
     test_fingerprint="bde1559884f55a4452526d639a4c77f46e2f20c2a98cc7884cc3ab2421105866",
@@ -98,6 +113,8 @@ def _capture_composer_llm_completion_fields(
     response: Any,
     *,
     pricing_model: str | None = None,
+    credential_surface: str = "composer_provider_response",
+    require_tool_calls_field: bool = True,
 ) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
     """Read the response/message surface once, before validating its tool batch."""
 
@@ -115,40 +132,47 @@ def _capture_composer_llm_completion_fields(
         content=None,
         tool_calls=(),
         provider_metadata=provider_metadata,
-        surface="composer_provider_response",
+        surface=credential_surface,
     )
     if choices is missing or not isinstance(choices, list | tuple):
         raise _MalformedLLMResponseError(
             "LLM returned malformed choices — cannot continue composition",
             provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
         )
     if not choices:
         raise _MalformedLLMResponseError(
             "LLM returned empty choices array — cannot continue composition",
             provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
         )
     if message is missing:
         raise _MalformedLLMResponseError(
             "LLM response choice carries no message",
             provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
         )
     content = getattr(message, "content", missing)
     if content is missing or (content is not None and type(content) is not str):
         raise _MalformedLLMResponseError(
             "LLM message content is neither absent nor a string",
             provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
         )
     _require_no_credential_material_in_completion_fields(
         content=content,
         tool_calls=(),
         provider_metadata=provider_metadata,
-        surface="composer_provider_response",
+        surface=credential_surface,
     )
     tool_calls = getattr(message, "tool_calls", missing)
+    if tool_calls is missing and not require_tool_calls_field:
+        tool_calls = None
     if tool_calls is missing or (tool_calls is not None and not isinstance(tool_calls, list | tuple)):
         raise _MalformedLLMResponseError(
             "LLM message tool_calls is neither absent nor a sequence",
             provider_metadata=provider_metadata,
+            credential_surface=credential_surface,
         )
     return _AdmittedAssistantMessage(content=content), tuple(tool_calls or ()), provider_metadata
 
@@ -219,17 +243,16 @@ def _require_no_credential_material_in_completion_fields(
     surface: str,
 ) -> None:
     """Guard the normalized provider fields that can be audited or replayed."""
-    require_no_credential_material(
-        {
-            "content": content,
-            "tool_calls": [{"id": call_id, "name": name} for call_id, name in tool_calls],
-            "reasoning_content": provider_metadata.reasoning_content,
-            "reasoning_details": provider_metadata.reasoning_details,
-            "thinking_blocks": provider_metadata.thinking_blocks,
-            "model_returned": provider_metadata.model_returned,
-            "provider_request_id": provider_metadata.provider_request_id,
-            "finish_reason": provider_metadata.finish_reason,
-        },
+    require_no_credential_material_in_llm_metadata(
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=provider_metadata.reasoning_content,
+        reasoning_details=provider_metadata.reasoning_details,
+        thinking_blocks=provider_metadata.thinking_blocks,
+        model_returned=provider_metadata.model_returned,
+        provider_request_id=provider_metadata.provider_request_id,
+        finish_reason=provider_metadata.finish_reason,
+        provider_served=provider_metadata.provider_served,
         surface=surface,
     )
 
@@ -500,30 +523,54 @@ class ProviderGateway:
                 provider_status_code=exc.status_code,
             ) from exc
         if not response.choices:
+            empty_response_metadata = admit_llm_provider_metadata(
+                response,
+                choice=None,
+                message=None,
+                pricing_model=self._settings.composer_pricing_model or self._model,
+            )
+            _require_no_credential_material_in_completion_fields(
+                content=None,
+                tool_calls=(),
+                provider_metadata=empty_response_metadata,
+                surface="composer_provider_response",
+            )
             raise _MalformedLLMResponseError(
                 "LLM returned empty choices array — cannot explain run diagnostics",
-                provider_metadata=admit_llm_provider_metadata(
-                    response, choice=None, message=None, pricing_model=self._settings.composer_pricing_model or self._model
-                ),
+                provider_metadata=empty_response_metadata,
             )
+        choice = response.choices[0]
+        message = choice.message
         response_metadata = admit_llm_provider_metadata(
             response,
-            choice=response.choices[0],
-            message=response.choices[0].message,
+            choice=choice,
+            message=message,
             pricing_model=self._settings.composer_pricing_model or self._model,
         )
-        require_no_credential_material(
-            {
-                "content": response.choices[0].message.content,
-                "reasoning_content": response_metadata.reasoning_content,
-                "reasoning_details": response_metadata.reasoning_details,
-                "thinking_blocks": response_metadata.thinking_blocks,
-                "model_returned": response_metadata.model_returned,
-                "provider_request_id": response_metadata.provider_request_id,
-                "finish_reason": response_metadata.finish_reason,
-            },
+        try:
+            content = message.content
+        except AttributeError:
+            _require_no_credential_material_in_completion_fields(
+                content=None,
+                tool_calls=(),
+                provider_metadata=response_metadata,
+                surface="composer_provider_response",
+            )
+            raise _MalformedLLMResponseError(
+                "LLM returned a diagnostics message with no content field",
+                provider_metadata=response_metadata,
+            ) from None
+        _require_no_credential_material_in_completion_fields(
+            content=content if type(content) is str else None,
+            tool_calls=(),
+            provider_metadata=response_metadata,
             surface="composer_provider_response",
         )
+        if type(content) is not str:
+            raise _MalformedLLMResponseError(
+                "LLM returned malformed diagnostics content",
+                provider_metadata=response_metadata,
+            )
         return response
 
     @quota_provider_calls

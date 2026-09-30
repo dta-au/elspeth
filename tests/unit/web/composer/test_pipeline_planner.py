@@ -4440,6 +4440,121 @@ async def test_credential_tool_call_id_refusal_is_atomic_before_history_dispatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "credential_field",
+    ["model_returned", "provider_request_id", "finish_reason", "combined_reasoning"],
+)
+async def test_planner_provider_metadata_refusal_is_atomic_before_audit_history_or_persistence(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    credential_field: str,
+) -> None:
+    engine, origin = await _session_context()
+    credential = "ghp_" + "a" * 36
+    response = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    if credential_field == "model_returned":
+        response.model = credential
+    elif credential_field == "provider_request_id":
+        response.id = credential
+    elif credential_field == "finish_reason":
+        response.choices[0].__dict__["finish_reason"] = credential
+    else:
+        response.model = credential
+        response.choices[0].message.__dict__["reasoning_content"] = credential
+    completion = _ScriptedCompletion(
+        response,
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    state = _empty_state()
+    state_before = state.to_dict()
+    schemas_marked: list[tuple[str, str]] = []
+    finalized_candidates: list[object] = []
+
+    def mark_schema_loaded(plugin_type: str, plugin_name: str) -> None:
+        schemas_marked.append((plugin_type, plugin_name))
+
+    def finalize_candidate(candidate: object) -> object:
+        finalized_candidates.append(candidate)
+        return candidate
+
+    with engine.begin() as conn:
+        message_count_before = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+
+    with pytest.raises(CredentialMaterialRefused) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            originating_message=origin,
+            custody_config=PlannerCustodyConfig(
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                max_storage_per_session=1_000_000,
+                secret_service=None,
+                runtime_preflight=None,
+            ),
+            current_state=state,
+            mark_schema_loaded=mark_schema_loaded,
+            candidate_finalizer=finalize_candidate,
+        )
+
+    assert caught.value.surface == "composer_planner_response"
+    assert caught.value.to_payload()["failure_code"] == "credential_material_rejected"
+    assert credential not in repr(caught.value.to_payload())
+    assert len(completion.requests) == 1
+    assert credential not in canonical_json(completion.requests)
+    assert recorder.invocations == ()
+    assert schemas_marked == []
+    assert finalized_candidates == []
+    assert state.to_dict() == state_before
+    assert len(recorder.llm_calls) == 1
+    refused_call = recorder.llm_calls[0]
+    assert refused_call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+    assert refused_call.error_message == "credential_material_rejected"
+    assert refused_call.model_returned is None
+    assert refused_call.provider_request_id is None
+    assert refused_call.finish_reason is None
+    assert credential not in canonical_json([refused_call.to_dict()])
+    assert credential not in canonical_json([attempt.to_dict() for attempt in recorder.planner_attempts])
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one() == message_count_before
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
+async def test_planner_provider_metadata_ordinary_controls_are_retained(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    response = _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))
+    response.model = "provider/planner-v2"
+    response.id = "ordinary-request-id"
+    response.choices[0].__dict__["finish_reason"] = "provider-stop"
+    completion = _ScriptedCompletion(response)
+    recorder = BufferingRecorder()
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+    )
+
+    assert isinstance(result.proposal, PipelineProposal)
+    assert len(completion.requests) == 1
+    assert len(recorder.llm_calls) == 1
+    call = recorder.llm_calls[0]
+    assert call.status is ComposerLLMCallStatus.SUCCESS
+    assert call.model_returned == "provider/planner-v2"
+    assert call.provider_request_id == "ordinary-request-id"
+    assert call.finish_reason == "provider-stop"
+
+
+@pytest.mark.asyncio
 async def test_invalid_inline_draft_exhaustion_leaves_zero_pre_custody_residue(
     tmp_path: Path,
     tool_context: ToolContext,

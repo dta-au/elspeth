@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from elspeth.contracts.credential_material import (
@@ -74,6 +74,36 @@ def require_no_credential_material(
     )
     if finding is not None:
         raise CredentialMaterialRefused(surface=surface, finding=finding)
+
+
+def require_no_credential_material_in_llm_metadata(
+    *,
+    content: str | None,
+    tool_calls: Sequence[tuple[str, str]],
+    reasoning_content: str | None,
+    reasoning_details: Any | None,
+    thinking_blocks: Any | None,
+    model_returned: str | None,
+    provider_request_id: str | None,
+    finish_reason: str | None,
+    provider_served: str | None,
+    surface: str,
+) -> None:
+    """Reject every provider-authored text field that can be audited or replayed."""
+    require_no_credential_material(
+        {
+            "content": content,
+            "tool_calls": [{"id": call_id, "name": name} for call_id, name in tool_calls],
+            "reasoning_content": reasoning_content,
+            "reasoning_details": reasoning_details,
+            "thinking_blocks": thinking_blocks,
+            "model_returned": model_returned,
+            "provider_request_id": provider_request_id,
+            "finish_reason": finish_reason,
+            "provider_served": provider_served,
+        },
+        surface=surface,
+    )
 
 
 def credential_material_tool_arguments_projection(tool_name: str, arguments: Any) -> Any:

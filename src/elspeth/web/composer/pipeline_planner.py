@@ -3333,6 +3333,7 @@ async def _plan_pipeline_inner(
                 max_completion_tokens_requested=budget_policy.max_completion_tokens,
                 planner_policy_hash=budget_policy.audit_hash,
                 planner_call_ordinal=ordinal,
+                credential_surface="composer_planner_response",
             )
             _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
             recorder.record_llm_call(failed_call)
@@ -3412,6 +3413,7 @@ async def _plan_pipeline_inner(
                     max_completion_tokens_requested=budget_policy.max_completion_tokens,
                     planner_policy_hash=budget_policy.audit_hash,
                     planner_call_ordinal=ordinal,
+                    credential_surface="composer_planner_response",
                 )
                 _assert_planner_call_matches_manifest(cancelled_call, manifest, recorder)
                 recorder.record_llm_call(cancelled_call)
@@ -3434,6 +3436,7 @@ async def _plan_pipeline_inner(
                     max_completion_tokens_requested=budget_policy.max_completion_tokens,
                     planner_policy_hash=budget_policy.audit_hash,
                     planner_call_ordinal=ordinal,
+                    credential_surface="composer_planner_response",
                 )
                 _assert_planner_call_matches_manifest(timed_out_call, manifest, recorder)
                 recorder.record_llm_call(timed_out_call)
@@ -3465,39 +3468,40 @@ async def _plan_pipeline_inner(
                     code="PROVIDER_ERROR",
                 ) from None
 
-            call = build_llm_call_record(
-                model_requested=effective_model,
-                pricing_model=effective_pricing_model,
-                messages=marked_messages,
-                tools=marked_tools,
-                status=ComposerLLMCallStatus.SUCCESS,
-                started_at=started_at,
-                started_ns=started_ns,
-                temperature=model_config.temperature,
-                seed=model_config.seed,
-                response=response,
-                max_completion_tokens_requested=budget_policy.max_completion_tokens,
-                planner_policy_hash=budget_policy.audit_hash,
-                planner_call_ordinal=ordinal,
-            )
             try:
-                require_no_credential_material(
-                    {
-                        "reasoning_content": call.reasoning_content,
-                        "reasoning_details": call.reasoning_details,
-                        "thinking_blocks": call.thinking_blocks,
-                    },
-                    surface="composer_planner_response",
+                call = build_llm_call_record(
+                    model_requested=effective_model,
+                    pricing_model=effective_pricing_model,
+                    messages=marked_messages,
+                    tools=marked_tools,
+                    status=ComposerLLMCallStatus.SUCCESS,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    temperature=model_config.temperature,
+                    seed=model_config.seed,
+                    response=response,
+                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                    planner_policy_hash=budget_policy.audit_hash,
+                    planner_call_ordinal=ordinal,
+                    credential_surface="composer_planner_response",
                 )
             except CredentialMaterialRefused as exc:
-                refused_call = replace(
-                    call,
+                refused_call = build_llm_call_record(
+                    model_requested=effective_model,
+                    pricing_model=effective_pricing_model,
+                    messages=marked_messages,
+                    tools=marked_tools,
                     status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
-                    reasoning_content=None,
-                    reasoning_details=None,
-                    thinking_blocks=None,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    temperature=model_config.temperature,
+                    seed=model_config.seed,
                     error_class=type(exc).__name__,
                     error_message="credential_material_rejected",
+                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                    planner_policy_hash=budget_policy.audit_hash,
+                    planner_call_ordinal=ordinal,
+                    credential_surface="composer_planner_response",
                 )
                 _assert_planner_call_matches_manifest(refused_call, manifest, recorder)
                 recorder.record_llm_call(refused_call)

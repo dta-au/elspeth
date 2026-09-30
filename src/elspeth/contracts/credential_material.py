@@ -10,10 +10,10 @@ general-purpose DLP system.
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Set
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, cast
 from urllib.parse import ParseResult, parse_qs, urlparse
 
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -375,14 +375,22 @@ def scrub_credential_material(value: Any, *, parent_key: str | None = None) -> A
 
 @trust_boundary(
     tier=3,
-    source="an arbitrary audit value whose concrete mapping implementation is external",
+    source="an arbitrary audit value whose concrete container or string implementation is external",
     source_param="value",
     suppresses=("R5",),
-    invariant="returns the value only when it implements Mapping; otherwise returns None without coercion",
+    invariant="classifies only legacy scrub-compatible Mapping, str, sequence, and Set shapes without coercion",
     non_raising=True,
 )
-def _mapping_for_audit_scrub(value: Any) -> Mapping[Any, Any] | None:
-    return value if isinstance(value, Mapping) else None
+def _audit_scrub_shape(value: Any) -> Literal["mapping", "string", "sequence", "set", "other"]:
+    if isinstance(value, Mapping):
+        return "mapping"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (list, tuple)):
+        return "sequence"
+    if isinstance(value, Set):
+        return "set"
+    return "other"
 
 
 def _scrub_mapping(
@@ -403,10 +411,10 @@ def _scrub_mapping(
         for item_index, (key, child) in enumerate(value.items()):
             if item_index >= 512:
                 return REDACTED_CREDENTIAL_TEXT
-            scrubbed_key = REDACTED_CREDENTIAL_TEXT if type(key) is str and _classify_string(key) is not None else key
+            scrubbed_key = REDACTED_CREDENTIAL_TEXT if isinstance(key, str) and _classify_string(key) is not None else key
             result[scrubbed_key] = _scrub(
                 child,
-                parent_key=key if type(key) is str else None,
+                parent_key=key if isinstance(key, str) else None,
                 active_ids=active_ids,
                 depth=depth + 1,
                 nodes=nodes,
@@ -416,6 +424,58 @@ def _scrub_mapping(
         # A custom Mapping can fail from len(), iteration, item access, or
         # key hashing. Partial output is unsafe because the unread remainder
         # may contain credentials, so redact the whole mapping value.
+        return REDACTED_CREDENTIAL_TEXT
+    finally:
+        active_ids.remove(object_id)
+
+
+def _scrub_sequence(
+    value: list[Any] | tuple[Any, ...],
+    *,
+    active_ids: set[int],
+    depth: int,
+    nodes: list[int],
+) -> Any:
+    object_id = id(value)
+    if object_id in active_ids:
+        return REDACTED_CREDENTIAL_TEXT
+    active_ids.add(object_id)
+    try:
+        if len(value) > 512:
+            return REDACTED_CREDENTIAL_TEXT
+        result: list[Any] = []
+        for item_index, child in enumerate(value):
+            if item_index >= 512:
+                return REDACTED_CREDENTIAL_TEXT
+            result.append(_scrub(child, parent_key=None, active_ids=active_ids, depth=depth + 1, nodes=nodes))
+        return result
+    except Exception:
+        return REDACTED_CREDENTIAL_TEXT
+    finally:
+        active_ids.remove(object_id)
+
+
+def _scrub_set(
+    value: Set[Any],
+    *,
+    active_ids: set[int],
+    depth: int,
+    nodes: list[int],
+) -> Any:
+    object_id = id(value)
+    if object_id in active_ids:
+        return REDACTED_CREDENTIAL_TEXT
+    active_ids.add(object_id)
+    try:
+        if len(value) > 512:
+            return REDACTED_CREDENTIAL_TEXT
+        result: list[Any] = []
+        for item_index, child in enumerate(value):
+            if item_index >= 512:
+                return REDACTED_CREDENTIAL_TEXT
+            result.append(_scrub(child, parent_key=None, active_ids=active_ids, depth=depth + 1, nodes=nodes))
+        return sorted(result, key=repr)
+    except Exception:
         return REDACTED_CREDENTIAL_TEXT
     finally:
         active_ids.remove(object_id)
@@ -434,23 +494,14 @@ def _scrub(
         return REDACTED_CREDENTIAL_TEXT
     if parent_key is not None and is_secret_field(parent_key):
         return REDACTED_CREDENTIAL_TEXT
-    mapping = _mapping_for_audit_scrub(value)
-    if mapping is not None:
-        return _scrub_mapping(mapping, active_ids=active_ids, depth=depth, nodes=nodes)
-    if type(value) is str:
-        return REDACTED_CREDENTIAL_TEXT if _classify_string(value) is not None else value
-    if type(value) in (list, tuple):
-        object_id = id(value)
-        if object_id in active_ids or len(value) > 512:
-            return REDACTED_CREDENTIAL_TEXT
-        active_ids.add(object_id)
-        try:
-            return [_scrub(child, parent_key=None, active_ids=active_ids, depth=depth + 1, nodes=nodes) for child in value]
-        finally:
-            active_ids.remove(object_id)
-    if type(value) in (set, frozenset):
-        return sorted(
-            (_scrub(child, parent_key=None, active_ids=active_ids, depth=depth + 1, nodes=nodes) for child in value),
-            key=repr,
-        )
+    shape = _audit_scrub_shape(value)
+    if shape == "mapping":
+        return _scrub_mapping(cast(Mapping[Any, Any], value), active_ids=active_ids, depth=depth, nodes=nodes)
+    if shape == "string":
+        text = cast(str, value)
+        return REDACTED_CREDENTIAL_TEXT if _classify_string(text) is not None else text
+    if shape == "sequence":
+        return _scrub_sequence(cast(list[Any] | tuple[Any, ...], value), active_ids=active_ids, depth=depth, nodes=nodes)
+    if shape == "set":
+        return _scrub_set(cast(Set[Any], value), active_ids=active_ids, depth=depth, nodes=nodes)
     return value

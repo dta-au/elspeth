@@ -68,6 +68,7 @@ from elspeth.web.composer.bounded_json import (
     require_bounded_text,
 )
 from elspeth.web.composer.provider_quota import bind_provider_attempt
+from elspeth.web.credential_guard import require_no_credential_material_in_llm_metadata
 
 if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
@@ -670,6 +671,7 @@ def build_llm_call_record(
     max_completion_tokens_requested: int | None = None,
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
+    credential_surface: str = "composer_provider_response",
 ) -> ComposerLLMCall:
     if response_metadata is None:
         usage = token_usage_from_response(response)
@@ -694,6 +696,18 @@ def build_llm_call_record(
         finish_reason = response_metadata.finish_reason
         provider_request_id = response_metadata.provider_request_id
         provider_served = response_metadata.provider_served
+    require_no_credential_material_in_llm_metadata(
+        content=None,
+        tool_calls=(),
+        reasoning_content=reasoning_metadata["reasoning_content"],
+        reasoning_details=reasoning_metadata["reasoning_details"],
+        thinking_blocks=reasoning_metadata["thinking_blocks"],
+        model_returned=model_returned,
+        provider_request_id=provider_request_id,
+        finish_reason=finish_reason,
+        provider_served=provider_served,
+        surface=credential_surface,
+    )
     # The dialect and strict count are read off the exact list that was sent
     # (the bytes ``tools_spec_hash`` covers): every tool stamped with an exact
     # bool is ``openai_strict``, no stamp at all is ``none``, and anything in

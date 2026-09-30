@@ -47,7 +47,6 @@ from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.chargeable_admission import ComposerChargeableAdmission
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
-    admit_llm_provider_metadata,
     attach_llm_calls,
     build_llm_call_record,
     safe_response_model,
@@ -373,23 +372,12 @@ class AdvisorCheckpointOwner:
                 provider_gateway._litellm_acompletion(on_provider_dispatch=on_provider_dispatch, **kwargs),
                 timeout=effective_timeout,
             )
-            if not response.choices:
-                empty_response_metadata = admit_llm_provider_metadata(
-                    response,
-                    choice=None,
-                    message=None,
-                    pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
-                )
-                _require_no_credential_material_in_completion_fields(
-                    content=None,
-                    tool_calls=(),
-                    provider_metadata=empty_response_metadata,
-                    surface="composer_advisor_response",
-                )
-                raise _MalformedLLMResponseError(
-                    "Advisor returned empty choices array",
-                    provider_metadata=empty_response_metadata,
-                )
+            message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(
+                response,
+                pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
+                credential_surface="composer_advisor_response",
+                require_tool_calls_field=structured_output,
+            )
             # F4: validate content BEFORE marking SUCCESS. None / empty /
             # whitespace-only content (content-filter triggered, malformed
             # provider output, tool-call-only response) must classify as
@@ -398,49 +386,16 @@ class AdvisorCheckpointOwner:
             # the composer LLM "you got advice" while no information was
             # actually produced.
             if structured_output:
-                message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(
-                    response, pricing_model=self._settings.composer_advisor_pricing_model or advisor_model
-                )
                 if tool_calls:
                     raise _MalformedLLMResponseError(
                         "Advisor returned tool calls with structured output",
                         provider_metadata=response_metadata,
                         text_received=type(message.content) is str,
+                        credential_surface="composer_advisor_response",
                     )
                 raw_content = message.content
             else:
-                try:
-                    raw_content = response.choices[0].message.content
-                except (AttributeError, IndexError, KeyError, TypeError):
-                    missing_content_metadata = admit_llm_provider_metadata(
-                        response,
-                        choice=None,
-                        message=None,
-                        pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
-                    )
-                    _require_no_credential_material_in_completion_fields(
-                        content=None,
-                        tool_calls=(),
-                        provider_metadata=missing_content_metadata,
-                        surface="composer_advisor_response",
-                    )
-                    raise _MalformedLLMResponseError(
-                        "Advisor response carries no message content",
-                        provider_metadata=missing_content_metadata,
-                    ) from None
-                admitted_metadata = admit_llm_provider_metadata(
-                    response,
-                    choice=response.choices[0],
-                    message=response.choices[0].message,
-                    pricing_model=self._settings.composer_advisor_pricing_model or advisor_model,
-                )
-                _require_no_credential_material_in_completion_fields(
-                    content=raw_content if type(raw_content) is str else None,
-                    tool_calls=(),
-                    provider_metadata=admitted_metadata,
-                    surface="composer_advisor_response",
-                )
-                response_metadata = admitted_metadata
+                raw_content = message.content
             # elspeth-b6be9e991f: exact runtime type check, mirroring the
             # diagnostics path. The earlier ``str(raw_content).strip()``
             # emptiness probe let a non-string content object (list/dict/int
@@ -450,6 +405,7 @@ class AdvisorCheckpointOwner:
                     "Advisor returned empty, whitespace-only, or non-string content",
                     text_received=type(raw_content) is str,
                     provider_metadata=response_metadata,
+                    credential_surface="composer_advisor_response",
                 )
             if response_metadata is None:
                 raise AuditIntegrityError("Advisor response metadata was not captured")
@@ -531,6 +487,7 @@ class AdvisorCheckpointOwner:
                         response_metadata=response_metadata,
                         error_class=error_class,
                         error_message=error_message,
+                        credential_surface="composer_advisor_response",
                     )
                 )
                 current_exc = sys.exc_info()[1]

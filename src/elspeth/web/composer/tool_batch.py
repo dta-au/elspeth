@@ -155,7 +155,11 @@ from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools._registry import resolve_tool_effects, response_contract_for
 from elspeth.web.composer.tools.sessions import RequestAdvisorHintArgumentsModel, canonicalize_authored_node_review_requirements
 from elspeth.web.composer.tools.wire_projection import _WIRE_TOOL_DEFS, decode_wire_arguments, encode_semantic_arguments
-from elspeth.web.credential_guard import require_no_credential_material, require_no_credential_material_in_tool_wire
+from elspeth.web.credential_guard import (
+    require_no_credential_material,
+    require_no_credential_material_in_llm_metadata,
+    require_no_credential_material_in_tool_wire,
+)
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import interpretation_sites
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -826,17 +830,16 @@ async def run_tool_batch(
     # already-admitted completion without passing through ProviderGateway, so
     # this common owner must cover prose, identifiers, reasoning, and mixed
     # batches all-or-nothing as well.
-    require_no_credential_material(
-        {
-            "content": raw_assistant_content,
-            "tool_calls": [{"id": call.id, "name": call.function.name} for call in assistant_tool_calls],
-            "reasoning_content": completion.provider_metadata.reasoning_content,
-            "reasoning_details": completion.provider_metadata.reasoning_details,
-            "thinking_blocks": completion.provider_metadata.thinking_blocks,
-            "model_returned": completion.provider_metadata.model_returned,
-            "provider_request_id": completion.provider_metadata.provider_request_id,
-            "finish_reason": completion.provider_metadata.finish_reason,
-        },
+    require_no_credential_material_in_llm_metadata(
+        content=raw_assistant_content,
+        tool_calls=tuple((call.id, call.function.name) for call in assistant_tool_calls),
+        reasoning_content=completion.provider_metadata.reasoning_content,
+        reasoning_details=completion.provider_metadata.reasoning_details,
+        thinking_blocks=completion.provider_metadata.thinking_blocks,
+        model_returned=completion.provider_metadata.model_returned,
+        provider_request_id=completion.provider_metadata.provider_request_id,
+        finish_reason=completion.provider_metadata.finish_reason,
+        provider_served=completion.provider_metadata.provider_served,
         surface="composer_tool_batch",
     )
     for tool_call in assistant_tool_calls:

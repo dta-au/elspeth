@@ -303,6 +303,7 @@ async def test_mixed_internal_tool_batch_refuses_atomically_before_any_handler_o
         "model_returned",
         "provider_request_id",
         "finish_reason",
+        "provider_served",
     ],
 )
 async def test_internal_completion_control_metadata_refuses_atomically_before_any_effect(

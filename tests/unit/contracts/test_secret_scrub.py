@@ -6,7 +6,7 @@ import base64
 from collections import OrderedDict, UserDict
 from collections.abc import Iterator, Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -75,6 +75,37 @@ class _LengthLyingMapping(Mapping[str, Any]):
 
     def __getitem__(self, key: str) -> Any:
         return key
+
+
+class _AuditDetails(NamedTuple):
+    ordinary: str
+    candidate: str
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _ListSubclass(list[Any]):
+    pass
+
+
+class _SetSubclass(set[str]):
+    pass
+
+
+class _ExplodingList(list[Any]):
+    def __iter__(self) -> Iterator[Any]:
+        raise RuntimeError("ghp_" + "a" * 36)
+
+
+class _LengthLyingList(list[Any]):
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self) -> Iterator[Any]:
+        while True:
+            yield "ordinary"
 
 
 def test_plain_values_pass_through() -> None:
@@ -186,6 +217,62 @@ def test_hostile_mapping_is_value_free_and_non_raising_at_top_level_and_nested(h
     assert nested == {"hostile": REDACTED, "ordinary": "stable"}
     assert "ghp_" not in repr(top_level) + repr(nested)
     assert "sk-" not in repr(top_level) + repr(nested)
+
+
+def test_legacy_string_sequence_and_set_subclasses_match_exact_parent_scrubbing() -> None:
+    credential = "ghp_" + "a" * 36
+    subclass_payload = OrderedDict(
+        {
+            "named_tuple": _AuditDetails("stable", credential),
+            "list_subclass": _ListSubclass(["stable", credential]),
+            "set_subclass": _SetSubclass({"stable", credential}),
+            "string_secret": _StringSubclass(credential),
+            "string_ordinary": _StringSubclass("stable"),
+        }
+    )
+    exact_parent_payload = {
+        "named_tuple": ("stable", credential),
+        "list_subclass": ["stable", credential],
+        "set_subclass": {"stable", credential},
+        "string_secret": credential,
+        "string_ordinary": "stable",
+    }
+
+    scrubbed = scrub_payload_for_audit(subclass_payload)
+
+    assert scrubbed == scrub_payload_for_audit(exact_parent_payload)
+    assert scrubbed["named_tuple"] == ["stable", REDACTED]
+    assert scrubbed["list_subclass"] == ["stable", REDACTED]
+    assert scrubbed["set_subclass"] == [REDACTED, "stable"]
+    assert scrubbed["string_secret"] == REDACTED
+    assert scrubbed["string_ordinary"] == "stable"
+    assert subclass_payload["named_tuple"].candidate == credential
+
+
+def test_sequence_subclass_cycles_width_and_hostile_iteration_are_bounded_and_value_free() -> None:
+    cyclic = _ListSubclass()
+    cyclic.append(cyclic)
+    at_width_limit = _ListSubclass(range(512))
+    oversized = _ListSubclass(range(513))
+    hostile_payload = {
+        "cycle": cyclic,
+        "at_limit": at_width_limit,
+        "oversized": oversized,
+        "exploding": _ExplodingList(["ordinary"]),
+        "lying": _LengthLyingList(["ordinary"]),
+        "ordinary": "stable",
+    }
+
+    scrubbed = scrub_payload_for_audit(hostile_payload)
+
+    assert scrubbed["cycle"] == [REDACTED]
+    assert len(scrubbed["at_limit"]) == 512
+    assert scrubbed["oversized"] == REDACTED
+    assert scrubbed["exploding"] == REDACTED
+    assert scrubbed["lying"] == REDACTED
+    assert scrubbed["ordinary"] == "stable"
+    assert "ghp_" not in repr(scrubbed)
+    assert cyclic[0] is cyclic
 
 
 def test_plain_text_passes_through() -> None:
