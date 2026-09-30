@@ -1,7 +1,7 @@
 # 00 — Assurance-pack lifecycle and completion plan
 
 **Status:** maintained lifecycle guide · **Product baseline reviewed against:**
-`release/0.8.1` @ `352430f4f` (2026-09-30) · **Owner:** ELSPETH
+`release/0.8.1` candidate @ `cb20ed2e2` (2026-09-30) · **Owner:** ELSPETH
 maintainer
 
 This document defines how to maintain the reusable ELSPETH security-assurance

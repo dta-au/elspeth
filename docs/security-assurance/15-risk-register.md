@@ -1,8 +1,8 @@
 # 15 — Risk register
 
 **Status:** public schema complete — populated register held in the controlled
-deployment copy · **Reviewed against:** `release/0.8.1` @
-`352430f4f659704d50efffc5dfca967ae9b73ebb` (2026-09-30) · **Owner:**
+deployment copy · **Reviewed against:** `release/0.8.1` candidate @
+`cb20ed2e2` (2026-09-30) · **Owner:**
 ELSPETH maintainer
 
 > **Do not populate this file in the public repository.** Open risks,

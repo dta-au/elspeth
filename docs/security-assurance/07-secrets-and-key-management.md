@@ -1,8 +1,8 @@
 # 07 — Secrets and key management
 
 **Status:** product control baseline complete; deployment storage, custody and
-rotation records open · **Reviewed against:** `release/0.8.1` @
-`49c1845085d36811b120ef1c540048463e32aabc` (2026-09-30) ·
+rotation records open · **Reviewed against:** `release/0.8.1` candidate @
+`cb20ed2e2` (2026-09-30) ·
 **Owner:** ELSPETH maintainer
 
 Describes which secrets and keys ELSPETH uses, how they reach the
@@ -264,7 +264,9 @@ Further controls on this path:
   request fields, Composer state before provider serialisation, raw and
   decoded tool calls, provider request/response metadata, publication,
   approval and execution boundaries. Refusal evidence is value-free, and the
-  guarded operation performs no mutation or audit side effect [EV-227].
+  guarded operation cannot apply the rejected candidate's business mutation
+  or retain its content. Provider attempts may retain one fixed, value-free
+  failure audit record [EV-227].
 
 These controls are not a general data-loss-prevention system. Recognised token
 shapes are detected even under ordinary control-field names, but arbitrary
@@ -410,11 +412,13 @@ its key-strength and generation controls in § 7.1.
   classifies any pull request that changes it as weakening or strengthening
   and requires the matching label, with a written rationale for a weakening
   ([policy guide](../guides/redaction-policy-changes.md)) [EV-014] [EV-220].
-- File excerpts intentionally requested by the planner and inline blob bodies
-  are data-plane content, so the credential detector does not rewrite or scan
-  those bodies. Their disclosure still requires provider suitability and
-  classification controls. Runtime rows, telemetry content and sink output
-  are likewise outside this control-plane claim [EV-227].
+- Raw stored blob bodies and inline blob bodies at tool admission are
+  data-plane content, so the credential detector does not rewrite or scan
+  those bodies. Blob excerpts and source facts promoted into Composer/provider
+  messages are guarded before persistence or egress. Their disclosure still
+  requires provider suitability and classification controls. Runtime rows,
+  telemetry content and sink output are likewise outside this control-plane
+  claim [EV-227].
 
 ### 4.4 Source control
 

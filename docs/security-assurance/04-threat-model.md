@@ -2,7 +2,7 @@
 
 **Status:** product threat model and method complete; deployment decisions and
 risk acceptance open · **Reviewed against:**
-`release/0.8.1` @ `352430f4f659704d50efffc5dfca967ae9b73ebb`
+`release/0.8.1` candidate @ `cb20ed2e2`
 (2026-09-30) · **Owner:** ELSPETH maintainer
 
 Identifies what is worth protecting, who controls each input, where an
@@ -153,7 +153,7 @@ controls on this channel are in [09](09-secure-development-lifecycle.md) and
 ## 4. Attack surfaces and controls
 
 Each subsection lists the attacker's goal, the controls in place at
-`352430f4f659704d50efffc5dfca967ae9b73ebb`, and where residual risk is
+`cb20ed2e272579529c776abf3942ce449e8a3859`, and where residual risk is
 recorded. Evidence IDs refer to
 [16](16-evidence-index.md).
 
@@ -346,19 +346,22 @@ Controls:
 - A finite, versioned detector refuses credential-named control fields,
   recognised token shapes, private keys and credentials in HTTP URLs at the
   documented Web request, Composer state, tool, provider and publication
-  boundaries. Findings and refusal envelopes retain no candidate value, and
-  each guarded operation refuses before its mutation or audit side effects
-  [EV-227].
+  boundaries. Findings and refusal envelopes retain no candidate value. A
+  rejection cannot apply the candidate's business mutation or retain the
+  rejected content; provider attempts may still retain a fixed, value-free
+  failure audit record [EV-227].
 - The audit trail records fingerprints, not values
   ([07 § 2.4](07-secrets-and-key-management.md#24-what-the-audit-trail-records))
   [EV-207] [EV-208] [EV-209].
 
 For CLI pipelines, `${VAR}` expansion is intended: the operator authors the
 YAML and owns its environment. The bounded Web/Composer detector does not scan
-pipeline rows, inline blob bodies, runtime model data, telemetry content or
-sink output, and it does not decode arbitrary encoded or cross-field content.
-Those surfaces remain subject to `R-008`, operator/user handling and
-destination-specific controls; this control is not universal DLP [EV-227].
+pipeline rows, raw stored or inline blob bodies at tool admission, runtime
+model data, telemetry content or sink output, and it does not decode arbitrary
+encoded or cross-field content. Blob excerpts and source facts promoted into
+Composer/provider messages are guarded. The excluded surfaces remain subject
+to `R-008`, operator/user handling and destination-specific controls; this
+control is not universal DLP [EV-227].
 
 Risk reference: see controlled risk register `R-008`.
 

@@ -1,7 +1,7 @@
 # 12 — Privacy impact assessment
 
 **Status:** reusable product assessment complete; deployment record open ·
-**Reviewed against:** `release/0.8.1` @ `352430f4f` (2026-09-30) ·
+**Reviewed against:** `release/0.8.1` candidate @ `cb20ed2e2` (2026-09-30) ·
 **Owner:** ELSPETH maintainer
 
 This document supplies a reusable privacy impact assessment (PIA) method and

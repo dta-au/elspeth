@@ -1,6 +1,6 @@
 # 03 — Shared responsibility matrix
 
-**Status:** product baseline complete; Deployment record required · **Reviewed against:** `352430f4f659704d50efffc5dfca967ae9b73ebb` (2026-09-30) · **Owner:** ELSPETH maintainer
+**Status:** product baseline complete; Deployment record required · **Reviewed against:** `release/0.8.1` candidate @ `cb20ed2e2` (2026-09-30) · **Owner:** ELSPETH maintainer
 
 This matrix separates controls supplied by ELSPETH from decisions and operations owned by a deploying organisation, duties placed on users, and controls owned by an external service provider. It applies to the product at the reviewed commit. A controlled copy must record the actual deployment in the [Deployment record](#deployment-record--additional-shared-controls).
 
