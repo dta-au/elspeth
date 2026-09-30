@@ -255,6 +255,10 @@ change with regression evidence, or an explicit decision that the affected
 capability is outside the submitted scope. Where the capability remains in
 scope, an assessor or accepting authority may make the item release-blocking.
 
+The additional judge lint and quality workflow is intentionally advisory and
+outside the standard enforcement package. Its absence from branch protection
+is therefore not a defect and is not included in this backlog [EV-611].
+
 | Priority | Confirmed gap | Required engineering outcome | Submission effect |
 |---|---|---|---|
 | High | A recipient of an audit-export bundle has no supported standalone verifier; exports are unsigned unless HMAC signing is configured [EV-316]. | Provide and test a supported verifier for delivered bundles, including manifest, record-chain, content-hash, signer-ID and configured-authentication checks. Define the key-resolution and historical-key contract. An assurance deployment should also fail closed when its required signing mode is absent. | Blocking when exported audit evidence is submitted or relied upon as independently authentic. Otherwise record the limitation and compensating custody procedure under `R-011`. |
