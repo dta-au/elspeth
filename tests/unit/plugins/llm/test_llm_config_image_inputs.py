@@ -145,6 +145,16 @@ class TestImageInputsRejection:
                 max_images_per_call=0,
             )
 
+    def test_rejects_max_images_per_call_over_hard_cap(self) -> None:
+        with pytest.raises(ValidationError):
+            LLMConfig(
+                provider="azure",
+                prompt_template="Classify: {{ row.text }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["text"],
+                max_images_per_call=21,
+            )
+
     def test_rejects_unknown_keys_inside_entries(self) -> None:
         with pytest.raises(ValidationError):
             LLMConfig(

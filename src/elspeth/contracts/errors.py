@@ -782,6 +782,8 @@ class TransformErrorReason(TypedDict):
     max_blob_bytes: NotRequired[int]  # Configured blob parser limit in bytes
     list_index: NotRequired[int]  # Position within a list-valued row column (image_inputs)
     max_images: NotRequired[int]  # Configured max_images_per_call limit (too_many_images)
+    max_image_bytes_total: NotRequired[int]  # Hard decoded-plus-wire image budget
+    projected_image_bytes: NotRequired[int]  # Decoded-plus-wire bytes after concurrent expansion
     phase: NotRequired[str]  # Parser phase: skip_rows, header, data, etc.
     line_number: NotRequired[int]  # Source text line number for parser errors
     row_number: NotRequired[int]  # Data row number for parser errors

@@ -178,7 +178,8 @@ class LLMConfig(TransformDataConfig):
     max_images_per_call: int = Field(
         20,
         gt=0,
-        description="Maximum resolved images per LLM call",
+        le=20,
+        description="Maximum resolved images per LLM call (hard upper bound 20)",
         json_schema_extra={"composer_tier": "advanced"},
     )
 

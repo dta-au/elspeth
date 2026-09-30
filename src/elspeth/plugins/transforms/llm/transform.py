@@ -652,6 +652,7 @@ class MultiQueryStrategy:
                 specs=self.image_specs,
                 max_image_bytes=self.max_image_bytes,
                 max_images_per_call=self.max_images_per_call,
+                expansion_factor=len(self.query_specs),
             )
             if isinstance(resolved, TransformResult):
                 return resolved
@@ -1187,7 +1188,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9d2acfb21a7717f5"
+    source_file_hash: str | None = "sha256:38f01bf6c093e684"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

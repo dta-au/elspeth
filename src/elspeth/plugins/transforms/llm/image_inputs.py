@@ -23,6 +23,10 @@ from elspeth.contracts.schema_contract import PipelineRow
 
 _PAYLOAD_REF_PATTERN = re.compile(r"[0-9a-f]{64}")
 
+# Includes the retained decoded bytes and their projected base64 wire form.
+# This is deliberately not configurable by pipeline authors.
+MAX_IMAGE_EXPANDED_BYTES = 32 * 1024 * 1024
+
 
 class ImageInputConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -144,8 +148,17 @@ def resolve_image_parts(
     specs: Sequence[ImageInputConfig],
     max_image_bytes: int,
     max_images_per_call: int,
+    expansion_factor: int = 1,
 ) -> tuple[ImagePart, ...] | TransformResult:
-    parts: list[ImagePart] = []
+    if expansion_factor < 1:
+        raise FrameworkBugError("image expansion factor must be positive")
+
+    prepared: list[tuple[ImageInputConfig, ImageFormat, int | None, object]] = []
+
+    # Validate the complete reference set before retrieving any payload. This
+    # keeps an oversized row from allocating up to its author-selected limit
+    # before the count guard fires.
+    total_refs = 0
     for spec in specs:
         if spec.field not in row or row[spec.field] is None:
             if spec.required:
@@ -158,14 +171,26 @@ def resolve_image_parts(
             return image_format
 
         raw_value = row[spec.field]
-        refs: list[tuple[int | None, object]]
-        if isinstance(raw_value, (list, tuple)):
-            refs = list(enumerate(raw_value))
-        else:
-            refs = [(None, raw_value)]
-
+        refs = enumerate(raw_value) if isinstance(raw_value, (list, tuple)) else [(None, raw_value)]
         for list_index, ref in refs:
-            resolved = _resolve_one_ref(
+            total_refs += 1
+            if total_refs > max_images_per_call:
+                too_many_reason: TransformErrorReason = {
+                    "reason": "too_many_images",
+                    "max_images": max_images_per_call,
+                    "actual": str(total_refs),
+                }
+                return TransformResult.error(too_many_reason, retryable=False)
+            prepared.append((spec, image_format, list_index, ref))
+
+    parts: list[ImagePart] = []
+    resolved_refs: dict[tuple[str, ImageFormat], ImagePart] = {}
+    expanded_bytes = 0
+    for spec, image_format, list_index, ref in prepared:
+        cache_key = (ref, image_format) if type(ref) is str else None
+        cached_part = resolved_refs.get(cache_key) if cache_key is not None else None
+        if cached_part is None:
+            resolution = _resolve_one_ref(
                 spec,
                 ref,
                 image_format,
@@ -173,15 +198,26 @@ def resolve_image_parts(
                 max_image_bytes=max_image_bytes,
                 list_index=list_index,
             )
-            if isinstance(resolved, TransformResult):
-                return resolved
-            parts.append(resolved)
-            if len(parts) > max_images_per_call:
-                too_many_reason: TransformErrorReason = {
-                    "reason": "too_many_images",
-                    "max_images": max_images_per_call,
-                    "actual": str(len(parts)),
-                }
-                return TransformResult.error(too_many_reason, retryable=False)
+            if isinstance(resolution, TransformResult):
+                return resolution
+            resolved = resolution
+            if cache_key is not None:
+                resolved_refs[cache_key] = resolved
+        else:
+            resolved = cached_part
+
+        decoded_bytes = len(resolved.data)
+        base64_bytes = 4 * ((decoded_bytes + 2) // 3)
+        expanded_bytes += expansion_factor * (decoded_bytes + base64_bytes)
+        if expanded_bytes > MAX_IMAGE_EXPANDED_BYTES:
+            budget_reason: TransformErrorReason = {
+                "reason": "invalid_input",
+                "field": spec.field,
+                "error_type": "image_payload_budget_exceeded",
+                "max_image_bytes_total": MAX_IMAGE_EXPANDED_BYTES,
+                "projected_image_bytes": expanded_bytes,
+            }
+            return TransformResult.error(budget_reason, retryable=False)
+        parts.append(resolved)
 
     return tuple(parts)
