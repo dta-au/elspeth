@@ -19085,6 +19085,54 @@ class TestFieldPreservationWalk:
         )
         assert self._walk(state, "merged", "price") is False
 
+    def test_shared_queue_predecessors_are_evaluated_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Layered queue fan-in remains linear in the authored graph size."""
+        from elspeth.web.composer._producer_resolver import ProducerResolver
+
+        state = self._observed_csv_state().with_named_source(
+            "other",
+            SourceSpec(
+                plugin="csv",
+                on_success="queue_0_a",
+                options={"path": "/data/other.csv", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+        )
+        state = state.with_node(self._node("queue_0_a", node_type="queue", plugin=None, input="queue_0_a", on_success=None))
+        state = state.with_node(self._node("queue_0_b", node_type="queue", plugin=None, input="queue_0_b", on_success=None))
+        depth = 8
+        for layer in range(1, depth + 1):
+            previous = layer - 1
+            destinations = (f"queue_{layer}_a", f"queue_{layer}_b")
+            for branch in ("a", "b"):
+                state = state.with_node(
+                    self._node(
+                        f"gate_{layer}_{branch}",
+                        node_type="gate",
+                        plugin=None,
+                        input=f"queue_{previous}_{branch}",
+                        on_success=None,
+                        condition="True",
+                        routes={"true": destinations[0], "false": destinations[1]},
+                        options={},
+                    )
+                )
+            for destination in destinations:
+                state = state.with_node(self._node(destination, node_type="queue", plugin=None, input=destination, on_success=None))
+
+        calls = 0
+        original = ProducerResolver.queue_predecessors
+
+        def counting_queue_predecessors(resolver: ProducerResolver, queue_id: str):
+            nonlocal calls
+            calls += 1
+            return original(resolver, queue_id)
+
+        monkeypatch.setattr(ProducerResolver, "queue_predecessors", counting_queue_predecessors)
+
+        assert self._walk(state, f"queue_{depth}_a", "price") is False
+        assert calls <= (2 * depth) + 1
+
 
 class TestBlockingDiagnosticRegistry:
     """``_blocking_diagnostic`` enforces the canonical-codes invariant.

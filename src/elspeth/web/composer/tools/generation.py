@@ -2892,6 +2892,11 @@ def _field_preservation_walker(
         sink_names=frozenset(output.name for output in state.outputs),
     )
     target_source_id = source_producer_id(source_name)
+    # One producer has one field-preservation answer for this walker (the
+    # source and field are fixed above).  Queue fan-in can make the same
+    # upstream producer reachable through many paths, so retain completed
+    # answers instead of expanding that shared subgraph once per path.
+    producer_results: dict[str, bool] = {}
 
     def _producer_preserves_field(
         producer: ProducerEntry,
@@ -2902,17 +2907,19 @@ def _field_preservation_walker(
             return producer.producer_id == target_source_id
         if producer.producer_id in visiting:
             return False
+        if producer.producer_id in producer_results:
+            return producer_results[producer.producer_id]
         node = resolver.get_node(producer.producer_id)
         if node is None:
             return False
         next_visiting = visiting | {producer.producer_id}
         if node.node_type == "queue":
-            return any(
+            result = any(
                 _producer_preserves_field(predecessor, visiting=next_visiting) for predecessor in resolver.queue_predecessors(node.id)
             )
-        if node.node_type == "gate":
-            return _connection_preserves_field(node.input, visiting=next_visiting)
-        if node.node_type in ("coalesce", "row_union"):
+        elif node.node_type == "gate":
+            result = _connection_preserves_field(node.input, visiting=next_visiting)
+        elif node.node_type in ("coalesce", "row_union"):
             # A merged/released row's field value comes from exactly one branch
             # payload, so the field is provably preserved only when EVERY
             # branch delivers it from the target source unchanged (unanimity —
@@ -2921,16 +2928,15 @@ def _field_preservation_walker(
             # nested-merge coalesce rewrites the top level to branch names, so
             # no top-level source field survives it.
             if node.node_type == "coalesce" and node.merge == "nested":
-                return False
-            branch_connections = _coalesce_branch_connections(node.branches)
-            if not branch_connections:
-                return False
-            return all(_connection_preserves_field(connection, visiting=next_visiting) for connection in branch_connections)
-        if node.plugin == "value_transform" and _value_transform_preserves_field(node, field_name):
-            return _connection_preserves_field(node.input, visiting=next_visiting)
-        if node.plugin == "passthrough":
-            return _connection_preserves_field(node.input, visiting=next_visiting)
-        if node.node_type == "transform" and node.plugin is not None and node.plugin in _pass_through_transform_plugin_names():
+                result = False
+            else:
+                branch_connections = _coalesce_branch_connections(node.branches)
+                result = bool(branch_connections) and all(
+                    _connection_preserves_field(connection, visiting=next_visiting) for connection in branch_connections
+                )
+        elif node.plugin == "passthrough" or (node.plugin == "value_transform" and _value_transform_preserves_field(node, field_name)):
+            result = _connection_preserves_field(node.input, visiting=next_visiting)
+        elif node.node_type == "transform" and node.plugin is not None and node.plugin in _pass_through_transform_plugin_names():
             # Engine declaration discipline (``resolve_guaranteed_field_type``):
             # a pass-through transform forwards the whole input row, and one
             # that rewrites a field in place declares it in its OUTPUT schema
@@ -2941,9 +2947,13 @@ def _field_preservation_walker(
             # type_coerce) and the walk abstains rather than guessing.
             declared_output_fields = _probe_transform_output_declared_field_names(node.plugin, node.options)
             if declared_output_fields and field_name not in declared_output_fields:
-                return _connection_preserves_field(node.input, visiting=next_visiting)
-            return False
-        return False
+                result = _connection_preserves_field(node.input, visiting=next_visiting)
+            else:
+                result = False
+        else:
+            result = False
+        producer_results[producer.producer_id] = result
+        return result
 
     def _connection_preserves_field(
         current: str,
