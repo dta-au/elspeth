@@ -362,6 +362,34 @@ jobs:
           ignore-unfixed: false
           exit-code: "1"
 
+      - name: Scan published main GHCR amd64 digest
+        if: steps.ghcr-push.outputs.digest != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
+          format: table
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.txt
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "1"
+
+      - name: Scan published main GHCR arm64 digest
+        if: steps.ghcr-push.outputs.digest != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.ghcr-push.outputs.digest }}
+          format: table
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.txt
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "1"
+
       # -----------------------------------------------------------------------
       # ACR publication.
       #
@@ -408,6 +436,34 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: true
           sbom: true
+
+      - name: Scan published main ACR-only amd64 digest
+        if: steps.acr-push.outputs.digest != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
+          format: table
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.txt
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "1"
+
+      - name: Scan published main ACR-only arm64 digest
+        if: steps.acr-push.outputs.digest != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        env:
+          TRIVY_PLATFORM: linux/arm64
+        with:
+          image-ref: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest }}
+          format: table
+          output: ${{ github.workspace }}/${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.txt
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: "1"
 
       # -----------------------------------------------------------------------
       # Sign pushed image digests with GitHub OIDC/Sigstore.
@@ -458,6 +514,19 @@ jobs:
         env:
           IMAGE_DIGEST: ${{ secrets.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.acr-push.outputs.digest || steps.acr-copy.outputs.digest }}
         run: cosign sign --yes "$IMAGE_DIGEST"
+
+      - name: Upload main image qualification evidence
+        if: always() && (steps.ghcr-push.outputs.digest != '' || steps.acr-push.outputs.digest != '')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: main-image-qualification-${{ env.IMAGE_SHA }}
+          path: |
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-amd64.txt
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-ghcr-linux-arm64.txt
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-amd64.txt
+            ${{ env.CI_CHECKOUT_PATH }}/.build-evidence/main-vulnerabilities-acr-linux-arm64.txt
+          if-no-files-found: error
+          retention-days: 90
 
       # -----------------------------------------------------------------------
       # Summary
