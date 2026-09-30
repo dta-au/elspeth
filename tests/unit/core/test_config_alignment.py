@@ -258,6 +258,7 @@ class TestLandscapeSettingsAlignment:
             "sink",
             "format",
             "signing_mode",
+            "authentication_policy",
             "signer_key_id",
             "signing_secret_ref",
             "signer_rotation_policy",

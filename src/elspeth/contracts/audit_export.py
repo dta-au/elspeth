@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, BinaryIO, Final, Literal, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, BinaryIO, Final, Literal, Protocol, TypedDict, cast, runtime_checkable
 
 from elspeth.contracts.audit import AuditExportSnapshot, AuditExportSnapshotChunk
 from elspeth.contracts.enums import RunStatus
@@ -33,6 +33,11 @@ AUDIT_EXPORT_DERIVATION_VERSION: Final = "audit-export-derivation-v1"
 AUDIT_EXPORT_COMPARTMENT_EXPORTER_VERSION: Final = "landscape-exporter-auth-v2"
 AUDIT_EXPORT_SERIALIZATION_VERSION: Final = "audit-export-v3"
 AUDIT_EXPORT_MANIFEST_SCHEMA: Final = "elspeth.audit-export-manifest.v2"
+AUDIT_EXPORT_DIRECTORY_BUNDLE_SCHEMA: Final = "elspeth.audit-export-directory-bundle.v1"
+AUDIT_EXPORT_DELIVERED_MANIFEST_NAME: Final = "audit_manifest.v2.json"
+AUDIT_EXPORT_PORTABLE_RECORDS_NAME: Final = "audit_records.v3.jsonl"
+AUDIT_EXPORT_MAX_DELIVERED_FILES: Final = 96
+AUDIT_EXPORT_MAX_DELIVERED_BYTES: Final = 1024 * 1024 * 1024 * 1024
 AUDIT_EXPORT_MAX_CHUNKS: Final = 100_000
 AUDIT_EXPORT_MAX_CHUNK_BYTES: Final = 64 * 1024 * 1024
 AUDIT_EXPORT_MAX_CHUNK_RECORDS: Final = 1_000_000
@@ -44,6 +49,42 @@ AUDIT_EXPORT_SAFE_INTEGER_MAX: Final = 9_007_199_254_740_991
 type ClosedAuditExportScalar = str | bool | int | None
 type ClosedAuditExportJSON = ClosedAuditExportScalar | list[ClosedAuditExportJSON] | dict[str, ClosedAuditExportJSON]
 type AuditExportObjectKind = Literal["data_chunk", "final_manifest"]
+type AuditExportDirectoryFileEvidence = tuple[str, str, int]
+
+
+class AuditExportDirectoryBundleFile(TypedDict):
+    content_hash: str
+    relative_path: str
+    size_bytes: int
+
+
+class AuditExportDirectoryBundleManifest(TypedDict):
+    files: list[AuditExportDirectoryBundleFile]
+    schema: str
+
+
+def audit_export_directory_bundle_manifest(
+    files: Iterable[AuditExportDirectoryFileEvidence],
+) -> AuditExportDirectoryBundleManifest:
+    """Return the canonical exact-file manifest shared by producer and verifier."""
+    return {
+        "files": [
+            {
+                "content_hash": content_hash,
+                "relative_path": relative_path,
+                "size_bytes": size_bytes,
+            }
+            for relative_path, content_hash, size_bytes in files
+        ],
+        "schema": AUDIT_EXPORT_DIRECTORY_BUNDLE_SCHEMA,
+    }
+
+
+def audit_export_directory_bundle_hash(files: Iterable[AuditExportDirectoryFileEvidence]) -> str:
+    """Bind one portable CSV delivery's names, hashes, sizes, order and schema."""
+    manifest = audit_export_directory_bundle_manifest(files)
+    return hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
+
 
 _LOWER_HEX_64 = re.compile(r"[0-9a-f]{64}\Z")
 _UTC_MICROSECOND_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\Z")

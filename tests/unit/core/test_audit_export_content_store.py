@@ -30,6 +30,7 @@ def _export_settings(root: Path) -> LandscapeExportSettings:
         enabled=True,
         compartment_id="test-compartment",
         sink="audit",
+        signing_mode="unsigned",
         total_record_limit=100,
         total_byte_limit=10_000,
         chunk_limit=10,

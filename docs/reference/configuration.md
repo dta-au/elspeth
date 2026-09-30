@@ -2427,6 +2427,7 @@ landscape:
     sink: audit_archive
     format: json
     signing_mode: hmac_sha256
+    authentication_policy: required
     signer_key_id: audit-export-2026-q3-v1
     signing_secret_ref: ELSPETH_AUDIT_EXPORT_SIGNING_KEY
     signer_rotation_policy: multi_version
@@ -2611,7 +2612,8 @@ compatibility record rather than relying on a structural probe alone.
 | `enabled` | bool | `false` | Enable audit trail export after run |
 | `sink` | string | - | Sink name to export to (required when enabled) |
 | `format` | string | `csv` | Export format: `csv`, `json` |
-| `signing_mode` | string | `unsigned` | `unsigned` or `hmac_sha256` |
+| `signing_mode` | string | required when enabled | `unsigned` or `hmac_sha256`; disabled export settings retain the `unsigned` model default, while every enabled export must state the decision |
+| `authentication_policy` | string | `optional` | `required` refuses an unsigned export at configuration parsing; `optional` permits an explicitly unsigned export |
 | `signer_key_id` | string | `UNSIGNED` | Credential-free public signer key ID/version recorded in snapshot identity |
 | `signing_secret_ref` | string | - | Exact environment-variable name containing the HMAC key; required for `hmac_sha256` |
 | `signer_rotation_policy` | string | `multi_version` | `multi_version` allows a new signer identity for a new snapshot; `single_export` refuses a different signer identity for the same export lineage |
@@ -2636,10 +2638,12 @@ compatibility record rather than relying on a structural probe alone.
 
 Auth-v2 binds `compartment_id` into the `audit_export_config.public_config` record and its public configuration hash for every export. With `signing_mode: hmac_sha256`, the marking is also covered by the signed manifest and record signatures. `landscape-exporter-auth-v1` is not accepted for new exports, verification, or resume. The cryptographic derivation algorithm label remains `audit-export-derivation-v1`; it is a separate version domain.
 
-Enabled export is deliberately all-explicit: total capacity must fit within
-`chunk_limit × per_chunk_*_limit`, and the spool must already be a private
-directory. Content-store retention never authorizes deletion of referenced
-snapshot objects.
+Enabled export is deliberately all-explicit: `signing_mode` must be present,
+total capacity must fit within `chunk_limit × per_chunk_*_limit`, and the spool
+must already be a private directory. Set `authentication_policy: required` in
+deployments where an unsigned export must fail closed before a run starts.
+Content-store retention never authorizes deletion of referenced snapshot
+objects.
 
 **Signing and rotation:** `signer_key_id` is a public, credential-free identity
 that includes the operator's key version. It participates in snapshot identity,
@@ -2651,6 +2655,62 @@ The value of `signing_secret_ref` is only the environment variable name. Key
 bytes, secret values, hashes of weak key material, and low-entropy key-derived identifiers
 are never persisted. See [Environment
 Variables](environment-variables.md) for secret provisioning.
+
+### Verify a delivered audit export
+
+`elspeth audit-export verify` is the supported database-independent verifier
+for delivered JSON and CSV exports. It rederives the canonical manifest,
+record chain, chunk boundaries, snapshot identity, content hashes and HMAC
+authentication. A CSV delivery is a directory containing
+`audit_records.v3.jsonl`, `audit_manifest.v2.json`, and one deterministic CSV
+projection per record type; verification authenticates the portable record
+stream and then checks every delivered CSV byte and the exact file set against
+that stream.
+
+The verifier opens each delivered regular file once with no-follow,
+nonblocking semantics, copies it through verifier-owned byte limits into
+private temporary storage, and checks source descriptor and path identity
+during that capture. Parsing, graph derivation, signature checks, and CSV
+projection comparison use only those captured bytes. A successful result
+includes `artifact_digest`: for JSON this is the SHA-256 of the exact captured
+file; for CSV it is the canonical directory-bundle hash binding the sorted
+relative names, content hashes, sizes, and bundle schema.
+
+Success authenticates that private snapshot. It does not freeze, lock, or
+certify the source pathname after capture. A downstream process that later
+reads the source must keep it under stable custody or run verification again
+and require the same `artifact_digest` immediately before use.
+
+Verification requires authentication by default. Map every retained public
+signer ID to the environment variable containing its historical HMAC key:
+
+```bash
+elspeth audit-export verify ./exports/run-123.jsonl \
+  --key-ref audit-export-2026-q2-v1=ELSPETH_AUDIT_EXPORT_2026_Q2_KEY \
+  --key-ref audit-export-2026-q3-v1=ELSPETH_AUDIT_EXPORT_2026_Q3_KEY
+
+elspeth audit-export verify ./exports/run-123-csv \
+  --key-ref audit-export-2026-q3-v1=ELSPETH_AUDIT_EXPORT_2026_Q3_KEY \
+  --json
+```
+
+The verifier reads the signer ID from the authenticated export and resolves
+that exact mapping. It has no current-key fallback. Keep each signer mapping
+and key available for at least as long as exports signed by it are retained;
+duplicate mappings and unknown signer IDs fail closed. Key bytes are read from
+the named environment variables and never accepted on the command line.
+
+For a deliberately unsigned legacy or development export, an operator must opt
+into an integrity-only result:
+
+```bash
+elspeth audit-export verify ./exports/unsigned.jsonl --allow-unsigned
+```
+
+The result says `authenticated: false`. HMAC proves possession of a shared
+secret; it does not provide public-key non-repudiation. Success exits 0,
+verification or input failure exits 1 with a stable result code, and command
+usage errors exit 2.
 
 ### Sink-effect resource and transport bounds
 

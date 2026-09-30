@@ -58,6 +58,7 @@ def test_web_auth_event_export_authorization(request: pytest.FixtureRequest, fro
                 "compartment_id": "test-compartment",
                 "sink": "audit",
                 "format": "json",
+                "signing_mode": "unsigned",
                 "auth_events": auth_events,
                 "total_record_limit": 10,
                 "total_byte_limit": 1000,

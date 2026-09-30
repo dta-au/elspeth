@@ -79,6 +79,7 @@ Options:
 | `purge` | Delete old payloads to free storage |
 | `resume` | Resume a failed run from checkpoint |
 | `export-resume` | Resume a finalized run's unfinished audit export |
+| `audit-export verify` | Verify a bounded private snapshot of a delivered JSON file or portable CSV bundle without its Landscape database, and report its artifact digest |
 | `join` | Attach to a running pipeline as a follower worker |
 | `abandon` | Finalize a run whose leader died, recording its undecided work as abandoned |
 | `health` | Check system health for deployment verification |

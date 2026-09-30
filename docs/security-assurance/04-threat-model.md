@@ -401,8 +401,10 @@ tooling surface.
 
 Controls: audit-first writes, closed vocabularies and hash checks, write
 fencing between replicas, append-only transcripts and sealed exports;
-exports are HMAC-signed when that signing mode is configured, while the
-product default is unsigned
+enabled exports require an explicit signing decision, deployments can require
+HMAC at configuration admission, and the delivered JSON or portable CSV
+artifact can be independently verified with exact historical signer-key
+selection
 ([08 § 2](08-logging-audit-and-monitoring.md#2-integrity)) [EV-315] [EV-316]. The Landscape
 MCP server runs locally over stdio, opens the database read-only, accepts a
 single `SELECT` or `WITH` statement inside a read-only transaction, and caps
@@ -508,7 +510,7 @@ controlled register.
 | T-020 | I, E | Request forgery to internal services or metadata endpoints | 4.6 | Network trust boundary and credentials (C, I) | Address policy, DNS pinning and always-blocked ranges | Residual | Critical — internal control-plane access can expose credentials or privileged services | `R-009` |
 | T-021 | I | Data sent to an unintended public host | 4.6 | Pipeline data (C) | Exact-origin allowlist and header origin binding | Residual | Medium — data leaves the intended destination boundary | `R-010` |
 | T-022 | T, I, E | Script injection in the frontend | 4.7 | Session tokens and user-visible state (C, I) | Escaping, sanitiser and CSP | Residual | High — script execution can act with the user's browser authority | `R-001` |
-| T-023 | T, R | Tampering with audit evidence | 4.8 | Audit trail (I) | Schema checks, mutation fencing, append-only transcripts, sealed exports, optional signing and database access control | Residual | Critical — evidence may no longer prove what ran or occurred | `R-011` |
+| T-023 | T, R | Tampering with audit evidence | 4.8 | Audit trail (I) | Schema checks, mutation fencing, append-only transcripts, sealed exports, configurable required signing, delivered-artifact verification and database access control | Residual | Critical — evidence may no longer prove what ran or occurred | `R-011` |
 | T-024 | I, E | Bulk audit disclosure through an exposed MCP server | 4.8 | Audit trail and pipeline data (C) | Local stdio, read-only transactions and row caps; exposure is a deployment decision | Deployment | High — audit records may contain personal or sensitive operational data | `R-012` if applicable |
 | T-025 | I | Reconnaissance through unauthenticated endpoints | 4.9 | Deployment metadata (C) | Redacted readiness and bearer-protected metrics | Residual | Medium — disclosed metadata can assist later targeting | `R-013` |
 | T-026 | D | Resource exhaustion affects all users | 4.10 | Web and execution service (A) | Bounded workers, body/time ceilings, graph limits and rate limits | Residual | High — shared service availability can be lost | `R-014` |

@@ -211,11 +211,13 @@ fixed before submission when the assessment requires the missing capability,
 or carried into the controlled risk register with an effective mitigation and
 authorised, time-bounded acceptance:
 
-1. **Audit-export authentication.** Audit exports are unsigned by default,
-   and ELSPETH has no supported standalone verifier or re-sign command for a
-   delivered bundle. Select and evidence the signing mode, key custody,
-   historical-key retention and an acceptable verification procedure, or
-   implement and assess the missing verifier capability [EV-316].
+1. **Audit-export authentication.** An enabled export requires an explicit
+   signing decision, but may still be deliberately unsigned, and ELSPETH has
+   no re-sign command for an existing bundle. For evidence relied upon as
+   authentic, configure `authentication_policy: required`, use HMAC signing,
+   retain every historical signer key for the evidence-retention period and
+   exercise `elspeth audit-export verify` against the delivered artifact
+   [EV-316].
 2. **Retention automation.** Payload purge is an explicit operator action,
    audit metadata has no product-wide automatic expiry, and the pending-
    identity purge authority has no production caller. Define, operate and
@@ -257,7 +259,6 @@ scope, an assessor or accepting authority may make the item release-blocking.
 
 | Priority | Confirmed gap | Required engineering outcome | Submission effect |
 |---|---|---|---|
-| High | A recipient of an audit-export bundle has no supported standalone verifier; exports are unsigned unless HMAC signing is configured [EV-316]. | Provide and test a supported verifier for delivered bundles, including manifest, record-chain, content-hash, signer-ID and configured-authentication checks. Define the key-resolution and historical-key contract. An assurance deployment should also fail closed when its required signing mode is absent. | Blocking when exported audit evidence is submitted or relied upon as independently authentic. Otherwise record the limitation and compensating custody procedure under `R-011`. |
 | High | `identity_pending_retention_days` is validated, and a purge authority exists, but no production caller invokes it [EV-812]. | Add a supported scheduled or operator-invoked purge path with authority checks, audit evidence and lifecycle tests, or remove the setting and state that pending identities are retained until explicit administration. | Blocking when the submission claims that pending identities are automatically deleted after the configured period or when that deletion is required by the approved privacy schedule. |
 | High | The optional gateway resolves ranged dependencies during each image build; it has no lockfile and is outside the root dependency audit and Dependabot coverage [EV-722]. | Add a reproducible lock/update path, dependency and image audit, SBOM/provenance coverage and CI enforcement for the gateway artifact. | Blocking when the gateway is part of the assessed deployment or supplied as an approved product artifact. Otherwise exclude it explicitly and require the deployer to build, scan and pin its own image. |
 | High | Web authoring and run admission use active identity state rather than requiring the intended `user` role; `auditor` and `oversight` role grants add no route authority at this baseline [EV-104]. | Decide and enforce one coherent authorisation contract. If `user` is the author/run permission, add live route and mutation checks with negative tests. Keep reserved roles non-authorising until their permitted read surfaces and tests exist. | Blocking when the SoA or deployment design claims role-based least privilege for authoring/running, or claims implemented auditor/oversight access. Otherwise record the active-identity authority model and accept its residual risk. |
