@@ -134,7 +134,7 @@ register in [12 § 8](12-privacy-impact-assessment.md#8-disclosure-and-cross-bor
 |---|---|---|---|---|
 | Direct or indirect prompt injection and unsafe authorised egress | Chat, uploads, pipeline state, rows, fetched pages, retrieved passages and destinations that policy permits | Untrusted framing; closed-schema tool validation; proposal binding; operator profiles; declared-field templates; optional required prompt-shield and content-safety coverage | EV-402, EV-403, EV-502, EV-506–EV-508 | Record deployment exposure, treatment and acceptance under [R-005](15-risk-register.md) |
 | Sensitive information disclosure | All provider calls, tracing, telemetry, retrieval and model output | Operator-chosen destinations; redaction manifest; secret names rather than values; declared-field projection; value-free public failures | EV-014, EV-503, EV-508, EV-516 | Approve the exact data, destination, terms and readers in §§ 3.1 and 11 |
-| Unvalidated output taking effect | Planner tools and pipeline output | Server-side closed-schema tool validation; graph validation; proposal authority; output treated as Tier 3; non-`stop` finish reasons fail a row; sanitised Web rendering | EV-402, EV-403, EV-406, EV-513 | Define human review and downstream validation for the use case |
+| Unvalidated output taking effect | Planner tools and pipeline output | Server-side closed-schema tool validation; graph validation; proposal authority; output treated as Tier 3; pipeline LLM plugins accept explicit `stop` or an absent finish reason and fail a row for every other present value; sanitised Web rendering | EV-402, EV-403, EV-406, EV-513 | Define human review and downstream validation for the use case |
 | Excessive agency or model-authored change without review | Composer tool loop | Fixed tool registry; no run tool; operator policy bounds plugins, paths, connectors and secret wiring; trust mode; separate run gate | EV-510, EV-511 | Choose trust mode, governance and reviewer competence; record residual exposure under [R-006](15-risk-register.md) |
 | Misinformation and automation bias | Advice, explanations and generated row content | Advisor is labelled as advice; interpretation reviews expose model-made choices; output is untrusted; calls and state transitions are recorded | EV-505, EV-513, EV-517 | Define accuracy thresholds, review sampling, override and escalation |
 | Unbounded provider cost or execution consumption | Planner, advisor and pipeline calls | Per-composition bounds; advisor bounds; required Composer rate setting; optional token quotas; run rate limits and bounded retry budgets | EV-503, EV-504 | Set limits, budgets and alerts; record residual exposure under [R-007](15-risk-register.md) |
@@ -400,8 +400,15 @@ The reusable reference baseline is:
 - [AI Impact Assessment Tool](https://www.digital.gov.au/ai/impact-assessment-tool),
   updated 1 December 2025;
 - [AI Technical Standard](https://www.digital.gov.au/policy/ai/AI-technical-standard),
-  updated 22 August 2025; and
+  updated 22 August 2025;
+- [Agentic AI addendum to the AI Technical Standard](https://www.digital.gov.au/policy/ai/agentic-ai-addendum),
+  updated 4 June 2026; and
 - the OWASP 2025 reference in § 5.
+
+The Composer planner is an LLM tool loop: it maintains session state, selects
+and invokes bounded authoring tools, and uses their results in later turns.
+Government deployments that enable Composer must therefore assess it against
+the Agentic AI Addendum as well as the underlying AI Technical Standard.
 
 | Policy theme | Reusable coverage | Deployment completion |
 |---|---|---|
@@ -412,6 +419,7 @@ The reusable reference baseline is:
 | Fairness and accessibility | §§ 6.1–6.2 | Evaluate actual groups, data and service channel |
 | Testing, monitoring and change control | § 9 | Approve metrics, thresholds, cadence and withdrawal criteria |
 | Privacy, security and records | §§ 3–5, 7 and [12](12-privacy-impact-assessment.md) | Determine legal applicability, disclosure, retention and records obligations |
+| Agentic governance, workflow, tools and lifecycle | Composer inventory in § 2; authority and tool controls in §§ 4.1, 4.3 and 8; session memory and retention in § 7; evaluation, monitoring and withdrawal in § 9 | Record applicability of Agentic AI Addendum statements AGT.1–AGT.8; define human oversight and intervention, memory controls, tool permissions, agent-level evaluation and monitoring, fallback, rollback and secure decommissioning |
 
 Policy applicability, the relevant ISM release and any agency-specific AI
 requirements are deployment decisions; record them in the controlled copy and
