@@ -50,6 +50,11 @@ from elspeth.plugins.infrastructure.schema_factory import create_schema_from_con
 #: The single name an ``output`` expression may address: the matched entry.
 REFERENCE_ENTRY_NAME = "ref"
 
+#: Upper bound on the materialized row-by-output matrix. The complete matrix
+#: is retained for constant-time joins, so bounding each input independently
+#: would still permit an unsafe Cartesian product.
+MAX_REFERENCE_INDEX_CELLS = 1_000_000
+
 #: Sentinel for an output path that did not resolve against a matched entry.
 #: Distinct from ``None``, which is a legitimate value a reference table may
 #: hold (a JSON ``null``), and which ``on_miss: null`` also produces.
@@ -303,6 +308,12 @@ def build_reference_index(cfg: ReferenceJoinConfig) -> ReferenceIndex:
             "A CSV header with no data rows, or a JSON [], is an empty container rather than "
             "sparse data — supply the table, or remove the reference_join node."
         )
+    cell_count = len(entries) * len(cfg.output)
+    if cell_count > MAX_REFERENCE_INDEX_CELLS:
+        raise ReferenceTableError(
+            f"reference table with {len(entries)} entries and {len(cfg.output)} output fields would materialize "
+            f"{cell_count} values; the limit is {MAX_REFERENCE_INDEX_CELLS}. Reduce the table or output map."
+        )
     compiled = _compile_output_expressions(cfg)
 
     resolved: dict[str, dict[str, Any]] = {}
@@ -551,7 +562,7 @@ class ReferenceJoin(BaseTransform):
     name = "reference_join"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7cef9b2856911e69"
+    source_file_hash: str | None = "sha256:f6caccc517971b90"
     config_model = ReferenceJoinConfig
     passes_through_input = True
     usage_when_to_use: str = (

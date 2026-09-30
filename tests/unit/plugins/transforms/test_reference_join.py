@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from elspeth.core.template_materialization import TemplateOptionMaterializer
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms import reference_join
 from elspeth.plugins.transforms.reference_join import ReferenceJoin
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_source_context
@@ -133,6 +134,12 @@ class TestJoinSemantics:
         assert "node:<node_id>.options.reference_content" in hints
         assert "create_blob only for table bytes you create" in hints
         assert "reference_format explicitly" in hints
+
+    def test_rejects_reference_index_cartesian_product_above_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(reference_join, "MAX_REFERENCE_INDEX_CELLS", 3)
+
+        with pytest.raises(PluginConfigError, match=r"2 entries and 2 output fields.*4 values; the limit is 3"):
+            build(output={"description": "ref['description']", "price": "ref['price']"})
 
     def test_csv_flat_hit_adds_named_field(self, ctx: "PluginContext") -> None:
         transform = build()
