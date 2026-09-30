@@ -179,6 +179,27 @@ class TestImageInputsRejection:
                 image_inputs=[],
             )
 
+    def test_rejects_more_image_inputs_than_per_call_default(self) -> None:
+        with pytest.raises(ValidationError, match="List should have at most 20 items"):
+            LLMConfig(
+                provider="azure",
+                prompt_template="Classify: {{ row.text }}",
+                schema_config=_OBSERVED_SCHEMA,
+                required_input_fields=["text"],
+                image_inputs=[{"field": f"page_{index}_blob_ref", "format": "png"} for index in range(21)],
+            )
+
+    def test_accepts_image_inputs_at_per_call_default(self) -> None:
+        config = LLMConfig(
+            provider="azure",
+            prompt_template="Classify: {{ row.text }}",
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=["text"],
+            image_inputs=[{"field": f"page_{index}_blob_ref", "format": "png"} for index in range(20)],
+        )
+        assert config.image_inputs is not None
+        assert len(config.image_inputs) == 20
+
     def test_omitting_image_inputs_key_stays_legal(self) -> None:
         """The rejection is scoped to an explicit empty list — omitting the key
         entirely (image_inputs defaulting to None) must remain the ordinary,
