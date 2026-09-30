@@ -36,6 +36,8 @@ flowchart LR
 The optional [LLM compatibility gateway](gateway/README.md) is a separate
 service. ELSPETH reaches it through an HTTP provider integration; it is not
 part of the `elspeth` package.
+Its independent frozen dependency lock and image qualification checks govern
+the gateway release; see the [gateway build contract](gateway/README.md#the-container-image).
 
 ## Code boundaries
 
@@ -68,6 +70,26 @@ executor. The exact enforced import rules and known exceptions live in
 5. Sinks publish through the effect protocol. Landscape records terminal
    outcomes, artifact evidence, and run accounting. Checkpoints and durable
    work records support eligible recovery and resume.
+
+Finite CSV/JSON sources can opt into a sealed emission snapshot. The engine
+parses and validates the complete single-source input before downstream work,
+records the snapshot through the source-load operation, and resumes from those
+retained bytes rather than reopening a mutable file. This preserves source
+identity and quarantine evidence; it does not make uncertain external effects
+safe to retry. The [resume runbook](docs/runbooks/resume-failed-run.md) gives
+configuration, bounds, and refusal conditions.
+
+HTTP enrichment belongs to the shared audited client. `web_scrape` handles
+bounded request bodies, response admission, structured extraction, provenance,
+and GET pagination; each fetched destination passes origin and SSRF checks.
+POST retrieval has no automatic retry or redirect and blocks automatic resume.
+Authenticated fetches remain disabled pending a protected response-evidence
+boundary. Browser admission/archive contracts exist in
+[`core/browser`](src/elspeth/core/browser/), but no live browser plugin or
+enforcing worker is available. Configuration and limits live in the
+[web scrape reference](docs/reference/web-scrape-transform.md); the
+[browser egress gate](docs/design/2026-09-29-web-browser-egress-gate.md) records
+the isolation required before live browser admission.
 
 The [graph validation ADR](docs/architecture/adr/003-schema-validation-lifecycle.md),
 [token lifecycle](docs/architecture/token-lifecycle.md), and
@@ -137,6 +159,15 @@ work. Route modules stay grouped by domain, including
 [execution](src/elspeth/web/execution/routes.py), and
 [auth](src/elspeth/web/auth/routes.py).
 
+Authentication establishes identity; the Sessions-backed identity authority
+establishes current permission. Pipeline operations require an active human
+from the configured browser provider with a live deployment-wide `user` grant,
+checked at routes and again at durable run admission and WebSocket ticket
+consumption. Administrative and workload roles remain separate. Administrators
+can purge never-activated pending identities under the retention policy, with
+an audit record of the deletion. The [identity guide](docs/guides/identity-providers.md) defines
+role admission and the reserved machine/role surfaces.
+
 ### Composer and session authority
 
 [`ComposerServiceImpl`](src/elspeth/web/composer/service.py) coordinates a
@@ -153,6 +184,13 @@ surface. Server code validates, rejects, redacts, gates, and persists it; it
 does not replace the planner with a server-authored proposal. The first-run
 tutorial uses the same authoring backend.
 
+The shared [credential guard](src/elspeth/web/credential_guard.py) rejects
+recognized credential material in control content before persistence or tool
+dispatch, including provider-authored metadata that becomes audit evidence.
+It admits supported secret references and excludes blob data-plane bodies
+from this detector. Separate audit scrubbing provides a safe persisted view;
+neither boundary replaces data retention and access policy.
+
 The [session service](src/elspeth/web/sessions/service.py) persists versioned
 conversations, composition state, proposal and review evidence, and web run
 state. [Coordination authorities](src/elspeth/web/coordination/) own leases,
@@ -162,6 +200,14 @@ single-host alternative. Those choices are wired in
 [`web/app.py`](src/elspeth/web/app.py). Session writes and Landscape writes are
 separate transactions, so the run-start path uses explicit coordination
 rather than assuming an atomic commit across stores.
+
+Interpretation mutations capture immutable plugin schemas, policy snapshots,
+and profile lowering facts before acquiring session mutation authority.
+Validation under locked rows uses those detached inputs, not live catalog or
+profile services. Blob-backed source edits reconcile authoritative reviews,
+so approval state follows the changed source. Runtime assembly and Composer
+both derive generated LLM outputs from the same plugin contract; schema
+declarations do not themselves extract fields from a provider response.
 
 ```mermaid
 sequenceDiagram
@@ -266,4 +312,5 @@ for current platform status, limitations, and runbooks.
 - [Engine and subsystem map](docs/architecture/subsystems.md)
 - [Plugin author guide](PLUGIN.md)
 - [Configuration reference](docs/reference/configuration.md)
+- [Deployment security assurance](docs/security-assurance/README.md)
 - [README and quick start](README.md)
