@@ -39,7 +39,7 @@ from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.integration.pipeline.test_colour_multi_query_contract_repair import ColourScenario, run_colour_pipeline
 from tests.integration.web.composer.test_prompt_review_card_end_to_end import _accept_as_drafted, _persist, _run_surfacer
 from tests.unit.web.composer.conftest import _fake_llm_response, _make_settings, build_test_sessions_service
@@ -80,6 +80,7 @@ async def _harness(tmp_path: Path) -> _Harness:
     initialize_session_schema(engine)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="alice")
+        grant_test_pipeline_user(conn, identity_id="alice")
     sessions = build_test_sessions_service(engine=engine, data_dir=tmp_path)
     session = await sessions.create_session(user_id="alice", title="Colour contracts", auth_provider_type="local")
     await sessions.update_composer_preferences(session.id, trust_mode="auto_commit", density_default="high", actor="user:alice")

@@ -66,7 +66,7 @@ from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.fixtures.identities import ensure_test_identity
+from tests.fixtures.identities import ensure_test_identity, grant_test_pipeline_user
 from tests.helpers.session_fences import seed_session_operation_fence
 from tests.unit.evals.conftest import _clean_advisor_checkpoint
 
@@ -199,6 +199,7 @@ def _session_engine() -> tuple[Any, str, SessionServiceImpl, SessionOperationCon
     now = datetime.now(UTC)
     with engine.begin() as conn:
         ensure_test_identity(conn, identity_id="test-user")
+        grant_test_pipeline_user(conn, identity_id="test-user")
         conn.execute(
             sessions_table.insert().values(
                 id=session_id,
