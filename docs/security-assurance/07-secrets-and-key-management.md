@@ -532,9 +532,10 @@ The effect on existing state, measured from the code and pinned by
 Audit-export key rotation changes future export snapshots only. Retain the
 retired key and its public key ID under the deployment's access-controlled
 historical-evidence policy for as long as an older signed bundle must be
-preserved. The reviewed ELSPETH tree has internal bind/recovery/resume checks,
-but it has no supported standalone verifier for a delivered bundle and no
-command that re-signs an existing bundle [EV-316].
+preserved. `elspeth audit-export verify` resolves the exact signer ID through
+an operator-supplied environment-variable mapping, so a retained historical
+key can verify its delivered JSON or portable CSV bundle without a Landscape
+database. ELSPETH has no command that re-signs an existing bundle [EV-316].
 
 ### 6.2 Generic rotation and compromise procedure
 
@@ -586,8 +587,8 @@ rotation policy permits the new signer identity, generate a fresh export
 under a replacement key and `signer_key_id`. Preserve the original bundle,
 old key and incident findings under the historical-evidence policy; do not
 present its exposed-key signature as independent integrity proof. ELSPETH has
-no re-sign command and no supported standalone delivered-bundle verifier
-[EV-226] [EV-316].
+no re-sign command; the delivered-bundle verifier cannot restore assurance
+once the authenticating key itself is compromised [EV-226] [EV-316].
 
 ### 6.3 Deployment record — rotation schedule and compromise procedure
 
@@ -598,7 +599,7 @@ no re-sign command and no supported standalone delivered-bundle verifier
 | SSO transaction secret | DEPLOYMENT-TODO: | Replace and restart; sign-ins already in progress fail and must restart | DEPLOYMENT-TODO: |
 | Shareable-link signing key | DEPLOYMENT-TODO: | Follow the [leaked-key procedure](../guides/sharing-pipelines.md#a-signing-key-has-been-leaked); re-issue required links | DEPLOYMENT-TODO: |
 | Fingerprint key | DEPLOYMENT-TODO: | Replace and restart; document the new comparison period and investigate the old period using its original key under incident controls | DEPLOYMENT-TODO: |
-| Audit export signing key | DEPLOYMENT-TODO: | Stop old-key signing; assess affected bundles; where source records and rotation policy permit, create a fresh export with the replacement key and `signer_key_id`; retain the old bundle and key under the historical-evidence policy. ELSPETH has no re-sign command or standalone delivered-bundle verifier [EV-226] [EV-316] | DEPLOYMENT-TODO: |
+| Audit export signing key | DEPLOYMENT-TODO: | Stop old-key signing; assess affected bundles with the delivered-bundle verifier; where source records and rotation policy permit, create a fresh export with the replacement key and `signer_key_id`; retain the old bundle, reported artifact digest, and key under the historical-evidence policy. ELSPETH has no re-sign command [EV-226] [EV-316] | DEPLOYMENT-TODO: |
 | Landscape passphrase | DEPLOYMENT-TODO: | Follow the datastore recovery decision; there is no in-product re-key | DEPLOYMENT-TODO: |
 | Database credentials | DEPLOYMENT-TODO: | Revoke at the database, replace in the store, restart and verify both runtime and schema-owner paths separately | DEPLOYMENT-TODO: |
 | Provider and cloud credentials | DEPLOYMENT-TODO: | Revoke at the provider, rotate, restart and review provider usage logs and Landscape call records | DEPLOYMENT-TODO: |

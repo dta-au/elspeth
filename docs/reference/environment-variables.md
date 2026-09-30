@@ -42,7 +42,7 @@ ELSPETH automatically loads environment variables from a `.env` file when you ru
 | Variable | Purpose | When Required |
 |----------|---------|---------------|
 | `ELSPETH_FINGERPRINT_KEY` | Secret fingerprinting | Config contains API keys or passwords |
-| `ELSPETH_SIGNING_KEY` | Signed audit exports | `landscape.export.sign: true` |
+| `ELSPETH_SIGNING_KEY` | Example signed audit-export key | Named by `landscape.export.signing_secret_ref` when `signing_mode: hmac_sha256` |
 
 ### ELSPETH_FINGERPRINT_KEY
 
@@ -1004,8 +1004,9 @@ Create a `.env` file in your project root:
 # and keep the resulting value stable for audit correlation.
 ELSPETH_FINGERPRINT_KEY=fake_fingerprint_key_for_docs_only
 
-# Signing key for audit exports (optional)
-# Enables HMAC signatures on exported audit records
+# Example signing key for audit exports. The export's signing_secret_ref must
+# name this variable; deployments requiring authentication also set
+# authentication_policy: required and signing_mode: hmac_sha256.
 ELSPETH_SIGNING_KEY=fake_signing_key_for_docs_only
 
 # =====================================================================

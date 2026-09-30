@@ -27,6 +27,20 @@ All notable changes to ELSPETH are documented here.
 - **SECURITY.md names a security mailbox.** Reports go to GitHub private
   vulnerability reporting or to `cloudengineering@dta.gov.au`; the public-issue
   fallback is removed.
+- **Delivered audit exports now have a standalone verifier.**
+  `elspeth audit-export verify` independently re-derives signed JSON exports
+  and portable CSV bundles, including record signatures and chain, chunk and
+  snapshot hashes, final manifest, exact CSV projections and file set. It
+  resolves the authenticated signer ID through explicit historical
+  key-to-environment mappings, refuses unsigned evidence by default, and
+  labels the explicit `--allow-unsigned` path as integrity-only. Enabled
+  exports must now state `signing_mode`; deployments can set
+  `authentication_policy: required` to reject unsigned export configuration.
+  Verification copies each delivered regular file once into bounded private
+  storage and verifies only that captured snapshot. Success reports an
+  `artifact_digest` (the exact JSON file SHA-256 or canonical CSV directory
+  bundle hash); it does not lock the source path, so later consumers must keep
+  stable custody or revalidate that digest before using the source again.
 - **CI's Test job no longer runs out of file descriptors on the self-hosted
   runners, and build-push can check out there.** Docker 29 starts containers
   with a soft open-file limit of 1024; one xdist worker exhausted it mid-suite

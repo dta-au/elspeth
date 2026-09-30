@@ -92,6 +92,30 @@ def _enabled_config(**overrides: object) -> dict[str, object]:
     return config
 
 
+def test_enabled_export_requires_explicit_signing_decision() -> None:
+    config = _enabled_config()
+    del config["signing_mode"]
+
+    with pytest.raises(ValidationError, match="requires explicit fields: signing_mode"):
+        LandscapeExportSettings(**config)
+
+
+def test_required_authentication_policy_refuses_unsigned_and_accepts_signed_export() -> None:
+    with pytest.raises(ValidationError, match="forbids unsigned"):
+        LandscapeExportSettings(**_enabled_config(authentication_policy="required"))
+
+    signed = LandscapeExportSettings(
+        **_enabled_config(
+            authentication_policy="required",
+            signing_mode="hmac_sha256",
+            signer_key_id="audit-key-2026-q3",
+            signing_secret_ref="AUDIT_EXPORT_SIGNING_KEY",
+        )
+    )
+    assert signed.authentication_policy == "required"
+    assert signed.sign is True
+
+
 def test_enabled_export_requires_complete_explicit_bounded_resource_policy() -> None:
     settings = LandscapeExportSettings(**_enabled_config())
     assert settings.signing_mode == "unsigned"

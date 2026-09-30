@@ -389,7 +389,9 @@ than repair it:
   (`src/elspeth/contracts/audit_export.py`;
   [configuration reference § Export Settings](../reference/configuration.md#export-settings)).
   The key is resolved from a named environment variable and is never
-  persisted. The default is `unsigned` [EV-316].
+  persisted. An enabled export must state `signing_mode` explicitly;
+  `authentication_policy: required` refuses an unsigned configuration before
+  the run starts [EV-316].
 
 **Verification support.** The product's internal snapshot bind, recovery and
 resume paths re-read the registered bytes and verify the complete snapshot
@@ -401,15 +403,34 @@ HMAC-signed snapshot and fail closed if the verifier is absent or any check
 fails (`_verify_snapshot_graph` in
 `src/elspeth/core/landscape/execution/audit_export_snapshots.py`).
 
-At the reviewed commit, ELSPETH does not provide a public standalone command
-or supported external procedure for verifying a delivered export bundle.
-`elspeth verify` verifies a pipeline run against recorded calls; it is not an
-audit-export verifier. An auditor who receives only the exported bundle
-therefore cannot use supported product tooling to authenticate it. Treat that
-as a product capability gap until a public verifier is implemented and
-documented. The deployment still decides whether exports are signed, who may
-access them, and who holds the HMAC key; record those installation choices in
-§ 4.4.
+`elspeth audit-export verify PATH` is the supported, database-independent
+verification path for a delivered JSON file or portable CSV directory. It
+re-derives the canonical record stream, record signatures and chain, chunk and
+snapshot graph, content hashes and final manifest. A portable CSV directory
+also carries the authenticated canonical stream; the verifier regenerates
+every deterministic CSV projection and refuses changed, missing, renamed,
+additional, non-regular or case-colliding entries. The physical container must
+match the authenticated `export_format` [EV-316].
+
+Verification first captures every delivered regular file exactly once through
+a bounded, no-follow, nonblocking descriptor into verifier-owned temporary
+storage. All parsing, re-derivation and cross-file comparison then use that
+private snapshot. The success result's `artifact_digest` identifies the exact
+captured JSON bytes or the canonical CSV directory bundle (relative names,
+hashes, sizes and schema). Mixed-file captures fail the authenticated manifest
+and projection checks. Verification does not freeze the source pathname after
+capture; any later consumer must preserve custody of the source or re-run
+verification and match the digest immediately before use.
+
+Verification requires HMAC authentication by default. Operators map the exact
+historical `signer_key_id` to an environment-variable reference with
+`--key-ref`; there is no current-key fallback and the key value is not accepted
+on the command line. A deliberately unsigned export is refused unless the
+operator supplies `--allow-unsigned`, and that successful result is labelled
+`authenticated: false`. HMAC proves shared-secret authentication rather than
+public-key non-repudiation. The deployment still decides who may access exports
+and verification keys and must retain each historical key for at least the
+corresponding export-retention period; record those choices in § 4.4.
 
 ### 2.4 Clock authority
 

@@ -1195,6 +1195,16 @@ sites:
   ordinal: 0
   disposition: not_authorable
   note: Same unauthorable landscape.export chunk-limit block (config.py:1525).
+- key: f40e616b310accf9
+  path: src/elspeth/core/config.py
+  qualname: LandscapeExportSettings.validate_snapshot_policy
+  exception: ValueError
+  message: required audit export authentication forbids unsigned signing_mode
+  ordinal: 0
+  disposition: not_authorable
+  note: landscape.export.authentication_policy and signing_mode are operator-owned deployment configuration.
+    Composer-generated YAML has no landscape key (test_yaml_generator.py::TestGenerateYaml::test_landscape_key_never_emitted),
+    so Composer cannot author the rejected required-plus-unsigned combination.
 - key: ed7bd2467de526d2
   path: src/elspeth/core/config.py
   qualname: LandscapeExportSettings.validate_snapshot_policy

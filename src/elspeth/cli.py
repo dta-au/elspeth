@@ -76,9 +76,122 @@ app = typer.Typer(
 composer_app = typer.Typer(help="Composer web UI commands.")
 composer_users_app = typer.Typer(help="Local composer user management commands.")
 doctor_app = typer.Typer(help="Deployment readiness checks.")
+audit_export_app = typer.Typer(help="Verify delivered audit-export evidence.")
 app.add_typer(composer_app, name="composer")
 composer_app.add_typer(composer_users_app, name="users")
 app.add_typer(doctor_app, name="doctor")
+app.add_typer(audit_export_app, name="audit-export")
+
+
+def _parse_audit_export_key_references(values: list[str] | None) -> dict[str, str]:
+    """Parse exact signer-to-environment references without reading secrets."""
+    import re
+
+    from elspeth.contracts.audit_export import validate_credential_free_identifier
+
+    environment_reference = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+    references: dict[str, str] = {}
+    for value in values or ():
+        if value.count("=") != 1:
+            raise typer.BadParameter(
+                "each key reference must be SIGNER_KEY_ID=ENVIRONMENT_VARIABLE",
+                param_hint="--key-ref",
+            )
+        signer_key_id, reference = value.split("=", 1)
+        try:
+            validate_credential_free_identifier(signer_key_id, "signer_key_id")
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--key-ref") from exc
+        if environment_reference.fullmatch(reference) is None:
+            raise typer.BadParameter(
+                "key reference values must be environment variable names",
+                param_hint="--key-ref",
+            )
+        if signer_key_id in references:
+            raise typer.BadParameter(
+                f"duplicate key reference for signer {signer_key_id!r}",
+                param_hint="--key-ref",
+            )
+        references[signer_key_id] = reference
+    return references
+
+
+@audit_export_app.command("verify")
+def verify_delivered_audit_export(
+    path: Path = typer.Argument(..., help="Delivered JSON file or portable CSV bundle directory."),
+    key_ref: list[str] | None = typer.Option(
+        None,
+        "--key-ref",
+        metavar="SIGNER_KEY_ID=ENVIRONMENT_VARIABLE",
+        help="Retained signing-key reference. Repeat for every historical signer that may be verified.",
+    ),
+    allow_unsigned: bool = typer.Option(
+        False,
+        "--allow-unsigned",
+        help="Allow an integrity-only result for a deliberately unsigned export.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit one stable JSON result object."),
+) -> None:
+    """Verify the manifest, record chain, content hashes, and delivered files."""
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.core.audit_export_verifier import (
+        AuditExportVerificationError,
+        environment_audit_export_verification_key_resolver,
+        verify_audit_export,
+    )
+
+    references = _parse_audit_export_key_references(key_ref)
+    resolver = environment_audit_export_verification_key_resolver(references) if references else None
+    try:
+        report = verify_audit_export(
+            path,
+            key_resolver=resolver,
+            require_authenticated=not allow_unsigned,
+        )
+    except AuditExportVerificationError as exc:
+        failure_code = exc.code
+        failure_message = str(exc)
+    except (AuditIntegrityError, OSError) as exc:
+        failure_code = "invalid_export"
+        failure_message = str(exc)
+    else:
+        payload = {
+            "authenticated": report.authenticated,
+            "artifact_digest": report.artifact_digest,
+            "chunk_content_hashes": list(report.chunk_content_hashes),
+            "chunk_count": report.chunk_count,
+            "code": "ok",
+            "format": report.format,
+            "manifest_content_hash": report.manifest_content_hash,
+            "record_count": report.record_count,
+            "run_id": report.run_id,
+            "signer_key_id": report.signer_key_id,
+            "snapshot_id": report.snapshot_id,
+            "status": "verified",
+            "total_bytes": report.total_bytes,
+        }
+        if json_output:
+            typer.echo(json.dumps(payload, sort_keys=True))
+        else:
+            authentication = "authenticated" if report.authenticated else "integrity-only (authenticated: false)"
+            typer.echo(
+                f"VERIFIED {authentication}: format={report.format} run_id={report.run_id} "
+                f"snapshot_id={report.snapshot_id} signer={report.signer_key_id} "
+                f"artifact_digest={report.artifact_digest}"
+            )
+        return
+
+    failure = {
+        "authenticated": False,
+        "code": failure_code,
+        "message": failure_message,
+        "status": "failed",
+    }
+    if json_output:
+        typer.echo(json.dumps(failure, sort_keys=True))
+    else:
+        typer.echo(f"FAILED [{failure_code}]: {failure_message}", err=True)
+    raise typer.Exit(1)
 
 
 def _preflight_follower_sink_effects(

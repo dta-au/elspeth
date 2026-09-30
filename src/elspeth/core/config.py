@@ -1625,6 +1625,7 @@ class LandscapeExportSettings(BaseModel):
     sink: str | None = None
     format: Literal["csv", "json"] = "csv"
     signing_mode: Literal["unsigned", "hmac_sha256"] = "unsigned"
+    authentication_policy: Literal["optional", "required"] = "optional"
     signer_key_id: str = "UNSIGNED"
     signing_secret_ref: str | None = None
     signer_rotation_policy: Literal["multi_version", "single_export"] = "multi_version"
@@ -1682,6 +1683,8 @@ class LandscapeExportSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_snapshot_policy(self) -> "LandscapeExportSettings":
+        if self.authentication_policy == "required" and self.signing_mode != "hmac_sha256":
+            raise ValueError("required audit export authentication forbids unsigned signing_mode")
         if self.signing_mode == "unsigned":
             if self.signer_key_id != "UNSIGNED":
                 raise ValueError("unsigned signing requires the typed UNSIGNED signer identity")
@@ -1694,6 +1697,7 @@ class LandscapeExportSettings(BaseModel):
                 raise ValueError("hmac_sha256 signing requires a signing secret reference")
 
         required = (
+            ("signing_mode", self.signing_mode),
             ("total_record_limit", self.total_record_limit),
             ("total_byte_limit", self.total_byte_limit),
             ("chunk_limit", self.chunk_limit),
@@ -1704,7 +1708,7 @@ class LandscapeExportSettings(BaseModel):
             ("compartment_id", self.compartment_id),
         )
         if self.enabled:
-            missing = [name for name, value in required if value is None]
+            missing = [name for name, value in required if value is None or (name == "signing_mode" and name not in self.model_fields_set)]
             if missing:
                 raise ValueError(f"enabled audit export requires explicit fields: {', '.join(missing)}")
         if all(value is not None for _name, value in required):
