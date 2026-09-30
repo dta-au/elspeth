@@ -3,7 +3,7 @@
 **Status:** product testing baseline and findings follow-up method complete;
 independent penetration testing record open · **Product source reviewed
 against:** `release/0.8.1` @
-`487ac85a377f135e012bb206e3769cd65f6fadb8` (2026-10-01) · **Owner:** DTA Cloud
+`e1075e93a791711a5280821a57e21d9d796b381c` (2026-10-01) · **Owner:** DTA Cloud
 Engineering
 
 Records the security testing carried out, who did it, what was in scope and
@@ -33,16 +33,18 @@ The security-relevant layers are:
 | Dependency and licence analysis | `pip-audit --strict` separately checks the frozen root and gateway Python graphs; `npm audit` checks both npm lockfiles at every severity; the licence job rejects GPL and AGPL dependencies in both Python graphs [EV-707] [EV-720] [EV-722] | The dependency-and-licence job feeds required `CI Success`; documented exceptions follow [10 § 2](10-vulnerability-and-supply-chain.md#2-triage-and-remediation-targets). A separate required gateway lane scans the assembled image and runs it read-only through external conformance |
 | Python behaviour | The default selection exercises unit, integration, property, invariant and end-to-end behaviour on Python 3.12 and 3.13. A separate required serial suite tests schema, SQL and contention against PostgreSQL [EV-618] [EV-619] | 61,039 default items and 660 PostgreSQL-marked items were collected at the reviewed commit; the sharded default lanes, combined coverage lane and serial PostgreSQL lane feed `CI Success` |
 | Browser and frontend behaviour | Vitest plus TypeScript type checking cover frontend components; Playwright runs browser journeys against a real backend and Chromium [EV-620] | Both frontend jobs feed `CI Success` |
-| Security policy and release integrity | Redaction-direction governance, telemetry attribution, trust-tier analysis, the local secret scanner, additional advisory judge lint and quality signals, required-check verification, image smoke tests, keyless image signing, provenance and SBOM generation cover policy and release seams. The gateway workflow-source contract adds exact-digest amd64/arm64 scans, attestation retrieval, signature verification and read-only smoke testing | [09 § 2.2](09-secure-development-lifecycle.md#22-gate-table) states which signals block a local commit, merge or publication and which remain advisory |
+| Security policy and release integrity | Redaction-direction governance, telemetry attribution, trust-tier analysis, the staged-index secret scanner, additional advisory judge lint and quality signals, required-check verification, image smoke tests, keyless image signing, provenance and SBOM generation cover policy and release seams. The main and gateway workflow-source contracts require exact-digest amd64/arm64 scans before signing; the gateway also retrieves attestations, verifies its signature and runs read-only smoke testing [EV-724] | [09 § 2.2](09-secure-development-lifecycle.md#22-gate-table) states which signals block a local commit, merge or publication and which remain advisory |
 
 Continuous testing has defined limits. CodeQL currently scans Python rather
 than every language and artifact. Live-provider tests run only on trusted
 pushes or manual workflows, and mutation testing is advisory. The gateway
 dependency and built-image controls are present in source and passed their
 reviewed local qualification. No GitHub CI run at this local commit has yet
-confirmed the required gateway job, and no publication run has supplied
-registry, multi-platform scan, attestation, signature and smoke evidence for a
-published gateway digest. Automated and AI-assisted review are not substitutes
+confirmed the new closure contracts, and no publication run has supplied the
+new main-image platform-scan bundle or the gateway registry, scan, attestation,
+signature and smoke evidence for a published digest. Residual persistent-runner
+cleanup, Docker-boundary and cross-job isolation controls remain project
+operating-evidence gaps. Automated and AI-assisted review are not substitutes
 for an independent penetration test.
 
 ## 3. Deployment record — independent penetration testing
