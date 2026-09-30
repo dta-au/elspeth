@@ -36,19 +36,13 @@ env:
 permissions:
   contents: read
 
-# Public-repository guardrail: pull_request workflows execute code from
-# unmerged branches, so all PRs stay on GitHub-hosted runners.
-# Trusted push workflows use the nyx runner.
-#
-# GitHub's runs-on expression accepts either a runner label string or a JSON
-# array of labels. Keep this expression identical across jobs so the aggregate
-# CI Success check reflects one routing policy.
+# Every job uses the trusted local pool. Code-executing jobs admit only
+# same-repository PRs and non-PR events. CI Success rejects fork PRs without
+# checking out or executing their repository code.
 #
 # Self-hosted container jobs can leave root-owned venv/cache artifacts in the
 # default workspace. Every checkout below uses a per-run, per-job path so stale
 # workspace siblings cannot break actions/checkout before project commands run.
-#
-#   ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
 
 jobs:
   # ===========================================================================
@@ -56,7 +50,8 @@ jobs:
   # ===========================================================================
   static-analysis:
     name: Static analysis
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm
     env:
@@ -373,7 +368,8 @@ jobs:
   # ===========================================================================
   test:
     name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:${{ matrix.python-version }}-bookworm
       # Docker 29 on the self-hosted runners starts containers with a soft
@@ -541,11 +537,11 @@ jobs:
 
   coverage:
     name: Combined coverage
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm
     needs: [test]
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
     steps:
@@ -618,13 +614,13 @@ jobs:
   # ===========================================================================
   integration:
     name: Integration Tests
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm
       # Same open-file limit as the Test job (see the note there).
       options: --ulimit nofile=65536:524288
     needs: [test]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/'))
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/RC') || startsWith(github.ref, 'refs/heads/release/')))
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-integration
     steps:
@@ -697,18 +693,31 @@ jobs:
   # ===========================================================================
   testcontainer:
     name: Testcontainer (PostgreSQL contention proofs)
-    # Always GitHub-hosted: testcontainers-python needs a Docker daemon, which
-    # neither the self-hosted container jobs nor the python:*-bookworm images
-    # expose. ubuntu-24.04 ships Docker preinstalled for both push and PR runs.
-    runs-on: ubuntu-24.04
+    # Run on the host so testcontainers-python can use the runner's Docker
+    # daemon directly; container jobs do not expose that daemon.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Run PostgreSQL proofs even if static analysis fails. CI Success requires both.
     # PR #212 selected 651 ids on a hosted runner and reached 53% when the
     # previous 30-minute limit cancelled the job. Allow the full required
     # serial suite to finish and report its result.
     timeout-minutes: 90
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-testcontainer
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Verify Docker prerequisites
+        run: |
+          docker info
+          docker compose version
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -717,10 +726,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -748,7 +759,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: testcontainer-junit
-          path: testcontainer-junit.xml
+          path: ${{ env.CI_CHECKOUT_PATH }}/testcontainer-junit.xml
           retention-days: 30
 
   host-runner-unit:
@@ -761,11 +772,25 @@ jobs:
     # container job those ids skip with a reason; here the ELSPETH_CI_*_REQUIRED
     # variables turn the skips into failures, so the ids are proven on every
     # push rather than silently absent (elspeth-bc97e06221 B1, B3).
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     timeout-minutes: 15
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-host-runner-unit
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Verify Docker prerequisites
+        run: |
+          docker info
+          docker compose version
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -774,10 +799,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -798,12 +825,21 @@ jobs:
   # ===========================================================================
   state-engine-validation:
     name: State-engine catalog and selector validation
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-state-engine-validation
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
@@ -812,10 +848,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -845,22 +883,34 @@ jobs:
   # ===========================================================================
   azure-container-apps-bicep:
     name: Azure Container Apps Bicep bundle
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs: [static-analysis]
     timeout-minutes: 15
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-azure-container-apps-bicep
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Install Bicep (pinned)
         run: |
           BICEP_VERSION=0.46.1
           BICEP_SHA256=3e011d629ea4311b7a7dd8f0040ab2b1a072ea4ff5d02cb75e0e55a9a6703fb9
-          curl -fsSLo /tmp/bicep \
+          bicep_dir="$RUNNER_TEMP/bicep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CI_CHECKOUT_PATH"
+          mkdir -p "$bicep_dir"
+          curl -fsSLo "$bicep_dir/bicep" \
             "https://github.com/Azure/bicep/releases/download/v${BICEP_VERSION}/bicep-linux-x64"
-          printf '%s  /tmp/bicep\n' "$BICEP_SHA256" | sha256sum -c -
-          sudo install -m 0755 /tmp/bicep /usr/local/bin/bicep
-          bicep --version
+          printf '%s  %s\n' "$BICEP_SHA256" "$bicep_dir/bicep" | sha256sum -c -
+          chmod 0755 "$bicep_dir/bicep"
+          echo "$bicep_dir" >> "$GITHUB_PATH"
+          "$bicep_dir/bicep" --version
 
       - name: Compile the bundle
         run: |
@@ -881,10 +931,12 @@ jobs:
           enable-cache: false
           prune-cache: true
 
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
       - name: Install system dependencies
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libsqlcipher-dev
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -894,7 +946,8 @@ jobs:
 
   supply-chain-audit:
     name: Dependency and License Audit
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     container:
       image: python:3.13-bookworm
     needs: [static-analysis]
@@ -965,6 +1018,7 @@ jobs:
           # once upstream ships a fix.
           uv run --with "pip-audit>=2.9,<3" pip-audit \
             --strict \
+            --timeout 60 \
             --requirement requirements-audit.txt \
             --no-deps \
             --disable-pip \
@@ -1016,7 +1070,8 @@ jobs:
   # browser journey blocks merge instead of being waved through.
   e2e-frontend:
     name: Frontend E2E (Playwright)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-e2e-frontend
     steps:
@@ -1043,12 +1098,7 @@ jobs:
       - name: Install system dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
-          if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
-            dpkg-query -W libsqlcipher-dev
-          else
-            sudo apt-get update -q
-            sudo apt-get install -y -q libsqlcipher-dev
-          fi
+          dpkg-query -W libsqlcipher-dev
 
       - name: Install Python dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -1067,16 +1117,30 @@ jobs:
 
       - name: Install Playwright browser
         working-directory: ${{ env.CI_CHECKOUT_PATH }}/src/elspeth/web/frontend
-        run: |
-          if [[ "${{ runner.environment }}" == "self-hosted" ]]; then
-            npx playwright install chromium
-          else
-            npx playwright install --with-deps chromium
-          fi
+        run: npx playwright install chromium
 
       - name: Assign isolated Playwright ports
         run: |
-          port_base=$((20000 + (GITHUB_RUN_ID % 20000)))
+          # One job runs per runner service. Disjoint pairs for each service
+          # prevent simultaneous push and PR runs from sharing a port.
+          if [[ ! "$RUNNER_NAME" =~ ^nyx-elspeth-([1-9][0-9]{0,4})$ ]]; then
+            echo "Unsupported local runner name: $RUNNER_NAME" >&2
+            exit 1
+          fi
+          runner_index="${BASH_REMATCH[1]}"
+          port_base=$((20000 + 2 * runner_index))
+          if (( port_base + 1 > 65535 )); then
+            echo "Runner index exceeds the Playwright port range: $runner_index" >&2
+            exit 1
+          fi
+          python - "$port_base" <<'PY'
+          import socket
+          import sys
+
+          for port in (int(sys.argv[1]), int(sys.argv[1]) + 1):
+              with socket.socket() as probe:
+                  probe.bind(("127.0.0.1", port))
+          PY
           echo "PLAYWRIGHT_BACKEND_PORT=$port_base" >> "$GITHUB_ENV"
           echo "PLAYWRIGHT_FRONTEND_PORT=$((port_base + 1))" >> "$GITHUB_ENV"
 
@@ -1115,7 +1179,8 @@ jobs:
   # blocks merge.
   frontend-unit:
     name: Frontend unit (vitest + typecheck)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-unit
     steps:
@@ -1150,7 +1215,7 @@ jobs:
   # ===========================================================================
   ci-success:
     name: CI Success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - static-analysis
       - test
@@ -1164,6 +1229,15 @@ jobs:
       - frontend-unit
     if: always()
     steps:
+      - name: Reject fork pull requests
+        env:
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [[ "$IS_FORK_PR" == "true" ]]; then
+            echo "Fork pull requests cannot run on the trusted local runners."
+            exit 1
+          fi
+
       - name: Check all jobs passed
         run: |
           if [[ "${{ needs.static-analysis.result }}" != "success" ]]; then

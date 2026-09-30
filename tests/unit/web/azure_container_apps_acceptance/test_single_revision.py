@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from functools import partial
 from itertools import count
 from pathlib import Path
@@ -19,8 +20,11 @@ from elspeth.web._acceptance_common.http_client import AcceptanceCredentials
 from elspeth.web._acceptance_common.replica_probes import (
     SESSION_OPERATION_CONFLICT_DETAIL,
     EvidenceObserver,
+    FenceConflictTrial,
     MembershipRow,
+    ProbeResult,
     ReplicaProbeDriver,
+    decide_fence_conflict,
 )
 from elspeth.web._azure_container_apps_acceptance.receipt_contracts import ReplicaBinding, extract_exec_receipt
 from elspeth.web.azure_container_apps_single_revision import AffinityClient, SingleTopology, discover_pair, main, run_fence_trials
@@ -178,7 +182,21 @@ class Observer(EvidenceObserver):
         return None
 
 
-def test_discovery_discards_duplicate_routes_and_retains_cookie_jars_for_all_twenty_trials() -> None:
+@pytest.fixture
+def recorded_dispatch_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Recorded HTTP tests measure routing and fence facts, not host scheduling.
+    # Binary-exact millisecond-scale ticks keep their dispatch evidence stable.
+    dispatch_ticks = count()
+    clock_lock = threading.Lock()
+
+    def clock() -> float:
+        with clock_lock:
+            return next(dispatch_ticks) / 1024.0
+
+    monkeypatch.setattr(single_revision, "ReplicaProbeDriver", partial(ReplicaProbeDriver, clock=clock))
+
+
+def test_discovery_discards_duplicate_routes_and_retains_cookie_jars_for_all_twenty_trials(recorded_dispatch_clock: None) -> None:
     routing = Routing((REPLICAS[0], REPLICAS[0], REPLICAS[1]))
     requests = tuple(
         (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())}) for i in range(20)
@@ -189,6 +207,33 @@ def test_discovery_discards_duplicate_routes_and_retains_cookie_jars_for_all_twe
         result = run_fence_trials(clients, routing.observer, requests)
         assert result.outcome == "pass", result.reasons
         assert routing.created == 3
+    assert len([path for _, path in routing.paths if path.endswith("/messages")]) == 40
+
+
+@pytest.mark.parametrize("dispatch_spread_ms", [5.0, 6.0], ids=["at-limit", "above-limit"])
+def test_fence_trials_enforce_five_millisecond_dispatch_limit(
+    monkeypatch: pytest.MonkeyPatch, recorded_dispatch_clock: None, dispatch_spread_ms: float
+) -> None:
+    routing = Routing()
+    requests = tuple(
+        (str(uuid4()), {"content": f"P1 Build a pipeline for {REPLICAS[i % 2]}", "client_request_id": str(uuid4())}) for i in range(20)
+    )
+
+    def score_recorded_dispatch(trials: list[FenceConflictTrial], *, required_trials: int) -> ProbeResult:
+        # Keep every real transport/fence observation; vary only recorded timing
+        # to test the operational boundary without float subtraction drift.
+        return decide_fence_conflict(
+            [replace(trial, dispatch_spread_ms=dispatch_spread_ms) for trial in trials], required_trials=required_trials
+        )
+
+    monkeypatch.setattr(single_revision, "decide_fence_conflict", score_recorded_dispatch)
+    with discover_pair(TOPOLOGY, routing.factory) as clients:
+        result = run_fence_trials(clients, routing.observer, requests)
+    if dispatch_spread_ms == 5.0:
+        assert result.outcome == "pass", result.reasons
+    else:
+        assert result.outcome == "fail"
+        assert result.reasons == tuple(f"trial[{i}]:dispatch_spread_ms:6.000>5.0" for i in range(20))
     assert len([path for _, path in routing.paths if path.endswith("/messages")]) == 40
 
 
@@ -244,17 +289,11 @@ def test_process_ids_must_join_distinct_current_platform_replicas(fault: str) ->
 
 @pytest.mark.parametrize("probe", ["P1", "P4a"])
 def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_requests(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], probe: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], probe: str, recorded_dispatch_clock: None
 ) -> None:
     routing = Routing()
     monkeypatch.setattr(AffinityClient, "from_env", lambda env: routing.factory())
     monkeypatch.setattr(single_revision, "_observer", lambda env: routing.observer)
-    dispatch_ticks = count()
-    monkeypatch.setattr(
-        single_revision,
-        "ReplicaProbeDriver",
-        partial(ReplicaProbeDriver, clock=lambda: next(dispatch_ticks) / 1000.0),
-    )
     app = tmp_path / "app.json"
     app.write_text(json.dumps(app_document()))
     app.chmod(0o600)

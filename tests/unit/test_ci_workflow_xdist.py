@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -195,6 +197,17 @@ def test_codeql_security_suites_do_not_filter_by_problem_severity() -> None:
         assert "problem.severity" not in exclude
 
 
+def test_codeql_analysis_relativizes_results_to_the_isolated_checkout() -> None:
+    """Uploaded findings must use repository paths rather than the run directory."""
+    job = _workflow(CODEQL_WORKFLOW)["jobs"]["analyze"]
+    checkout = _step(job, "Checkout code")["with"]["path"]
+    init = _step(job, "Initialize CodeQL")["with"]
+    analyze = _step(job, "Perform CodeQL analysis")["with"]
+
+    assert init["source-root"] == checkout
+    assert analyze["checkout_path"] == f"${{{{ github.workspace }}}}/{checkout}"
+
+
 def test_override_rate_workflow_pins_threshold_policy() -> None:
     """C3 threshold is CI policy and must be explicit in workflow YAML."""
     judge_workflow = _workflow(JUDGE_GATES_WORKFLOW)
@@ -336,19 +349,77 @@ def test_push_workflows_include_release_branches(workflow_path: Path) -> None:
     assert '"release/**"' in push.group("branches")
 
 
-def test_pull_request_jobs_never_use_the_trusted_runner() -> None:
-    """No PR-controlled workflow code may execute on the persistent nyx runner."""
+def test_every_workflow_job_uses_the_declared_self_hosted_pool() -> None:
+    """Hosted runners are forbidden; live topology proofs retain their cloud pool."""
+    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    assert CI_WORKFLOW in workflow_paths
+    for workflow_path in workflow_paths:
+        if workflow_path.suffix not in {".yml", ".yaml"}:
+            continue
+        workflow = _workflow(workflow_path)
+        for job_name, job in workflow["jobs"].items():
+            expected = ["self-hosted", "Linux", "X64", "nyx-ci", "trusted"]
+            if workflow_path.name == "state-engine-live-provider.yml":
+                expected = ["self-hosted", "Linux", "X64", "ephemeral", "aws-ecs", "postgresql-16-rds", "state-engine-live-provider"]
+            assert job["runs-on"] == expected, f"{workflow_path.name}:{job_name} must route to its declared self-hosted pool"
+
+
+def test_fork_pull_requests_cannot_reach_checkout_jobs() -> None:
+    """Repository PRs run locally; fork code needs admission onto a repository branch."""
     for workflow_path in PR_WORKFLOWS:
         workflow = _workflow(workflow_path)
         for job_name, job in workflow["jobs"].items():
-            selector = str(job["runs-on"])
-            if "nyx-ci" not in selector:
+            if not any(str(step.get("uses", "")).startswith("actions/checkout@") for step in job["steps"]):
                 continue
             condition = str(job.get("if", ""))
-            assert "github.event_name != 'pull_request'" in selector or "github.event_name != 'pull_request'" in condition, (
-                f"{workflow_path.name}:{job_name} can route PR code to nyx"
+            assert "github.event_name != 'pull_request'" in condition, f"{workflow_path.name}:{job_name} lacks event admission"
+            if condition == "github.event_name != 'pull_request'":
+                continue
+            assert "github.event.pull_request.head.repo.full_name == github.repository" in condition, (
+                f"{workflow_path.name}:{job_name} can execute fork code locally"
             )
-            assert "head.repo.full_name == github.repository" not in selector
+
+
+@pytest.mark.parametrize("workflow_path,job_name", [(CI_WORKFLOW, "ci-success"), (JUDGE_GATES_WORKFLOW, "judge-gates-success")])
+@pytest.mark.parametrize("is_fork,expected_status", [("true", 1), ("false", 0)])
+def test_fork_pull_requests_fail_required_checks_without_checkout(
+    workflow_path: Path, job_name: str, is_fork: str, expected_status: int
+) -> None:
+    """Skipped fork jobs cannot make the required aggregate check green."""
+    job = _workflow(workflow_path)["jobs"][job_name]
+    assert job["if"] == "always()"
+    assert not any(str(step.get("uses", "")).startswith("actions/checkout@") for step in job["steps"])
+    gate = job["steps"][0]
+    assert gate["env"]["IS_FORK_PR"] == (
+        "${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}"
+    )
+    environment = os.environ.copy()
+    environment["IS_FORK_PR"] = is_fork
+    result = subprocess.run(["bash", "-e", "-c", gate["run"]], env=environment, capture_output=True, text=True, check=False, timeout=5)
+    assert result.returncode == expected_status, result.stdout + result.stderr
+
+
+def test_local_checkouts_are_isolated_between_jobs_and_attempts() -> None:
+    """Host jobs cannot inherit root-owned container environments from another run."""
+    paths: set[str] = set()
+    for workflow_path in sorted((REPO_ROOT / ".github" / "workflows").iterdir()):
+        if workflow_path.suffix not in {".yml", ".yaml"}:
+            continue
+        if workflow_path.name == "state-engine-live-provider.yml":
+            continue  # This workflow retains disposable cloud runners for topology proofs.
+        workflow = _workflow(workflow_path)
+        for job_name, job in workflow["jobs"].items():
+            for step in job["steps"]:
+                if not str(step.get("uses", "")).startswith("actions/checkout@"):
+                    continue
+                checkout_path = step["with"]["path"]
+                assert checkout_path == "${{ env.CI_CHECKOUT_PATH }}", f"{workflow_path.name}:{job_name} has a shared checkout"
+                path = job["env"]["CI_CHECKOUT_PATH"]
+                assert "github.run_id" in path and "github.run_attempt" in path
+                assert path not in paths, f"{workflow_path.name}:{job_name} shares a checkout with another job"
+                paths.add(path)
+                if "matrix" in job.get("strategy", {}):
+                    assert "matrix." in path or "strategy.job-index" in path, f"{workflow_path.name}:{job_name} shares matrix checkouts"
 
 
 def test_no_workflow_references_the_operator_hmac_key() -> None:
