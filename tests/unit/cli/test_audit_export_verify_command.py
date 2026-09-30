@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+from click.utils import strip_ansi
 from typer.testing import CliRunner
 
 from elspeth.cli import app
@@ -221,7 +222,8 @@ def test_verify_command_help_documents_authenticated_default_and_unsigned_overri
     result = runner.invoke(app, ["audit-export", "verify", "--help"])
 
     assert result.exit_code == 0
-    assert "--key-ref" in result.output
-    assert "historical signer" in result.output
-    assert "--allow-unsigned" in result.output
-    assert "integrity-only" in result.output
+    help_text = strip_ansi(result.output)
+    assert "--key-ref" in help_text
+    assert "historical signer" in help_text
+    assert "--allow-unsigned" in help_text
+    assert "integrity-only" in help_text
