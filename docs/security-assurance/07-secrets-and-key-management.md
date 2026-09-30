@@ -258,15 +258,23 @@ Further controls on this path:
   create and return only the name and scope; response models forbid extra
   fields, so a value accidentally passed to one raises an error instead of
   being sent (`src/elspeth/web/secrets/schemas.py`) [EV-213].
+- **Control-plane credential material is refused atomically.** The shared
+  versioned detector recognises credential-named fields, a closed token-shape
+  set, private keys and credentials in HTTP URLs. It guards in-scope Web
+  request fields, Composer state before provider serialisation, raw and
+  decoded tool calls, provider request/response metadata, publication,
+  approval and execution boundaries. Refusal evidence is value-free, and the
+  guarded operation performs no mutation or audit side effect [EV-227].
 
-These controls are not a general data-loss-prevention system. A value pasted
-into ordinary user text or an unrecognised option name is outside the
-credential-field policy and could enter composition state, model input or an
-audit payload. Operators must provision credentials through the managed
-secret path, authors must not paste values into prompts or ordinary fields,
-and new credential-bearing plugin options must be added to the shared
-recognition policy before use. The deployment records any accepted residual
-risk in § 7.1 [EV-215].
+These controls are not a general data-loss-prevention system. Recognised token
+shapes are detected even under ordinary control-field names, but arbitrary
+encoded, low-entropy or cross-field values under an unrecognised name may not
+be. Pipeline rows, inline blob bodies, runtime model data, telemetry content
+and sink output are intentionally outside the detector. Operators must
+provision credentials through the managed secret path, authors must not paste
+values into ordinary data or prompts, and new credential-bearing plugin
+options must be added to the shared recognition policy before use. The
+deployment records the applicable residual risk in § 7.1 [EV-215] [EV-227].
 
 ### 2.4 What the audit trail records
 
@@ -374,7 +382,9 @@ its key-strength and generation controls in § 7.1.
   replaces the whole string on a match for common key formats (AWS, OpenAI,
   OpenRouter, GitHub, Google, Slack, JWT, PEM private keys, Azure storage
   keys and SAS signatures) and for credential-bearing connection strings and
-  URLs. It is a last line of defence behind typed payloads [EV-218].
+  URLs. Mapping and legacy container subclasses are traversed with fixed
+  resource bounds and fail to value-free sentinels on hostile traversal. It
+  is a last line of defence behind typed payloads [EV-218] [EV-227].
 - The exporter serialises `secret_resolution` records with the resolution
   metadata and fingerprint (`tests/unit/core/landscape/test_exporter.py::TestSecretResolutionRecords::test_secret_resolution_fields`).
   Recognised credential fields in exported run and node configuration carry
@@ -388,9 +398,11 @@ its key-strength and generation controls in § 7.1.
   credential fields (§ 2.3). The secret-service tools and HTTP response
   models return names, scopes and availability rather than resolved values,
   so values handled through that path are not sent to the planner or advisor.
-  Authors must not paste secret material into ordinary composition text or
-  unrecognised fields, because those inputs are outside this control
-  [EV-213] [EV-215].
+  The bounded credential detector also checks composition control state before
+  provider serialisation and provider-authored response/audit metadata before
+  retention. It permits exact authorised reference markers and returns only a
+  fixed value-free refusal when it finds credential material [EV-213]
+  [EV-215] [EV-227].
 - Internal storage paths and blob locations are removed from state sent to
   the model by the redaction manifest (`src/elspeth/web/composer/redaction.py`).
   A committed snapshot holds a hash per manifest entry, and the
@@ -398,6 +410,11 @@ its key-strength and generation controls in § 7.1.
   classifies any pull request that changes it as weakening or strengthening
   and requires the matching label, with a written rationale for a weakening
   ([policy guide](../guides/redaction-policy-changes.md)) [EV-014] [EV-220].
+- File excerpts intentionally requested by the planner and inline blob bodies
+  are data-plane content, so the credential detector does not rewrite or scan
+  those bodies. Their disclosure still requires provider suitability and
+  classification controls. Runtime rows, telemetry content and sink output
+  are likewise outside this control-plane claim [EV-227].
 
 ### 4.4 Source control
 

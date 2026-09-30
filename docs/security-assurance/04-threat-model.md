@@ -278,8 +278,11 @@ Model output is Tier 3. Controls:
   [EV-013] [EV-503].
 - **Data minimisation.** A prompt or query template can read only the
   fields its node declares; the redaction manifest strips internal paths and
-  sensitive arguments before state reaches the model; secret values never
-  enter composition state [EV-014] [EV-220] [EV-508].
+  sensitive arguments before state reaches the model. A separate bounded
+  credential detector scans control-plane state before provider
+  serialisation, and scans provider response text, tool identifiers and
+  arguments, reasoning and retained provider metadata before audit or state
+  effects [EV-014] [EV-220] [EV-227] [EV-508].
 - **Required controls.** The operator's policy can require prompt-shield or
   content-safety plugins in every web-authored pipeline [EV-502] [EV-507].
 - **Bounded cost.** Per-composition limits on provider calls, request size,
@@ -340,12 +343,22 @@ Controls:
   model sees secret names, never values
   ([07 § 2.3](07-secrets-and-key-management.md#23-secrets-used-by-web-authored-pipelines))
   [EV-211] [EV-214] [EV-215].
+- A finite, versioned detector refuses credential-named control fields,
+  recognised token shapes, private keys and credentials in HTTP URLs at the
+  documented Web request, Composer state, tool, provider and publication
+  boundaries. Findings and refusal envelopes retain no candidate value, and
+  each guarded operation refuses before its mutation or audit side effects
+  [EV-227].
 - The audit trail records fingerprints, not values
   ([07 § 2.4](07-secrets-and-key-management.md#24-what-the-audit-trail-records))
   [EV-207] [EV-208] [EV-209].
 
 For CLI pipelines, `${VAR}` expansion is intended: the operator authors the
-YAML and owns its environment.
+YAML and owns its environment. The bounded Web/Composer detector does not scan
+pipeline rows, inline blob bodies, runtime model data, telemetry content or
+sink output, and it does not decode arbitrary encoded or cross-field content.
+Those surfaces remain subject to `R-008`, operator/user handling and
+destination-specific controls; this control is not universal DLP [EV-227].
 
 Risk reference: see controlled risk register `R-008`.
 

@@ -267,15 +267,28 @@ live unscoped `user` grant at request and durable chargeable boundaries
 by its explicit 0.8.1 scope exclusion; this disposition does not claim a
 service-identity feature.
 
+The source-level gateway finding is also resolved: the reference gateway has a
+separate frozen lock and update path, required dependency, licence, image and
+conformance checks, and an exact-digest GHCR publication contract [EV-722]. A
+successful GitHub run and published-digest evidence remain submission evidence
+to collect when the gateway is in the assessed deployment. The unmatched
+PyJWT audit exception was removed; the current frozen audit and its remaining
+dated exceptions are recorded in [EV-708].
+
+The credential-boundary finding is resolved for the Web and Composer control
+plane by the versioned bounded detector and atomic refusal points described in
+[EV-227]. This is a finite recogniser, not universal data-loss prevention.
+Pipeline rows, inline blob bodies, runtime model data, telemetry content and
+sink output remain outside that detector. Keep `R-008`, the user guidance and
+destination-specific controls wherever those data-plane surfaces are in the
+assessed scope.
+
 The additional judge lint and quality workflow is intentionally advisory and
 outside the standard enforcement package. Its absence from branch protection
-is therefore not a defect and is not included in this backlog [EV-611].
-
-| Priority | Confirmed gap | Required engineering outcome | Submission effect |
-|---|---|---|---|
-| High | The optional gateway resolves ranged dependencies during each image build; it has no lockfile and is outside the root dependency audit and Dependabot coverage [EV-722]. | Add a reproducible lock/update path, dependency and image audit, SBOM/provenance coverage and CI enforcement for the gateway artifact. | Blocking when the gateway is part of the assessed deployment or supplied as an approved product artifact. Otherwise exclude it explicitly and require the deployer to build, scan and pin its own image. |
-| Medium | Secret-reference enforcement, fingerprinting and export evidence cover managed references and recognised credential-bearing fields, not arbitrary text or unrecognised options [EV-208] [EV-215]. Universal sink-output redaction is not provided [EV-002]. | Either add a defined, tested data-loss-prevention boundary for the additional inputs and outputs in scope, or constrain authoring, provider and sink use so the field-scoped control is sufficient. Do not restore a universal “secrets never enter state or output” claim without corresponding enforcement. | Blocking only when the selected control baseline requires technical prevention across arbitrary user content or every sink. In all other cases retain `R-008`, user guidance and destination-specific controls. |
-| Low | The Python audit command still carries a PyJWT advisory exception that matched no advisory for the locked version at the review date [EV-708]. | Remove the stale exception before the next public release, or retain it only with a fresh advisory match, reachability review, owner and expiry under the documented exception policy. Continue dated review of the Chroma client-only exceptions. | A stale unmatched exception is a release-hygiene defect; any matched exception follows the severity and acceptance policy in [10](10-vulnerability-and-supply-chain.md). |
+is therefore not a defect and is not included in this backlog [EV-611]. No
+assessment-discovered source-remediation row remains open at this reviewed
+baseline. Deployment evidence, scope decisions, the independent penetration
+test and any controlled residual-risk decisions remain necessary under § 7.1.
 
 The independent penetration test may add further software defects. Add each
 validated finding to the engineering tracker and controlled risk register,

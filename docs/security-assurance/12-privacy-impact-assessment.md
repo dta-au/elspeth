@@ -172,10 +172,13 @@ the flow.
 ELSPETH offers product controls that can support minimisation: authors declare
 the fields visible to prompt and retrieval templates; Web LLM destinations are
 operator-profiled; Composer redaction removes internal paths and sensitive
-arguments; secret values are excluded from Composer state; author-set tracing
-is refused for Web pipelines; and payload content can be purged while hashes
-and metadata remain. These controls do not choose the minimum necessary fields
-or prove that AI processing is necessary.
+arguments; a bounded detector refuses recognised credential material in the
+Web and Composer control plane before provider or persistence effects;
+author-set tracing is refused for Web pipelines; and payload content can be
+purged while hashes and metadata remain. The detector is not universal DLP and
+does not scan pipeline rows, inline blob bodies, runtime model data, telemetry
+content or sink output [EV-227]. These controls do not choose the minimum
+necessary fields or prove that AI processing is necessary.
 
 The deployment assessment must challenge:
 
