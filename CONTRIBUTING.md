@@ -49,6 +49,25 @@ The root suite is scoped to `testpaths = ["tests"]`, so it does **not** cover
 `pyproject.toml` and test suite; if you change it, run its tests from
 `gateway/` as well.
 
+GitHub Actions uses self-hosted runners for every workflow. Automated CI,
+release, website and mutation-testing jobs use the local labels
+`self-hosted, Linux, X64, nyx-ci, trusted`; there is no GitHub-hosted fallback.
+Manual live-provider acceptance retains its specialized self-hosted cloud
+runners because it proves ECS execution and managed-identity behavior.
+Pull requests from repository branches run locally. Fork pull requests skip
+jobs that check out code and fail the required `CI Success` and
+`Judge gates success` checks. A maintainer must review a fork's code and
+workflow changes before admitting them onto a repository branch.
+Repository Actions settings must require approval for all outside
+contributors (`all_external_contributors`): a fork can change its workflow
+and remove the YAML admission condition. Approval alone does not make fork
+code safe to execute on the persistent runner host.
+
+Runner slots share one host, so jobs can queue behind other workflows.
+Report a runner or prerequisite failure to the maintainer with the failing
+Actions job URL. Manual live-provider acceptance still needs its GitHub
+environment credentials and remote service access.
+
 ## Code Standards
 
 - **No defensive programming** against our own code. Access typed fields directly (`obj.field`), not defensively (`getattr(obj, "field", None)`). See [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the trust-boundary rationale.

@@ -404,7 +404,7 @@ def test_build_workflow_uses_the_pinned_frontend_runtime_for_both_architectures(
 
     for name in ("Build and push to GHCR", "Build and push to ACR"):
         step = _step(_build_push_job(), name)
-        assert step["with"]["context"] == "."
+        assert step["with"]["context"] == _step(_build_push_job(), "Checkout code")["with"]["path"]
         assert step["with"]["platforms"] == "${{ env.PLATFORMS }}"
         assert "build-contexts" not in step["with"]
 

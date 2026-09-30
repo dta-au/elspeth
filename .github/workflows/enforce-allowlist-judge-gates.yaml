@@ -90,14 +90,13 @@ defaults:
   run:
     shell: bash
 
-# Public-repository guardrail mirrors ci.yaml: every PR stays on GitHub-hosted
-# runners, while trusted pushes use nyx. Both gates are I/O-light (no
-# compilation, no tests); a small hosted runner is sufficient for PR checks.
+# Code-executing jobs admit same-repository PRs and trusted pushes. Fork PRs
+# fail the aggregate without checking out or executing their repository code.
 jobs:
   check-judge-quality:
     name: Judge-quality validation corpus (VAL)
     if: github.event_name != 'pull_request'
-    runs-on: ${{ fromJSON('["self-hosted","Linux","X64","nyx-ci","trusted"]') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # This job makes real OpenRouter calls; keep the corpus bounded and fail
     # quickly on transport/config drift.
     timeout-minutes: 20
@@ -154,7 +153,8 @@ jobs:
 
   check-override-rate:
     name: Override-rate drift gate (C3)
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     # Judge gates should fail fast if checkout/dependency/git plumbing hangs.
     timeout-minutes: 15
     container:
@@ -218,12 +218,21 @@ jobs:
   # mechanical: it fails unless C3 succeeded and VAL succeeded-or-skipped.
   judge-gates-success:
     name: Judge gates success
-    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
     needs:
       - check-judge-quality
       - check-override-rate
     if: always()
     steps:
+      - name: Reject fork pull requests
+        env:
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [[ "$IS_FORK_PR" == "true" ]]; then
+            echo "Fork pull requests cannot run on the trusted local runners."
+            exit 1
+          fi
+
       - name: Check all judge gates passed
         run: |
           # C1 (new-entry judge-coverage) is temporarily removed: the judge

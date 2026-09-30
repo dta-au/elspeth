@@ -67,6 +67,11 @@ jobs:
   build-push:
     name: Build and Push
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    env:
+      CI_CHECKOUT_PATH: delivery-${{ github.run_id }}-${{ github.run_attempt }}-build-push
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     # Only run if CI passed for a trusted push in this repository, or always
     # for tags/dispatch. The workflow_run branch filter alone is not a trust
     # boundary: fork pull_request runs can report a matching head branch name.
@@ -107,6 +112,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.IMAGE_SHA }}
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Verify required checks for image commit
         env:
@@ -258,7 +264,7 @@ jobs:
         if: steps.registries.outputs.push_ghcr == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
-          context: .
+          context: ${{ env.CI_CHECKOUT_PATH }}
           platforms: ${{ env.PLATFORMS }}
           build-args: INSTALL_EXTRAS=all
           push: true
@@ -305,7 +311,7 @@ jobs:
         if: steps.registries.outputs.push_acr == 'true' && steps.registries.outputs.push_ghcr != 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a
         with:
-          context: .
+          context: ${{ env.CI_CHECKOUT_PATH }}
           platforms: ${{ env.PLATFORMS }}
           build-args: INSTALL_EXTRAS=all
           push: true
@@ -372,6 +378,11 @@ jobs:
   smoke-test:
     name: Smoke Test
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    env:
+      CI_CHECKOUT_PATH: delivery-${{ github.run_id }}-${{ github.run_attempt }}-smoke-test
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     needs: [build-push]
     # Only smoke-test when an image was actually pushed. An ACR-only manual
     # dispatch sets push_ghcr=false; if neither registry was pushed there is
@@ -383,6 +394,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ env.IMAGE_SHA }}
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       # Bind smoke verification to the immutable action-output digests that the
       # release job will promote. When both registries are enabled the ACR
@@ -620,6 +632,11 @@ jobs:
   release:
     name: Create Release
     runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    env:
+      CI_CHECKOUT_PATH: delivery-${{ github.run_id }}-${{ github.run_attempt }}-release
+    defaults:
+      run:
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
     needs: [build-push, smoke-test]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -628,6 +645,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c

@@ -5,9 +5,6 @@ name: Deploy website to GitHub Pages
 # run flips the Pages source from "deploy from branch" to "GitHub Actions" via
 # configure-pages `enablement`, then serves the `website/` directory at the
 # site root (so /tutorial-site/project-N.html resolves as before).
-#
-# Runs on a GitHub-hosted runner on purpose: a public static-site deploy needs
-# no repository secrets, so it stays off the trusted self-hosted pool.
 
 on:
   push:
@@ -31,13 +28,18 @@ concurrency:
 jobs:
   deploy:
     name: Deploy website/ to Pages
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, X64, nyx-ci, trusted]
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-pages
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
       - name: Configure Pages (enable + select GitHub Actions source)
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6.0.0
         with:
@@ -45,7 +47,7 @@ jobs:
       - name: Upload website/ as the Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
         with:
-          path: website
+          path: ${{ env.CI_CHECKOUT_PATH }}/website
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0
