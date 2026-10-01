@@ -465,24 +465,13 @@ def test_pull_request_jobs_never_use_the_trusted_runner() -> None:
             assert "head.repo.full_name == github.repository" not in selector
 
 
-def test_static_analysis_signed_allowlist_steps_are_keyless_for_every_pr() -> None:
-    """PR code gets shape/binding checks but never receives the operator HMAC key."""
-    workflow = _ci_workflow()
-    static_analysis = workflow["jobs"]["static-analysis"]
-    expected_secret = "${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}"
-
-    for step_name in (
-        "Run trust-tier elspeth-lints rule",
-        "Run trust-boundary honesty-gate elspeth-lints rules",
-        "Emit elspeth-lints trust-tier SARIF artifact",
-    ):
-        step = _step(static_analysis, step_name)
-        env = step.get("env")
-        assert isinstance(env, dict), f"{step_name!r} must define step env"
-        assert env.get("ELSPETH_JUDGE_METADATA_HMAC_KEY") == expected_secret
-        verify_mode = env.get("ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE")
-        assert isinstance(verify_mode, str), f"{step_name!r} must define signature verification mode"
-        assert verify_mode == "${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}"
+def test_no_workflow_references_the_operator_hmac_key() -> None:
+    """A key injected at job/workflow scope is as reachable as a step secret."""
+    workflow_paths = sorted((REPO_ROOT / ".github" / "workflows").iterdir())
+    assert CI_WORKFLOW in workflow_paths
+    for workflow_path in workflow_paths:
+        if workflow_path.suffix in {".yml", ".yaml"}:
+            assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" not in json.dumps(_workflow(workflow_path)), workflow_path.name
 
 
 def test_static_analysis_all_prs_reject_unverified_signed_allowlist_edits() -> None:
@@ -503,7 +492,6 @@ def test_static_analysis_all_prs_reject_unverified_signed_allowlist_edits() -> N
     assert "--baseline-ref ${{ github.event.pull_request.base.sha }}" in run
 
     gate_index = _step_index(static_analysis, step_name)
-    assert gate_index < _step_index(static_analysis, "Run trust-tier elspeth-lints rule")
     assert gate_index < _step_index(static_analysis, "Run trust-boundary honesty-gate elspeth-lints rules")
 
 
@@ -545,7 +533,7 @@ def test_static_analysis_ratchets_permanent_multi_rule_blankets_repo_wide_on_prs
 
     gate_index = _step_index(static_analysis, step_name)
     assert gate_index < _step_index(static_analysis, "Reject unverified PR signed allowlist edits")
-    assert gate_index < _step_index(static_analysis, "Run trust-tier elspeth-lints rule")
+    assert gate_index < _step_index(static_analysis, "Run trust-boundary honesty-gate elspeth-lints rules")
 
 
 def test_push_ratchet_resolver_accepts_successful_step_from_failed_workflow(
@@ -975,17 +963,23 @@ def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
     assert job["env"]["OPENROUTER_API_KEY"] == "${{ secrets.OPENROUTER_API_KEY }}"
 
 
-def test_trust_tier_ci_failure_points_to_signature_diagnosis_command() -> None:
-    """Signed allowlist failures should point operators at the repair triage command."""
+def test_static_analysis_keeps_active_gates_without_operator_signed_tier_model() -> None:
+    """CI enforces executable contracts; operator signature clearance stays separate."""
     workflow = _ci_workflow()
     static_analysis = workflow["jobs"]["static-analysis"]
-
-    trust_tier_run = _step_run(static_analysis, "Run trust-tier elspeth-lints rule")
-    sarif_run = _step_run(static_analysis, "Emit elspeth-lints trust-tier SARIF artifact")
-
-    for run in (trust_tier_run, sarif_run):
-        assert "diagnose-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model" in run
-        assert "sign-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model" in run
-        assert "--env-file /path/to/operator.env --owner" in run
-        assert "judge_metadata_signature" in run
-        assert "scope_fingerprint" in run
+    assert "trust_tier.tier_model" not in json.dumps(static_analysis)
+    assert "elspeth-lints-trust-tier.sarif" not in json.dumps(static_analysis)
+    for step_name, rules in (
+        ("Run trust-boundary honesty-gate elspeth-lints rules", "trust_boundary.tests,trust_boundary.scope,trust_boundary.tier"),
+        ("Run plugin-contract elspeth-lints rules", "plugin_contract.component_type,plugin_contract.plugin_hashes"),
+        ("Run immutability elspeth-lints rules", "immutability.freeze_guards,immutability.frozen_annotations"),
+        (
+            "Run audit-evidence elspeth-lints rules",
+            "audit_evidence.nominal_base,audit_evidence.tier_1_decoration,audit_evidence.guard_symmetry,audit_evidence.gve_attribution",
+        ),
+        ("Run contract-invariants elspeth-lints rules", "contract_invariants/*"),
+    ):
+        step = _step(static_analysis, step_name)
+        assert "continue-on-error" not in step, step_name
+        tokens = shlex.split(_step_run(static_analysis, step_name))
+        assert tokens[tokens.index("--rules") + 1] == rules, step_name

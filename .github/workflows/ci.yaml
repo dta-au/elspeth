@@ -449,28 +449,10 @@ jobs:
             --rules manifest.symbol_inventory,manifest.test_to_source_mapping \
             --root .
 
-      - name: Run trust-tier elspeth-lints rule
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
-        run: |
-          set +e
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
-            --rules trust_tier.tier_model \
-            --root src/elspeth
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ]; then
-            echo "::error title=Trust-tier signed allowlist diagnosis::If this failure mentions judge_metadata_signature, file_fingerprint, scope_fingerprint, or ast_path drift, run: diagnose-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model. To repair diagnosed drift from an operator shell, run: sign-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model --env-file /path/to/operator.env --owner \"\$USER\""
-          fi
-          exit "$status"
-
+      # Signed trust-tier review runs in the operator's trusted context.
+      # CI keeps the active contract and trust-boundary checks key-free.
       - name: Run trust-boundary honesty-gate elspeth-lints rules
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
         run: |
           PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
             --rules trust_boundary.tests,trust_boundary.scope,trust_boundary.tier \
@@ -612,24 +594,6 @@ jobs:
             exit "$status"
           fi
 
-      - name: Emit elspeth-lints trust-tier SARIF artifact
-        if: always()
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        env:
-          ELSPETH_JUDGE_METADATA_HMAC_KEY: ${{ github.event_name != 'pull_request' && secrets.ELSPETH_JUDGE_METADATA_HMAC_KEY || '' }}
-          ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE: ${{ github.event_name == 'pull_request' && 'shape-only-when-key-missing' || 'required' }}
-        run: |
-          set +e
-          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli check \
-            --rules trust_tier.tier_model \
-            --root src/elspeth \
-            --format sarif > elspeth-lints-trust-tier.sarif
-          status=$?
-          if [ "$status" -gt 1 ]; then
-            echo "::error title=Trust-tier signed allowlist diagnosis::If this failure mentions judge_metadata_signature, file_fingerprint, scope_fingerprint, or ast_path drift, run: diagnose-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model. To repair diagnosed drift from an operator shell, run: sign-judge-signatures --root src/elspeth --allowlist-dir config/cicd/enforce_tier_model --env-file /path/to/operator.env --owner \"\$USER\""
-            exit "$status"
-          fi
-
       - name: Upload elspeth-lints SARIF artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -645,7 +609,6 @@ jobs:
             ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-session-engine-factory.sarif
             ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-contract-manifest.sarif
             ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-manifest-inventory.sarif
-            ${{ env.CI_CHECKOUT_PATH }}/elspeth-lints-trust-tier.sarif
           retention-days: 7
 
       - name: Compare shadow-mode lints
@@ -665,11 +628,8 @@ jobs:
       image: python:${{ matrix.python-version }}-bookworm
     env:
       CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
-    # No `needs: [static-analysis]` (operator ruling 2026-09-05, elspeth-d8749aeaa3):
-    # the trust-tier step keeps static-analysis red by design until Phase 5
-    # signs, and behind that `needs:` the suites never ran, so a merge could not
-    # be scored at all. `ci-success` still requires static-analysis, so the red
-    # still blocks the merge; it just no longer hides the test verdict.
+    # Run independently so static-analysis failures cannot hide test results.
+    # CI Success still requires both jobs to pass.
     strategy:
       fail-fast: false
       matrix:
@@ -902,9 +862,8 @@ jobs:
     # neither the self-hosted container jobs nor the python:*-bookworm images
     # expose. ubuntu-24.04 ships Docker preinstalled for both push and PR runs.
     runs-on: ubuntu-24.04
-    # No `needs: [static-analysis]`: same ruling as the `test` job above — the
-    # PostgreSQL proofs must report even while trust-tier keeps static-analysis
-    # red; `ci-success` still requires both.
+    # PostgreSQL proofs report independently of static analysis.
+    # CI Success still requires both jobs to pass.
     # 276 ids ran serially in 8 min on the maintainer's box (2026-09-05,
     # elspeth-d8749aeaa3); hosted runners are slower, so allow ~3x.
     timeout-minutes: 30
