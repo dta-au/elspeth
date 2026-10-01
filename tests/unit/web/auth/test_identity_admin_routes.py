@@ -635,6 +635,88 @@ async def test_bodies_are_strict(harness: _Harness) -> None:
     assert harness.audit.calls == []
 
 
+# Aware body values whose offset carries their UTC instant past the last, or
+# before the first, instant a datetime can hold. Converting either to UTC for
+# storage raised ``OverflowError``, which reached the client as a 500.
+_PAST_THE_LAST_UTC_INSTANT = "9999-12-31T23:00:00-05:00"
+_BEFORE_THE_FIRST_UTC_INSTANT = "0001-01-01T00:30:00+10:00"
+
+
+@pytest.mark.parametrize("expires_at", [_PAST_THE_LAST_UTC_INSTANT, _BEFORE_THE_FIRST_UTC_INSTANT])
+async def test_an_expiry_outside_the_utc_range_is_refused_as_invalid_input(harness: _Harness, expires_at: str) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        response = await client.post(
+            "/api/auth/admin/roles", headers=root, json={"identity_id": bob_id, "role": "approver", "expires_at": expires_at}
+        )
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", "expires_at"]]
+    assert harness.authority.list_roles(identity_id=bob_id, include_revoked=True, limit=50, offset=0) == ()
+    assert harness.audit.calls == []
+
+
+async def test_an_expiry_at_the_last_utc_instant_is_granted_and_one_microsecond_later_is_not(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        later = await client.post(
+            "/api/auth/admin/roles",
+            headers=root,
+            json={"identity_id": bob_id, "role": "approver", "expires_at": "9999-12-31T19:00:00-05:00"},
+        )
+        last = await client.post(
+            "/api/auth/admin/roles",
+            headers=root,
+            json={"identity_id": bob_id, "role": "approver", "expires_at": "9999-12-31T18:59:59.999999-05:00"},
+        )
+    assert later.status_code == 422, later.text
+    assert last.status_code == 201, last.text
+    (grant,) = harness.authority.list_roles(identity_id=bob_id, include_revoked=True, limit=50, offset=0)
+    assert grant.expires_at == datetime.max.replace(tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    "window",
+    [{"effective_until": _PAST_THE_LAST_UTC_INSTANT}, {"effective_from": _BEFORE_THE_FIRST_UTC_INSTANT}],
+    ids=["effective_until", "effective_from"],
+)
+async def test_a_relationship_window_outside_the_utc_range_is_refused_as_invalid_input(harness: _Harness, window: dict[str, str]) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        response = await client.post(
+            "/api/auth/admin/relationships",
+            headers=root,
+            json={"from_identity_id": bob_id, "to_identity_id": carol_id, "relationship_type": "approver", **window},
+        )
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", *window]]
+    assert harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0) == ()
+    assert [call.method for call in harness.audit.calls] == ["record_role_changed"]
+
+
+async def test_a_window_from_the_first_utc_instant_is_asserted_and_one_microsecond_earlier_is_not(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        edge = {"from_identity_id": bob_id, "to_identity_id": carol_id, "relationship_type": "approver"}
+        earlier = await client.post(
+            "/api/auth/admin/relationships", headers=root, json={**edge, "effective_from": "0001-01-01T09:59:59.999999+10:00"}
+        )
+        first = await client.post(
+            "/api/auth/admin/relationships", headers=root, json={**edge, "effective_from": "0001-01-01T10:00:00+10:00"}
+        )
+    assert earlier.status_code == 422, earlier.text
+    assert first.status_code == 201, first.text
+    (asserted,) = harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0)
+    assert asserted.effective_from == datetime.min.replace(tzinfo=UTC)
+
+
 # ── delegated curator administration ────────────────────────────────────
 
 

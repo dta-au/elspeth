@@ -46,11 +46,11 @@ returned for any state.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from elspeth.contracts.auth import (
     ActivationRole,
@@ -90,6 +90,28 @@ MAX_PAGE_SIZE = 200
 
 
 # ── Wire shapes ──────────────────────────────────────────────────────────
+
+
+_FIRST_UTC_INSTANT = datetime.min.replace(tzinfo=UTC)
+_LAST_UTC_INSTANT = datetime.max.replace(tzinfo=UTC)
+
+
+def _utc_instant(value: datetime) -> datetime:
+    """Admit an aware body timestamp as the UTC instant the authority stores.
+
+    An offset can carry a representable wall-clock value past the last, or
+    before the first, instant a datetime holds (``9999-12-31T23:00-05:00``).
+    That instant has no UTC form, so converting it for storage raised
+    ``OverflowError`` and the request failed as a 500. Comparing aware
+    datetimes never builds the out-of-range value, so the range is checked
+    first and the body refused as invalid input.
+    """
+    if not _FIRST_UTC_INSTANT <= value <= _LAST_UTC_INSTANT:
+        raise ValueError("timestamp is outside the range a UTC datetime can represent")
+    return value.astimezone(UTC)
+
+
+_UtcInstant = Annotated[AwareDatetime, AfterValidator(_utc_instant)]
 
 
 class _StrictModel(BaseModel):
@@ -147,8 +169,9 @@ class GrantRoleRequest(_Provenance):
     role: IdentityRole
     scope: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
     # The one field family parsed from a string: strict mode would refuse an
-    # ISO-8601 body value, and an aware instant is the only shape accepted.
-    expires_at: AwareDatetime | None = Field(default=None, strict=False)
+    # ISO-8601 body value, and an aware instant that exists in UTC is the
+    # only shape accepted.
+    expires_at: _UtcInstant | None = Field(default=None, strict=False)
     note: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
 
 
@@ -162,8 +185,8 @@ class AssertRelationshipRequest(_Provenance):
     from_identity_id: str = Field(min_length=1, max_length=64)
     to_identity_id: str = Field(min_length=1, max_length=64)
     relationship_type: RelationshipType
-    effective_from: AwareDatetime | None = Field(default=None, strict=False)
-    effective_until: AwareDatetime | None = Field(default=None, strict=False)
+    effective_from: _UtcInstant | None = Field(default=None, strict=False)
+    effective_until: _UtcInstant | None = Field(default=None, strict=False)
     note: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
 
 
