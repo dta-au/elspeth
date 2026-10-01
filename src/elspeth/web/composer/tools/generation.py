@@ -2400,6 +2400,8 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 _MAX_PROOF_BLOB_SOURCES: Final[int] = 256
+_MAX_DECLARED_INPUT_TYPE_PROOF_CHECKS: Final[int] = 256
+_MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS: Final[int] = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -3170,6 +3172,15 @@ class _DeclaredConcreteFields:
         return self.schema_unparseable or not self.fields
 
 
+@dataclass(slots=True)
+class _DeclaredInputTypeProofBudget:
+    """Request-wide bounds for the observed-CSV declared-input proof arm."""
+
+    checks_remaining: int = _MAX_DECLARED_INPUT_TYPE_PROOF_CHECKS
+    diagnostics_remaining: int = _MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS
+    exhausted: bool = False
+
+
 def _declared_input_type_diagnostics_for_observed_csv(
     state: CompositionState,
     source_name: str,
@@ -3178,6 +3189,7 @@ def _declared_input_type_diagnostics_for_observed_csv(
     blob_id: str,
     inferred_types: Mapping[str, str] | None,
     observed_headers: tuple[str, ...] | None,
+    budget: _DeclaredInputTypeProofBudget,
 ) -> list[Mapping[str, Any]]:
     """Block concretely-typed input declarations fed observed CSV strings.
 
@@ -3277,6 +3289,10 @@ def _declared_input_type_diagnostics_for_observed_csv(
         if declared.abstains:
             continue
         for field_def in declared.fields:
+            if budget.checks_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.checks_remaining -= 1
             if not _source_field_reaches_connection_without_type_change(
                 state,
                 node.input,
@@ -3284,6 +3300,10 @@ def _declared_input_type_diagnostics_for_observed_csv(
                 field_name=field_def.name,
             ):
                 continue
+            if budget.diagnostics_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.diagnostics_remaining -= 1
             diagnostics.append(
                 _mismatch_diagnostic(
                     component_kind="Transform",
@@ -3299,6 +3319,10 @@ def _declared_input_type_diagnostics_for_observed_csv(
         if declared.abstains:
             continue
         for field_def in declared.fields:
+            if budget.checks_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.checks_remaining -= 1
             if not _source_field_reaches_sink_without_type_change(
                 state,
                 output.name,
@@ -3306,6 +3330,10 @@ def _declared_input_type_diagnostics_for_observed_csv(
                 field_name=field_def.name,
             ):
                 continue
+            if budget.diagnostics_remaining == 0:
+                budget.exhausted = True
+                return diagnostics
+            budget.diagnostics_remaining -= 1
             diagnostics.append(
                 _mismatch_diagnostic(
                     component_kind="Output",
@@ -3326,6 +3354,7 @@ def _compute_proof_diagnostics_for_source(
     source: SourceSpec,
     blob_id: object,
     blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None],
+    declared_input_type_budget: _DeclaredInputTypeProofBudget,
 ) -> list[Mapping[str, Any]]:
     """Compute machine-readable proof diagnostics for one blob-backed source.
 
@@ -3647,6 +3676,7 @@ def _compute_proof_diagnostics_for_source(
                 blob_id=str(blob_id),
                 inferred_types=facts.inferred_types,
                 observed_headers=facts.observed_headers,
+                budget=declared_input_type_budget,
             )
         )
 
@@ -3862,6 +3892,7 @@ def compute_proof_diagnostics(
         ]
 
     diagnostics: list[Mapping[str, Any]] = []
+    declared_input_type_budget = _DeclaredInputTypeProofBudget()
     for source_name, source, blob_id in blob_sources:
         source_diagnostics = _compute_proof_diagnostics_for_source(
             state,
@@ -3869,8 +3900,26 @@ def compute_proof_diagnostics(
             source=source,
             blob_id=blob_id,
             blob_resolver=_memoized_resolver,
+            declared_input_type_budget=declared_input_type_budget,
         )
         diagnostics.extend(_attribute_proof_diagnostic_to_source(diagnostic, source_name=source_name) for diagnostic in source_diagnostics)
+        if declared_input_type_budget.exhausted:
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message=("Declared-input type proof exceeded its bounded request budget; no partial proof was admitted."),
+                    suggested_repair=(
+                        "Reduce the number of observed CSV sources or concretely typed consumer fields, "
+                        "partition the pipeline, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "pipeline",
+                        "max_declared_input_type_checks": _MAX_DECLARED_INPUT_TYPE_PROOF_CHECKS,
+                        "max_declared_input_type_diagnostics": _MAX_DECLARED_INPUT_TYPE_DIAGNOSTICS,
+                    },
+                )
+            )
+            break
     return diagnostics
 
 
