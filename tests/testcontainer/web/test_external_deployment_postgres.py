@@ -16,24 +16,30 @@ import importlib
 import json
 import os
 import re
+import threading
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from time import monotonic, sleep
+from typing import Any, Literal, cast
 
 import psycopg
 import pytest
 from click.testing import Result
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from httpx import Response
 from psycopg import sql
 from pydantic import SecretBytes
 from sqlalchemy import create_engine, inspect, update
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.exc import ProgrammingError
 from typer.testing import CliRunner
 
 from elspeth.cli import app as cli_app
+from elspeth.web import readiness
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
@@ -369,13 +375,108 @@ def _assert_ddl_denied(url: str) -> None:
         engine.dispose()
 
 
+def _wait_for_transient_database_readiness(client: TestClient, response: Response) -> Response:
+    # Readiness deliberately fails closed on a transient probe timeout. Wait
+    # for a fresh probe without relaxing its deadline or retrying a schema,
+    # authentication, or filesystem refusal. The cache expires in two seconds.
+    deadline = monotonic() + 10
+    timeout_details = {
+        "probe timed out",
+        "probe already in flight",
+    }
+    transient_details = timeout_details | {"not checked: connectivity probe failed"}
+    while response.status_code == 503 and monotonic() < deadline:
+        failed_checks = [check for check in response.json()["checks"] if not check["ok"]]
+        if (
+            not failed_checks
+            or not any(check["detail"] in timeout_details for check in failed_checks)
+            or any(
+                check["name"] not in {"session_db", "session_schema", "landscape_db", "landscape_schema"}
+                or check["detail"] not in transient_details
+                for check in failed_checks
+            )
+        ):
+            break
+        sleep(0.1)
+        response = client.get("/api/ready")
+    return response
+
+
+@pytest.mark.parametrize(
+    ("name", "detail"),
+    [
+        ("session_schema", "schema state: STALE"),
+        ("landscape_schema", "schema state: MISSING"),
+        ("auth_mode", "authentication configuration incomplete"),
+        ("data_dir", "directory probe failed (PermissionError)"),
+        ("session_db", "probe failed (ProgrammingError)"),
+        ("session_db", "probe failed (OperationalError)"),
+        ("session_schema", "not checked: connectivity probe failed"),
+    ],
+)
+def test_readiness_wait_does_not_retry_nontransient_refusals(name: str, detail: str) -> None:
+    probe_app = FastAPI()
+    calls = 0
+
+    @probe_app.get("/api/ready")
+    def ready() -> JSONResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return JSONResponse({"ready": False, "checks": [{"name": name, "ok": False, "detail": detail}]}, status_code=503)
+        return JSONResponse({"ready": True, "checks": []})
+
+    with TestClient(probe_app) as client:
+        response = client.get("/api/ready")
+        assert _wait_for_transient_database_readiness(client, response) is response
+    assert calls == 1
+
+
+def test_readiness_wait_stops_after_its_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe_app = FastAPI()
+    calls = 0
+    clock_values = iter((0.0, 0.0, 10.0, 11.0))
+    monkeypatch.setattr(f"{__name__}.monotonic", lambda: next(clock_values))
+    monkeypatch.setattr(f"{__name__}.sleep", lambda _seconds: None)
+
+    @probe_app.get("/api/ready")
+    def ready() -> JSONResponse:
+        nonlocal calls
+        calls += 1
+        return JSONResponse({"ready": False, "checks": [{"name": "session_db", "ok": False, "detail": "probe timed out"}]}, status_code=503)
+
+    with TestClient(probe_app) as client:
+        response = _wait_for_transient_database_readiness(client, client.get("/api/ready"))
+    assert response.status_code == 503
+    assert calls == 2
+
+
 @pytest.mark.usefixtures("aws_rds_trust_test_override")
-@pytest.mark.parametrize("target", _RUNTIME_CONTRACT_TARGETS)
+@pytest.mark.parametrize(
+    ("target", "hold_first_probe"),
+    [pytest.param(target, False, id=target) for target in _RUNTIME_CONTRACT_TARGETS]
+    + [pytest.param("aws-ecs", True, id="aws-ecs-transient-probe-timeout")],
+)
 def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     tmp_path: Path,
     database_pair: _DatabasePair,
     target: str,
+    hold_first_probe: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_probe = readiness._probe_database_engine
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_probe(engine: Engine, *, kind: Literal["session", "landscape"]) -> tuple[readiness.ReadinessCheck, ...]:
+        if kind == "session" and not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=15), "test did not release the first readiness probe"
+        return original_probe(engine, kind=kind)
+
+    if hold_first_probe:
+        monkeypatch.setattr(readiness, "_probe_database_engine", held_probe)
+
     environment = _doctor_environment(
         tmp_path,
         target=target,
@@ -412,7 +513,17 @@ def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
         before_landscape = tuple(sorted(inspect(landscape_owner).get_table_names()))
         web_app = create_app(settings)
         with TestClient(web_app) as client:
-            response = client.get("/api/ready")
+            try:
+                response = client.get("/api/ready")
+                if hold_first_probe:
+                    assert entered.is_set()
+                    assert response.status_code == 503
+                    by_name = {check["name"]: check for check in response.json()["checks"]}
+                    assert by_name["session_db"]["detail"] == "probe timed out"
+                    assert by_name["session_schema"]["ok"] is False
+            finally:
+                release.set()
+            response = _wait_for_transient_database_readiness(client, response)
 
         assert response.status_code == 200, response.text
         assert response.json()["ready"] is True
