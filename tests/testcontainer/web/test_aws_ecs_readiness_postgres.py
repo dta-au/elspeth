@@ -227,11 +227,50 @@ def _dispose_app(app: object) -> None:
     state.session_engine.dispose()
 
 
-def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_databases: _RuntimeDatabases) -> None:
+@pytest.mark.parametrize("hold_first_probe", [False, True])
+def test_ready_returns_200_for_current_postgres(
+    tmp_path: Path,
+    runtime_databases: _RuntimeDatabases,
+    monkeypatch: pytest.MonkeyPatch,
+    hold_first_probe: bool,
+) -> None:
     app, session_owner, landscape_owner = _initialized_app(tmp_path, runtime_databases)
+    entered = threading.Event()
+    release = threading.Event()
+    if hold_first_probe:
+        original = readiness_module._check_session_database
+
+        def held(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            release.wait()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(readiness_module, "_check_session_database", held)
     try:
-        response = TestClient(app).get("/api/ready")
-        assert response.status_code == 200
+        client = TestClient(app)
+        try:
+            response = client.get("/api/ready")
+            if hold_first_probe:
+                assert entered.is_set()
+                assert response.status_code == 503, response.text
+                by_name = {check["name"]: check for check in response.json()["checks"]}
+                assert by_name["session_db"]["detail"] == "probe timed out"
+        finally:
+            release.set()
+        # A fresh probe may fail closed before its worker finishes. Wait for
+        # recovery through the public cache, preserving both probe deadlines.
+        deadline = time.monotonic() + 10
+        transient_details = {"probe timed out", "probe already in flight"}
+        database_checks = {"session_db", "session_schema", "landscape_db", "landscape_schema"}
+        while response.status_code == 503 and time.monotonic() < deadline:
+            failed_checks = [check for check in response.json()["checks"] if not check["ok"]]
+            if not failed_checks or any(
+                check["name"] not in database_checks or check["detail"] not in transient_details for check in failed_checks
+            ):
+                break
+            time.sleep(0.1)
+            response = client.get("/api/ready")
+        assert response.status_code == 200, response.text
         payload = response.json()
         assert payload["ready"] is True
         assert [check["name"] for check in payload["checks"]] == list(READINESS_CHECK_NAMES)
@@ -240,6 +279,7 @@ def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_database
         assert probe_session_schema(session_owner) is SchemaState.CURRENT
         assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT
     finally:
+        release.set()
         _dispose_app(app)
         session_owner.dispose()
         landscape_owner.dispose()
