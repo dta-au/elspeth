@@ -622,18 +622,21 @@ jobs:
   # Stage 3: Test (Quality gate - ~3-5 minutes)
   # ===========================================================================
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Test (Python ${{ matrix.python-version }}, shard ${{ matrix.shard }})
     runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
     container:
       image: python:${{ matrix.python-version }}-bookworm
     env:
-      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-test-${{ matrix.python-version }}-${{ matrix.shard }}
+      PYTEST_WORKERS: "2"
+      COVERAGE_FILE: coverage-data
     # Run independently so static-analysis failures cannot hide test results.
     # CI Success still requires both jobs to pass.
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+        shard: [0, 1, 2, 3]
         # Coverage runs on Python 3.13 only because 3.13 is the release
         # interpreter for this branch. The Python 3.12 lane remains
         # dependency-compatibility signal and intentionally skips coverage so
@@ -728,50 +731,120 @@ jobs:
           # were selected, tests/conftest.py refused them with a UsageError
           # inside every xdist worker, and xdist reported that as a crashed
           # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
-          # Bound concurrency on the hosted runner; retain the full selection.
-          uv run pytest tests/ -n 2 \
+          # Partition after normal marker selection to bound accumulated worker
+          # state while preserving every selected ID across independent jobs.
+          uv run python -m pytest tests/ -p scripts.ci_test_shards \
+            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-report=shard-manifest.json \
             -o faulthandler_timeout=300 \
             --cov=src/elspeth \
-            --cov-report=xml \
-            --cov-report=term-missing \
-            --cov-fail-under=85 \
-            -v
-
-      - name: Enforce audit-critical coverage floors
-        if: matrix.coverage
-        working-directory: ${{ env.CI_CHECKOUT_PATH }}
-        run: |
-          # Ratchet the verified 2026-05-19 baseline while the test-debt
-          # uplift to 95% is planned. Do not lower without fresh evidence.
-          # 2026-06-19: landscape floor 93 -> 92, orchestrator 91 -> 90. Fresh
-          # evidence: the 0.6.0 multi-worker work added substantial landscape +
-          # orchestrator code (run_coordination, scheduler/execution/lifecycle
-          # repositories; multi-worker orchestration paths) whose test coverage
-          # sits below the prior subsystem floors (scheduler 88%, execution 89%,
-          # run_lifecycle 90%; the new run_coordination_repository is itself at
-          # 94%). The Test lane was masked behind static-analysis while this
-          # landed, so the dip surfaced only now. Uplift remains tracked debt.
-          # All four floors are checked every run (collect-then-fail) so a dip
-          # in any subsystem surfaces together rather than one cycle at a time.
-          status=0
-          uv run coverage report --include="src/elspeth/core/landscape/*" --fail-under=92 || status=1
-          uv run coverage report --include="src/elspeth/core/canonical.py" --fail-under=99 || status=1
-          uv run coverage report --include="src/elspeth/engine/orchestrator/*" --fail-under=90 || status=1
-          uv run coverage report --include="src/elspeth/contracts/*" --fail-under=62 || status=1
-          exit "$status"
+            --cov-report= \
+            --cov-fail-under=0 \
+            -n "$PYTEST_WORKERS" \
+            -q -rfE \
+            --junitxml=pytest-junit.xml
 
       - name: Run tests without coverage
         if: ${{ !matrix.coverage }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           # No `-m`: same reason as the coverage step above.
-          # Same worker budget as the coverage lane; no marker override.
-          uv run pytest tests/ -n 2 \
+          # Same shard selection and worker budget as the coverage lane.
+          uv run python -m pytest tests/ -p scripts.ci_test_shards \
+            --ci-shard-count=4 --ci-shard-index=${{ matrix.shard }} \
+            --ci-shard-report=shard-manifest.json \
             -o faulthandler_timeout=300 \
-            -v
+            -n "$PYTEST_WORKERS" \
+            -q -rfE \
+            --junitxml=pytest-junit.xml
 
-      - name: Upload coverage report
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pytest-junit-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: ${{ env.CI_CHECKOUT_PATH }}/pytest-junit.xml
+          retention-days: 7
+
+      - name: Upload shard coverage and selection evidence
         if: matrix.coverage && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage-shard-${{ matrix.python-version }}-${{ matrix.shard }}
+          path: |
+            ${{ env.CI_CHECKOUT_PATH }}/coverage-data
+            ${{ env.CI_CHECKOUT_PATH }}/shard-manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  coverage:
+    name: Combined coverage
+    runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
+    container:
+      image: python:3.13-bookworm
+    needs: [test]
+    if: always()
+    env:
+      CI_CHECKOUT_PATH: ci-${{ github.run_id }}-${{ github.run_attempt }}-coverage
+    steps:
+      - name: Require every test shard to pass
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test shards failed or did not complete"
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: ${{ env.CI_CHECKOUT_PATH }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Use checkout-local uv cache
+        run: echo "UV_CACHE_DIR=$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.uv-cache" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          apt-get update -q
+          apt-get install -y -q libsqlcipher-dev
+
+      - name: Install dependencies
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv sync --frozen --all-extras
+
+      - name: Download Python 3.13 coverage shards
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: coverage-shard-3.13-*
+          path: ${{ env.CI_CHECKOUT_PATH }}/coverage-shards
+
+      - name: Combine complete coverage evidence
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: uv run python scripts/ci_test_shards.py --artifact-dir coverage-shards --shard-count 4
+
+      - name: Enforce overall and audit-critical coverage floors
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        run: |
+          # Apply the existing floors to the union of all successful shards.
+          # Collect every deficit before failing so each run reports them all.
+          status=0
+          uv run coverage report --fail-under=85 || status=1
+          uv run coverage report --include="src/elspeth/core/landscape/*" --fail-under=92 || status=1
+          uv run coverage report --include="src/elspeth/core/canonical.py" --fail-under=99 || status=1
+          uv run coverage report --include="src/elspeth/engine/orchestrator/*" --fail-under=90 || status=1
+          uv run coverage report --include="src/elspeth/contracts/*" --fail-under=62 || status=1
+          uv run coverage xml || status=1
+          exit "$status"
+
+      - name: Upload combined coverage report
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage-report
@@ -1285,6 +1358,7 @@ jobs:
     needs:
       - static-analysis
       - test
+      - coverage
       - testcontainer
       - host-runner-unit
       - state-engine-validation
@@ -1302,6 +1376,10 @@ jobs:
           fi
           if [[ "${{ needs.test.result }}" != "success" ]]; then
             echo "Test job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.coverage.result }}" != "success" ]]; then
+            echo "Combined coverage job failed"
             exit 1
           fi
           if [[ "${{ needs.testcontainer.result }}" != "success" ]]; then

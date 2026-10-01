@@ -11,10 +11,12 @@ green.
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -44,6 +46,18 @@ def _job(name: str) -> dict[str, Any]:
 
 def _run_lines(job: dict[str, Any]) -> str:
     return "\n".join(step.get("run", "") for step in job["steps"])
+
+
+def _pytest_arguments(run: str) -> list[str]:
+    # Python's module-launch flag precedes pytest's own marker arguments.
+    tokens = shlex.split(run.replace("\\\n", " "), comments=True)
+    return tokens[tokens.index("pytest") + 1 :]
+
+
+@pytest.mark.parametrize("launcher", ["uv run pytest", "uv run python -m pytest"])
+def test_marker_override_instrument_distinguishes_module_launch_from_selection(launcher: str) -> None:
+    assert "-m" not in _pytest_arguments(f"# pytest launch comment\n{launcher} tests/ -n 2")
+    assert "-m" in _pytest_arguments(f"{launcher} tests/ -m live_provider -n 2")
 
 
 PUSH_WORKFLOWS = (
@@ -168,7 +182,7 @@ def test_test_job_steps_carry_no_marker_expression_of_their_own() -> None:
     pytest_steps = [step for step in _job("test")["steps"] if "pytest" in str(step.get("run", ""))]
     assert len(pytest_steps) == 2, [step.get("name") for step in pytest_steps]
     for step in pytest_steps:
-        tokens = step["run"].replace("\\\n", " ").split()
+        tokens = _pytest_arguments(step["run"])
         assert "-m" not in tokens, step.get("name")
         assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), step.get("name")
 
@@ -190,7 +204,7 @@ def test_integration_job_carries_no_marker_expression_of_its_own() -> None:
     """
     pytest_steps = [step for step in _job("integration")["steps"] if "pytest" in str(step.get("run", ""))]
     assert len(pytest_steps) == 1, [step.get("name") for step in pytest_steps]
-    tokens = pytest_steps[0]["run"].replace("\\\n", " ").split()
+    tokens = _pytest_arguments(pytest_steps[0]["run"])
     assert "-m" not in tokens, pytest_steps[0].get("name")
     assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), pytest_steps[0].get("name")
 
@@ -225,7 +239,7 @@ def test_no_job_restates_the_marker_selection_except_the_testcontainer_override(
             if "pytest" not in run:
                 continue
             steps_with_pytest.append((job_name, str(step.get("name"))))
-            tokens = run.replace("\\\n", " ").split()
+            tokens = _pytest_arguments(run)
             assert not any(token.startswith("-m=") or token.startswith("--markexpr") for token in tokens), job_name
             markers = [tokens[index + 1] for index, token in enumerate(tokens) if token == "-m" and index + 1 < len(tokens)]
             if markers:
