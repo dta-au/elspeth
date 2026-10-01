@@ -52,6 +52,13 @@ control-group state. These controls reduce accidental host mutation. They do
 not turn a persistent Docker-capable runner into an isolation boundary, so the
 admission rule in § 1 remains mandatory.
 
+Docker bind mounts resolve source paths in the daemon's host filesystem.
+The runner's private `/tmp` and `/var/tmp` are separate namespaces, so files
+created there cannot be supplied to containers by their runner-visible paths.
+The PostgreSQL CI job uses `--basetemp` inside its unique checkout for the
+TLS fixtures it bind-mounts. Use the same shared-path approach for other
+host-runner jobs that supply temporary files to Docker; retain `PrivateTmp`.
+
 ## 3. Audit and apply
 
 The audit is read-only and fails closed on a missing runner, custody file,
