@@ -12,10 +12,12 @@ The judge-metadata signature is an **HMAC** — a symmetric MAC. Any holder of
 `judge_verdict: ACCEPTED` with a fabricated rationale over a publicly-computable
 fingerprint, sign it, and pass every gate. The whole design follows from that
 single fact (invariant elspeth-fa00de6ec1, *[O1] operator-only HMAC custody*).
-The CI-exposure corollary is mitigated in `.github/workflows/ci.yaml`: every
-step that injects `ELSPETH_JUDGE_METADATA_HMAC_KEY` gates it on
-`github.event_name != 'pull_request'`, so PR-controlled code never runs with the
-secret present.
+The key stays out of every CI workflow, including trusted push jobs.
+`test_no_workflow_references_the_operator_hmac_key` in
+`tests/unit/test_ci_workflow_xdist.py` checks workflow, job and step scopes.
+CI does not verify signed trust-tier allowlist metadata or gate merges on that
+signature verdict; the operator verifies and signs the reviewed package in a
+trusted context. A green CI result covers the checks that actually run.
 
 - **An agent never holds the key.** Agents may *propose* work — survey the tree,
   stage a bundle, run a non-authoritative preview judge — but the authoritative

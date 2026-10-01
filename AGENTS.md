@@ -124,11 +124,10 @@ working around it.
   prefix is what lets a keyless agent run it at all: verification otherwise
   demands `ELSPETH_JUDGE_METADATA_HMAC_KEY`, which agents must never hold
   ([O1]). Shape-only verification cannot detect forged judge metadata, so a
-  trusted context must re-verify before any merge is authoritative — the same
-  treatment CI gives fork PRs.
-- That gate currently exits 1 with a large finding corpus: the deliberate
-  fail-closed state described under "Judge-signature stage", not a regression
-  you introduced. Compare the corpus before and after your change, not to zero.
+  trusted operator context must re-verify before claiming signed allowlist
+  clearance. CI does not make that claim.
+- A keyless trust-tier scan currently exits 1 with a large finding corpus.
+  Compare the corpus before and after your change, not to zero.
 - Treat the trust-tier gate as a catch-obvious-bug-hiding check, not a death
   pact. Review every touched file in full; apply the trust-tier rules to
   production code and clean related tests, config, and docs to house style.
@@ -294,17 +293,12 @@ unauthorized unless refusal telemetry shows a real tax.
 
 ## Judge-signature stage (tier-model allowlist signing)
 
-The trust-tier CI failure is a deliberate fail-closed state: it prevents
-unauthorised merges while keeping the outstanding package-level signing work
-visible. **Do not attempt to resolve, re-sign, restage, or otherwise clear the
-trust-tier CI failure globally during ordinary feature work.** Fix tier-model
-defects as you find them, and never make the tier-model state worse. There is
-no global obligation for this gate to pass during feature delivery; the global
-obligation is to follow the trust-tier standards and avoid introducing new
-defects or drift. The operator signs once, at package completion, after churn
-has settled. Since 2026-09-05 the `test` and `testcontainer` jobs no longer
-wait on `static-analysis`, so the suites run and report while that job is red;
-`CI Success` still requires `static-analysis`, so the red still blocks merges.
+CI does not run the signed trust-tier check. Its green result covers the
+checks that actually run, not operator signature clearance. Fix tier-model
+defects as you find them and do not add drift; compare keyless finding sets
+before and after a change. The operator verifies and signs the reviewed
+package in a trusted context after churn has settled. Keep the operator-held
+key out of CI and agent environments.
 
 The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `stage_annotate` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs with read-only judge tool access (`--judge-tools readonly`) on whichever `--judge-transport` the operator selects: the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and [docs/judge-signature-handoff.md](docs/judge-signature-handoff.md).
 

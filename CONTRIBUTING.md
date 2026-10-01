@@ -248,9 +248,9 @@ comparison as a test before touching resolution.
 ### Gate: trust-tier lint corpus
 
 **Pins:** the finding corpus of the `elspeth-lints` static-analysis rules over
-`src/elspeth`. The gate is deliberately fail-closed (exit 1 with a standing
-corpus) until the operator signs the package; do not expect zero and do not
-try to clear it during ordinary feature work.
+`src/elspeth`. The keyless operator diagnostic exits 1 with a standing
+corpus; do not expect zero. CI does not run the signed trust-tier check or
+claim operator signature clearance.
 
 ```bash
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
