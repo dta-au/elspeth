@@ -189,6 +189,13 @@ class AssertRelationshipRequest(_Provenance):
     effective_until: _UtcInstant | None = Field(default=None, strict=False)
     note: str | None = Field(default=None, min_length=1, max_length=MAX_AUTH_AUDIT_TEXT_LENGTH)
 
+    @model_validator(mode="after")
+    def _window_opens_before_it_closes(self) -> AssertRelationshipRequest:
+        """A fact about the body alone, so it is invalid input here; the authority keeps the same check as its guard."""
+        if self.effective_from is not None and self.effective_until is not None and self.effective_from >= self.effective_until:
+            raise ValueError("effective_from must precede effective_until")
+        return self
+
 
 class PurgePendingIdentitiesRequest(_Provenance):
     """The retention window is deployment configuration, never request input."""
