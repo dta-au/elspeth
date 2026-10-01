@@ -749,11 +749,14 @@ jobs:
         # The junit report is the evidence Phase 7 cites for the P0 pin test
         # tests/testcontainer/web/test_schema_probe_postgres.py::
         # test_fresh_create_reaches_current (elspeth-d8749aeaa3).
+        # PrivateTmp isolates the runner's /tmp from the host Docker daemon.
+        # Bind-mounted TLS fixture files must live in the shared checkout.
         run: |
           uv run pytest tests/ \
             -v \
             -m testcontainer \
             -n 0 \
+            --basetemp="$GITHUB_WORKSPACE/$CI_CHECKOUT_PATH/.pytest-tmp" \
             --junitxml=testcontainer-junit.xml
 
       - name: Upload testcontainer junit report

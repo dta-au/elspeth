@@ -103,19 +103,27 @@ def test_runner_audit_accepts_four_hardened_runner_services(tmp_path: Path) -> N
     assert "runner_host_controls=PASS" in result.stdout
 
 
-def test_runner_audit_reports_when_locked_directory_cannot_be_traversed(tmp_path: Path) -> None:
+def test_runner_audit_rejects_locked_directory_for_current_privileges(tmp_path: Path) -> None:
     runner_root, service_dir = _runner_layout(tmp_path, secure=True)
     locked_runner = runner_root / "elspeth-nyx-2"
     locked_runner.chmod(0o000)
 
     try:
+        # CI containers can traverse mode-000 directories with CAP_DAC_OVERRIDE.
+        can_traverse = os.access(locked_runner, os.X_OK, effective_ids=True)
         result = _audit(runner_root, service_dir)
     finally:
         locked_runner.chmod(0o700)
 
-    assert result.returncode == 2
-    assert f"cannot traverse {locked_runner}" in result.stderr
-    assert "rerun --check as root" in result.stderr
+    if can_traverse:
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert f"{locked_runner} mode 0, expected 700" in result.stdout
+        assert "runner_host_controls=FAIL failures=1" in result.stdout
+        assert result.stderr == ""
+    else:
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert f"cannot traverse {locked_runner}" in result.stderr
+        assert "rerun --check as root" in result.stderr
 
 
 @pytest.mark.parametrize(
