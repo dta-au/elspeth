@@ -71,6 +71,10 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
+    # lane-manager's own merge subprocesses need an identity, independently of
+    # the explicit GIT_ENV used by this module's commit helper.
+    _git(root, "config", "user.name", "t")
+    _git(root, "config", "user.email", "t@x")
     (root / "src").mkdir()
     (root / "tests").mkdir()
     (root / "src" / "target.py").write_text("VALUE = 1\n", encoding="utf-8")
@@ -403,7 +407,7 @@ def test_lane_whose_test_fails_on_the_merged_tree_is_not_verified_even_if_the_su
 
 
 def test_lane_whose_test_crashes_on_the_base_is_not_verified(repo: Path) -> None:
-    """RED means the test FAILED (exit 1). A test that cannot fail but crashes without the fix must not pass the gate (reviewer R1)."""
+    """A collection crash supplies no failed assertion and must not pass the RED gate (reviewer R1)."""
     run = _init(
         repo,
         _ticket(
@@ -424,7 +428,8 @@ def test_lane_whose_test_crashes_on_the_base_is_not_verified(repo: Path) -> None
     _git(lane.worktree_path, "add", "src")
     _git(lane.worktree_path, "commit", "-q", "-m", "fix: adds helper")
     result = lm.verify(run, "lane-01-t1")
-    assert result.red_exit_code not in (0, 1, None), result.red_exit_code
+    assert result.red_exit_code not in (0, None), result.red_exit_code
+    assert result.red_failures == [], "collection never reached a test's call phase"
     assert result.verified is False
     assert any("crash" in r for r in result.reasons), result.reasons
     assert result.green_exit_code is None
