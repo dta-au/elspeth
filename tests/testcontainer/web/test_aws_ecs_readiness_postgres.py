@@ -9,11 +9,14 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from time import monotonic, sleep
+from typing import Any, Literal
 
 import psycopg
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from httpx import Response
 from psycopg import sql
 from pydantic import SecretBytes
 from sqlalchemy import Engine, create_engine
@@ -227,11 +230,110 @@ def _dispose_app(app: object) -> None:
     state.session_engine.dispose()
 
 
-def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_databases: _RuntimeDatabases) -> None:
+def _wait_for_database_probe_recovery(client: TestClient, response: Response) -> Response:
+    # Keep the real probe deadlines. Admit fresh requests only for database
+    # timeout/in-flight reports, within one fixed ten-second polling window.
+    deadline = monotonic() + 10
+    database_checks = {"session_db", "session_schema", "landscape_db", "landscape_schema"}
+    transient_details = {"probe timed out", "probe already in flight"}
+    while response.status_code == 503 and monotonic() < deadline:
+        failed_checks = [check for check in response.json()["checks"] if not check["ok"]]
+        if not failed_checks or any(
+            check["name"] not in database_checks or check["detail"] not in transient_details for check in failed_checks
+        ):
+            break
+        sleep(0.1)
+        response = client.get("/api/ready")
+    return response
+
+
+@pytest.mark.parametrize(
+    ("name", "detail"),
+    [
+        ("session_schema", "schema state: STALE"),
+        ("landscape_schema", "schema state: MISSING"),
+        ("auth_mode", "authentication configuration incomplete"),
+        ("data_dir", "directory probe failed (PermissionError)"),
+        ("session_db", "probe failed (ProgrammingError)"),
+        ("session_db", "probe failed (OperationalError)"),
+        ("session_schema", "not checked: connectivity probe failed"),
+        ("auth_mode", "probe timed out"),
+        ("data_dir", "probe already in flight"),
+    ],
+)
+def test_probe_recovery_does_not_retry_nontransient_refusals(name: str, detail: str) -> None:
+    probe_app = FastAPI()
+    calls = 0
+
+    @probe_app.get("/api/ready")
+    def ready() -> JSONResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return JSONResponse({"ready": False, "checks": [{"name": name, "ok": False, "detail": detail}]}, status_code=503)
+        return JSONResponse({"ready": True, "checks": []})
+
+    client = TestClient(probe_app)
+    response = client.get("/api/ready")
+    assert _wait_for_database_probe_recovery(client, response) is response
+    assert calls == 1
+
+
+def test_probe_recovery_stops_after_its_fixed_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe_app = FastAPI()
+    calls = 0
+    clock_values = iter((0.0, 0.0, 10.0, 11.0))
+    monkeypatch.setattr(f"{__name__}.monotonic", lambda: next(clock_values))
+    monkeypatch.setattr(f"{__name__}.sleep", lambda _seconds: None)
+
+    @probe_app.get("/api/ready")
+    def ready() -> JSONResponse:
+        nonlocal calls
+        calls += 1
+        return JSONResponse({"ready": False, "checks": [{"name": "session_db", "ok": False, "detail": "probe timed out"}]}, status_code=503)
+
+    client = TestClient(probe_app)
+    response = _wait_for_database_probe_recovery(client, client.get("/api/ready"))
+    assert response.status_code == 503
+    assert calls == 2
+
+
+@pytest.mark.parametrize("hold_first_probe", [False, True])
+def test_ready_returns_200_for_current_postgres(
+    tmp_path: Path,
+    runtime_databases: _RuntimeDatabases,
+    monkeypatch: pytest.MonkeyPatch,
+    hold_first_probe: bool,
+) -> None:
     app, session_owner, landscape_owner = _initialized_app(tmp_path, runtime_databases)
+    entered = threading.Event()
+    release = threading.Event()
+    if hold_first_probe:
+        original = readiness_module._check_session_database
+
+        def held(
+            settings: WebSettings,
+            session_engine: Engine,
+            deployment_state_mode: Literal["sqlite-single", "external-postgresql"] | None = None,
+        ) -> tuple[readiness_module.ReadinessCheck, ...]:
+            entered.set()
+            assert release.wait(timeout=15), "test did not release the first readiness probe"
+            return original(settings, session_engine, deployment_state_mode)
+
+        monkeypatch.setattr(readiness_module, "_check_session_database", held)
     try:
-        response = TestClient(app).get("/api/ready")
-        assert response.status_code == 200
+        client = TestClient(app)
+        try:
+            response = client.get("/api/ready")
+            if hold_first_probe:
+                assert entered.is_set()
+                assert response.status_code == 503, response.text
+                by_name = {check["name"]: check for check in response.json()["checks"]}
+                assert by_name["session_db"]["detail"] == "probe timed out"
+        finally:
+            release.set()
+        response = _wait_for_database_probe_recovery(client, response)
+        assert response.status_code == 200, response.text
         payload = response.json()
         assert payload["ready"] is True
         assert [check["name"] for check in payload["checks"]] == list(READINESS_CHECK_NAMES)
@@ -240,6 +342,7 @@ def test_ready_returns_200_for_current_postgres(tmp_path: Path, runtime_database
         assert probe_session_schema(session_owner) is SchemaState.CURRENT
         assert probe_landscape_schema(landscape_owner) is SchemaState.CURRENT
     finally:
+        release.set()
         _dispose_app(app)
         session_owner.dispose()
         landscape_owner.dispose()
