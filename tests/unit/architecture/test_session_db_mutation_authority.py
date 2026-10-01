@@ -1640,7 +1640,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "RepositoryRateLimitAuthority.admit",
         "<sessions-write-connection>",
         "write_connection",
-        "242a081fdde02292",
+        "e5948a03417a95b0",
         1,
         "RateLimitAuthority",
         line=85,

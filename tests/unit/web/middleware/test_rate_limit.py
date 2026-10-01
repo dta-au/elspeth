@@ -9,9 +9,9 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 
-from elspeth.web.middleware import rate_limit as rate_limit_module
 from elspeth.web.middleware.rate_limit import (
     ComposerRateLimiter,
+    get_audit_readiness_rate_limiter,
     get_rate_limiter,
     get_write_rate_limiter,
 )
@@ -273,8 +273,7 @@ def test_audit_readiness_rate_limiter_dependency_reads_distinct_app_state() -> N
     request = Request({"type": "http", "app": app, "headers": []})
 
     strict = asyncio.run(get_rate_limiter(request))
-    assert hasattr(rate_limit_module, "get_audit_readiness_rate_limiter")
-    readiness = asyncio.run(rate_limit_module.get_audit_readiness_rate_limiter(request))
+    readiness = asyncio.run(get_audit_readiness_rate_limiter(request))
 
     assert readiness is app.state.audit_readiness_rate_limiter
     assert readiness is not strict
