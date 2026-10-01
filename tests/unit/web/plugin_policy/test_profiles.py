@@ -426,6 +426,7 @@ def test_profile_aliases_are_opaque_canonical_identifiers() -> None:
 def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
     settings_fields = {
         "plugin_allowlist",
+        "power_automate_allowed_origins",
         "plugin_preferences",
         "plugin_control_modes",
         "llm_profiles",

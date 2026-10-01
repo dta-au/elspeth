@@ -20,6 +20,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, requ
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.results import ArtifactDescriptor, require_no_artifact_uri_credentials
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.contracts.sink_effect_http import SinkEffectHTTPPost, SinkEffectHTTPPostFactory
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
@@ -134,6 +135,7 @@ class SinkEffectRuntimeBinding:
     purpose: SinkEffectExecutionPurpose
     effect_mode: ResolvedSinkEffectMode | None
     audit_export_publication_preflight: Callable[[], None] | None = None
+    http_post_factory: SinkEffectHTTPPostFactory | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.sink_name, str) or not self.sink_name.strip():
@@ -146,6 +148,8 @@ class SinkEffectRuntimeBinding:
             raise TypeError("Sink runtime binding purpose must be exact SinkEffectExecutionPurpose")
         if self.effect_mode is not None and type(self.effect_mode) is not ResolvedSinkEffectMode:
             raise TypeError("Sink runtime binding mode must be ResolvedSinkEffectMode or None")
+        if self.http_post_factory is not None and not isinstance(self.http_post_factory, SinkEffectHTTPPostFactory):
+            raise TypeError("http_post_factory must be a nominal SinkEffectHTTPPostFactory")
 
 
 class AuditExportFormat(StrEnum):
@@ -1427,6 +1431,7 @@ class RestrictedSinkEffectContext:
     run_started_at: datetime
     operation_id: str
     sink_node_id: str
+    http_post: SinkEffectHTTPPost | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_nonempty_string(self.run_id, "run_id")
@@ -1434,6 +1439,8 @@ class RestrictedSinkEffectContext:
         _require_nonempty_string(self.sink_node_id, "sink_node_id")
         if not isinstance(self.run_started_at, datetime):
             raise TypeError("run_started_at must be datetime")
+        if self.http_post is not None and not isinstance(self.http_post, SinkEffectHTTPPost):
+            raise TypeError("http_post must be a nominal SinkEffectHTTPPost")
 
 
 class SinkEffectContract:

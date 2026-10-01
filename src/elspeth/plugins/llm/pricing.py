@@ -1,9 +1,9 @@
 """Observe monetary evidence on HTTP LLM failures without replacing the failure."""
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.llm_pricing import provider_cost_from_response
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 
 
 @observation_boundary(

@@ -793,6 +793,7 @@ def _trained_operator_validation_context(
         usable_profile_aliases=plugin_snapshot.usable_profile_aliases,
         selected_profile_aliases=plugin_snapshot.selected_profile_aliases,
         control_modes=plugin_snapshot.control_modes,
+        power_automate_allowed_origins=plugin_snapshot.power_automate_allowed_origins,
         binding_generation_fingerprint=plugin_snapshot.binding_generation_fingerprint,
         authority=PluginSnapshotAuthority.TRAINED_OPERATOR,
     )

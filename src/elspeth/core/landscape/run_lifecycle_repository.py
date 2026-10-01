@@ -1515,6 +1515,13 @@ class RunLifecycleRepository:
             )
         return records
 
+    def get_run_source_config_hashes(self, run_id: str) -> dict[str, str]:
+        """Return stored source configuration identities for early archive admission."""
+        rows = self._ops.execute_fetchall(
+            select(run_sources_table.c.source_node_id, run_sources_table.c.config_hash).where(run_sources_table.c.run_id == run_id)
+        )
+        return {row.source_node_id: row.config_hash for row in rows}
+
     def get_run_source_lifecycle_records(self, run_id: str) -> dict[str, RunSourceLifecycleRecord]:
         """Return per-source lifecycle records without requiring replay schemas.
 

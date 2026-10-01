@@ -33,6 +33,7 @@ from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.token_usage import UNKNOWN_TOKEN_USAGE, TokenUsage
+from elspeth.core.canonical import stable_hash
 from elspeth.core.rate_limit.registry import NoOpLimiter
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.testing import make_pipeline_row
@@ -142,8 +143,9 @@ class _ExecutionRepositoryDouble:
             created_at=datetime.now(UTC),
             state_id=call_kwargs.get("state_id"),
             operation_id=call_kwargs.get("operation_id"),
-            request_ref=call_kwargs["request_ref"] or "request_payload_ref",
-            response_ref=call_kwargs["response_ref"] or ("response_payload_ref" if call_kwargs["response_data"] is not None else None),
+            request_ref=call_kwargs["request_ref"] or stable_hash(call_kwargs["request_data"].to_dict()),
+            response_ref=call_kwargs["response_ref"]
+            or (stable_hash(call_kwargs["response_data"].to_dict()) if call_kwargs["response_data"] is not None else None),
             latency_ms=call_kwargs["latency_ms"],
             approved_prompt_artifact_hash=call_kwargs["approved_prompt_artifact_hash"],
             prompt_tokens=call_kwargs["token_usage"].prompt_tokens,
@@ -624,6 +626,64 @@ class TestBlobFetchTelemetryWiring:
 
 
 # ---------------------------------------------------------------------------
+# Behavioral wiring for the shared Power Automate transport
+# ---------------------------------------------------------------------------
+
+
+class TestPowerAutomateTelemetryWiring:
+    """Source operations and bound sink HTTP capabilities emit audited HTTP events."""
+
+    @pytest.mark.parametrize("component", ["source", "sink"])
+    def test_telemetry_emitted_on_power_automate_call(self, monkeypatch: pytest.MonkeyPatch, component: str) -> None:
+        import respx
+
+        from elspeth.contracts.sink_effect_http import SinkEffectHTTPBindContext, SinkEffectHTTPPostRequest
+        from elspeth.plugins.infrastructure.clients.power_automate import PowerAutomateHTTPPostFactory, PowerAutomateOperationClient
+        from elspeth.plugins.infrastructure.power_automate import PowerAutomateSinkConfig, PowerAutomateSourceConfig
+
+        monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "fake-test-fingerprint-key")
+        monkeypatch.setattr("elspeth.core.security.web._resolve_hostname", lambda *args, **kwargs: ["93.184.216.34"])
+        options = {
+            "auth": {"method": "sas_url", "trigger_url_secret": "https://flows.example.org/read?sig=fake-test-capability"},
+            "allowed_origin": "https://flows.example.org",
+            "schema": {"mode": "flexible", "fields": ["id: str"]},
+        }
+        events: list[Any] = []
+        recorder = _ExecutionRepositoryDouble()
+        token = CoordinationToken("test-run", "test-worker", 1)
+        with respx.mock:
+            route = respx.post("https://93.184.216.34:443/read?sig=fake-test-capability").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+            if component == "source":
+                source_config = PowerAutomateSourceConfig.from_dict({**options, "on_validation_failure": "discard"})
+                with PowerAutomateOperationClient(
+                    source_config,
+                    recorder=recorder,
+                    run_id="test-run",
+                    operation_id="source-load",
+                    coordination_token=token,
+                    telemetry_emit=events.append,
+                    before_send=lambda: None,
+                ) as client:
+                    response = client.post_json({"operation": "read"})
+            else:
+                sink_config = PowerAutomateSinkConfig.from_dict({**options, "fields": ["id"]})
+                capability = PowerAutomateHTTPPostFactory(sink_config, safe_config={"allowed_origin": "https://flows.example.org"}).bind(
+                    SinkEffectHTTPBindContext(recorder, "test-run", "sink-write", token, events.append, lambda: None)
+                )
+                response = capability.post_json(SinkEffectHTTPPostRequest({"operation": "write", "id": "row-1"}))
+            assert route.call_count == 1
+
+        http_events = [event for event in events if isinstance(event, ExternalCallCompleted) and event.call_type is CallType.HTTP]
+        assert len(http_events) == 1
+        assert http_events[0].status is CallStatus.SUCCESS
+        assert http_events[0].run_id == "test-run"
+        assert response.call_id == "call_1"
+        assert recorder.recorded_calls[0]["operation_id"] == ("source-load" if component == "source" else "sink-write")
+
+
+# ---------------------------------------------------------------------------
 # Structural discovery: find unregistered plugins that use audited clients
 # ---------------------------------------------------------------------------
 
@@ -639,6 +699,7 @@ _KNOWN_AUDITED_CLIENT_USERS: set[str] = {
     "src/elspeth/plugins/transforms/azure/document_intelligence.py",
     "src/elspeth/plugins/transforms/web_scrape.py",
     "src/elspeth/plugins/transforms/blob_fetch.py",
+    "src/elspeth/plugins/infrastructure/clients/power_automate.py",
     # Batch APIs — use file uploads, not per-row audited clients
     "src/elspeth/plugins/transforms/llm/azure_batch.py",
     "src/elspeth/plugins/transforms/llm/openrouter_batch.py",

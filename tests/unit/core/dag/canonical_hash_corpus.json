@@ -100,6 +100,7 @@
     "examples/azure_blob_sentiment/settings_pooled.yaml": "ValidationError",
     "examples/azure_keyvault_secrets/settings.yaml": "PluginConfigError",
     "examples/azure_openai_sentiment/settings.yaml": "PluginConfigError",
-    "examples/azure_openai_sentiment/settings_pooled.yaml": "ValidationError"
+    "examples/azure_openai_sentiment/settings_pooled.yaml": "ValidationError",
+    "examples/power_automate/settings.yaml": "SecretFingerprintError"
   }
 }

@@ -380,6 +380,8 @@ def _persisted_first_error(tool_name: str, error_code: str) -> dict[str, object]
         ("set_pipeline", "required_control_coverage"),
         ("patch_node_options", "llm_base_url_not_allowed"),
         ("set_source", "fabricated_secret"),
+        ("set_source", "power_automate_origin_not_allowed"),
+        ("set_output", "power_automate_origin_not_allowed"),
     ],
 )
 def test_registered_code_survives_response_redaction(tool_name: str, error_code: str) -> None:

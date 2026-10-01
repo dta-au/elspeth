@@ -81,6 +81,13 @@ def _minimal_sink_configs(tmp_dir: str) -> dict[str, dict[str, Any]]:
         },
         "document": {"path": f"{tmp_dir}/a.docx", "field": "body", "schema": _OBSERVED},
         "json": {"path": f"{tmp_dir}/a.json", "schema": _OBSERVED},
+        "power_automate": {
+            "auth": {"method": "managed_identity", "client_id": "example-user-assigned-client"},
+            "trigger_url": "https://flow-endpoint.example.org/workflows/example/triggers/manual/paths/invoke",
+            "allowed_origin": "https://flow-endpoint.example.org",
+            "fields": ["body"],
+            "schema": {"mode": "flexible", "fields": ["body: str"]},
+        },
         "text": {"path": f"{tmp_dir}/a.txt", "field": "body", "schema": _OBSERVED},
     }
 

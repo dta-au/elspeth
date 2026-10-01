@@ -108,8 +108,15 @@ def test_verify_rejects_changed_validation_discards_before_transform_start(
     with patch.object(PassThrough, "on_start", side_effect=AssertionError("transform started before verification")) as startup:
         result = _invoke(tmp_path, settings)
     assert result.exit_code == 2, result.output
-    assert "verification_mismatch" in result.output
-    assert "validation discards differ" in result.output
+    events = [json.loads(line) for line in result.output.strip().splitlines()]
+    mismatch = [event for event in events if event["event"] == "verification_mismatch"]
+    assert mismatch == [
+        {
+            "event": "verification_mismatch",
+            "error": "Verify source 'primary': validation decisions differ from audited run",
+            "error_type": "VerificationMismatchError",
+        }
+    ]
     startup.assert_not_called()
 
 

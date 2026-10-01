@@ -8,10 +8,8 @@ Covers all branches per the spec:
 
 from __future__ import annotations
 
-from elspeth.plugins.infrastructure.clients.json_utils import (
-    contains_non_finite,
-    parse_json_strict,
-)
+from elspeth.contracts.json_parser import parse_json_strict
+from elspeth.plugins.infrastructure.clients.json_utils import contains_non_finite
 
 
 class TestContainsNonFinite:

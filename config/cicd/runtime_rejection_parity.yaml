@@ -25,6 +25,47 @@
 # Never hand-edit a `key`.
 
 sites:
+- key: 5062cdd71e0a0d98
+  path: src/elspeth/config_loading.py
+  qualname: _admit_power_automate_effective_settings
+  exception: AuditIntegrityError
+  message: power_automate_archive_settings_invalid
+  ordinal: 0
+  disposition: structural
+  note: This is archive integrity admission, reached only when a caller supplies a nominal PowerAutomateArchive.
+    resolve_config persists the full owned settings shape; missing archived settings keys are corruption.
+    Composer authoring supplies no archive and cannot create this persisted-evidence violation.
+- key: b47474961bc8eb40
+  path: src/elspeth/config_loading.py
+  qualname: _admit_power_automate_effective_settings
+  exception: AuditIntegrityError
+  message: power_automate_archive_settings_invalid
+  ordinal: 1
+  disposition: structural
+  note: The nonlive archive admission requires the complete owned concurrency mapping before comparing
+    invocation differences. Composer authoring supplies no PowerAutomateArchive; it cannot alter archived
+    concurrency evidence or reach this integrity rejection.
+- key: b6f3acb39c694123
+  path: src/elspeth/config_loading.py
+  qualname: _admit_power_automate_effective_settings
+  exception: AuditIntegrityError
+  message: power_automate_archive_settings_invalid
+  ordinal: 2
+  disposition: structural
+  note: The archived max_workers value must remain a positive owned integer, as originally persisted by
+    resolve_config. This detects archive corruption on nonlive admission; composer authoring supplies
+    no PowerAutomateArchive and cannot create or reach this persisted-evidence violation.
+- key: 189a88083e8d8690
+  path: src/elspeth/config_loading.py
+  qualname: _admit_power_automate_effective_settings
+  exception: ValueError
+  message: power_automate_execution_settings_differ
+  ordinal: 0
+  disposition: not_authorable
+  note: This comparison belongs to replay or verify invocation admission with a supplied PowerAutomateArchive.
+    It rejects effective settings changes beyond run_mode, replay_from and the deliberate serial worker
+    invocation. Composer YAML has no run_mode or replay_from surface and supplies no archive; these are
+    run invocation concerns explicitly refused by yaml_importer and the web runtime loader.
 - key: d5d21ee28663e6cf
   path: src/elspeth/config_loading.py
   qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
@@ -66,6 +107,26 @@ sites:
     malformed and wired credential values. This stronger authoring gate matches the current disabled authenticated
     runtime feature; composer_hidden alone is only catalog projection and is not the admission proof.
     Tests: test_web_scrape_auth_is_unavailable_during_authoring and test_auth_refusal_does_not_reject_unauthenticated_or_other_plugins.'
+- key: 0a94a954f945f8f9
+  path: src/elspeth/config_loading.py
+  qualname: load_nonlive_settings
+  exception: ValueError
+  message: Configuration must be a mapping
+  ordinal: 0
+  disposition: not_authorable
+  note: This file loader is exclusively for replay or verify with a supplied PowerAutomateArchive. Composer
+    authoring emits a mapping through generate_yaml and uses the live settings loader without an archive;
+    it cannot select this nonlive file-loading entry point or provide a non-mapping generated document.
+- key: c40bd64480fb8f4e
+  path: src/elspeth/config_loading.py
+  qualname: load_nonlive_settings_from_yaml_string
+  exception: ValueError
+  message: Configuration must be a mapping
+  ordinal: 0
+  disposition: not_authorable
+  note: This YAML-string loader requires a supplied PowerAutomateArchive and is a nonlive invocation path.
+    Composer authoring uses load_settings_from_yaml_string without an archive and generate_yaml always
+    serializes a mapping; it cannot select this entry point or supply a non-mapping generated document.
 - key: d4c584dc8e39ee9b
   path: src/elspeth/config_loading.py
   qualname: load_settings
@@ -83,6 +144,15 @@ sites:
   ordinal: 0
   disposition: not_authorable
   note: Same CLI-only file loader (config.py:2908); the composer path never reads a settings file (validation.py:221-223).
+- key: bfc5095fd105e6bd
+  path: src/elspeth/config_loading.py
+  qualname: load_settings
+  exception: ValueError
+  message: Power Automate nonlive loading requires admitted archive context
+  ordinal: 0
+  disposition: not_authorable
+  note: load_settings is the CLI file loader. The rejected Power Automate replay or verify invocation
+    requires archived evidence; composer authoring neither loads a file nor emits run_mode or replay_from.
 - key: 82c333f93d15d482
   path: src/elspeth/config_loading.py
   qualname: load_settings
@@ -92,6 +162,16 @@ sites:
   disposition: not_authorable
   note: Same CLI-only file loader (config.py:2912); the unknown-key check reads the YAML file from disk,
     which the composer path never provides (validation.py:221-223).
+- key: 76fae481860b23b9
+  path: src/elspeth/config_loading.py
+  qualname: load_settings_from_config_dict
+  exception: ValueError
+  message: Power Automate nonlive loading requires admitted archive context
+  ordinal: 0
+  disposition: not_authorable
+  note: Composer-generated settings have no run_mode or replay_from; yaml_importer rejects these invocation
+    concerns and web/execution/_validation_runtime.py also rejects nonlive modes before loading settings.
+    This guard admits only archive-bound Power Automate replay or verify invocations outside authoring.
 - key: 0ccae0b07c0d8a4b
   path: src/elspeth/config_loading.py
   qualname: load_settings_from_config_dict

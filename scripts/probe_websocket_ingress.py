@@ -18,7 +18,7 @@ import httpx
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
+from elspeth.contracts.json_parser import parse_json_strict
 
 _TERMINAL = {"completed", "failed", "cancelled"}
 

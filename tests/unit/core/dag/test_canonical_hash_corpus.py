@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ import pytest
 from elspeth.config_loading import load_settings
 from elspeth.core.canonical import compute_full_topology_hash
 from elspeth.core.dag import ExecutionGraph
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from tests.fixtures.declared_input_proof_pin import named_declared_input_proof
 
@@ -70,6 +72,8 @@ _PLACEHOLDER_ENV: dict[str, str] = {
     "AZURE_STORAGE_SAS_TOKEN": "placeholder-not-a-secret-AZURE_STORAGE_SAS_TOKEN",
     "CHAOSLLM_ENDURANCE_INPUT_PATH": "/placeholder-not-a-secret/CHAOSLLM_ENDURANCE_INPUT_PATH.jsonl",
     "OPENROUTER_API_KEY": "placeholder-not-a-secret-OPENROUTER_API_KEY",
+    "POWER_AUTOMATE_READ_TRIGGER_URL": "https://flows.example.test/read?sig=placeholder-not-a-secret-read",
+    "POWER_AUTOMATE_WRITE_TRIGGER_URL": "https://flows.example.test/write?sig=placeholder-not-a-secret-write",
 }
 
 
@@ -105,6 +109,11 @@ def _referenced_environment_variables() -> frozenset[str]:
 
 
 def _build_corpus(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, Any]]:
+    # Complete lazy vendor imports before clearing the environment. Some SDK
+    # imports load dotenv; cold discovery must not reintroduce operator values
+    # after the controlled placeholders have been installed.
+    get_shared_plugin_manager()
+    import_module("litellm")
     # Only the placeholders reach the build: an operator's real values (or a
     # loaded .env) must neither make an example buildable nor move a hash.
     for name in list(os.environ):

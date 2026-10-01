@@ -139,6 +139,7 @@ def build_interpretation_validation_inputs(
         usable_profile_aliases=copied_snapshot.usable_profile_aliases,
         selected_profile_aliases=copied_snapshot.selected_profile_aliases,
         control_modes=copied_snapshot.control_modes,
+        power_automate_allowed_origins=copied_snapshot.power_automate_allowed_origins,
         binding_generation_fingerprint=copied_snapshot.binding_generation_fingerprint,
         authority=copied_snapshot.authority,
     )

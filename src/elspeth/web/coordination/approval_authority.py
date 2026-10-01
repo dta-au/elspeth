@@ -55,6 +55,8 @@ EXCLUDED_EVIDENCE_FIELDS: Final = frozenset(
         "selected_implementations",
         "selected_profile_aliases",
         "plugin_code_identities",
+        # Exact origins already participate in the bound policy_hash.
+        "power_automate_allowed_origins",
         "decision_codes",
         "admission_decision",
     }

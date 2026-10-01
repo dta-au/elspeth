@@ -142,8 +142,9 @@ def test_multisource_admission_preserves_the_audited_source_order(corruption: st
     assert factory.execution.mock_calls == []
 
 
-def _quarantine_audit() -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
-    factory, source, row = _source_audit(payload={"_raw": "bad"})
+def _quarantine_audit(*, original: object = "bad") -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
+    payload = original if type(original) is dict else {"_raw": original}
+    factory, source, row = _source_audit(payload=payload)
     # Reuse the fixture's token-shaped record; do not introduce structural
     # stand-ins for the production failure record, which is nominally checked.
     token = copy.copy(row)
@@ -155,14 +156,14 @@ def _quarantine_audit() -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
     outcome.token_id = "source-token"
     outcome.sink_name = "quarantine"
     factory.data_flow.get_token_outcomes_for_row.return_value = [outcome]
-    factory.data_flow.get_validation_errors_for_row.return_value = [
+    factory.data_flow.get_validation_errors_for_run.return_value = [
         ValidationErrorRecord(
             error_id="error-1",
             run_id="previous-run",
             node_id="source-old",
             row_id="row-1",
-            row_hash=stable_hash("bad"),
-            row_data_json='"bad"',
+            row_hash=stable_hash(original),
+            row_data_json=json.dumps(original),
             error="bad value",
             schema_mode="fixed",
             destination="quarantine",
@@ -170,6 +171,21 @@ def _quarantine_audit() -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
         )
     ]
     return factory, source, row
+
+
+def test_generic_source_preserves_mapping_quarantine_without_validation_ledger() -> None:
+    """SourceRow permits a source's own quarantine decision without a ledger ID."""
+    original = {"value": "bad"}
+    factory, source, _row = _quarantine_audit(original=original)
+    factory.data_flow.get_validation_errors_for_run.return_value = []
+
+    audited = prepare_audited_sources(factory, "previous-run", {"primary": source})["primary"]
+
+    assert audited.rows[0].row == original
+    assert audited.rows[0].is_quarantined
+    assert audited.rows[0].validation_error_id is None
+    assert audited.validation_errors == ()
+    source.load.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -185,8 +201,8 @@ def _quarantine_audit() -> tuple[MagicMock, SimpleNamespace, SimpleNamespace]:
         ("exception-empty", "malformed source validation error evidence"),
         ("row-hash", "quarantine payload hash mismatch"),
         ("missing-validation", "ambiguous _raw quarantine payload"),
-        ("duplicate-validation", "ambiguous _raw quarantine payload"),
-        ("missing-validation-payload", "ambiguous _raw quarantine payload"),
+        ("duplicate-validation", "ambiguous quarantine validation evidence"),
+        ("missing-validation-payload", "payload or linkage is invalid"),
         ("divergent-validation", "quarantine payload disagrees with validation evidence"),
     ],
 )
@@ -194,7 +210,7 @@ def test_quarantine_admission_requires_one_complete_original_decision(corruption
     factory, source, row = _quarantine_audit()
     failure = factory.query.get_node_states_for_token.return_value[0]
     outcome = factory.data_flow.get_token_outcomes_for_row.return_value[0]
-    error = factory.data_flow.get_validation_errors_for_row.return_value[0]
+    error = factory.data_flow.get_validation_errors_for_run.return_value[0]
     if corruption == "duplicate-failure":
         factory.query.get_node_states_for_token.return_value.append(replace(failure, state_id="state-2"))
     elif corruption == "missing-error":
@@ -214,14 +230,16 @@ def test_quarantine_admission_requires_one_complete_original_decision(corruption
     elif corruption == "row-hash":
         row.source_data_hash = "f" * 64
     elif corruption == "missing-validation":
-        factory.data_flow.get_validation_errors_for_row.return_value = []
+        factory.data_flow.get_validation_errors_for_run.return_value = []
     elif corruption == "duplicate-validation":
-        factory.data_flow.get_validation_errors_for_row.return_value.append(replace(error, error_id="error-2"))
+        factory.data_flow.get_validation_errors_for_run.return_value.append(replace(error, error_id="error-2"))
     elif corruption == "missing-validation-payload":
-        factory.data_flow.get_validation_errors_for_row.return_value = [replace(error, row_data_json=None)]
+        factory.data_flow.get_validation_errors_for_run.return_value = [replace(error, row_data_json=None)]
     else:
         assert corruption == "divergent-validation"
-        factory.data_flow.get_validation_errors_for_row.return_value = [replace(error, row_data_json='"different"')]
+        factory.data_flow.get_validation_errors_for_run.return_value = [
+            replace(error, row_data_json='"different"', row_hash=stable_hash("different"))
+        ]
     retained_payload = dict(factory.query.get_row_data.return_value.data)
 
     with pytest.raises(AuditIntegrityError, match=reason):
@@ -236,8 +254,8 @@ def test_quarantine_admission_requires_one_complete_original_decision(corruption
 @pytest.mark.parametrize("original", ["bad", {"_raw": "bad"}], ids=["primitive", "single-key-dictionary"])
 def test_quarantine_reconstruction_distinguishes_identical_stored_payloads(original: object) -> None:
     factory, source, _row = _quarantine_audit()
-    error = factory.data_flow.get_validation_errors_for_row.return_value[0]
-    factory.data_flow.get_validation_errors_for_row.return_value = [
+    error = factory.data_flow.get_validation_errors_for_run.return_value[0]
+    factory.data_flow.get_validation_errors_for_run.return_value = [
         replace(error, row_data_json=json.dumps(original), row_hash=stable_hash(original))
     ]
 
@@ -248,6 +266,8 @@ def test_quarantine_reconstruction_distinguishes_identical_stored_payloads(origi
     assert audited.rows[0].source_row_index == 5
     assert audited.rows[0].quarantine_error == "bad value"
     assert audited.rows[0].quarantine_destination == "quarantine"
+    assert audited.rows[0].validation_error_id == error.error_id
+    assert audited.validation_errors == tuple(factory.data_flow.get_validation_errors_for_run.return_value)
     source.load.assert_not_called()
 
 

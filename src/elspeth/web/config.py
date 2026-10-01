@@ -22,6 +22,7 @@ from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.core.config import PayloadStoreSettings, RateLimitSettings
 from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.core.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.infrastructure.power_automate import normalize_allowed_origin
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     BEDROCK_GUARDRAIL_PLUGIN_IDS,
     BedrockGuardrailProfileSettings,
@@ -503,6 +504,7 @@ class WebSettings(BaseModel):
     # Universal web plugin policy.  These user-facing Pydantic values are
     # converted immediately to RuntimeWebPluginConfig before consumption.
     plugin_allowlist: tuple[str, ...] = ()
+    power_automate_allowed_origins: tuple[str, ...] = ()
     plugin_preferences: Mapping[PluginCapability, tuple[str, ...]] = Field(default_factory=dict)
     plugin_control_modes: Mapping[PluginCapability, ControlMode] = Field(
         default_factory=lambda: {
@@ -948,6 +950,16 @@ class WebSettings(BaseModel):
         if reserved:
             raise ValueError(f"server_secret_allowlist entries must not start with {SERVER_SECRET_RESERVED_PREFIX}: {sorted(reserved)}")
         return validated
+
+    @field_validator("power_automate_allowed_origins")
+    @classmethod
+    def _validate_power_automate_allowed_origins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized = tuple(normalize_allowed_origin(value) for value in values)
+        if any(_is_loopback_or_private_origin(value) for value in normalized):
+            raise ValueError("power_automate_allowed_origins requires public HTTPS443 origins")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("power_automate_allowed_origins contains duplicate origins")
+        return tuple(sorted(normalized))
 
     @field_validator("llm_profiles")
     @classmethod
@@ -1454,6 +1466,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "sso_endpoint_origins",
         "sso_admin_subjects",
         "plugin_allowlist",
+        "power_automate_allowed_origins",
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
         "aws_textract_profiles",
@@ -1597,6 +1610,7 @@ def settings_from_env() -> WebSettings:
     except ValidationError as error:
         policy_fields = {
             "plugin_allowlist",
+            "power_automate_allowed_origins",
             "plugin_preferences",
             "plugin_control_modes",
             "llm_profiles",

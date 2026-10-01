@@ -501,6 +501,7 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
             SinkEffectExecutionPurpose,
             SinkEffectInputKind,
         )
+        from elspeth.contracts.enums import RunMode
         from elspeth.engine.orchestrator import PipelineConfig
         from elspeth.engine.orchestrator.preflight import validate_pipeline_sink_effect_capabilities
 
@@ -512,6 +513,7 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
             config.sinks = {}
             config.sink_effect_modes = {}
             config.sink_effect_admission = None
+            config.sink_effect_bindings = {}
             return config
         if type(config) is not PipelineConfig:
             return config
@@ -536,6 +538,8 @@ def _freeze_runtime_val_registries_before_begin_run(monkeypatch: pytest.MonkeyPa
             config.sinks,
             configured_modes=modes,
             required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+            runtime_bindings=config.sink_effect_bindings,
+            run_mode=RunMode(config.config["run_mode"] if "run_mode" in config.config else RunMode.LIVE),
         )
         return replace(config, sink_effect_modes=modes, sink_effect_admission=admission)
 

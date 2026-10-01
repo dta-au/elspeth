@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elspeth.dev/schemas/power-automate/v1/read",
+  "type": "object",
+  "properties": {
+    "protocol": {
+      "const": "elspeth.power-automate.v1"
+    },
+    "operation": {
+      "const": "read"
+    },
+    "query": {
+      "$ref": "#/$defs/credentialFreeObject"
+    },
+    "snapshot_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "x-maxUtf8Bytes": 256,
+          "pattern": "\\S"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cursor": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "x-maxUtf8Bytes": 4096,
+          "pattern": "\\S"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "page_size": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+    }
+  },
+  "required": [
+    "protocol",
+    "operation",
+    "query",
+    "snapshot_id",
+    "cursor",
+    "page_size"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "credentialFreeObject": {
+      "type": "object",
+      "propertyNames": {
+        "not": {
+          "anyOf": [
+            {
+              "pattern": "(^|[^0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\u212a])(?:[Aa][Cc][Cc][Ee][Ss][Ss][Tt][Oo][Kk\u212a][Ee][Nn]|[Aa][Pp][Ii][Kk\u212a][Ee][Yy]|[Aa][Uu][Tt][Hh]|[Aa][Uu][Tt][Hh][Kk\u212a][Ee][Yy]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Aa][Uu][Tt][Hh][Tt][Oo][Kk\u212a][Ee][Nn]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Kk\u212a][Ee][Yy]|[Pp][Aa][Ss][Ss]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Ss][Ii][Dd]|[Ss][Ii][Gg]|[Ss][Ii][Gg][Nn][Aa][Tt][Uu][Rr][Ee]|[Tt][Oo][Kk\u212a][Ee][Nn])([^0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz\u0130\u212a]|$)"
+            },
+            {
+              "pattern": "^(?:[Aa][Pp][Ii]\\-[Kk\u212a][Ee][Yy]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Oo][Oo][Kk\u212a][Ii][Ee]|[Oo][Cc][Pp]\\-[Aa][Pp][Ii][Mm]\\-[Ss][Uu][Bb][Ss][Cc][Rr][Ii][Pp][Tt][Ii][Oo][Nn]\\-[Kk\u212a][Ee][Yy]|[Pp][Rr][Oo][Xx][Yy]\\-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Pp][Rr][Oo][Xx][Yy]\\-[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Ss][Ee][Tt]\\-[Cc][Oo][Oo][Kk\u212a][Ii][Ee]|[Ww][Ww][Ww]\\-[Aa][Uu][Tt][Hh][Ee][Nn][Tt][Ii][Cc][Aa][Tt][Ee]|[Xx]\\-[Aa][Cc][Cc][Ee][Ss][Ss]\\-[Tt][Oo][Kk\u212a][Ee][Nn]|[Xx]\\-[Aa][Pp][Ii]\\-[Kk\u212a][Ee][Yy]|[Xx]\\-[Aa][Uu][Tt][Hh]\\-[Tt][Oo][Kk\u212a][Ee][Nn]|[Xx]\\-[Cc][Ss][Rr][Ff]\\-[Tt][Oo][Kk\u212a][Ee][Nn]|[Xx]\\-[Xx][Ss][Rr][Ff]\\-[Tt][Oo][Kk\u212a][Ee][Nn]|[Xx][Aa][Cc][Cc][Ee][Ss][Ss][Tt][Oo][Kk\u212a][Ee][Nn]|[Xx][Aa][Pp][Ii][Kk\u212a][Ee][Yy]|[Xx][Aa][Uu][Tt][Hh]|[Xx][Aa][Uu][Tt][Hh][Kk\u212a][Ee][Yy]|[Xx][Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Xx][Aa][Uu][Tt][Hh][Tt][Oo][Kk\u212a][Ee][Nn]|[Xx][Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Xx][Kk\u212a][Ee][Yy]|[Xx][Pp][Aa][Ss][Ss]|[Xx][Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Xx][Pp][Ww][Dd]|[Xx][Ss][Ee][Cc][Rr][Ee][Tt]|[Xx][Ss][Ii][Dd]|[Xx][Ss][Ii][Gg]|[Xx][Ss][Ii][Gg][Nn][Aa][Tt][Uu][Rr][Ee]|[Xx][Tt][Oo][Kk\u212a][Ee][Nn])(?![\\s\\S])"
+            },
+            {
+              "pattern": "^(?:[Aa][Cc][Cc][Ee](?:[Ss\u017f][Ss\u017f]\\-[Tt][Oo][Kk\u212a][Ee][Nn]|[\u00df\u1e9e]\\-[Tt][Oo][Kk\u212a][Ee][Nn])|[Aa][Cc][Cc][Ee](?:[Ss\u017f][Ss\u017f]_[Tt][Oo][Kk\u212a][Ee][Nn]|[\u00df\u1e9e]_[Tt][Oo][Kk\u212a][Ee][Nn])|[Aa][Pp][Ii]\\-[Kk\u212a][Ee][Yy]|[Aa][Pp][Ii]_[Kk\u212a][Ee][Yy]|[Aa][Pp][Ii][Kk\u212a][Ee][Yy]|[Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]|[Cc][Ll][Ii][Ee][Nn][Tt]\\-[Ss\u017f][Ee][Cc][Rr][Ee][Tt]|[Cc][Ll][Ii][Ee][Nn][Tt]_[Ss\u017f][Ee][Cc][Rr][Ee][Tt]|[Cc][Oo][Dd][Ee]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]|[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll][Ss\u017f]|[Pp][Aa](?:[Ss\u017f][Ss\u017f][Ww][Oo][Rr][Dd]|[\u00df\u1e9e][Ww][Oo][Rr][Dd])|[Rr][Ee][Ff][Rr][Ee][Ss\u017f][Hh]\\-[Tt][Oo][Kk\u212a][Ee][Nn]|[Rr][Ee][Ff][Rr][Ee][Ss\u017f][Hh]_[Tt][Oo][Kk\u212a][Ee][Nn]|[Ss\u017f][Ee][Cc][Rr][Ee][Tt]|[Ss\u017f][Ee][Cc][Rr][Ee][Tt]\\-[Rr][Ee][Ff]|[Ss\u017f][Ee][Cc][Rr][Ee][Tt]\\-[Ss\u017f][Cc][Oo][Pp][Ee]|[Ss\u017f][Ee][Cc][Rr][Ee][Tt]_[Rr][Ee][Ff]|[Ss\u017f][Ee][Cc][Rr][Ee][Tt]_[Ss\u017f][Cc][Oo][Pp][Ee]|[Ss\u017f][Ii][Gg]|[Ss\u017f][Ii][Gg][Nn][Aa][Tt][Uu][Rr][Ee]|[Tt][Oo][Kk\u212a][Ee][Nn])(?![\\s\\S])"
+            }
+          ]
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/credentialFreeValue"
+      }
+    },
+    "credentialFreeValue": {
+      "anyOf": [
+        {
+          "type": [
+            "null",
+            "boolean",
+            "number"
+          ]
+        },
+        {
+          "type": "string",
+          "not": {
+            "pattern": "\\$\\{"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/credentialFreeValue"
+          }
+        },
+        {
+          "$ref": "#/$defs/credentialFreeObject"
+        }
+      ]
+    }
+  },
+  "description": "Read request with recursive credential-free query data. UTF-8 identifier byte limits and maximum JSON depth 64 are supplementary runtime checks; x-maxUtf8Bytes is an annotation."
+}

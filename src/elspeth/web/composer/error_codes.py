@@ -131,6 +131,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "pipeline_cycle",
         "pipeline_decision_unregistered",
         "plugin_options_invalid",
+        "power_automate_origin_not_allowed",
         "prompt_template_parts_required",
         "prompt_template_unbound_variables",
         "field_name_header_spelling",

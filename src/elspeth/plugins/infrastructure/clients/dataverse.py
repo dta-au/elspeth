@@ -23,6 +23,7 @@ import structlog
 from pydantic import BaseModel, Field, model_validator
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.core.security.web import NetworkError, SSRFBlockedError, SSRFSafeRequest, validate_url_for_ssrf
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.infrastructure.clients.fingerprinting import (
@@ -30,7 +31,6 @@ from elspeth.plugins.infrastructure.clients.fingerprinting import (
     fingerprint_headers,
     fingerprint_url,
 )
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
 
 if TYPE_CHECKING:
     from typing import Self

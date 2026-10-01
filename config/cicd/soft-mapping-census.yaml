@@ -19,7 +19,7 @@ files:
   src/elspeth/composer_mcp/session.py:
     dict[str, Any]: 2
   src/elspeth/config_loading.py:
-    Mapping[str, object]: 1
+    Mapping[str, object]: 2
     boundary: 2
   src/elspeth/contracts/audit.py:
     Mapping[str, object]: 3
@@ -37,7 +37,7 @@ files:
     dict[str, Any]: 7
   src/elspeth/contracts/call_data.py:
     Mapping[str, Any]: 8
-    dict[str, Any]: 15
+    dict[str, Any]: 17
   src/elspeth/contracts/call_mode.py:
     Mapping[str, Any]: 15
   src/elspeth/contracts/chat_parts.py:
@@ -77,6 +77,8 @@ files:
   src/elspeth/contracts/export_records.py:
     dict[str, Any]: 1
     dict[str, object]: 1
+  src/elspeth/contracts/json_parser.py:
+    dict[str, Any]: 2
   src/elspeth/contracts/node_state_context.py:
     dict[str, Any]: 9
   src/elspeth/contracts/plugin_assistance.py:
@@ -109,6 +111,8 @@ files:
   src/elspeth/contracts/secret_scrub.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
+  src/elspeth/contracts/sink_effect_http.py:
+    Mapping[str, object]: 1
   src/elspeth/contracts/sink_effects.py:
     Mapping[str, object]: 15
     boundary: 1
@@ -274,7 +278,7 @@ files:
   src/elspeth/engine/orchestrator/audit_export_effects.py:
     Mapping[str, object]: 1
   src/elspeth/engine/orchestrator/call_mode_session.py:
-    Mapping[str, Any]: 16
+    Mapping[str, Any]: 17
     dict[str, Any]: 1
     dict[str, object]: 1
   src/elspeth/engine/orchestrator/preflight.py:
@@ -290,6 +294,10 @@ files:
     dict[str, Any]: 1
   src/elspeth/engine/orchestrator/source_compatibility.py:
     dict[str, Any]: 1
+  src/elspeth/engine/orchestrator/source_read_verification.py:
+    Mapping[str, Any]: 1
+    Mapping[str, object]: 1
+    dict[str, object]: 2
   src/elspeth/engine/orchestrator/types.py:
     Mapping[str, Any]: 1
     dict[str, Any]: 1
@@ -330,11 +338,11 @@ files:
   src/elspeth/plugins/infrastructure/clients/http.py:
     Mapping[str, Any]: 16
     dict[str, Any]: 2
-  src/elspeth/plugins/infrastructure/clients/json_utils.py:
-    dict[str, Any]: 2
   src/elspeth/plugins/infrastructure/clients/llm.py:
     Mapping[str, Any]: 3
     dict[str, Any]: 1
+  src/elspeth/plugins/infrastructure/clients/power_automate.py:
+    Mapping[str, object]: 3
   src/elspeth/plugins/infrastructure/clients/replayer.py:
     Mapping[str, Any]: 2
     dict[str, Any]: 6
@@ -347,6 +355,8 @@ files:
     dict[str, Any]: 4
   src/elspeth/plugins/infrastructure/clients/retrieval/types.py:
     dict[str, Any]: 1
+  src/elspeth/plugins/infrastructure/clients/vendor_logging.py:
+    Mapping[str, object]: 1
   src/elspeth/plugins/infrastructure/clients/verifier.py:
     Mapping[str, Any]: 12
     dict[str, Any]: 2
@@ -359,6 +369,11 @@ files:
   src/elspeth/plugins/infrastructure/pooling/executor.py:
     Mapping[str, Any]: 5
     dict[str, Any]: 1
+  src/elspeth/plugins/infrastructure/power_automate.py:
+    Mapping[str, object]: 1
+  src/elspeth/plugins/infrastructure/power_automate_nonlive.py:
+    Mapping[str, object]: 5
+    dict[str, object]: 1
   src/elspeth/plugins/infrastructure/probe_factory.py:
     Mapping[str, Any]: 1
   src/elspeth/plugins/infrastructure/runtime_factory.py:
@@ -416,6 +431,10 @@ files:
   src/elspeth/plugins/sinks/json_sink.py:
     Mapping[str, object]: 2
     dict[str, Any]: 2
+  src/elspeth/plugins/sinks/power_automate.py:
+    Mapping[str, object]: 1
+    dict[str, Any]: 4
+    dict[str, object]: 6
   src/elspeth/plugins/sinks/text_sink.py:
     Mapping[str, object]: 1
     dict[str, Any]: 3
@@ -443,6 +462,8 @@ files:
     dict[str, Any]: 6
   src/elspeth/plugins/sources/null_source.py:
     dict[str, Any]: 1
+  src/elspeth/plugins/sources/power_automate.py:
+    dict[str, Any]: 2
   src/elspeth/plugins/sources/text_source.py:
     Mapping[str, object]: 1
     dict[str, Any]: 2
@@ -1032,10 +1053,10 @@ files:
     Mapping[str, Any]: 13
     dict[str, Any]: 1
 totals:
-  Mapping[str, Any]: 738
-  Mapping[str, object]: 297
+  Mapping[str, Any]: 740
+  Mapping[str, object]: 311
   MutableMapping[str, Any]: 8
   boundary: 59
-  dict[str, Any]: 1061
-  dict[str, object]: 380
-  soft: 2484
+  dict[str, Any]: 1069
+  dict[str, object]: 389
+  soft: 2517

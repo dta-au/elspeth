@@ -277,7 +277,7 @@ def test_missing_source_run_refused_before_json_client_package_import(tmp_path: 
     original_import = builtins.__import__
 
     def guarded_import(name: str, *args: object, **kwargs: object) -> object:
-        if name == "elspeth.plugins.infrastructure.clients.json_utils":
+        if name == "elspeth.contracts.json_parser":
             raise AssertionError("client package imported before source-run admission")
         return original_import(name, *args, **kwargs)
 

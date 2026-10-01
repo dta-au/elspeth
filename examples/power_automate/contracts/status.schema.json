@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elspeth.dev/schemas/power-automate/v1/status",
+  "type": "object",
+  "properties": {
+    "protocol": {
+      "const": "elspeth.power-automate.v1"
+    },
+    "operation": {
+      "const": "status"
+    },
+    "delivery_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "payload_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    }
+  },
+  "required": [
+    "protocol",
+    "operation",
+    "delivery_id",
+    "payload_sha256"
+  ],
+  "additionalProperties": false
+}

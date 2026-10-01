@@ -49,6 +49,7 @@ _EXAMPLES_WITH_ENV_VARS: frozenset[str] = frozenset(
         "multi_query_assessment",
         "openrouter_multi_query_assessment",
         "openrouter_sentiment",
+        "power_automate",
         "schema_contracts_llm_assessment",
         "template_lookups",
     }

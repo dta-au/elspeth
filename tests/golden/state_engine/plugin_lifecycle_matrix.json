@@ -265,6 +265,40 @@
       "release_lane": "local"
     },
     {
+      "plugin_key": "sink:power_automate",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.power_automate",
+      "qualname": "PowerAutomateSink",
+      "source_path": "src/elspeth/plugins/sinks/power_automate.py",
+      "determinism": "external_call",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.power_automate:PowerAutomateSink",
+        "flush": "elspeth.plugins.sinks.power_automate:PowerAutomateSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.power_automate:PowerAutomateSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "member",
+      "sink_effect_modes": [
+        "write"
+      ],
+      "variants": [
+        "sas_url",
+        "service_principal",
+        "managed_identity"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "real-process-http",
+      "release_lane": "local"
+    },
+    {
       "plugin_key": "sink:text",
       "kind": "sink",
       "module": "elspeth.plugins.sinks.text_sink",
@@ -526,6 +560,36 @@
         "PB-09"
       ],
       "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "source:power_automate",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.power_automate",
+      "qualname": "PowerAutomateSource",
+      "source_path": "src/elspeth/plugins/sources/power_automate.py",
+      "determinism": "external_call",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sources.power_automate:PowerAutomateSource",
+        "load": "elspeth.plugins.sources.power_automate:PowerAutomateSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.power_automate:PowerAutomateSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "sas_url",
+        "service_principal",
+        "managed_identity"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "real-process-http",
       "release_lane": "local"
     },
     {

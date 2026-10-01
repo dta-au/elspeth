@@ -545,6 +545,7 @@ class TestQuarantinedRowsAdvanceCoalesceDeadlines:
 
         source = MagicMock(spec=SourceProtocol)
         source.name = "fake"
+        source.config = {}
         source.on_success = "default"
         sink = MagicMock(spec=SinkProtocol)
         sink.name = "default"

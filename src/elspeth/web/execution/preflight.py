@@ -309,6 +309,8 @@ def preflight_runtime_sink_effects(
         sinks,
         configured_modes=modes,
         required_input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        runtime_bindings=bindings,
+        run_mode=settings.run_mode,
     )
     return sinks, modes, admission
 

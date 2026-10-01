@@ -3110,6 +3110,8 @@ def sanitize_node_config_for_audit(
     settings tree handled by ``_fingerprint_config_for_audit``. Keep the
     placement-specific database DSN rule here with the rest of the audit
     sanitization policy so repositories only persist the resulting payload.
+    Power Automate credentials require HMAC fingerprints even in development
+    mode, because their safe config also binds durable external effects.
     """
     import os
 
@@ -3118,7 +3120,7 @@ def sanitize_node_config_for_audit(
         raise TypeError(f"Node config must thaw to dict[str, object], got {type(thawed).__name__}: {thawed!r}")
 
     allow_raw = "ELSPETH_ALLOW_RAW_SECRETS" in os.environ and os.environ["ELSPETH_ALLOW_RAW_SECRETS"].lower() == "true"
-    sanitized = _fingerprint_secrets(thawed, fail_if_no_key=not allow_raw)
+    sanitized = _fingerprint_secrets(thawed, fail_if_no_key=plugin_name == "power_automate" or not allow_raw)
     if plugin_name == "database":
         # Node config is flat: the DSN sits at top-level `url`.
         _sanitize_dsn_option_for_audit(
@@ -3201,13 +3203,19 @@ def _fingerprint_config_for_audit(
     if "sources" in config and type(config["sources"]) is dict:
         for source in config["sources"].values():
             if type(source) is dict and "options" in source and type(source["options"]) is dict:
-                source["options"] = _fingerprint_secrets(source["options"], fail_if_no_key=fail_if_no_key)
+                source["options"] = _fingerprint_secrets(
+                    source["options"],
+                    fail_if_no_key=fail_if_no_key or ("plugin" in source and source["plugin"] == "power_automate"),
+                )
 
     # === Sink options ===
     if "sinks" in config and type(config["sinks"]) is dict:
         for sink in config["sinks"].values():
             if type(sink) is dict and "options" in sink and type(sink["options"]) is dict:
-                options = _fingerprint_secrets(sink["options"], fail_if_no_key=fail_if_no_key)
+                options = _fingerprint_secrets(
+                    sink["options"],
+                    fail_if_no_key=fail_if_no_key or ("plugin" in sink and sink["plugin"] == "power_automate"),
+                )
                 if "plugin" in sink and sink["plugin"] == "database":
                     # Database sink URLs are a plugin-specific secret-ref placement:
                     # the field is named "url" rather than a heuristic secret name.

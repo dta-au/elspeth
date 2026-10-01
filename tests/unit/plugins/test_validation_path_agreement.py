@@ -491,6 +491,18 @@ _TRANSFORM_REJECTION_CASES = [
 ]
 
 _SOURCE_REJECTION_CASES = [
+    pytest.param(
+        "power_automate",
+        {
+            "auth": {"method": "managed_identity", "client_id": "agreement-client"},
+            "trigger_url": "https://flows.example.org/read",
+            "allowed_origin": "https://another.example.org",
+            "schema": _make_observed_schema(),
+            "on_validation_failure": "discard",
+        },
+        "origin_mismatch",
+        id="power_automate-origin-mismatch",
+    ),
     # ── AWS S3 source ───────────────────────────────────────────────────
     pytest.param(
         "aws_s3",
@@ -556,6 +568,18 @@ _SOURCE_REJECTION_CASES = [
 ]
 
 _SINK_REJECTION_CASES = [
+    pytest.param(
+        "power_automate",
+        {
+            "auth": {"method": "managed_identity", "client_id": "agreement-client"},
+            "trigger_url": "https://flows.example.org/write",
+            "allowed_origin": "https://flows.example.org",
+            "fields": ["result"],
+            "schema": _make_observed_schema(),
+        },
+        "selected_fields_must_be_required_input",
+        id="power_automate-selected-field-not-required",
+    ),
     # ── AWS S3 sink ─────────────────────────────────────────────────────
     pytest.param(
         "aws_s3",

@@ -405,7 +405,7 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
         ),
         (SinkEffectCommitResult, ("descriptor", "evidence", "accepted_ordinals", "diverted_ordinals")),
         (SinkEffectReconcileResult, ("kind", "descriptor", "evidence", "accepted_ordinals", "diverted_ordinals")),
-        (RestrictedSinkEffectContext, ("run_id", "run_started_at", "operation_id", "sink_node_id")),
+        (RestrictedSinkEffectContext, ("run_id", "run_started_at", "operation_id", "sink_node_id", "http_post")),
     ],
 )
 def test_public_value_objects_have_exact_field_shapes(record_type: type[object], expected_fields: tuple[str, ...]) -> None:

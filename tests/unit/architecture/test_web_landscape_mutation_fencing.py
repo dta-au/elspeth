@@ -928,7 +928,10 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # TokenManager.create_token_for_existing_row -> create_token), moved 0 — the QR arrival
 # and departures named above. Measured by scripts/fencing_inventory.py --baseline
 # against a git archive of a375d7f13.
-_EXPECTED_CALL_COUNT = 286
+# Power Automate: measured against the release parent of 05af04770. One arrival:
+# PowerAutomateSource._reject_candidate -> ctx.record_validation_error. The remaining
+# 286 caller identities are unchanged (no departures or moves).
+_EXPECTED_CALL_COUNT = 287
 # Release integration retains the ACA callers and the Dataverse lifecycle
 # wrapper: six validation writes move from load() to _load_rows().
 # AGG-ERROR-EDGE: 0b7a9382… -> d82c45a5…, the one caller added above.
@@ -945,7 +948,7 @@ _EXPECTED_CALL_COUNT = 286
 # a00408f8… (the arrival and departures named at _EXPECTED_CALL_COUNT).
 # QR merged with release/0.8.1: 72e3db35… (release) -> the value below, the arrival
 # and departures named at _EXPECTED_CALL_COUNT.
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "2be2a394f3d500e08b4af400dd259c4f56720894d7692789d9c35c4c66f76f6c"
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "584288fd1e0aae2ff9dc879b809b169e3ef5cd06c062e603d3a762d1a79da2fc"
 # C4 (recorded FAILED verdict): 138 -> 143, d3b83b4c… -> the value below. Arrived:
 # ExecutionRepository.complete_aggregation_failure -> insert_batch_transform_errors_on,
 # -> NodeStateRepository.record_routing_event_on, -> NodeStateRepository.complete_node_state_on,

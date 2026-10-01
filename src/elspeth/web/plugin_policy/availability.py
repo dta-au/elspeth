@@ -102,6 +102,9 @@ def build_plugin_snapshot(
             unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.NOT_INSTALLED))
             continue
         summary = catalog_items[plugin_id]
+        if plugin_id.name == "power_automate" and plugin_id.kind in ("source", "sink") and not policy.power_automate_allowed_origins:
+            unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING))
+            continue
         if summary.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED:
             profile_states = profiles.profile_availability(
                 plugin_id,
@@ -181,6 +184,7 @@ def build_plugin_snapshot(
         selected_profile_aliases=tuple(selected_profile_aliases),
         binding_generation_fingerprint=fingerprint,
         control_modes=policy.control_modes,
+        power_automate_allowed_origins=policy.power_automate_allowed_origins,
     )
 
 

@@ -224,6 +224,23 @@ def _mapper(
     )
 
 
+def test_power_automate_source_to_llm_keeps_ordinary_shield_requirement() -> None:
+    from elspeth.web.interpretation_state import prompt_shield_recommendation_warning_pairs
+
+    unshielded = _state(_llm())
+    source_name, source = next(iter(unshielded.sources.items()))
+    unshielded = replace(unshielded, sources={source_name: replace(source, plugin="power_automate")})
+    findings = control_coverage_findings(unshielded, PluginCapability.PROMPT_SHIELD)
+    assert any(finding.reason == "input_not_dominated" for finding in findings)
+    assert prompt_shield_recommendation_warning_pairs(unshielded)
+
+    shielded = _state(_shield("shield", "raw", "llm_in"), _llm(), source_target="raw")
+    source_name, source = next(iter(shielded.sources.items()))
+    shielded = replace(shielded, sources={source_name: replace(source, plugin="power_automate")})
+    assert control_coverage_findings(shielded, PluginCapability.PROMPT_SHIELD) == ()
+    assert prompt_shield_recommendation_warning_pairs(shielded) == ()
+
+
 @pytest.mark.parametrize(
     ("state", "covered"),
     [

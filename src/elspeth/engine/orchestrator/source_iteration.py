@@ -59,6 +59,7 @@ from elspeth.engine.orchestrator.outcomes import (
 from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
 from elspeth.engine.orchestrator.run_state import AggNodeEntry, LoopContext, LoopResult
 from elspeth.engine.orchestrator.source_lifecycle_recorder import SourceLifecycleRecorder
+from elspeth.engine.orchestrator.source_read_verification import source_load_input_data
 from elspeth.engine.orchestrator.source_replay import AuditedSource, replay_source_rows
 from elspeth.engine.orchestrator.source_snapshot import (
     SOURCE_SNAPSHOT_MAX_BYTES,
@@ -603,7 +604,7 @@ class SourceIterationDriver:
                     node_id=source_id,
                     operation_type="source_load",
                     ctx=ctx,
-                    input_data={"source_plugin": active_source.name, "snapshot_for_resume": True},
+                    input_data={**source_load_input_data(active_source), "snapshot_for_resume": True},
                 ) as snapshot_operation,
             ):
                 content = encode_source_snapshot(
@@ -653,7 +654,7 @@ class SourceIterationDriver:
                 node_id=source_id,
                 operation_type="source_load",
                 ctx=ctx,
-                input_data={"source_plugin": active_source.name},
+                input_data=source_load_input_data(active_source),
             )
         )
         with (

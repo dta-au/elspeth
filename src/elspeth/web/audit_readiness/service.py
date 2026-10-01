@@ -348,6 +348,7 @@ def build_boot_plugin_policy_readiness(
         usable_profile_aliases=((llm_id, configured_aliases),),
         selected_profile_aliases=((llm_id, tutorial_profile),),
         control_modes=policy.control_modes,
+        power_automate_allowed_origins=policy.power_automate_allowed_origins,
         binding_generation_fingerprint=policy.policy_hash,
     )
     return build_plugin_policy_readiness(

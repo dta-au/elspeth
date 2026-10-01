@@ -9,7 +9,7 @@ from typing import Final, Literal, TypedDict, get_args
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
-from elspeth.plugins.infrastructure.clients.json_utils import parse_json_strict
+from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.web.validation import _PII_WARNING_PATTERNS
 
 AdvisorFindingCategory = Literal["request_not_met", "error_handling", "prompt_defect", "schema_mismatch", "other"]

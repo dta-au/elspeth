@@ -22,9 +22,16 @@ from typing import ClassVar, Literal, Protocol, cast, overload
 from elspeth.contracts.audit import SinkEffect, SinkEffectAttempt, SinkEffectMemberRecord
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import CallType
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, canonical_json_loads, stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
+from elspeth.contracts.sink_effect_http import (
+    SinkEffectHTTPBindContext,
+    SinkEffectHTTPEnvironment,
+    SinkEffectHTTPPost,
+    SinkEffectHTTPPostFactory,
+)
 from elspeth.contracts.sink_effects import (
     MemberSinkEffectCapability,
     RestagingSinkEffectCapability,
@@ -291,6 +298,8 @@ class SinkEffectCoordinator:
         shutdown_event: threading.Event | None = None,
         check_coordination_latch: Callable[[], None] | None = None,
         make_shutdown_error: Callable[[], BaseException] | None = None,
+        http_post_factory: SinkEffectHTTPPostFactory | None = None,
+        http_environment: SinkEffectHTTPEnvironment | None = None,
     ) -> None:
         if not isinstance(factory, RecorderFactory):
             raise TypeError("factory must be RecorderFactory")
@@ -322,6 +331,14 @@ class SinkEffectCoordinator:
         self._shutdown_event = shutdown_event
         self._check_coordination_latch = check_coordination_latch
         self._make_shutdown_error = make_shutdown_error
+        if (http_post_factory is None) != (http_environment is None):
+            raise TypeError("HTTP factory and environment must be supplied together")
+        if http_post_factory is not None and not isinstance(http_post_factory, SinkEffectHTTPPostFactory):
+            raise TypeError("http_post_factory must be a nominal SinkEffectHTTPPostFactory")
+        if http_environment is not None and type(http_environment) is not SinkEffectHTTPEnvironment:
+            raise TypeError("http_environment must be exact SinkEffectHTTPEnvironment")
+        self._http_post_factory = http_post_factory
+        self._http_environment = http_environment
 
     def execute(
         self,
@@ -555,6 +572,53 @@ class SinkEffectCoordinator:
         """Poll caller authority immediately before an external-effect cohort."""
         if self._check_coordination_latch is not None:
             self._check_coordination_latch()
+
+    def _member_attempt_context(
+        self,
+        ctx: RestrictedSinkEffectContext,
+        heartbeat: _SinkEffectLeaseHeartbeat,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> tuple[RestrictedSinkEffectContext, Callable[[], None] | None]:
+        if self._http_post_factory is None:
+            return ctx, None
+        environment = self._http_environment
+        if environment is None:
+            raise FrameworkBugError("HTTP attempt is missing its executor environment")
+        active = threading.Event()
+        active.set()
+
+        def before_send() -> None:
+            if not active.is_set():
+                raise FrameworkBugError("HTTP attempt authority was revoked")
+            self._check_wait_interruptions()
+            heartbeat.refresh_and_check(coordination_token=coordination_token)
+            self._guard_external_effect()
+
+        try:
+            capability = self._require_attempt_http_post(
+                self._http_post_factory.bind(
+                    SinkEffectHTTPBindContext(
+                        recorder=self._factory.execution,
+                        run_id=ctx.run_id,
+                        operation_id=ctx.operation_id,
+                        coordination_token=coordination_token,
+                        telemetry_emit=environment.telemetry_emit,
+                        rate_limit_registry=environment.rate_limit_registry,
+                        before_send=before_send,
+                    )
+                )
+            )
+            return replace(ctx, http_post=capability), active.clear
+        except BaseException:
+            active.clear()
+            raise
+
+    @staticmethod
+    def _require_attempt_http_post(capability: object) -> SinkEffectHTTPPost:
+        if not isinstance(capability, SinkEffectHTTPPost):
+            raise FrameworkBugError("HTTP factory returned a non-nominal attempt capability")
+        return capability
 
     def _execute_effect(
         self,
@@ -906,12 +970,17 @@ class SinkEffectCoordinator:
         )
         self._guard_external_effect()
         started = time.monotonic()
+        revoke: Callable[[], None] | None = None
         try:
-            result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+            attempt_ctx, revoke = self._member_attempt_context(ctx, heartbeat, coordination_token=coordination_token)
+            result = sink.reconcile_member_effect(plan, member, effect_input, attempt_ctx)
             heartbeat.refresh_and_check(coordination_token=coordination_token)
         except BaseException:
             self._effects.mark_response_lost(attempt.attempt_id, coordination_token=coordination_token)
             raise
+        finally:
+            if revoke is not None:
+                revoke()
         self._effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
@@ -949,13 +1018,18 @@ class SinkEffectCoordinator:
         self._fault(SinkEffectExecutionSeam.BEFORE_EFFECT)
         self._guard_external_effect()
         started = time.monotonic()
+        revoke: Callable[[], None] | None = None
         try:
-            result = sink.commit_member_effect(plan, member, effect_input, ctx)
+            attempt_ctx, revoke = self._member_attempt_context(ctx, heartbeat, coordination_token=coordination_token)
+            result = sink.commit_member_effect(plan, member, effect_input, attempt_ctx)
             self._fault(SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN)
             heartbeat.refresh_and_check(coordination_token=coordination_token)
         except BaseException:
             self._effects.mark_response_lost(attempt.attempt_id, coordination_token=coordination_token)
             raise
+        finally:
+            if revoke is not None:
+                revoke()
         self._effects.record_attempt_result(
             SinkEffectAttemptResult(
                 attempt_id=attempt.attempt_id,
