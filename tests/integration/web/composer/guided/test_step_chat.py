@@ -1399,36 +1399,6 @@ class TestStepChatTransientFailure:
         assert body["guided_session"]["step"] == "step_1_source"
         assert body["guided_session"]["terminal"] is None
 
-    def test_litellm_guardrail_intervention_normal_string_returns_synthetic_message(self, composer_test_client: TestClient) -> None:
-        """GuardrailInterventionNormalStringError from the LLM seam → 200 with the synthetic message.
-
-        Fourth member of the elspeth-4cec1a03b9 named absorb set. The ticket
-        enumerates this class explicitly; its MRO is a direct ``Exception``
-        subclass (NOT a subclass of ``GuardrailRaisedException`` nor
-        ``APIError``), so before the catch-tuple widening it escaped
-        ``solve_step_chat_with_auto_drop`` to an unhandled 500 instead of the
-        synthetic-unavailable audit contract.
-        """
-        from litellm.exceptions import GuardrailInterventionNormalStringError
-
-        session_id = _create_session(composer_test_client)
-        _seed_guided_session(composer_test_client, session_id)
-
-        with patch(
-            _CHAT_SOLVER_ACOMPLETION,
-            new=_RaisingLiteLLMCompletion(GuardrailInterventionNormalStringError(message="intervention")),
-        ):
-            status, body = _post_chat(
-                composer_test_client,
-                session_id,
-                message="anything",
-            )
-
-        assert status == 200, body
-        assert body["assistant_message"] == "I'm unavailable right now; you can still use the wizard controls."
-        assert body["guided_session"]["step"] == "step_1_source"
-        assert body["guided_session"]["terminal"] is None
-
     def test_malformed_litellm_response_returns_synthetic_message(self, composer_test_client: TestClient) -> None:
         """Empty choices list (IndexError in solve_step_chat) → synthetic message."""
         session_id = _create_session(composer_test_client)

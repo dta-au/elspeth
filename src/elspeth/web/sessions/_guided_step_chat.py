@@ -70,7 +70,6 @@ def _provider_transient_exception_types() -> tuple[type[BaseException], ...]:
     from litellm.exceptions import (
         BlockedPiiEntityError,
         BudgetExceededError,
-        GuardrailInterventionNormalStringError,
         GuardrailRaisedException,
     )
 
@@ -81,7 +80,6 @@ def _provider_transient_exception_types() -> tuple[type[BaseException], ...]:
         BudgetExceededError,
         BlockedPiiEntityError,
         GuardrailRaisedException,
-        GuardrailInterventionNormalStringError,
         TimeoutError,
         IndexError,
         AttributeError,
@@ -1005,8 +1003,7 @@ async def solve_step_chat_with_auto_drop(
     ``composer/service.py``:
     ``LiteLLMAPIError``, ``LiteLLMAuthError``, ``LiteLLMBadRequestError``,
     plus the non-``APIError`` operational classes ``BudgetExceededError``,
-    ``BlockedPiiEntityError``, ``GuardrailRaisedException`` and
-    ``GuardrailInterventionNormalStringError`` (direct ``Exception``
+    ``BlockedPiiEntityError`` and ``GuardrailRaisedException`` (direct ``Exception``
     subclasses — provider budget / content-policy failures that must be
     absorbed, matching ``_explain_run_diagnostics``), and ``TimeoutError``
     for asyncio timeouts. ``IndexError``,
