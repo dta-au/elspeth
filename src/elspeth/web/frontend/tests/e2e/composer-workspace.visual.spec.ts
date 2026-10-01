@@ -88,6 +88,12 @@ async function openStableVisualScenario(
       await page.evaluate(async () => {
         await document.fonts.ready;
       });
+      // Inter's Latin subset omits the all-clear checkmark. Pin its fallback
+      // for screenshots: Ubuntu on a workstation and DejaVu Sans on CI have
+      // different glyph widths, which also move the adjacent Run tab.
+      await page.addStyleTag({
+        content: '.artifact-tab-badge--glyph { font-family: "Inter", "DejaVu Sans", sans-serif; }',
+      });
       await expect(createdComposer.checksTab()).toHaveAccessibleName(
         expectedTerminalChecksStatus(scenario),
       );
