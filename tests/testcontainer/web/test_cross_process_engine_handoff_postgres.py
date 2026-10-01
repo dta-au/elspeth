@@ -293,7 +293,7 @@ def test_sigkill_owner_recovers_same_run_once_in_new_process(engine_handoff_data
 def test_replaced_web_owner_with_live_landscape_seat_cannot_start_later_sink_effect(engine_handoff_databases, tmp_path: Path) -> None:
     session_url, landscape_url = engine_handoff_databases
     binding = _initialize(landscape_url, tmp_path)
-    engine, authority, context, _state_id = _prepare(session_url)
+    engine, authority, context, _state_id, _user_id = _prepare(session_url)
     try:
         with spawn_database_process_with_pause(
             database_url=landscape_url,
