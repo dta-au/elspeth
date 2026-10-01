@@ -23,6 +23,8 @@ Independent reviewers and Astra's final systems review found no remaining blocke
 
 The request-authority controls distinguish a valid acknowledgement handoff from an orphan. A saved well-formed requirement may receive real backend-generated review cards without a graph change: completion can hand off to the user while execution remains blocked. An unresolvable missing-wiring orphan blocks both. The authorized counterpart uses real tool acceptance and canonical server-owned requirement IDs; dispatch completion alone is insufficient evidence of repair.
 
+The broad Python run exposed three compound CSV assistance hints exceeding the existing short-hint contract. They were separated at sentence boundaries by subject, preserving their exact ordered text and every repair qualification. The 128 discovery and CSV guidance checks passed without changing the limit. The source fingerprint, 15 corpus provenance literals, production-observed resume projection and derived registry digest were regenerated from the resulting source; these bindings are consequences of the edit rather than constraints on its wording.
+
 The keyless trust-tier comparison measured 1,428 unique baseline diagnostics and 1,442 after repair, ignoring source-position shifts. The added patterns include external-data parsing boundaries, an admitted-response encoder invariant and three stale header-sampling entries. Eleven new uncovered sites have site-specific rationale drafts in the key-free `composer-all-findings-20261002` worklist. Operator adjudication and signatures remain pending; the worklist also contains the standing repository backlog and is not blanket signing clearance.
 
 ## Findings

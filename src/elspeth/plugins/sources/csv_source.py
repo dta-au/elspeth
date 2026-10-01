@@ -106,7 +106,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:16bf39d8c3cc36eb"
+    source_file_hash: str | None = "sha256:5a67572be967d4aa"
     # Structural observed-cell fact (elspeth-e6e552ce34): csv.reader yields
     # strings, and observed schemas preserve parsed cells untouched (module
     # docstring), so under mode: observed EVERY emitted cell is str by
@@ -690,14 +690,21 @@ class CSVSource(BaseSource):
                     "schemas coerce declared fields at the Tier-3 boundary. Malformed rows can be quarantined."
                 ),
                 composer_hints=(
-                    "Use schema.mode 'observed' when no explicit runtime field contract is required; if downstream transforms require uploaded columns, prefer 'flexible' with non-optional schema.fields. Use 'fixed' only for an explicitly required closed schema. To keep fewer columns, use a field_mapper downstream — a fixed source schema rejects extras rather than projecting them away.",
+                    "Use schema.mode 'observed' when no explicit runtime field contract is required; if downstream transforms require uploaded columns, prefer 'flexible' with non-optional schema.fields.",
+                    "Use 'fixed' only for an explicitly required closed schema. To keep fewer columns, use a field_mapper downstream — a fixed source schema rejects extras rather than projecting them away.",
                     "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode rejects rows that don't match, including unexpected columns; on_validation_failure routes them to quarantine or discards them with audit.",
                     "Decide whether the CSV is headered: without columns CSVSource treats the first non-skipped row as headers; for headerless data set columns=[...] so the first data row stays data. Do not copy a header row into inline source data unless it is real headered CSV.",
                     "If you have been asked to generate CSV rows yourself (the invented_source path): always emit a header row as the first non-skipped line of the generated CSV, and always leave the `columns` option unset so CSVSource treats your first row as headers.",
-                    "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id, case_study_ -> case_study). Leading/trailing underscores are stripped. inspect_source returns raw observed_headers, runtime_headers and field_name_mapping; declare the runtime name, or preserve an identifier via field_mapping: {case_study: case_study_}. Other declared names are rejected at config time.",
+                    "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id, case_study_ -> case_study). Leading/trailing underscores are stripped.",
+                    "inspect_source returns raw observed_headers, runtime_headers and field_name_mapping; declare the runtime name, or preserve an identifier via field_mapping: {case_study: case_study_}. Other declared names are rejected at config time.",
                     "When generating CSV rows yourself, declare the NORMALIZED form of those generated column names in `schema.fields` (or `schema.guaranteed_fields`) — or generate already-lowercase headers. The header row, the `columns` decision, and the schema must all agree.",
                     "Never generate headerless CSV — the audit trail and downstream contracts need the header to be self-describing.",
-                    "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a field contract. For uploaded/path-bound CSV, an inspected header is only a sample: you must not author schema.guaranteed_fields. Declare a flexible/fixed runtime contract with non-optional schema.fields, or retain observed mode and request_interpretation_review(kind='source_data_contract'), omit llm_draft, and let the user acknowledge the server-computed promise. This review requires the intended source and demanding consumers to be saved already; it cannot review a rejected candidate or a scaffold without those consumers. For a rejected full replacement, prefer an explicit runtime contract. Composer-authored content receives verified guarantees through source binding.",
+                    "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a field contract.",
+                    "For uploaded/path-bound CSV, an inspected header is only a sample: you must not author schema.guaranteed_fields.",
+                    "Declare a flexible/fixed runtime contract with non-optional schema.fields, or retain observed mode and request_interpretation_review(kind='source_data_contract'), omit llm_draft, and let the user acknowledge the server-computed promise.",
+                    "This review requires the intended source and demanding consumers to be saved already; it cannot review a rejected candidate or a scaffold without those consumers.",
+                    "For a rejected full replacement, prefer an explicit runtime contract.",
+                    "Composer-authored content receives verified guarantees through source binding.",
                     "CSV source options do not have url_field; if a downstream web_scrape needs URLs, keep the URL column in the CSV schema and set url_field on the web_scrape node.",
                     "If you authored CSV rows or chose source values for this CSV, bind the exact artifact as a blob-backed source, stage invented_source on source.options.interpretation_requirements.",
                     "Then call request_interpretation_review with affected_node_id='source' and omit llm_draft; the server uses the exact staged source draft, avoiding newline or escaping drift.",

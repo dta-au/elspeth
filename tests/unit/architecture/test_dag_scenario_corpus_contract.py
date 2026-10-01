@@ -964,7 +964,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "ce864e47072455449fc0498e7f0d5e39bf7f0fe25dd
 # Strict snapshot opt-in: csv/json source hashes moved; the exact projection
 # pins retain their behavior and the checkpoint full-history hash was measured
 # by the production harness. This digest comes from the canonical loader.
-EXPECTED_CASE_REGISTRY_SHA256 = "68ddc21d2be8e664599aeac5f55ad86d8eb093b395e6eaf794e0a6b49b993930"
+EXPECTED_CASE_REGISTRY_SHA256 = "5b90e5b4eef5e7fb7b7f3f509a7f9eb6b3d3e997d71c20570d80173427afc215"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
