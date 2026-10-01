@@ -12568,7 +12568,9 @@ class TestGetPluginAssistance:
         hints = " ".join(payload["composer_hints"])
 
         assert "columns tells CSVSource how to parse headerless rows" in hints
-        assert "downstream DAG validation still needs a schema guarantee" in hints
+        assert "downstream DAG validation still needs a field contract" in hints
+        assert "must not author schema.guaranteed_fields" in hints
+        assert "source_data_contract" in hints
         assert "schema.guaranteed_fields" in hints
         assert "CSV source options do not have url_field" in hints
         assert "set url_field on the web_scrape node" in hints

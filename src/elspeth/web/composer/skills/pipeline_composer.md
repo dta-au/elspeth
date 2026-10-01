@@ -542,7 +542,17 @@ ask a narrow column-identification question instead of fabricating a field.
 Declarations name a field as rows carry it. Headered sources normalize raw
 headers to lowercase identifiers (spaces and punctuation become `_`, a leading
 digit gains a `_` prefix, a Python keyword gains a `_` suffix), and
-`inspect_source`'s `observed_headers` are the RAW headers: header `Approved`
+`inspect_source`'s `observed_headers` are the RAW headers; for CSV,
+`runtime_headers` gives the actual row keys before any configured `field_mapping`,
+and `field_name_mapping` records original label to runtime name. Use those
+runtime names for declarations; `inferred_types` remains keyed by raw labels.
+Leading/trailing underscores are stripped: `Case Study_` and `case_study_`
+become `case_study`; to require the literal `case_study_` row key, configure
+`field_mapping: {case_study: case_study_}` and declare `case_study_` consistently.
+A null runtime-name projection means inspection cannot certify runtime names;
+read the warnings for header parsing, encoding, sample truncation, or normalization
+collisions. Resolve that issue before declaring fields; do not invent names or
+alter a valid label merely because the bounded sample cut its header. Header `Approved`
 is declared `approved`, `First Name` is `first_name`, `Price USD` is
 `price_usd`. A source `field_mapping` renames after normalizing: under
 `field_mapping: {name: b}` header `Name` is declared `b`, and `Name`, `NAME`
@@ -694,8 +704,13 @@ paragraphs.
 data cannot be checked up front** (uploaded files, path-bound, external fetch,
 continuous feeds — any bound source WITHOUT composer-authored content). When
 the pipeline requires fields from such a source (validation reports the
-edge-contract gap), the fix is the user's forward-looking promise, not your
-guess: call `request_interpretation_review(kind="source_data_contract",
+edge-contract gap), choose an explicit runtime contract when the required fields
+are known: source `schema.mode: flexible` with non-optional `fields` enforces
+them per row while accepting extra columns. Use `fixed` only when the user
+requires a closed schema. An inspected uploaded header is a bounded sample;
+you must not author `schema.guaranteed_fields` for uploaded or path-bound data.
+If observed mode is appropriate, the fix is the user's forward-looking promise:
+call `request_interpretation_review(kind="source_data_contract",
 affected_node_id="source"` or `"source:<name>",
 user_term="source_data_contract")` and OMIT `llm_draft` — the server computes
 the demanded field set from the graph (never supply a field list; a supplied
@@ -708,6 +723,17 @@ boundary evidence and stops the run. Rows the source quarantines during its
 own validation never reach this check. Do not call it for composer-authored bound
 blobs (the `invented_source` flow and bind-time auto-declare own those) or
 when validation reports no missing source fields.
+
+On a schema rejection, retain the prior valid graph and repair your rejected
+candidate using these rules. A saved report scaffold is incomplete until it
+uses the requested input and includes the requested assessment transforms;
+structural validation alone does not establish that the request is complete.
+The data-contract review reads the current saved graph, not a rejected
+replacement. Request it only when the intended source and demanding consumers
+are already saved with a pending source data-contract review site. If the
+saved graph is still a report scaffold, repair the full candidate using an
+explicit runtime contract; reviewing the scaffold cannot approve the rejected
+candidate's columns.
 
 Before any mutation that creates or updates an LLM prompt you wrote, inspect the
 prompt text you are about to put in `prompt_template`. If it asks the model to

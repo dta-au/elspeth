@@ -95,6 +95,9 @@ _REVIEWED_FORWARDERS: frozenset[tuple[str, str, str]] = frozenset(
         ("composer/provider_discovery_response.py", "to_wire", "code"),
         ("composer/provider_discovery_response.py", "to_wire", "self.error_code"),
         ("composer/tools/generation.py", "_execute_explain_validation_error", "code"),
+        # Conversation diagnostics forward only the leading persisted code
+        # after registry membership and public catalogue lookup succeed.
+        ("sessions/routes/_helpers.py", "_message_response", "projected.rejection.error_code"),
         # Not a producer: the redaction allowlist entry for the field itself.
         ("composer/redaction.py", "<module>", "REGISTERED_ERROR_CODES"),
         # --- Outside web/composer ---

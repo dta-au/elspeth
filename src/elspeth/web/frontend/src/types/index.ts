@@ -110,6 +110,11 @@ export interface ToolCall {
   outcome?: "applied" | "rejected" | "failed" | "cancelled" | "completed";
   /** Composition-state version this call created; only with outcome "applied". */
   applied_state_version?: number | null;
+  /** Public repair guidance authored by the server; excludes session data. */
+  rejection?: {
+    error_code: string;
+    guidance: string[];
+  };
 }
 
 /** A visible chat segment whose kind carries its rendering authority. */

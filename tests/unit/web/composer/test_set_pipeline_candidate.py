@@ -499,6 +499,32 @@ def _linear_args(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("named_sources", [False, True])
+def test_uploaded_observed_guarantee_rejection_has_repair_guidance(tmp_path: Path, named_sources: bool) -> None:
+    from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+    from elspeth.web.composer.tools.generation import build_validation_guidance
+
+    args = _linear_args(tmp_path)
+    args["source"]["options"]["schema"]["guaranteed_fields"] = ["case_study"]
+    if named_sources:
+        args["sources"] = {"source": args.pop("source")}
+    state = _empty_state()
+    result = build_set_pipeline_candidate(args, state, _trained_context(data_dir=tmp_path)).result
+
+    assert result.success is False
+    assert result.updated_state is state
+    assert result.validation.errors[0].error_code == "source_data_contract_required"
+    guidance = build_validation_guidance(entry.error_code for entry in result.validation.errors)
+    assert guidance is not None
+    fix = guidance["codes"]["source_data_contract_required"]["suggested_fix"]
+    assert "guaranteed_fields" in fix
+    assert "request_interpretation_review" in fix
+    assert "flexible" in fix and "fields" in fix
+    feedback = _allowlisted_candidate_feedback(result)
+    assert feedback["validation"]["errors"][0]["error_code"] == "source_data_contract_required"
+    assert feedback["validation"]["errors"][0]["suggested_fix"] == fix
+
+
 def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
     engine = create_session_engine(
         "sqlite:///:memory:",

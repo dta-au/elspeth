@@ -7037,11 +7037,8 @@ class TestComposerRuntimePreflightFinalGate:
         assert "Do not answer by repeating the runtime preflight complaint" in repair
         assert "Do not inline a literal credential" in repair
 
-    def test_preflight_repair_budget_note_names_read_only_turns_generally(self) -> None:
-        """elspeth-71617f1d21 (b): the budget note must warn against ANY
-        read-only turn, get_pipeline_state included, not only a bare
-        preview_pipeline re-run — while keeping the pinned header and
-        turn-counter wording intact."""
+    def test_preflight_recovery_preserves_authority_and_explains_read_only_evidence(self) -> None:
+        """Inspection supplies evidence; authorized repairs still need mutation."""
         invalid_preflight = ValidationResultModel(
             is_valid=False,
             checks=[],
@@ -7060,10 +7057,13 @@ class TestComposerRuntimePreflightFinalGate:
         repair = _compose_preflight_repair_message(invalid_preflight, next_turn=1)
 
         assert "Pre-finalisation runtime preflight" in repair
-        assert "forced repair turn 1 of 2" in repair
+        assert "runtime review turn 1 of 2" in repair
         assert "get_pipeline_state" in repair
         assert "preview_pipeline" in repair
-        assert "read-only" in repair
+        assert "Read-only" in repair
+        assert "do not repair a violation" in repair
+        assert "If the user's active request authorizes changes" in repair
+        assert "without changing the pipeline" in repair
 
     @pytest.mark.asyncio
     async def test_changed_state_completion_is_replaced_when_runtime_preflight_fails(self) -> None:
@@ -8625,7 +8625,9 @@ class TestAttemptProofRepair:
         assert "Suggested repair" in msg["content"]
         assert "preview_pipeline" in msg["content"]
         # Budget note acknowledges the cap
-        assert "forced repair turn 1 of 2" in msg["content"]
+        assert "proof review turn 1 of 2" in msg["content"]
+        assert "If the user's active request authorizes changes" in msg["content"]
+        assert "answer that request without changing the pipeline" in msg["content"]
 
     def test_duplicate_header_repair_payload_withholds_raw_header_values(self) -> None:
         sentinel = "ELSPETH_DUPLICATE_HEADER_SENTINEL_7F3A"
@@ -8712,7 +8714,7 @@ class TestAttemptProofRepair:
             repair_turns_used=1,
         )
         assert outcome.action == "repair_injected"
-        assert "forced repair turn 2 of 2" in messages[0]["content"]
+        assert "proof review turn 2 of 2" in messages[0]["content"]
 
     def test_repair_does_not_catch_plugin_exceptions(self) -> None:
         """Plugin exceptions must propagate — the repair gate only handles configs.
@@ -8993,15 +8995,14 @@ class TestComposeLoopForcedRepair:
         ]
 
     @pytest.mark.asyncio
-    async def test_empty_state_uploaded_blob_stall_forces_repair_turn(self) -> None:
-        """A no-tool prose reply must not end the turn when ready uploaded blobs exist.
+    async def test_empty_state_uploaded_blob_stall_gets_neutral_recovery_turn(self) -> None:
+        """An authorized uploaded build retains a neutral recovery opportunity.
 
         Regression for elspeth-b493ddf810: the hard-mode uploaded-CSV happy
         path produced repeated prose replies, no tool calls, and an empty
         CompositionState even though a ready uploaded CSV blob was present.
-        The service should feed the model a concrete repair instruction naming
-        the ready blob and continue the loop, instead of finalizing the
-        empty-state response.
+        The service should expose the ready blob on a neutral retry while
+        retaining the user's request as the authority for construction.
         """
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         turn1_stall = _make_llm_response(
@@ -9050,9 +9051,11 @@ class TestComposeLoopForcedRepair:
         assert "inspect_source" in repair_text
         assert "source.blob_id" in repair_text
         assert "Do not infer that a CSV is header-only" in repair_text
+        assert "explanation or revoked construction" in repair_text
+        assert "availability does not authorize construction" in repair_text
 
     @pytest.mark.asyncio
-    async def test_unsupported_from_json_recovery_forces_supported_fallback_build(self, tmp_path: Path) -> None:
+    async def test_unsupported_from_json_recovery_retains_authorized_fallback_build(self, tmp_path: Path) -> None:
         """Unsupported requested syntax must not strand the session in empty state.
 
         Regression for elspeth-164d7078cb / hard-mode p4_t2_edge: the model
@@ -9140,7 +9143,8 @@ class TestComposeLoopForcedRepair:
         assert "unsupported requested primitive" in repair_text
         assert "from_json" in repair_text
         assert "supported fallback" in repair_text
-        assert "Do not reply with another conceptual plan" in repair_text
+        assert "authorized supported fallback" in repair_text
+        assert "explanation or revoked construction" in repair_text
 
     def _futile_repair_tool_call(self, call_id: str, name_value: str) -> list[dict[str, Any]]:
         """Tool call that mutates state but does NOT clear the proof blocker.

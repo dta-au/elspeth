@@ -6,6 +6,19 @@ All notable changes to ELSPETH are documented here.
 
 ## 0.8.1 - 2026-09-10 (Replica recovery and deployment hardening)
 
+- **Composer CSV repair guidance follows the runtime field contract.** Source
+  inspection exposes normalized row keys and original-label mappings. Uploaded
+  sample headers cannot become planner-authored guarantees; rejection feedback
+  identifies supported runtime contracts and user acknowledgement. Cancelled
+  requests retain public validation guidance and offer a correlated retry,
+  while the saved pipeline remains visibly a draft for the unfinished request.
+- **Composer recovery preserves request intent, evidence and cancellation
+  ownership.** Source proof follows configured CSV/JSON interpretation and
+  distinguishes sampled keys from all-row failures. Batch rejections carry
+  actionable codes, and partial model discovery retains useful expansion.
+  Recovery respects explanation and no-change requests while retaining
+  authorized build repair. Chat Stop cancels work started from Checks, and
+  creating or switching sessions maintains each request's own busy state.
 - **Web search and API retrieval now support bounded POST bodies and structured
   results.** `web_scrape` accepts fixed URLs, row-bound query parameters,
   JSON, URL-encoded forms, and payload-store-backed multipart uploads. It can

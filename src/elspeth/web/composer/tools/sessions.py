@@ -997,7 +997,9 @@ def build_set_pipeline_candidate(
                 tool_name="set_pipeline",
             )
             if guarantee_stamp_error is not None:
-                return _failure_result(state, guarantee_stamp_error, rejected_component="source")
+                return _failure_result(
+                    state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component="source"
+                )
         if source_blob_id is not None:
             resolved = _resolve_source_blob(
                 blob_id=source_blob_id,
@@ -1068,7 +1070,9 @@ def build_set_pipeline_candidate(
                 tool_name="set_pipeline",
             )
             if guarantee_stamp_error is not None:
-                return _failure_result(state, guarantee_stamp_error, rejected_component="source")
+                return _failure_result(
+                    state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component="source"
+                )
 
             # ``prepared_inline_blob.mime_type`` was validated by
             # ``_prepare_blob_create`` against ``_ALLOWED_BLOB_MIME_TYPES``,
@@ -1311,7 +1315,9 @@ def build_set_pipeline_candidate(
                 )
             )
             if guarantee_stamp_error is not None:
-                _record_component_rejection(_failure_result(state, guarantee_stamp_error, rejected_component=source_ref))
+                _record_component_rejection(
+                    _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required", rejected_component=source_ref)
+                )
                 continue
             manual_blobs_error = None if reviewed_source else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
             if manual_blobs_error is not None:
@@ -1463,11 +1469,15 @@ def build_set_pipeline_candidate(
                 continue
             batch_placement_error = _batch_aware_placement_error(node_id, node_type, node_plugin, node.output_mode)
             if batch_placement_error is not None:
-                _record_component_rejection(_failure_result(state, batch_placement_error, rejected_component=node_ref))
+                _record_component_rejection(
+                    _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced", rejected_component=node_ref)
+                )
                 continue
             batch_required_error = _batch_aware_required_input_fields_error(node_id, node_plugin, review_options)
             if batch_required_error is not None:
-                _record_component_rejection(_failure_result(state, batch_required_error, rejected_component=node_ref))
+                _record_component_rejection(
+                    _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid", rejected_component=node_ref)
+                )
                 continue
 
             # Before prevalidation, which withholds a top-level inline_content

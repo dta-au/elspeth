@@ -777,7 +777,7 @@ files:
     Mapping[str, Any]: 8
   src/elspeth/web/composer/composition_completion.py:
     Mapping[str, Any]: 4
-    dict[str, Any]: 5
+    dict[str, Any]: 4
   src/elspeth/web/composer/control_messages.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/discovery_cache.py:
@@ -857,7 +857,7 @@ files:
     dict[str, Any]: 1
   src/elspeth/web/composer/source_inspection.py:
     Mapping[str, Any]: 1
-    dict[str, Any]: 4
+    dict[str, Any]: 5
   src/elspeth/web/composer/state.py:
     Mapping[str, Any]: 16
     dict[str, Any]: 12

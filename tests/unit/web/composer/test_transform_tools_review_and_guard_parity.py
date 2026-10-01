@@ -40,6 +40,8 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools import ToolResult, transforms
 from elspeth.web.composer.tools._common import REVIEW_RECONCILIATION_FAILURE_PREFIX, ToolContext
 from elspeth.web.composer.tools._dispatch import execute_tool
+from elspeth.web.composer.tools.generation import explain_validation_code
+from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     GATE_CONDITION_AUTHORED_USER_TERM,
@@ -361,12 +363,12 @@ def _batch_plugin_as_transform() -> dict[str, Any]:
     }
 
 
-def _assert_guard_rejection(result: ToolResult, state: CompositionState, guard_message: str, *, path: str) -> None:
+def _assert_guard_rejection(result: ToolResult, state: CompositionState, guard_message: str, *, path: str, error_code: str) -> None:
     assert result.success is False, path
     assert result.updated_state is state, path
     leading = result.validation.errors[0]
     assert leading.component == "rejected_mutation", path
-    assert leading.error_code is None, path
+    assert leading.error_code == error_code, path
     # set_pipeline attributes the entry with a ``Node 'agg': `` prefix; the
     # guard text itself must be the whole remainder on every path.
     assert leading.message.endswith(guard_message), (path, leading.message)
@@ -374,6 +376,39 @@ def _assert_guard_rejection(result: ToolResult, state: CompositionState, guard_m
 
 def _dispatch(tool_name: str, arguments: dict[str, Any], state: CompositionState, context: ToolContext) -> ToolResult:
     return execute_tool(tool_name, arguments, state, context.catalog, plugin_snapshot=context.plugin_snapshot)
+
+
+@pytest.mark.parametrize(
+    "node_factory, error_code",
+    [(_batch_plugin_as_transform, "batch_transform_misplaced"), (_aggregation_with_required_fields, "batch_required_fields_invalid")],
+)
+def test_batch_candidate_feedback_preserves_specific_private_repair_classification(node_factory, error_code: str) -> None:
+    state = _linear_state()
+    context = _context()
+    candidate = build_set_pipeline_candidate(_set_pipeline_arguments(node_factory()), state, context)
+    feedback = _allowlisted_candidate_feedback(candidate.result)
+
+    assert candidate.acceptable is False
+    assert candidate.result.updated_state is state
+    leading = feedback["validation"]["errors"][0]
+    assert leading["error_code"] == error_code
+    assert "detail" not in leading
+    guidance = explain_validation_code(error_code)
+    assert guidance is not None
+    assert (leading["explanation"], leading["suggested_fix"]) == guidance
+    if error_code == "batch_required_fields_invalid":
+        assert "Remove required_input_fields" in leading["suggested_fix"]
+        assert "schema.required_fields" in leading["suggested_fix"]
+    else:
+        assert "Read the message" not in leading["suggested_fix"]
+        assert "node_type='aggregation'" in leading["suggested_fix"]
+    assert candidate.result.validation.errors[0].message not in str(feedback)
+
+    corrected = _aggregation_with_required_fields()
+    corrected["options"].pop("required_input_fields")
+    accepted = build_set_pipeline_candidate(_set_pipeline_arguments(corrected), state, context)
+    assert accepted.acceptable is True
+    assert accepted.result.validation.errors == ()
 
 
 def test_required_input_fields_on_a_batch_aware_aggregation_is_rejected_the_same_way_on_every_path() -> None:
@@ -405,9 +440,9 @@ def test_required_input_fields_on_a_batch_aware_aggregation_is_rejected_the_same
     patch = _dispatch("patch_node_options", {"node_id": "agg", "patch": {"required_input_fields": ["x"]}}, existing, context)
     set_pipeline = _dispatch("set_pipeline", _set_pipeline_arguments(node_arguments), linear, context)
 
-    _assert_guard_rejection(upsert, existing, guard_message, path="upsert_node")
-    _assert_guard_rejection(patch, existing, guard_message, path="patch_node_options")
-    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline")
+    _assert_guard_rejection(upsert, existing, guard_message, path="upsert_node", error_code="batch_required_fields_invalid")
+    _assert_guard_rejection(patch, existing, guard_message, path="patch_node_options", error_code="batch_required_fields_invalid")
+    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline", error_code="batch_required_fields_invalid")
 
 
 def test_batch_aware_plugin_placed_as_a_transform_is_rejected_the_same_way_on_every_path() -> None:
@@ -432,10 +467,10 @@ def test_batch_aware_plugin_placed_as_a_transform_is_rejected_the_same_way_on_ev
     )
     set_pipeline = _dispatch("set_pipeline", _set_pipeline_arguments(_batch_plugin_as_transform()), linear, context)
 
-    _assert_guard_rejection(upsert, linear, guard_message, path="upsert_node")
-    _assert_guard_rejection(patch, misplaced, guard_message, path="patch_node_options")
-    _assert_guard_rejection(splice, linear, guard_message, path="splice_transform")
-    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline")
+    _assert_guard_rejection(upsert, linear, guard_message, path="upsert_node", error_code="batch_transform_misplaced")
+    _assert_guard_rejection(patch, misplaced, guard_message, path="patch_node_options", error_code="batch_transform_misplaced")
+    _assert_guard_rejection(splice, linear, guard_message, path="splice_transform", error_code="batch_transform_misplaced")
+    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline", error_code="batch_transform_misplaced")
 
 
 _REPORT_OPTIONS: dict[str, Any] = {"schema": {"mode": "observed"}, "text_field": "x"}
@@ -476,9 +511,9 @@ def test_a_flush_window_plugin_placed_as_a_collector_is_rejected_the_same_way_on
     patch = _dispatch("patch_node_options", {"node_id": "agg", "patch": {"text_field": "y"}}, misplaced, context)
     set_pipeline = _dispatch("set_pipeline", _set_pipeline_arguments(_report_assemble_as_collector()), linear, context)
 
-    _assert_guard_rejection(upsert, linear, guard_message, path="upsert_node")
-    _assert_guard_rejection(patch, misplaced, guard_message, path="patch_node_options")
-    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline")
+    _assert_guard_rejection(upsert, linear, guard_message, path="upsert_node", error_code="batch_transform_misplaced")
+    _assert_guard_rejection(patch, misplaced, guard_message, path="patch_node_options", error_code="batch_transform_misplaced")
+    _assert_guard_rejection(set_pipeline, linear, guard_message, path="set_pipeline", error_code="batch_transform_misplaced")
 
 
 def test_the_collector_arm_names_only_flush_window_plugins() -> None:

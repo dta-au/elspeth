@@ -108,29 +108,39 @@ export function ToolCallCard({
         ? toolCall.applied_state_version
         : null;
     return (
-      <div
-        className={`tool-call-ribbon${outcome ? ` tool-call-ribbon--${outcome}` : ""}`}
-      >
-        <ToolCallInfo
-          toolName={toolCall.function.name}
-          describedById={`tool-call-info-${toolCall.id}`}
-        />
-        <span className="tool-call-ribbon-text">
-          {prefix}: {sentence ?? toolCall.function.name}
-          {qualifier}
-        </span>
-        {sentence !== undefined && (
-          <code className="tool-call-ribbon-name">{toolCall.function.name}</code>
+      <>
+        <div
+          className={`tool-call-ribbon${outcome ? ` tool-call-ribbon--${outcome}` : ""}`}
+        >
+          <ToolCallInfo
+            toolName={toolCall.function.name}
+            describedById={`tool-call-info-${toolCall.id}`}
+          />
+          <span className="tool-call-ribbon-text">
+            {prefix}: {sentence ?? toolCall.function.name}
+            {qualifier}
+          </span>
+          {sentence !== undefined && (
+            <code className="tool-call-ribbon-name">{toolCall.function.name}</code>
+          )}
+          {appliedVersion !== null && (
+            <code
+              className="tool-call-ribbon-version"
+              title={`Pipeline advanced to version ${appliedVersion}`}
+            >
+              v{appliedVersion}
+            </code>
+          )}
+        </div>
+        {outcome === "rejected" && toolCall.rejection !== undefined && (
+          <details className="tool-call-details">
+            <summary>Validation issue</summary>
+            <ul>
+              {toolCall.rejection.guidance.map((guidance) => <li key={guidance}>{guidance}</li>)}
+            </ul>
+          </details>
         )}
-        {appliedVersion !== null && (
-          <code
-            className="tool-call-ribbon-version"
-            title={`Pipeline advanced to version ${appliedVersion}`}
-          >
-            v{appliedVersion}
-          </code>
-        )}
-      </div>
+      </>
     );
   }
 

@@ -175,6 +175,7 @@ _EMITTED_VALIDATION_ERROR_CODES: Final[frozenset[str]] = frozenset(
         "sink_contract_violation",
         "sink_locked_extras",
         "source_name_invalid",
+        "source_data_contract_required",
         "source_on_success_dangling",
         "splice_validation_failed",
         "structural_node_plugin_forbidden",

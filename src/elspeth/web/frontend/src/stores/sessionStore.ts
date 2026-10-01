@@ -22,6 +22,7 @@ import * as api from "@/api/client";
 import {
   COMPOSE_TIMEOUT_ABORT_REASON,
   COMPOSE_USER_CANCEL_ABORT_REASON,
+  runComposeWithTimeout,
 } from "@/config/composer";
 import { useBlobStore } from "./blobStore";
 import { useExecutionStore } from "./executionStore";
@@ -39,6 +40,10 @@ import {
 
 function getExecutionStore() {
   return useExecutionStore.getState();
+}
+
+function localComposeRequestIsPending(sessionId: string): boolean {
+  return useSessionStore.getState().composeRequests.has(sessionId);
 }
 
 
@@ -332,6 +337,8 @@ let composerProgressPollSeenNonTerminal = false;
 // Prevents an aborted turn's delayed teardown (its settle wait yields the
 // loop) from stopping the pollers a newer same-session turn now owns.
 let composerProgressPollGeneration = 0;
+// Explicit request reads outlive navigation and other sessions' pollers.
+const composerProgressLatestClaimBySession = new Map<string, number>();
 let inflightMessagesPollGeneration = 0;
 // Response ORDERING, which ownership generations cannot supply: both intervals
 // launch a read without awaiting the previous one, so several reads of the
@@ -526,7 +533,7 @@ async function waitForCancelledComposeToSettle(
     const current = useSessionStore.getState();
     if (
       current.activeSessionId !== sessionId ||
-      composerProgressPollGeneration !== ownerGeneration
+      composerProgressLatestClaimBySession.get(sessionId) !== ownerGeneration
     ) {
       return;
     }
@@ -573,7 +580,7 @@ async function resyncAfterAbortedComposeTurn(
 ): Promise<void> {
   const superseded = () =>
     useSessionStore.getState().activeSessionId !== sessionId ||
-    composerProgressPollGeneration !== ownerGeneration;
+    composerProgressLatestClaimBySession.get(sessionId) !== ownerGeneration;
   await waitForCancelledComposeToSettle(sessionId, ownerGeneration);
   if (superseded()) {
     // The wait exited because the resync became moot (the user navigated
@@ -663,7 +670,7 @@ async function resyncAfterAmbiguousComposeFailure(
 ): Promise<void> {
   const superseded = () =>
     useSessionStore.getState().activeSessionId !== sessionId ||
-    composerProgressPollGeneration !== ownerGeneration;
+    composerProgressLatestClaimBySession.get(sessionId) !== ownerGeneration;
   await waitForCancelledComposeToSettle(sessionId, ownerGeneration);
   if (superseded()) return;
 
@@ -835,7 +842,7 @@ async function reconcileAcceptedSend(
         compositionState: nextState,
         compositionProposals: proposalSnapshot.reconcile(s.compositionProposals, proposals),
         composerProgress: progress.phase === "idle" ? null : progress,
-        isComposing: false,
+        isComposing: localComposeRequestIsPending(sessionId),
         error: canDeliberatelyRetry
           ? "Your message was saved without a reply. Retry the saved message to request a response."
           : "Your message was saved. The latest session state is shown.",
@@ -848,7 +855,7 @@ async function reconcileAcceptedSend(
   } catch {
     if (!current()) return;
     useSessionStore.setState((s) => ({
-      isComposing: false,
+      isComposing: localComposeRequestIsPending(sessionId),
       error: "Your message was saved, but the latest session state could not be confirmed. Retry to refresh it; this will not resend the message.",
       messages: s.messages.map((message) =>
         message.id === localMessageId ||
@@ -975,6 +982,10 @@ export interface ExportedYamlBlobBinding {
   sourceBlobIds: Record<string, string>;
 }
 
+interface ComposeRequestOwner {
+  current: AbortController | null;
+}
+
 interface SessionState {
   sessions: Session[];
   /**
@@ -1023,6 +1034,10 @@ interface SessionState {
   proposalActionPendingIds: string[];
   composerProgress: ComposerProgressSnapshot | null;
   isComposing: boolean;
+  /** Ephemeral browser requests, retained across view/session navigation. */
+  composeRequests: ReadonlyMap<string, ComposeRequestOwner>;
+  composeRequest: (kind: "send" | "retry", value: string) => Promise<void>;
+  cancelComposition: () => void;
   composeTimeoutReady: boolean;
   setComposeTimeoutReady: (ready: boolean) => void;
   /**
@@ -1171,6 +1186,7 @@ const initialState = {
   proposalActionPendingIds: [] as string[],
   composerProgress: null as ComposerProgressSnapshot | null,
   isComposing: false,
+  composeRequests: new Map<string, ComposeRequestOwner>(),
   composeTimeoutReady: false,
   composerTimeoutUnavailable: false,
   composerModel: null as string | null,
@@ -1186,6 +1202,40 @@ const initialState = {
 
 export const useSessionStore = create<SessionState>((set, get) => ({
   ...initialState,
+
+  async composeRequest(kind, value) {
+    const { activeSessionId, isComposing, composeTimeoutReady, composeRequests } = get();
+    if (!activeSessionId || isComposing || !composeTimeoutReady || composeRequests.has(activeSessionId)) return;
+    const owner: ComposeRequestOwner = { current: null };
+    set((state) => ({
+      composeRequests: new Map(state.composeRequests).set(activeSessionId, owner),
+    }));
+    try {
+      await runComposeWithTimeout(owner, composeTimeoutReady, (signal) =>
+        kind === "send"
+          ? get().sendMessage(value, signal)
+          : get().retryMessage(value, signal),
+      );
+    } finally {
+      if (get().composeRequests.get(activeSessionId) === owner) {
+        set((state) => {
+          const remaining = new Map(state.composeRequests);
+          remaining.delete(activeSessionId);
+          return {
+            composeRequests: remaining,
+            ...(state.activeSessionId === activeSessionId ? { isComposing: false } : {}),
+          };
+        });
+      }
+    }
+  },
+
+  cancelComposition() {
+    const { activeSessionId, composeRequests } = get();
+    if (activeSessionId !== null) {
+      composeRequests.get(activeSessionId)?.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
+    }
+  },
 
   setExportedYamlBlobBinding(binding) {
     set({ exportedYamlBlobBinding: binding });
@@ -1255,6 +1305,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
     advanceSessionPublicationGeneration();
+    getExecutionStore().clearValidation();
     useBlobStore.getState().activateSession(session.id);
     set((state) => ({
       sessions: [session, ...state.sessions],
@@ -1262,14 +1313,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       messages: [],
       // A freshly created session is KNOWN to have no composition state.
       compositionState: null,
+      lastComposeChangedPipeline: null,
       compositionStateLoaded: true,
+      exportedYamlBlobBinding: null,
       compositionProposals: [],
       composerPreferences: null,
       staleProposalIds: [],
       proposalActionPendingIds: [],
       composerProgress: null,
       stateVersions: [],
+      isLoadingVersions: false,
+      isComposing: false,
       error: null,
+      errorDetails: null,
       selectedNodeId: null, // Clear selection for new session
       // A collapsed authoring pane is a GLOBAL persisted preference
       // (useWorkspacePaneState's localStorage layout), so without this a
@@ -1368,6 +1424,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       messages: [],
       compositionState: null,
       lastComposeChangedPipeline: null,
+      exportedYamlBlobBinding: null,
       compositionStateLoaded: false,
       compositionProposals: [],
       composerPreferences: null,
@@ -1375,8 +1432,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       proposalActionPendingIds: [],
       composerProgress: null,
       stateVersions: [],
-      isComposing: false,
+      isLoadingVersions: false,
+      isComposing: get().composeRequests.has(id),
       error: null,
+      errorDetails: null,
       selectedNodeId: null,
       ...clearedRecoveryState(),
     });
@@ -1601,7 +1660,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             s.compositionProposals,
             proposals,
           ),
-          isComposing: false,
+          isComposing: localComposeRequestIsPending(activeSessionId),
           ...(nodeStillExists ? {} : { selectedNodeId: null }),
         };
       });
@@ -1625,7 +1684,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       ) {
         if (freeformComposeClaimIsCurrent(activeSessionId, inflightPollGeneration)) {
           set((state) => ({
-            isComposing: false,
+            isComposing: localComposeRequestIsPending(activeSessionId),
             messages: state.messages.map((message) =>
               message.id === optimisticMessage.id ||
               (message.role === "user" && message.client_request_id === clientRequestId)
@@ -1701,7 +1760,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         ? {}
         : convergencePartialStatePatch(apiErr, get().selectedNodeId);
       set((state) => ({
-        isComposing: false,
+        isComposing: localComposeRequestIsPending(activeSessionId),
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === optimisticMessage.id ||
@@ -1752,7 +1811,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // poller; a newer turn's own polling handles it otherwise. The
       // generation goes THROUGH the read as well, because a newer turn can
       // claim the poller during its await.
-      if (progressPollGeneration === composerProgressPollGeneration) {
+      if (composerProgressLatestClaimBySession.get(activeSessionId) === progressPollGeneration) {
         await get().loadComposerProgress(activeSessionId, {
           ownerGeneration: progressPollGeneration,
         });
@@ -1984,7 +2043,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         ) {
           return;
         }
-      } else if (composerProgressPollGeneration !== options.ownerGeneration) {
+      } else if (composerProgressLatestClaimBySession.get(targetSessionId) !== options.ownerGeneration) {
         return;
       }
       // Ordering, once ownership holds: a reply older than one already
@@ -2012,6 +2071,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     clearComposerProgressPollTimer();
     composerProgressPollGeneration += 1;
     composerProgressPollSessionId = sessionId;
+    composerProgressLatestClaimBySession.set(sessionId, composerProgressPollGeneration);
     composerProgressPollSeenNonTerminal = false;
     set({ composerProgress: null });
     void get().loadComposerProgress(sessionId, { discardStaleTerminal: true });
@@ -2279,7 +2339,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             s.compositionProposals,
             proposals,
           ),
-          isComposing: false,
+          isComposing: localComposeRequestIsPending(activeSessionId),
           ...(nodeStillExists ? {} : { selectedNodeId: null }),
         };
       });
@@ -2328,7 +2388,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         ? {}
         : convergencePartialStatePatch(apiErr, get().selectedNodeId);
       set((state) => ({
-        isComposing: false,
+        isComposing: localComposeRequestIsPending(activeSessionId),
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === messageId
@@ -2371,7 +2431,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       // poller; a newer turn's own polling handles it otherwise. The
       // generation goes THROUGH the read as well, because a newer turn can
       // claim the poller during its await.
-      if (progressPollGeneration === composerProgressPollGeneration) {
+      if (composerProgressLatestClaimBySession.get(activeSessionId) === progressPollGeneration) {
         await get().loadComposerProgress(activeSessionId, {
           ownerGeneration: progressPollGeneration,
         });
@@ -2699,8 +2759,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   reset() {
+    for (const owner of get().composeRequests.values()) {
+      owner.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
+    }
     clearComposerProgressPollTimer();
     clearInflightMessagesPollTimer();
+    composerProgressLatestClaimBySession.clear();
+    inflightMessagesLatestClaimBySession.clear();
     clearAllSessionOperationRetries();
     advanceSessionPublicationGeneration();
     useBlobStore.getState().activateSession(null);

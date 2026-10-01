@@ -30,8 +30,10 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.sessions.protocol import ChatMessageRecord
 from elspeth.web.sessions.routes._helpers import (
+    _message_response,
     _tool_call_outcomes_by_call_id,
     _ToolCallOutcomeKind,
 )
@@ -313,3 +315,89 @@ class TestNonToolRows:
                 [_tool_row(tool_call_id="call-1", content="not json")],
                 state_versions_by_id={},
             )
+
+
+class TestConversationRejectionGuidance:
+    @pytest.mark.parametrize("code", ["plugin_options_invalid", "source_data_contract_required"])
+    def test_rejection_projects_only_canonical_guidance_in_call_order(self, code: str) -> None:
+        raw_detail = "Private uploaded row: CANARY-do-not-disclose"
+        rows = [
+            _tool_row(
+                tool_call_id="call-reject",
+                content=json.dumps(
+                    {
+                        "success": False,
+                        "validation": {
+                            "errors": [
+                                {"error_code": code, "message": raw_detail},
+                                {"error_code": "no_source_configured", "message": "standing scaffold error"},
+                            ]
+                        },
+                    }
+                ),
+            ),
+            _tool_row(tool_call_id="call-read"),
+        ]
+        outcomes = _tool_call_outcomes_by_call_id(rows, state_versions_by_id={})
+        response = _message_response(_assistant_row(["call-read", "call-reject"]), tool_outcomes=outcomes)
+
+        assert response.tool_calls is not None
+        assert [entry["id"] for entry in response.tool_calls] == ["call-read", "call-reject"]
+        assert "rejection" not in response.tool_calls[0]
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        assert response.tool_calls[1]["rejection"] == {"error_code": code, "guidance": list(guidance)}
+        assert raw_detail not in response.model_dump_json()
+        assert "no_source_configured" not in response.model_dump_json()
+        assert response.rejection is None  # The audit-only record remains opt-in.
+
+    @pytest.mark.parametrize("code", [None, "PRIVATE-UNKNOWN-CODE", "plugin_options_invalid with private bytes"])
+    def test_unknown_leading_rejection_never_uses_baseline_guidance(self, code: str | None) -> None:
+        row = _tool_row(
+            tool_call_id="call-reject",
+            content=json.dumps(
+                {
+                    "success": False,
+                    "validation": {
+                        "errors": [
+                            {"error_code": code, "message": "private bytes"},
+                            {"error_code": "no_source_configured", "message": "standing baseline"},
+                        ]
+                    },
+                }
+            ),
+        )
+        response = _message_response(
+            _assistant_row(["call-reject"]),
+            tool_outcomes=_tool_call_outcomes_by_call_id([row], state_versions_by_id={}),
+        )
+        assert response.tool_calls is not None
+        assert response.tool_calls[0]["outcome"] == "rejected"
+        assert "rejection" not in response.tool_calls[0]
+
+    @pytest.mark.parametrize(
+        "content_overrides, state_id",
+        [
+            ({"success": True}, None),
+            ({"error_class": "CancelledError", "_redaction_status": "cancelled"}, None),
+            ({"error_class": "ValueError"}, None),
+            ({"success": False}, uuid4()),
+        ],
+    )
+    def test_non_rejected_calls_never_expose_rejection_guidance(self, content_overrides: dict, state_id) -> None:
+        row = _tool_row(
+            tool_call_id="call-1",
+            content=json.dumps(
+                {
+                    "validation": {"errors": [{"error_code": "plugin_options_invalid", "message": "private"}]},
+                    **content_overrides,
+                }
+            ),
+            composition_state_id=state_id,
+        )
+        response = _message_response(
+            _assistant_row(["call-1"]),
+            tool_outcomes=_tool_call_outcomes_by_call_id([row], state_versions_by_id={}),
+        )
+        assert response.tool_calls is not None
+        assert "rejection" not in response.tool_calls[0]

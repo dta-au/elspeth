@@ -721,11 +721,11 @@ def _execute_upsert_node(
 
         batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, validated.output_mode)
         if batch_placement_error is not None:
-            return _failure_result(state, batch_placement_error)
+            return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
 
         batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, node_options)
         if batch_required_error is not None:
-            return _failure_result(state, batch_required_error)
+            return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
 
         # Before prevalidation, which withholds a top-level inline_content marker
         # as a deferred value: an LLM-authored blob in an llm prompt surface or
@@ -1716,10 +1716,10 @@ def _execute_patch_node_options(
         # FrameworkBugError escaped the tool and ended the turn as a 500.
         batch_placement_error = _batch_aware_placement_error(node_id, current.node_type, current.plugin, current.output_mode)
         if batch_placement_error is not None:
-            return _failure_result(state, batch_placement_error)
+            return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
         batch_required_error = _batch_aware_required_input_fields_error(node_id, current.plugin, new_options)
         if batch_required_error is not None:
-            return _failure_result(state, batch_required_error)
+            return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
 
         # Same refusal upsert_node and splice_transform apply, on the merged options.
         prompt_surface_error = _llm_authored_inline_prompt_surface_error(
@@ -1942,10 +1942,10 @@ def _prepare_transform_candidate(
         return _plugin_policy_failure(state, plugin_error)
     batch_placement_error = _batch_aware_placement_error(node_id, node_type, plugin, output_mode)
     if batch_placement_error is not None:
-        return _failure_result(state, batch_placement_error)
+        return _failure_result(state, batch_placement_error, error_code="batch_transform_misplaced")
     batch_required_error = _batch_aware_required_input_fields_error(node_id, plugin, review_options)
     if batch_required_error is not None:
-        return _failure_result(state, batch_required_error)
+        return _failure_result(state, batch_required_error, error_code="batch_required_fields_invalid")
 
     # Same refusal upsert_node and patch_node_options apply (both splice arms).
     prompt_surface_error = _llm_authored_inline_prompt_surface_error(

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 from collections import Counter
 from collections.abc import Mapping
@@ -37,7 +38,8 @@ from elspeth.contracts.blobs import BlobContentMissingError, BlobIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.json_parser import parse_json_strict
 from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.plugins.sources.field_normalization import resolve_field_names
+from elspeth.plugins.sources.field_normalization import ExternalHeaderError, extend_field_resolution, resolve_field_names
+from elspeth.plugins.sources.json_source import JSONSourceConfig
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.response_contracts import SelectedResponseContract
 
@@ -88,11 +90,21 @@ class SourceInspectionFacts:
     inferred_types: Mapping[str, InferredType] | None
     url_candidates: tuple[str, ...]
     warnings: tuple[str, ...]
+    runtime_headers: tuple[str, ...] | None = None
+    field_name_mapping: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "redacted_identity")
         if self.inferred_types is not None:
             freeze_fields(self, "inferred_types")
+        if self.field_name_mapping is not None:
+            freeze_fields(self, "field_name_mapping")
+        if (self.runtime_headers is None) != (self.field_name_mapping is None):
+            raise ValueError("SourceInspectionFacts runtime_headers and field_name_mapping must be present together")
+        if self.field_name_mapping is not None and tuple(self.field_name_mapping.values()) != self.runtime_headers:
+            raise ValueError("SourceInspectionFacts field_name_mapping must resolve to runtime_headers in column order")
+        if self.field_name_mapping is not None and tuple(self.field_name_mapping) != self.observed_headers:
+            raise ValueError("SourceInspectionFacts field_name_mapping must preserve observed header labels in column order")
         # Tier-1 invariants on dataclass fields the audit trail will record.
         # Per the engine-patterns-reference skill §Offensive Programming
         # Examples: detect invalid states and raise meaningful errors at
@@ -141,7 +153,7 @@ def inspect_blob_content(
         # otherwise default to comma. The chosen delimiter is recorded as a
         # warning so the operator/composer LLM can see it in the audit trail.
         delimiter = delimiter_for_filename(filename) or ","
-        return _inspect_csv(inspected, redacted_identity, byte_range, delimiter=delimiter)
+        return _inspect_csv(inspected, redacted_identity, byte_range, delimiter=delimiter, sample_truncated=truncated)
     if kind == "jsonl":
         return _inspect_jsonl(inspected, redacted_identity, byte_range)
     if kind == "json":
@@ -190,15 +202,20 @@ def inspect_csv_source_content(
     columns: tuple[str, ...] | None = None,
     blob_id: UUID | None = None,
     content_hash: str | None = None,
+    total_size_bytes: int | None = None,
+    encoding: object = "utf-8",
 ) -> SourceInspectionFacts:
     """Inspect blob bytes using CSVSource semantics instead of MIME inference."""
+    if not isinstance(encoding, str):
+        raise ValueError("CSV source encoding must be a string")
     inspected = content[:_MAX_BYTES]
+    byte_size = len(content) if total_size_bytes is None else total_size_bytes
     return _inspect_csv(
         inspected,
         _redacted_identity(
             filename=filename,
             mime_type=mime_type,
-            byte_size=len(content),
+            byte_size=byte_size,
             blob_id=blob_id,
             content_hash=content_hash,
         ),
@@ -207,7 +224,126 @@ def inspect_csv_source_content(
         skip_rows=skip_rows,
         columns=columns,
         skip_blank_records=True,
+        sample_truncated=byte_size > len(inspected),
+        encoding=encoding,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfiguredJsonInspection:
+    """Selected runtime records, without promoting a sampled key union to a guarantee."""
+
+    facts: SourceInspectionFacts
+    row_fields: tuple[tuple[str, ...] | None, ...]
+    all_rows_inspected: bool
+
+
+def inspect_json_source_content(
+    *,
+    content: bytes,
+    filename: str,
+    mime_type: str,
+    config: JSONSourceConfig,
+    total_size_bytes: int,
+    content_hash: str | None = None,
+) -> ConfiguredJsonInspection:
+    """Inspect the configured JSON selection and the runtime's stateful key resolution.
+
+    Completeness requires both the entire artifact and every selected record to
+    fit the bounds. A malformed record is represented separately from object
+    fields; it never vanishes into an object-only universal claim.
+    """
+    sample = content[:_MAX_BYTES]
+    complete = total_size_bytes == len(sample)
+    kind: Literal["json", "jsonl"] = config.format or ("jsonl" if config.path.endswith(".jsonl") else "json")
+    warnings: list[str] = []
+    records: list[Any] = []
+    try:
+        text = sample.decode(config.encoding, errors="surrogateescape" if kind == "jsonl" else "strict")
+    except LookupError as exc:
+        # Registry-known codecs can still be nontext codecs. The plugin config
+        # admits them, but file/bytes decoding refuses them at this boundary.
+        raise ValueError("Configured JSON encoding is not a text decoding codec") from exc
+    except UnicodeError:
+        text = ""
+        complete = False
+        warnings.append("configured_json_decode_failed: sample cannot be decoded using the source encoding")
+
+    def parse_record(value: str) -> Any:
+        def reject_nonfinite(constant: str) -> None:
+            raise ValueError("non-finite JSON number")
+
+        return json.loads(value, parse_constant=reject_nonfinite)
+
+    if kind == "jsonl":
+        # Match universal-newline file iteration, including bare CR records.
+        lines = list(io.StringIO(text, newline=None))
+        if not complete and lines and not lines[-1].endswith("\n"):
+            lines.pop()
+        for line in lines:
+            if not line.strip():
+                continue
+            if len(records) >= _MAX_ROWS:
+                complete = False
+                break
+            if any(0xDC80 <= ord(char) <= 0xDCFF for char in line):
+                records.append(None)
+                warnings.append("configured_json_record_decode_failed: a sampled record has invalid encoding")
+                continue
+            try:
+                records.append(parse_record(line))
+            except (ValueError, RecursionError):
+                records.append(None)
+                warnings.append("configured_json_record_parse_failed: a sampled record is invalid")
+    elif text:
+        try:
+            selected = parse_record(text)
+            if config.data_key:
+                selected = selected[config.data_key] if isinstance(selected, dict) and config.data_key in selected else None
+            if isinstance(selected, list):
+                records = selected[:_MAX_ROWS]
+                complete = complete and len(selected) <= _MAX_ROWS
+            else:
+                complete = False
+                warnings.append("configured_json_selection_failed: source requires a selected array")
+        except (ValueError, RecursionError):
+            complete = False
+            warnings.append("configured_json_document_parse_failed: bounded sample cannot establish the selected array")
+
+    resolution = None
+    objects: list[dict[str, Any]] = []
+    row_fields: list[tuple[str, ...] | None] = []
+    for record in records:
+        if not isinstance(record, dict):
+            row_fields.append(None)
+            continue
+        try:
+            if resolution is None:
+                resolution = resolve_field_names(
+                    raw_headers=list(record), field_mapping=config.field_mapping, columns=None, require_all_mapping_keys=False
+                )
+            else:
+                new_keys = [key for key in record if key not in resolution.resolution_mapping]
+                if new_keys:
+                    resolution = extend_field_resolution(resolution, raw_headers=new_keys, field_mapping=config.field_mapping)
+            normalized = {resolution.resolution_mapping[key]: value for key, value in record.items()}
+        except ExternalHeaderError:
+            row_fields.append(None)
+            warnings.append("configured_json_field_resolution_failed: sampled record keys cannot be resolved")
+            continue
+        objects.append(normalized)
+        row_fields.append(tuple(normalized))
+    facts = _facts_from_objects(
+        objects=objects,
+        kind=kind,
+        redacted_identity=_redacted_identity(
+            filename=filename, mime_type=mime_type, byte_size=total_size_bytes, blob_id=None, content_hash=content_hash
+        ),
+        byte_range=(0, len(sample)),
+        extra_warnings=list(dict.fromkeys(warnings)),
+        sample_text="",  # only selected records contribute URL hints
+    )
+    return ConfiguredJsonInspection(facts=facts, row_fields=tuple(row_fields), all_rows_inspected=complete)
 
 
 def _redacted_identity(
@@ -394,14 +530,25 @@ def _inspect_csv(
     delimiter: str = ",",
     skip_rows: int = 0,
     columns: tuple[str, ...] | None = None,
-    skip_blank_records: bool = False,
+    skip_blank_records: bool = True,
+    sample_truncated: bool = False,
+    encoding: str | None = None,
 ) -> SourceInspectionFacts:
     if skip_rows < 0:
         raise ValueError(f"skip_rows must be non-negative for CSV inspection; got {skip_rows}")
-    text, bom_encoding = _decode_csv_sample(sample)
+    if encoding is None:
+        text, bom_encoding = _decode_csv_sample(sample)
+    else:
+        try:
+            text = sample.decode(encoding, errors="replace")
+        except LookupError as exc:
+            raise ValueError("CSV source encoding is unknown") from exc
+        bom_encoding = None
     decode_replacements = _count_replacement_chars(text)
-    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
     rows: list[list[str]] = []
+    runtime_headers: tuple[str, ...] | None = None
+    field_name_mapping: Mapping[str, str] | None = None
     try:
         for i, row in enumerate(reader):
             if i >= _MAX_ROWS:
@@ -462,7 +609,7 @@ def _inspect_csv(
             )
 
     if columns is None:
-        headers = tuple(h.strip() for h in rows[0])
+        headers = tuple(rows[0])
         data_rows = rows[1:]
     else:
         headers = columns
@@ -582,6 +729,50 @@ def _inspect_csv(
     # Deduplicate while preserving order.
     url_candidates = list(dict.fromkeys(url_candidates))
 
+    # Preserve the raw labels separately from the actual row keys. Use the
+    # runtime resolver, including its explicit-columns semantics; a handrolled
+    # normalization hint missed trailing underscores such as case_study_.
+    try:
+        # Recheck only the records that choose the header. Strict parsing the
+        # entire sample would mistake a quoted DATA record cut at 8 KiB for a
+        # corrupt artifact and erase an already validated complete header.
+        header_stream = io.StringIO(text, newline="")
+        header_reader = csv.reader(header_stream, delimiter=delimiter, strict=True)
+        for _ in range(skip_rows):
+            next(header_reader, None)
+        raw_runtime_headers = next((row for row in header_reader if row), None) if columns is None else None
+        header_end = header_stream.tell()
+        if sample_truncated and header_end == len(text) and not text.endswith(("\r", "\n")):
+            warnings.append(
+                "csv_header_sample_truncated: the inspected prefix cuts a header or skipped record; runtime field names cannot be certified from this sample"
+            )
+        elif bom_encoding is not None:
+            warnings.append(
+                "csv_runtime_encoding_required: the BOM-aware observed header requires an explicit source encoding; default-runtime field names are not asserted"
+            )
+        elif "�" in text[:header_end]:
+            warnings.append(
+                "csv_header_decode_failed: the observed header or skipped records contain decoding replacements; runtime field names are not asserted"
+            )
+        else:
+            resolution = resolve_field_names(
+                raw_headers=raw_runtime_headers,
+                field_mapping=None,
+                columns=list(columns) if columns is not None else None,
+            )
+            runtime_headers = resolution.final_headers
+            field_name_mapping = resolution.resolution_mapping
+    except csv.Error:
+        warnings.append(
+            "csv_header_parse_failed: the CSV header or skipped records failed strict runtime parsing; correct the source and re-upload it"
+        )
+    except ExternalHeaderError:
+        # Do not copy the exception: malformed/headerless values can be data,
+        # and warnings flow into metadata-only proof diagnostics.
+        warnings.append(
+            "csv_field_normalization_failed: headers cannot produce unique runtime field names; correct the headers or use explicit columns for genuinely headerless data"
+        )
+
     return SourceInspectionFacts(
         source_kind="csv",
         redacted_identity=redacted_identity,
@@ -591,6 +782,8 @@ def _inspect_csv(
         inferred_types=inferred,
         url_candidates=tuple(url_candidates),
         warnings=tuple(warnings),
+        runtime_headers=runtime_headers,
+        field_name_mapping=field_name_mapping,
     )
 
 
@@ -853,6 +1046,8 @@ def facts_to_dict(facts: SourceInspectionFacts) -> dict[str, Any]:
         "inferred_types": dict(facts.inferred_types) if facts.inferred_types is not None else None,
         "url_candidates": list(facts.url_candidates),
         "warnings": list(facts.warnings),
+        "runtime_headers": list(facts.runtime_headers) if facts.runtime_headers is not None else None,
+        "field_name_mapping": dict(facts.field_name_mapping) if facts.field_name_mapping is not None else None,
     }
 
 
@@ -873,6 +1068,8 @@ def _parse_inspection_response(value: object) -> SourceInspectionFacts:
                 or type(value.byte_range_inspected) is not tuple
                 or type(value.url_candidates) is not tuple
                 or type(value.warnings) is not tuple
+                or (value.runtime_headers is not None and type(value.runtime_headers) is not tuple)
+                or (value.field_name_mapping is not None and type(value.field_name_mapping) is not MappingProxyType)
             ):
                 raise FrameworkBugError(message)
             value = {
@@ -884,6 +1081,8 @@ def _parse_inspection_response(value: object) -> SourceInspectionFacts:
                 "inferred_types": value.inferred_types,
                 "url_candidates": value.url_candidates,
                 "warnings": value.warnings,
+                "runtime_headers": value.runtime_headers,
+                "field_name_mapping": value.field_name_mapping,
             }
         if type(value) is not dict and type(value) is not MappingProxyType:
             raise FrameworkBugError(message)
@@ -896,6 +1095,8 @@ def _parse_inspection_response(value: object) -> SourceInspectionFacts:
             "inferred_types",
             "url_candidates",
             "warnings",
+            "runtime_headers",
+            "field_name_mapping",
         }:
             raise FrameworkBugError(message)
         if type(value["source_kind"]) is not str:
@@ -981,6 +1182,8 @@ def facts_from_dict(d: Mapping[str, Any]) -> SourceInspectionFacts:
         if type(sample_row_count) is not int:
             raise TypeError("sample_row_count must be int")
         observed_headers_raw = d["observed_headers"]
+        runtime_headers_raw = d["runtime_headers"]
+        field_name_mapping_raw = d["field_name_mapping"]
         return SourceInspectionFacts(
             source_kind=cast(SourceKind, source_kind_raw),
             redacted_identity=_strict_str_dict(d["redacted_identity"], field_name="redacted_identity"),
@@ -992,6 +1195,10 @@ def facts_from_dict(d: Mapping[str, Any]) -> SourceInspectionFacts:
             inferred_types=_strict_inferred_types(d["inferred_types"]),
             url_candidates=_strict_str_tuple(d["url_candidates"], field_name="url_candidates"),
             warnings=_strict_str_tuple(d["warnings"], field_name="warnings"),
+            runtime_headers=None if runtime_headers_raw is None else _strict_str_tuple(runtime_headers_raw, field_name="runtime_headers"),
+            field_name_mapping=(
+                None if field_name_mapping_raw is None else _strict_str_dict(field_name_mapping_raw, field_name="field_name_mapping")
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise InvariantError(f"facts_from_dict: malformed record {d!r}") from exc
@@ -1096,20 +1303,18 @@ def derive_required_header_mismatch_risk(
     facts: SourceInspectionFacts,
     declared_fields: tuple[DeclaredFieldSpec, ...] | None,
     *,
-    explicit_required_fields: tuple[str, ...] = (),
     field_mapping: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
-    """Return required declared fields when none overlap observed CSV headers."""
+    """Return required fields absent from a certified CSV determining header."""
     if declared_fields is None or facts.observed_headers is None:
+        return ()
+    if facts.source_kind == "csv" and facts.runtime_headers is None:
         return ()
 
     required_names: list[str] = []
     for field in declared_fields:
         name = _declared_field_name(field)
         if name is not None and _declared_field_is_required(field):
-            required_names.append(name)
-    for name in explicit_required_fields:
-        if name not in required_names:
             required_names.append(name)
 
     if not required_names:
@@ -1120,9 +1325,7 @@ def derive_required_header_mismatch_risk(
     # source's model_validate will. Case-folding here reported "no risk" for
     # a declaration that discards 100% of rows.
     observed = set(_runtime_resolved_observed_headers(facts, field_mapping=field_mapping))
-    if observed & set(required_names):
-        return ()
-    return tuple(required_names)
+    return tuple(name for name in required_names if name not in observed)
 
 
 def _runtime_resolved_observed_headers(
@@ -1142,7 +1345,16 @@ def _runtime_resolved_observed_headers(
     if facts.observed_headers is None:
         return ()
     if facts.source_kind == "csv":
-        require_all_mapping_keys = True
+        if facts.runtime_headers is None:
+            return ()
+        # Already certified by strict header parsing. Applying mapping to these
+        # carried names also preserves explicit columns verbatim.
+        resolution = resolve_field_names(
+            raw_headers=None,
+            field_mapping=dict(field_mapping) if field_mapping is not None else None,
+            columns=list(facts.runtime_headers),
+        )
+        return resolution.final_headers
     elif facts.source_kind in ("json", "jsonl"):
         require_all_mapping_keys = False
     else:

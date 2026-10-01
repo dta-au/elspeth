@@ -35,7 +35,7 @@ import type {
   CompositionProposal,
   Session,
 } from "@/types/api";
-import { COMPOSE_CONNECTING_MESSAGE } from "@/config/composer";
+import { COMPOSE_CONNECTING_MESSAGE, COMPOSE_UNAVAILABLE_MESSAGE } from "@/config/composer";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX } from "@/types/interpretation";
 
@@ -393,6 +393,156 @@ describe("ChatPanel", () => {
     expect(screen.getByText("Composition stopped before saving.")).toBeInTheDocument();
     expect(screen.getByText("Revise the request and send it again.")).toBeInTheDocument();
   });
+
+  it.each(["registered", "unknown"])("offers recovery with the latest %s rejection after canonical messages reload", (latestRejection) => {
+    const retryMessage = vi.fn();
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(), retryMessage, isComposing: false, error: null,
+    });
+    const scaffold = makeComposition(2, { nodes: [] });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      composeTimeoutReady: true,
+      compositionState: scaffold,
+      messages: [{
+        id: "cancelled-request", session_id: "session-1", role: "user",
+        content: "Assess the case studies", tool_calls: null,
+        created_at: "2026-10-01T06:40:19Z",
+      }, {
+        id: "rejected-proposal", session_id: "session-1", role: "assistant",
+        content: "", created_at: "2026-10-01T06:44:12Z",
+        tool_calls: [{
+          id: "first-rejected-call", type: "function", outcome: "rejected",
+          function: { name: "set_pipeline", arguments: "{}" },
+          rejection: {
+            error_code: "plugin_options_invalid",
+            guidance: ["Use the normalized CSV field name."],
+          },
+        }, {
+          id: "rejected-call", type: "function", outcome: "rejected",
+          function: { name: "set_pipeline", arguments: "{}" },
+          rejection: {
+            error_code: "source_data_contract_required",
+            guidance: ["Declare an explicit runtime schema or request a source data contract review."],
+          },
+        }, ...(latestRejection === "unknown" ? [{
+          id: "last-unknown-rejection", type: "function", outcome: "rejected" as const,
+          function: { name: "set_pipeline", arguments: "{}" },
+        }] : [])],
+      }],
+      composerProgress: {
+        session_id: "session-1", request_id: "cancelled-request",
+        phase: "cancelled", reason: "client_cancelled",
+        headline: "The request was cancelled before the composer finished.",
+        evidence: ["The client closed the connection before a response was returned."],
+        likely_next: "Retry when ready.", updated_at: "2026-10-01T06:44:18Z",
+        inflight_requests: 0,
+      },
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.getByText("This request did not finish. The saved pipeline remains a draft for this request.")).toBeInTheDocument();
+    if (latestRejection === "registered") {
+      expect(screen.getByText("Last validation issue")).toBeInTheDocument();
+      expect(screen.getByText("Declare an explicit runtime schema or request a source data contract review.")).toBeInTheDocument();
+    } else {
+      expect(screen.queryByText("Last validation issue")).not.toBeInTheDocument();
+      expect(screen.queryByText("Declare an explicit runtime schema or request a source data contract review.")).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText("Use the normalized CSV field name.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry interrupted request" }));
+    expect(retryMessage).toHaveBeenCalledWith("cancelled-request");
+    expect(useSessionStore.getState().compositionState).toBe(scaffold);
+  });
+
+  it.each([
+    [false, COMPOSE_CONNECTING_MESSAGE],
+    [true, COMPOSE_UNAVAILABLE_MESSAGE],
+  ])("explains unavailable recovery while timeout readiness is missing (unavailable=%s)", (unavailable, explanation) => {
+    const retryMessage = vi.fn();
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(), retryMessage, isComposing: false, error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1", composeTimeoutReady: false,
+      composerTimeoutUnavailable: unavailable,
+      messages: [{
+        id: "cancelled-request", session_id: "session-1", role: "user",
+        content: "Assess the case studies", tool_calls: null,
+        created_at: "2026-10-01T06:40:19Z",
+      }],
+      composerProgress: {
+        session_id: "session-1", request_id: "cancelled-request",
+        phase: "cancelled", reason: "client_cancelled", headline: "Cancelled",
+        evidence: [], likely_next: "Retry when ready.",
+        updated_at: "2026-10-01T06:44:18Z", inflight_requests: 0,
+      },
+    });
+    render(<ChatPanel />);
+    const retry = screen.getByRole("button", { name: "Retry interrupted request" });
+    expect(retry).toBeDisabled();
+    expect(retry).toHaveAccessibleDescription(explanation);
+    expect(screen.getByText(explanation)).toBeInTheDocument();
+    fireEvent.click(retry);
+    expect(retryMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([1, undefined])("withholds cancellation recovery until settlement is confirmed (%s inflight)", (inflight) => {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(), retryMessage: vi.fn(), isComposing: false, error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [{
+        id: "cancelled-request", session_id: "session-1", role: "user",
+        content: "Assess the case studies", tool_calls: null,
+        created_at: "2026-10-01T06:40:19Z",
+      }],
+      composerProgress: {
+        session_id: "session-1", request_id: "cancelled-request",
+        phase: "cancelled", reason: "client_cancelled", headline: "Cancelled",
+        evidence: [], likely_next: "Retry when ready.",
+        updated_at: "2026-10-01T06:44:18Z", inflight_requests: inflight,
+      },
+    });
+    render(<ChatPanel />);
+    expect(screen.queryByRole("button", { name: "Retry interrupted request" })).not.toBeInTheDocument();
+  });
+
+  it.each(["newer_request", "final_reply", "other_session", "still_composing"])(
+    "withholds cancellation recovery for %s",
+    (state) => {
+      (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+        sendMessage: vi.fn(), retryMessage: vi.fn(),
+        isComposing: state === "still_composing", error: null,
+      });
+      const user: ChatMessage = {
+        id: "cancelled-request", session_id: "session-1", role: "user",
+        content: "Assess the case studies", tool_calls: null,
+        created_at: "2026-10-01T06:40:19Z",
+      };
+      const messages = [user];
+      if (state === "newer_request" || state === "final_reply") {
+        messages.push({
+          ...user, id: "later-message",
+          role: state === "newer_request" ? "user" : "assistant",
+          content: "Later turn", created_at: "2026-10-01T06:45:00Z",
+        });
+      }
+      useSessionStore.setState({
+        activeSessionId: "session-1", messages,
+        composerProgress: {
+          session_id: state === "other_session" ? "session-2" : "session-1",
+          request_id: user.id, phase: "cancelled", reason: "client_cancelled",
+          headline: "Cancelled", evidence: [], likely_next: "Retry when ready.",
+          updated_at: "2026-10-01T06:44:18Z", inflight_requests: 0,
+        },
+      });
+      render(<ChatPanel />);
+      expect(screen.queryByRole("button", { name: "Retry interrupted request" })).not.toBeInTheDocument();
+    },
+  );
 
   // The terminal snapshot bridges the gap between a turn settling and its
   // reply rendering, then must RETIRE. Nothing else clears composerProgress

@@ -33,7 +33,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 # Actual handler captures from clean a6c58c68fe99c726805937f297a156af8f2cd3ef.
 # JSON spacing, escaping, object order and array order are part of this witness.
 _GOLDEN_INVENTORY = r"""{"available": [{"name": "example", "description": "Example \u00e9", "plugin_type": "source", "config_fields": [{"name": "options", "type": "object", "required": false, "description": null, "default": {"z": [null, true, 1, 1.5], "a": "\u00e9"}}], "usage_when_to_use": null, "usage_when_not_to_use": null, "example_use": null, "capability_tags": [], "aggregation_output_modes": [], "web_config_authority": "user_configurable", "policy_capabilities": [], "audit_characteristics": [], "composer_hints": [], "secret_requirements": []}], "prohibited": [{"name": "example", "reason": "plugin_not_allowed_on_web", "explanation": "the plugin is installed and authorized for this deployment's runtime but prohibited on the web authoring surface by security policy"}]}"""
-_GOLDEN_INSPECTION = r"""{"source_kind": "csv", "redacted_identity": {"filename": "data.csv", "mime_type": "text/csv", "byte_size": "11", "blob_id": "00000000-0000-0000-0000-000000000001", "content_hash_prefix": "0528fb34"}, "byte_range_inspected": [0, 11], "sample_row_count": 1, "observed_headers": ["z", "a"], "inferred_types": {"z": "int", "a": "bool"}, "url_candidates": [], "warnings": ["csv_lexical_types_advisory: 2 column(s) have int/float/bool inferred_types \u2014 these are lexical observations of CSV text. At runtime every csv value arrives as str unless the SOURCE schema declares the field's type (declared source fields are coerced at ingestion). Do not copy an inferred type into a downstream node's schema without declaring it on the source or inserting a type_coerce."]}"""
+_GOLDEN_INSPECTION = r"""{"source_kind": "csv", "redacted_identity": {"filename": "data.csv", "mime_type": "text/csv", "byte_size": "11", "blob_id": "00000000-0000-0000-0000-000000000001", "content_hash_prefix": "0528fb34"}, "byte_range_inspected": [0, 11], "sample_row_count": 1, "observed_headers": ["z", "a"], "inferred_types": {"z": "int", "a": "bool"}, "url_candidates": [], "warnings": ["csv_lexical_types_advisory: 2 column(s) have int/float/bool inferred_types \u2014 these are lexical observations of CSV text. At runtime every csv value arrives as str unless the SOURCE schema declares the field's type (declared source fields are coerced at ingestion). Do not copy an inferred type into a downstream node's schema without declaring it on the source or inserting a type_coerce."], "runtime_headers": ["z", "a"], "field_name_mapping": {"z": "z", "a": "a"}}"""
 
 
 def _state() -> CompositionState:
@@ -131,7 +131,19 @@ def test_inventory_nested_producer_corruption_is_not_an_argument_error(mutation:
 
 
 @pytest.mark.parametrize(
-    "mutation", ["extra_root", "extra_identity", "missing_identity", "numeric_size", "inferred_type", "bool_range", "warnings_string"]
+    "mutation",
+    [
+        "extra_root",
+        "extra_identity",
+        "missing_identity",
+        "numeric_size",
+        "inferred_type",
+        "bool_range",
+        "warnings_string",
+        "mapping_label",
+        "runtime_header",
+        "mapping_type",
+    ],
 )
 def test_inspection_closed_records_reject_corruption(mutation: str) -> None:
     raw = json.loads(_GOLDEN_INSPECTION)
@@ -147,6 +159,12 @@ def test_inspection_closed_records_reject_corruption(mutation: str) -> None:
         raw["inferred_types"]["z"] = "object"
     elif mutation == "bool_range":
         raw["byte_range_inspected"] = [False, 11]
+    elif mutation == "mapping_label":
+        raw["field_name_mapping"] = {"private": "z", "a": "a"}
+    elif mutation == "runtime_header":
+        raw["runtime_headers"] = ["private", "a"]
+    elif mutation == "mapping_type":
+        raw["field_name_mapping"] = {"z": 1, "a": "a"}
     else:
         raw["warnings"] = "secret"
     with pytest.raises(FrameworkBugError) as error:

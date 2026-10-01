@@ -67,6 +67,7 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.control_messages import replay_composer_control_message
+from elspeth.web.composer.error_codes import REGISTERED_ERROR_CODES
 from elspeth.web.composer.implicit_decisions import merge_implicit_decisions_meta
 from elspeth.web.composer.invariants import InvariantError
 from elspeth.web.composer.no_tool_policy import visible_message_segments
@@ -103,6 +104,7 @@ from elspeth.web.composer.telemetry_phase8 import (
     record_session_switched,
 )
 from elspeth.web.composer.tools import execute_tool
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.coordination.composer_progress_authority import ComposerRequestLeaseLost, DatabaseComposerProgressRegistry
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
@@ -393,6 +395,14 @@ class _ToolCallOutcomeKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class _ToolCallRejection:
+    """Public closed-code guidance, with no session-derived diagnostic text."""
+
+    error_code: str
+    guidance: tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolCallOutcome:
     """Server-derived outcome of one tool call, projected for the SPA.
 
@@ -403,6 +413,7 @@ class _ToolCallOutcome:
 
     outcome: _ToolCallOutcomeKind
     applied_state_version: int | None
+    rejection: _ToolCallRejection | None = None
 
 
 def _tool_call_outcomes_by_call_id(
@@ -499,7 +510,23 @@ def _tool_call_outcomes_by_call_id(
                 )
                 continue
             if "success" in content and content["success"] is False:
-                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None)
+                # The failure producer puts the rejected mutation first; later
+                # errors can describe the unchanged baseline, so never search
+                # them for a replacement diagnosis. Only registered codes with
+                # public catalogue guidance cross into the conversation. Raw
+                # messages remain confined to the audit opt-in below.
+                validation = content["validation"] if "validation" in content else None
+                errors = validation["errors"] if type(validation) is dict and "errors" in validation else None
+                leading_error = errors[0] if type(errors) is list and errors else None
+                code = leading_error["error_code"] if type(leading_error) is dict and "error_code" in leading_error else None
+                rejection: _ToolCallRejection | None = None
+                if type(code) is str and code in REGISTERED_ERROR_CODES:
+                    guidance = explain_validation_code(code)
+                    if guidance is not None:
+                        rejection = _ToolCallRejection(code, guidance)
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome=_ToolCallOutcomeKind.REJECTED, applied_state_version=None, rejection=rejection
+                )
                 continue
         outcomes[row.tool_call_id] = _ToolCallOutcome(outcome=_ToolCallOutcomeKind.COMPLETED, applied_state_version=None)
     return outcomes
@@ -544,6 +571,11 @@ def _message_response(
     names. Envelopes without a projection are passed through untouched and
     render under the client's conservative default.
 
+    Rejected envelopes can additionally carry ``rejection`` with only the
+    leading closed error code and static public catalogue guidance. This
+    supports recovery in the conversation without publishing raw diagnostic
+    messages, source facts, or the separate audit-only rejection record.
+
     ``rejections`` (elspeth-3e28029d2f read side) is supplied only by the
     audit-grade view under ``include_rejection_reasons``; a ``role="tool"``
     row whose call id has a rejection row carries it as ``rejection``. Every
@@ -570,6 +602,11 @@ def _message_response(
                     "outcome": projected.outcome.value,
                     "applied_state_version": projected.applied_state_version,
                 }
+                if projected.rejection is not None:
+                    entry["rejection"] = {
+                        "error_code": projected.rejection.error_code,
+                        "guidance": list(projected.rejection.guidance),
+                    }
             stamped.append(entry)
         tool_calls = stamped
     rejection_record = (

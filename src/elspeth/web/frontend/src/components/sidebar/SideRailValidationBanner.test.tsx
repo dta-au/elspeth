@@ -334,6 +334,7 @@ describe("SideRailValidationBanner", () => {
       const user = userEvent.setup();
       const sendMessage = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({
+        activeSessionId: "session-1",
         compositionState: makeComposition(1, {
           validation_suggestions: [SUGGESTION],
         }),
@@ -357,6 +358,7 @@ describe("SideRailValidationBanner", () => {
       const user = userEvent.setup();
       const sendMessage = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({
+        activeSessionId: "session-1",
         compositionState: makeComposition(1, {
           validation_suggestions: [SUGGESTION],
         }),

@@ -26,11 +26,13 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
 from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import (
     PluginNotFoundError,
     get_shared_plugin_manager,
     http_fetch_transform_names,
 )
+from elspeth.plugins.sources.json_source import JSONSourceConfig
 from elspeth.plugins.transforms.llm.model_catalog import (
     MODEL_CATALOG_OPENROUTER,
     OPENROUTER_LITELLM_PREFIX,
@@ -43,11 +45,13 @@ from elspeth.web.composer._validation_probe import prepare_validation_probe_opti
 from elspeth.web.composer.redaction import _JsonInteger, _OmittableString
 from elspeth.web.composer.response_contracts import SelectedResponseContract
 from elspeth.web.composer.source_inspection import (
+    ConfiguredJsonInspection,
     SourceInspectionFacts,
     derive_extra_column_risk,
     derive_required_header_mismatch_risk,
     inspect_blob_content,
     inspect_csv_source_content,
+    inspect_json_source_content,
 )
 from elspeth.web.composer.state import (
     _LLM_SYSTEM_PROMPT_MISSING_EXPLANATION,
@@ -83,6 +87,7 @@ from elspeth.web.composer.tools._common import (
     _discovery_result,
     _failure_result,
     _plugin_policy_failure,
+    _source_options_for_prevalidation,
     _validate_mutation_arguments,
     _validate_plugin_name,
     diff_states,
@@ -970,9 +975,16 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "violation once EVERY 'missing_fields' name is gone from what the sink REQUIRES — it then reads satisfied "
         "true, or disappears entirely where the sink is left requiring nothing. Emptying required_fields is not the "
         "whole repair: a name the sink still requires through its 'fields', or through a writing option such as a "
-        "text or document sink's 'field', keeps the violation standing. A source guarantee names only "
-        "VERIFIED fields, never intent: "
-        "patch_source_options(patch={'schema':{'mode':'observed','guaranteed_fields':[...]}}), a COMPLETE list. Only "
+        "text or document sink's 'field', keeps the violation standing. For uploaded or path-bound sources, you "
+        "must not author schema.guaranteed_fields from sample headers: patch_source_options with schema.mode "
+        "'flexible' and non-optional 'fields' to enforce the required columns per row ('fixed' only for a required "
+        "closed schema), or retain observed mode and request_interpretation_review(kind='source_data_contract', "
+        "affected_node_id='source' or 'source:<name>', user_term='source_data_contract'), omitting llm_draft, and "
+        "let the user acknowledge the server-computed field promise. This review requires the intended source "
+        "and demanding consumers to be saved already; it cannot review a rejected candidate or a scaffold "
+        "without those consumers. For a rejected full replacement, prefer an explicit runtime contract. "
+        "Composer-authored source content receives "
+        "its complete verified guarantee through source binding. Only "
         "without 'contract' facts: get_pipeline_state on the sink, then reconcile its required fields upstream.",
     ),
     (
@@ -993,9 +1005,16 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "candidate and add the field to EVERY arm (one for a require_all union). Nested coalesce with policy require_all: "
         "repoint the requirement at a branch name; otherwise it guarantees nothing: switch it to merge: union, or set "
         "policy: require_all AND repoint at a branch name. Where preview_pipeline is offered, re-preview until the error "
-        "is gone. Declare a source guarantee ONLY for fields VERIFIED from its content (bound blob or inspect_source) or "
-        "user-confirmed, not intent, via patch_source_options(patch={'schema': {'mode': 'observed', 'guaranteed_fields': "
-        "[...]}}), a COMPLETE claim: list every such field. Only without 'contract' facts: take 'from', 'to' and "
+        "is gone. For uploaded or path-bound sources, you must not author schema.guaranteed_fields from sample "
+        "headers. Use patch_source_options with schema.mode 'flexible' and non-optional 'fields' for a runtime "
+        "contract ('fixed' only for a required closed schema), or retain observed mode and "
+        "request_interpretation_review(kind='source_data_contract', affected_node_id='source' or 'source:<name>', "
+        "user_term='source_data_contract'), omitting llm_draft, and let the user acknowledge the server-computed "
+        "promise. This review requires the intended source and demanding consumers to be saved already; "
+        "it cannot review a rejected candidate or a scaffold without those consumers. For a rejected full "
+        "replacement, prefer an explicit runtime contract. Composer-authored source content receives its "
+        "verified guarantee through source binding. "
+        "Only without 'contract' facts: take 'from', 'to' and "
         "'missing_fields' from preview_pipeline's unsatisfied edge_contracts row or errors.",
     ),
     # ── Closed structural node-shape codes ──────────────────────────────────
@@ -1249,7 +1268,7 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "plugin as node_type='transform' (it processes a whole batch, never one row); a plugin that reads the "
         "aggregation flush window (report_assemble) as a collector, whose end-of-group flush has no window; and "
         "a batch plugin under passthrough whose flush does not emit one row per buffered row (such as batch_stats, batch_replicate, or an annotator that skips rows).",
-        "Read the message to see which placement was refused. A transform: re-emit the node with "
+        "Choose the correction for the rejected candidate's node_type and output_mode. A transform: re-emit the node with "
         "node_type='aggregation' and a trigger (e.g. trigger={'count': N}), or pick a row-level transform plugin. "
         "A collector: keep the collector, close the scope with a batch-aware plugin that reads no flush window "
         "(list_transforms, then get_plugin_schema), and if the refused plugin is still wanted, run it as an aggregation "
@@ -1258,8 +1277,10 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"batch_required_fields_invalid",
-        "A batch-aware aggregation's required_input_fields declaration is invalid for its plugin.",
-        "Call get_plugin_schema('transform', <plugin>) for the exact option shapes and re-emit only the offending options.",
+        "A batch-aware plugin cannot enforce the row-mode required_input_fields option; batch input requirements use its schema contract.",
+        "Remove required_input_fields from the rejected node's options. Declare batch input requirements with "
+        "schema.required_fields using the plugin's documented schema shape; call get_plugin_schema for the "
+        "transform plugin to inspect that contract, then re-emit the corrected node.",
     ),
     (
         r"batch_value_field_not_numeric",
@@ -1638,6 +1659,23 @@ _DIRECT_VALIDATION_GUIDANCE: Final = (
         "Rewrite the lookup to the declared name the message names (row['score_text'] or row.score_text) with "
         "patch_node_options on the rejected node. Do not rename the field back or add a field_mapper to recreate the "
         "header spelling.",
+    ),
+    DirectValidationGuidance(
+        "source_data_contract_required",
+        "An uploaded or path-bound source header is sample evidence. An observed-mode guaranteed_fields "
+        "stamp is the user's recorded data promise and cannot be authored by the planner. The rejected "
+        "proposal was not applied; the saved graph remains unchanged.",
+        "Remove the newly authored schema.guaranteed_fields from the rejected proposal, or echo the stored "
+        "acknowledged stamp unchanged. Either declare a runtime-enforced schema with mode 'flexible' or "
+        "'fixed' and non-optional fields using the source's runtime field names, then retry the proposal; "
+        "or retain observed mode and request_interpretation_review(kind='source_data_contract', "
+        "affected_node_id='source' or 'source:<name>', user_term='source_data_contract'), omitting llm_draft, "
+        "only when the intended source and demanding consumers are already saved and have a pending "
+        "source data-contract review site. The review reads the current saved graph, never the rejected "
+        "candidate; if that graph is still a scaffold, repair the full candidate with an explicit runtime "
+        "contract instead. Ask the user to acknowledge the server-computed field promise. The server writes the stamp "
+        "on acknowledgement. A rejected replacement is not the current saved graph: retain the requested "
+        "input binding and evaluation transforms when repairing it.",
     ),
     *_direct_plugin_policy_guidance(),
 )
@@ -3458,6 +3496,7 @@ def _compute_proof_diagnostics_for_source(
         content_hash=blob["content_hash"],
         total_size_bytes=total_size_bytes,
     )
+    json_inspection: ConfiguredJsonInspection | None = None
     if source.plugin == "csv":
         # ``source.options`` is composer/user-authored config re-read from
         # persisted session state — Tier-3 origin (see the long note on the
@@ -3488,6 +3527,8 @@ def _compute_proof_diagnostics_for_source(
                 skip_rows=_csv_source_skip_rows(source.options),
                 columns=columns,
                 content_hash=blob["content_hash"],
+                total_size_bytes=total_size_bytes,
+                encoding=source.options["encoding"] if "encoding" in source.options else "utf-8",
             )
         except ValueError as exc:
             diagnostics.append(
@@ -3495,6 +3536,34 @@ def _compute_proof_diagnostics_for_source(
                     blob_id=blob_id,
                     facts=facts,
                     exc=exc,
+                )
+            )
+            return diagnostics
+
+    elif source.plugin == "json":
+        try:
+            json_config = JSONSourceConfig.from_dict(
+                {
+                    **deep_thaw(_source_options_for_prevalidation(source.options)),
+                    "on_validation_failure": source.on_validation_failure,
+                }
+            )
+            json_inspection = inspect_json_source_content(
+                content=content,
+                filename=blob["filename"],
+                mime_type=blob["mime_type"],
+                config=json_config,
+                total_size_bytes=total_size_bytes,
+                content_hash=blob["content_hash"],
+            )
+            facts = json_inspection.facts
+        except (PluginConfigError, ValueError) as exc:
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message="Configured JSON source inspection failed; source options cannot support runtime record selection and field resolution.",
+                    suggested_repair="Correct JSON format, data_key, encoding, field_mapping and schema options using get_plugin_schema, then preview again.",
+                    evidence_locator={"blob_id": str(blob_id), "source_plugin": source.plugin, "error_class": type(exc).__name__},
                 )
             )
             return diagnostics
@@ -3537,10 +3606,9 @@ def _compute_proof_diagnostics_for_source(
             schema_config = None
         if schema_config is not None and schema_config.mode in {"fixed", "flexible"}:
             declared: tuple[Mapping[str, Any], ...] = tuple(schema_config.to_dict()["fields"] or ())
-            headerless_columns = source.plugin == "csv" and columns is not None
             field_mapping: dict[str, str] | None = None
             field_resolution_failed = False
-            if source.plugin == "csv" and not headerless_columns:
+            if source.plugin == "csv":
                 try:
                     field_mapping = _csv_source_field_mapping(source.options)
                 except ValueError as exc:
@@ -3554,12 +3622,11 @@ def _compute_proof_diagnostics_for_source(
                     field_resolution_failed = True
 
             missing_declared: tuple[str, ...] = ()
-            if not field_resolution_failed and not headerless_columns and facts.source_kind == "csv":
+            if not field_resolution_failed and facts.source_kind == "csv":
                 try:
                     missing_declared = derive_required_header_mismatch_risk(
                         facts,
                         declared,
-                        explicit_required_fields=schema_config.required_fields or (),
                         field_mapping=field_mapping,
                     )
                 except ValueError as exc:
@@ -3579,7 +3646,7 @@ def _compute_proof_diagnostics_for_source(
                         message=(
                             f"CSV source declares required field(s) {list(missing_declared)} "
                             f"but the bound blob's parsed header has {observed_header_count} column(s) "
-                            "with no overlapping field names. Header values are redacted because "
+                            "missing these required field names. Header values are redacted because "
                             "headerless CSV input can make the first data row look like headers. "
                             "Every row will fail validation; "
                             "with on_validation_failure='discard', the run will terminate empty. "
@@ -3604,12 +3671,12 @@ def _compute_proof_diagnostics_for_source(
                 )
             elif schema_config.mode == "fixed" and not field_resolution_failed:
                 missing: tuple[str, ...] = ()
-                if not headerless_columns:
+                if source.plugin == "csv":
                     try:
                         missing = derive_extra_column_risk(
                             facts,
                             declared,
-                            field_mapping=field_mapping if source.plugin == "csv" else None,
+                            field_mapping=field_mapping,
                         )
                     except ValueError as exc:
                         diagnostics.append(
@@ -3644,6 +3711,38 @@ def _compute_proof_diagnostics_for_source(
                                     "observed_columns_redacted": True,
                                 },
                             )
+                        )
+                elif json_inspection is not None:
+                    declared_names = {field.name for field in schema_config.fields or ()}
+                    extra_rows = [fields for fields in json_inspection.row_fields if fields is not None and set(fields) - declared_names]
+                    if extra_rows and source.on_validation_failure == "discard":
+                        universal = json_inspection.all_rows_inspected and len(extra_rows) == len(json_inspection.row_fields)
+                        diagnostics.append(
+                            _blocking_diagnostic(
+                                code="csv_fixed_schema_omits_observed_columns",
+                                message=(
+                                    "Every selected JSON record contains undeclared fields; mode=fixed with "
+                                    "on_validation_failure='discard' will drop every row. All selected records were inspected."
+                                ),
+                                suggested_repair="Declare the carried JSON fields or use schema.mode='flexible', then preview again.",
+                                evidence_locator={
+                                    "blob_id": str(blob_id),
+                                    "selected_record_count": len(extra_rows),
+                                    "all_rows_inspected": True,
+                                },
+                            )
+                            if universal
+                            else {
+                                "code": "json_fixed_schema_sample_omits_fields",
+                                "severity": "warning",
+                                "message": "Some sampled JSON records contain undeclared fields and will be discarded; the sample does not prove every row will be lost.",
+                                "suggested_repair": "Inspect the configured record selection and declare its carried fields or use schema.mode='flexible'.",
+                                "evidence_locator": {
+                                    "blob_id": str(blob_id),
+                                    "sample_extra_record_count": len(extra_rows),
+                                    "all_rows_inspected": json_inspection.all_rows_inspected,
+                                },
+                            }
                         )
 
     # 2. Observed CSV + numeric gate predicate => preview/runtime agreement gap.

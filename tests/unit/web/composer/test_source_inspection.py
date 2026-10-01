@@ -847,6 +847,126 @@ class TestDeriveRequiredHeaderMismatchRisk:
 
 
 class TestFactsToDict:
+    def test_csv_runtime_names_skip_leading_blank_records(self) -> None:
+        facts = inspect_blob_content(content=b"\n\nCase Study_\nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+        assert facts.field_name_mapping == {"Case Study_": "case_study"}
+
+    def test_csv_runtime_mapping_retains_original_label_whitespace(self) -> None:
+        facts = inspect_blob_content(content=b" Case Study_ \nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+        assert facts.field_name_mapping == {" Case Study_ ": "case_study"}
+
+    def test_csv_invalid_quoted_header_has_no_runtime_projection(self) -> None:
+        facts = inspect_blob_content(content=b'"Case Study_\nexample\n', filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_header_parse_failed" in warning for warning in facts.warnings)
+
+    def test_csv_truncated_quoted_data_preserves_complete_runtime_header(self) -> None:
+        facts = inspect_blob_content(content=b'Case Study_\n"' + b"x" * 9000 + b'"\n', filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+        assert facts.field_name_mapping == {"Case Study_": "case_study"}
+        assert not any("csv_header_parse_failed" in warning for warning in facts.warnings)
+
+    def test_csv_truncated_unquoted_header_does_not_claim_a_runtime_name(self) -> None:
+        facts = inspect_blob_content(content=b"Case Study_" + b"x" * 9000 + b"\nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_header_sample_truncated" in warning for warning in facts.warnings)
+
+    def test_csv_complete_header_at_artifact_eof_is_still_projected(self) -> None:
+        facts = inspect_blob_content(content=b"Case Study_", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+
+    def test_csv_undecodable_header_does_not_claim_a_runtime_name(self) -> None:
+        facts = inspect_blob_content(content=b"\xffCase Study_\nexample\n", filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_header_decode_failed" in warning for warning in facts.warnings)
+
+    @pytest.mark.parametrize("encoding", ["utf-8-sig", "utf-16", "utf-32"])
+    def test_csv_bom_projection_waits_for_an_explicit_runtime_encoding(self, encoding: str) -> None:
+        facts = inspect_blob_content(content="Case Study_\nexample\n".encode(encoding), filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers is None
+        assert facts.field_name_mapping is None
+        assert any("csv_encoding_bom_detected" in warning for warning in facts.warnings)
+
+    @pytest.mark.parametrize("newline", [b"\r", b"\r\n"])
+    def test_csv_runtime_projection_uses_csv_universal_newlines(self, newline: bytes) -> None:
+        facts = inspect_blob_content(content=newline.join((b"Case Study_", b"example", b"")), filename="cases.csv", mime_type="text/csv")
+        assert facts.runtime_headers == ("case_study",)
+
+    def test_csv_prefix_inspection_knows_full_artifact_is_larger(self) -> None:
+        facts = inspect_blob_content(
+            content=b"Case Study_" + b"x" * 100,
+            filename="cases.csv",
+            mime_type="text/csv",
+            total_size_bytes=10000,
+        )
+        assert facts.runtime_headers is None
+        assert any("csv_header_sample_truncated" in warning for warning in facts.warnings)
+
+    def test_csv_skip_rows_does_not_promote_a_truncated_header(self) -> None:
+        facts = inspect_csv_source_content(
+            content=b"preamble\nCase Study_" + b"x" * 9000 + b"\nexample\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=1,
+        )
+        assert facts.runtime_headers is None
+        assert any("csv_header_sample_truncated" in warning for warning in facts.warnings)
+
+    def test_csv_truncated_skipped_record_has_no_runtime_projection(self) -> None:
+        facts = inspect_csv_source_content(
+            content=b"preamble" + b"x" * 9000 + b"\nCase Study_\nexample\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=1,
+        )
+        assert facts.runtime_headers is None
+
+    def test_csv_exposes_runtime_names_without_replacing_original_labels(self) -> None:
+        facts = inspect_blob_content(
+            content=b"Case Study_,User ID\nSynthetic case,1\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+        )
+        payload = facts_to_dict(facts)
+        assert payload["observed_headers"] == ["Case Study_", "User ID"]
+        assert payload["runtime_headers"] == ["case_study", "user_id"]
+        assert payload["field_name_mapping"] == {"Case Study_": "case_study", "User ID": "user_id"}
+        assert "Synthetic case" not in str(payload)
+
+    def test_csv_explicit_columns_remain_as_written(self) -> None:
+        facts = inspect_csv_source_content(
+            content=b"Synthetic case,1\n",
+            filename="cases.csv",
+            mime_type="text/csv",
+            delimiter=",",
+            skip_rows=0,
+            columns=("Case_", "ID"),
+        )
+        payload = facts_to_dict(facts)
+        assert payload["runtime_headers"] == ["Case_", "ID"]
+        assert payload["field_name_mapping"] == {"Case_": "Case_", "ID": "ID"}
+
+    @pytest.mark.parametrize("header", [b"Case Study,case_study", b"id,id", b",id", b"!!!,id"])
+    def test_csv_unresolvable_headers_do_not_fabricate_runtime_names(self, header: bytes) -> None:
+        facts = inspect_blob_content(content=header + b"\n1,2\n", filename="cases.csv", mime_type="text/csv")
+        payload = facts_to_dict(facts)
+        assert payload["runtime_headers"] is None
+        assert payload["field_name_mapping"] is None
+        assert any("csv_field_normalization_failed" in warning for warning in facts.warnings)
+
+    def test_text_has_no_tabular_runtime_names(self) -> None:
+        facts = inspect_blob_content(content=b"Synthetic instructions", filename="context.md", mime_type="text/markdown")
+        payload = facts_to_dict(facts)
+        assert payload["runtime_headers"] is None
+        assert payload["field_name_mapping"] is None
+
     def test_round_trip_shape(self) -> None:
         f = inspect_blob_content(
             content=b"id,name\n1,Alice\n",

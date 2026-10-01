@@ -32,9 +32,6 @@ import cycle.
 
 from __future__ import annotations
 
-import codecs
-import csv
-import io
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
@@ -42,8 +39,13 @@ from pathlib import Path
 from typing import Any, Final
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.sources.csv_source import CSVSourceConfig
+from elspeth.plugins.sources.field_normalization import resolve_field_names
+from elspeth.web.composer.source_inspection import inspect_csv_source_content
 from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, SourceSpec
 
 # Stable user-facing label for the data-contract review row. The card's
@@ -329,31 +331,42 @@ def sample_header_for_source(source: SourceSpec) -> tuple[str, ...] | None:
     path_value = options.get("path") if "path" in options else options.get("file") if "file" in options else None
     if not isinstance(path_value, str) or not path_value:
         return None
-    delimiter_value = options.get("delimiter")
-    delimiter = delimiter_value if isinstance(delimiter_value, str) and len(delimiter_value) == 1 else ","
-    encoding_value = options.get("encoding")
-    encoding = encoding_value if isinstance(encoding_value, str) and encoding_value else "utf-8"
     try:
         with Path(path_value).open("rb") as handle:
             raw = handle.read(_SAMPLE_HEADER_READ_BYTES + 1)
     except OSError:
         return None
-    truncated = len(raw) > _SAMPLE_HEADER_READ_BYTES
     try:
-        decoder = codecs.getincrementaldecoder(encoding)()
-        text = decoder.decode(raw[:_SAMPLE_HEADER_READ_BYTES], final=not truncated)
-    except (LookupError, UnicodeDecodeError, ValueError):
+        # Source prevalidation consumes blob-binding metadata. Import locally
+        # to avoid the interpretation-state demand helpers' initialization cycle.
+        from elspeth.web.composer.tools._common import _source_options_for_prevalidation
+
+        prepared = deep_thaw(_source_options_for_prevalidation(options))
+        prepared["path"] = path_value
+        if "schema" not in prepared and "schema_config" not in prepared:
+            prepared["schema"] = {"mode": "observed"}
+        prepared["on_validation_failure"] = source.on_validation_failure
+        config = CSVSourceConfig.from_dict(prepared)
+        facts = inspect_csv_source_content(
+            content=raw,
+            filename=Path(path_value).name,
+            mime_type="text/csv",
+            delimiter=config.delimiter,
+            skip_rows=config.skip_rows,
+            columns=tuple(config.columns) if config.columns is not None else None,
+            encoding=config.encoding,
+            total_size_bytes=len(raw),
+        )
+        if facts.runtime_headers is None:
+            return None
+        if len(facts.runtime_headers) > _SAMPLE_HEADER_MAX_COLUMNS or any(
+            len(cell) > _SAMPLE_HEADER_MAX_CELL_CHARS for cell in facts.observed_headers or ()
+        ):
+            return None
+        resolution = resolve_field_names(raw_headers=None, columns=list(facts.runtime_headers), field_mapping=config.field_mapping)
+        return resolution.final_headers
+    except (PluginConfigError, ValueError):
         return None
-    try:
-        for row in csv.reader(io.StringIO(text), delimiter=delimiter, strict=True):
-            if not row or all(not cell.strip() for cell in row):
-                continue
-            if len(row) > _SAMPLE_HEADER_MAX_COLUMNS or any(len(cell) > _SAMPLE_HEADER_MAX_CELL_CHARS for cell in row):
-                return None
-            return tuple(cell.strip() for cell in row)
-    except csv.Error:
-        return None
-    return None
 
 
 def build_source_data_contract_draft(

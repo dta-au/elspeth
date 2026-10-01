@@ -281,10 +281,11 @@ ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
 # case-5 reason on ``ADVISOR_OUTPUT_CONTRACT_CLAUSE``. Trailing space is
 # load-bearing: the two clauses concatenate.
 ADVISOR_MUTATION_EXPECTATION_CLAUSE: Final[str] = (
-    "Resolving these findings requires pipeline MUTATIONS via tool calls "
+    "If the user's active request authorizes changes, resolve graph findings through pipeline MUTATIONS via tool calls "
     "(e.g. patch_node_options, upsert_node, patch_source_options, "
     "patch_output_options). Re-reading state (get_pipeline_state) or other "
-    "lookup-only calls is not a fix and wastes this repair pass. If a "
+    "lookup-only calls is not a fix, though they can supply evidence. If the user asks for explanation or says not to make changes, "
+    "answer that request without changing the pipeline; the advisor block still prevents completion. If a "
     "finding needs a decision only the user can make, or no tool call can "
     "address it, make no change: tell the user what blocks you and what "
     "their options are. That reply ends the turn. "

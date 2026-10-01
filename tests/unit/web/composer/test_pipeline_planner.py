@@ -185,7 +185,20 @@ _FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
 # preserves the existing 72 B headroom and the original 10% band for prior
 # scaffolding; it does not reset the general baseline to the grown request.
 _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES = 823
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10) + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
+# CSV schema recovery guidance (2026-10-02): actual initial requests measured
+# against HEAD's archived source with the same interpreter/catalog. The live
+# scaffold grew 120,149 -> 120,729 B; the small-catalog control grew
+# 118,454 -> 119,034 B. Both +580 B deltas are exclusively inspect_source's
+# static declaration (1,127 -> 1,707 B); system/payload bytes and every other
+# tool are unchanged. Batch error guidance rides repair responses, adding
+# zero initial-request bytes. Keep the prior 72 B headroom and original 10%
+# scaffolding band instead of trimming actionable CSV guidance to fit it.
+_CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES = 580
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = (
+    int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
+    + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
+    + _CSV_SOURCE_INSPECTION_GUIDANCE_CANONICAL_BYTES
+)
 
 
 @dataclass
@@ -1392,6 +1405,14 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "tools": request["tools"],
     }
     assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
+    if catalog_inventory == "live":
+        # Positive control for the byte gate: the measured 72 B headroom
+        # cannot silently absorb unrelated static-guidance growth. Mutate a
+        # real declaration, keeping request data and the other tools fixed.
+        enlarged_scaffolding = deepcopy(fixed_scaffolding)
+        source_tool = next(tool for tool in enlarged_scaffolding["tools"] if tool["function"]["name"] == "inspect_source")
+        source_tool["function"]["description"] += "x" * 73
+        assert len(canonical_json(enlarged_scaffolding).encode("utf-8")) > _FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES
 
 
 @pytest.mark.asyncio

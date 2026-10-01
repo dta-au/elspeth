@@ -636,6 +636,42 @@ describe("sessionStore", () => {
       expect(useSessionStore.getState().compositionState).toBeNull();
     });
 
+    it.each(["success", "failure"])("createSession resets active compose state before an old send %s settles", async (outcome) => {
+      const api = await import("@/api/client");
+      const post = deferred<{ message: ChatMessage; state: CompositionState; proposals: CompositionProposal[] }>();
+      vi.mocked(api.sendMessage).mockReturnValueOnce(post.promise);
+      vi.mocked(api.createSession).mockResolvedValue({
+        id: "new-session", title: "New session", created_at: "2026-10-02T00:00:00Z", updated_at: "2026-10-02T00:00:00Z",
+      });
+      vi.mocked(api.fetchComposerProgress).mockResolvedValue({ phase: "idle", inflight_requests: 0 } as ComposerProgressSnapshot);
+      useSessionStore.setState({
+        activeSessionId: "old-session", lastComposeChangedPipeline: true,
+        errorDetails: ["Old validation issue"], isLoadingVersions: true,
+      });
+      const pending = useSessionStore.getState().sendMessage("Assess old data");
+      expect(useSessionStore.getState().isComposing).toBe(true);
+      await useSessionStore.getState().createSession();
+      const activated = useSessionStore.getState();
+      if (outcome === "success") {
+        post.resolve({
+          message: { id: "old-reply", session_id: "old-session", role: "assistant", content: "Old reply", tool_calls: null, created_at: "2026-10-02T00:00:01Z" },
+          state: makeCompositionState(2), proposals: [],
+        });
+      } else {
+        post.reject({ status: 502, detail: "Old provider failure" });
+      }
+      await pending;
+      expect(activated.isComposing).toBe(false);
+      expect(activated.lastComposeChangedPipeline).toBeNull();
+      expect(activated.errorDetails).toBeNull();
+      expect(activated.isLoadingVersions).toBe(false);
+      expect(useSessionStore.getState()).toMatchObject({
+        activeSessionId: "new-session", messages: [], compositionState: null,
+        compositionProposals: [], composerProgress: null, isComposing: false,
+        error: null, errorDetails: null, lastComposeChangedPipeline: null,
+      });
+    });
+
     it("createSession requests authoring focus so a collapsed pane cannot hide a new session's composer", async () => {
       // The collapsed-pane preference persists globally (localStorage), so
       // without this a user who collapsed the pane once would find EVERY new

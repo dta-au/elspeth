@@ -1,61 +1,28 @@
 // src/hooks/useComposer.ts
-import { useCallback, useRef } from "react";
+import { useCallback } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
-import {
-  COMPOSE_USER_CANCEL_ABORT_REASON,
-  runComposeWithTimeout,
-} from "@/config/composer";
 
 /**
- * Hook for composing messages. Wraps sessionStore.sendMessage()
- * with an AbortController timeout. Dispatches error messages
- * based on HTTP status and error_type field.
- *
- * The AbortController is wired to abort the underlying fetch when the
- * timeout fires. Because abort() is given a bare-string reason, the
- * in-flight fetch rejects with that raw string (not a DOMException);
- * sessionStore classifies it and maps it to the user-facing copy.
+ * All authoring surfaces share the session store's request lifecycle and
+ * cancellation owner. Unmounting the originating surface does not remove
+ * Stop's authority over the active session's request.
  */
 export function useComposer() {
-  const storeSendMessage = useSessionStore((s) => s.sendMessage);
-  const storeRetryMessage = useSessionStore((s) => s.retryMessage);
+  const composeRequest = useSessionStore((s) => s.composeRequest);
+  const cancelComposition = useSessionStore((s) => s.cancelComposition);
   const isComposing = useSessionStore((s) => s.isComposing);
   const compositionState = useSessionStore((s) => s.compositionState);
   const error = useSessionStore((s) => s.error);
   const errorDetails = useSessionStore((s) => s.errorDetails);
-  const composeTimeoutReady = useSessionStore((s) => s.composeTimeoutReady);
-  const activeControllerRef = useRef<AbortController | null>(null);
-
-  const runWithTimeout = useCallback(
-    (runner: (signal: AbortSignal) => Promise<void>) =>
-      runComposeWithTimeout(activeControllerRef, composeTimeoutReady, runner),
-    [composeTimeoutReady],
-  );
-
-  // Admission pre-check (elspeth-3f38ebb1b5): the store's synchronous gate
-  // refuses a second freeform compose, but the refusal must also never touch
-  // activeControllerRef — runComposeWithTimeout installs (then clears) a
-  // fresh controller before the store can refuse, which would leave Stop
-  // owning no controller while the first compose still runs.
   const sendMessage = useCallback(
-    async (content: string) => {
-      if (useSessionStore.getState().isComposing) return;
-      await runWithTimeout((signal) => storeSendMessage(content, signal));
-    },
-    [runWithTimeout, storeSendMessage],
+    (content: string) => composeRequest("send", content),
+    [composeRequest],
   );
 
   const retryMessage = useCallback(
-    async (messageId: string) => {
-      if (useSessionStore.getState().isComposing) return;
-      await runWithTimeout((signal) => storeRetryMessage(messageId, signal));
-    },
-    [runWithTimeout, storeRetryMessage],
+    (messageId: string) => composeRequest("retry", messageId),
+    [composeRequest],
   );
-
-  const cancelComposition = useCallback(() => {
-    activeControllerRef.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
-  }, []);
 
   return {
     sendMessage,

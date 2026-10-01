@@ -17,6 +17,20 @@ from tests.fixtures.catalog_reference import (
 )
 
 
+def test_csv_assistance_distinguishes_uploaded_samples_from_source_guarantees() -> None:
+    assistance = CSVSource.get_agent_assistance(issue_code=None)
+    assert assistance is not None
+    hints = "\n".join(assistance.composer_hints)
+    assert "case_study_ -> case_study" in hints
+    assert "runtime_headers" in hints
+    assert "must not author schema.guaranteed_fields" in hints
+    assert "source_data_contract" in hints
+    assert "acknowledge" in hints
+    assert "flexible" in hints and "non-optional" in hints
+    assert "intended source and demanding consumers to be saved already" in hints
+    assert "rejected full replacement" in hints
+
+
 def test_csv_source_reference_content_is_specific_and_valid() -> None:
     assert_reference_text(CSVSource)
     assert_reference_tags(CSVSource)

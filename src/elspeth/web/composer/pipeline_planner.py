@@ -204,6 +204,7 @@ def _valid_information_key(key: str) -> bool:
             "blob.content:",
             "validation.code:",
             "secret.reference:",
+            "model.catalog.",
         )
     )
 
@@ -227,6 +228,8 @@ class PlannerInformationManifest:
             return False
         if key in self.supplied or key in self.unavailable:
             return True
+        if key.startswith("model.catalog."):
+            return _model_catalog_information_covered(key, self.supplied)
         if key in _CATALOG_DETAIL_INFORMATION_BY_TOOL.values():
             return _CATALOG_SELECTION_INFORMATION in self.supplied
         is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
@@ -238,6 +241,8 @@ class PlannerInformationManifest:
             return False
         if key in self.supplied:
             return True
+        if key.startswith("model.catalog."):
+            return _model_catalog_information_covered(key, self.supplied)
         if key in _CATALOG_DETAIL_INFORMATION_BY_TOOL.values():
             return _CATALOG_SELECTION_INFORMATION in self.supplied
         is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
@@ -350,6 +355,11 @@ class PlannerDiscoveryPolicy:
         )
 
     def _retains_tool(self, manifest: PlannerInformationManifest, name: str) -> bool:
+        if name == "list_models":
+            # A provider summary or a complete provider subset cannot close
+            # discovery of the rest of the catalog. Complete aids keep the
+            # existing parity affordance advertised.
+            return "model.catalog" in self.aid_supplied_information or not manifest.covers("model.catalog")
         keys = _tool_information_keys(name, {})
         if keys and all(key in self.aid_supplied_information for key in keys):
             return True
@@ -391,7 +401,13 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
         code = error_code or error_text or "unknown"
         return (f"validation.code:{code}",)
     if name == "list_models":
-        return ("model.catalog",)
+        provider = arguments["provider"] if "provider" in arguments else None
+        if provider is None:
+            return ("model.catalog.summary",)
+        limit = arguments["limit"] if "limit" in arguments else 50
+        if type(provider) is str and provider.rstrip("/") == "openrouter":
+            provider = "openrouter"
+        return ("model.catalog.list:" + canonical_json((provider, limit)),)
     if name == "list_blobs":
         return ("blob.index.session",)
     if name == "list_composer_blobs":
@@ -426,6 +442,62 @@ def planner_discovery_information_keys(call: _ParsedToolCall) -> tuple[str, ...]
     if call.wire_error is not None:
         return ()
     return _tool_information_keys(call.name, call.arguments)
+
+
+def _model_catalog_information_covered(key: str, supplied: frozenset[str]) -> bool:
+    """Close only model listings supported by prior scopes and completeness.
+
+    The key payloads are canonical JSON authored by this module. A summary
+    supplies provider counts, never identifiers. Ordinary filters use the
+    listing handler's startswith semantics; its live OpenRouter and empty
+    provider branches are separate scopes rather than prefix supersets.
+    """
+    if "model.catalog" in supplied:
+        return True
+    if not key.startswith("model.catalog.list:"):
+        return False
+    provider, limit = json.loads(key.removeprefix("model.catalog.list:"))
+    if type(provider) is not str or type(limit) is not int:
+        return False  # Invalid arguments have not resolved a discovery fact.
+    for previous in supplied:
+        if previous.startswith("model.catalog.complete:"):
+            complete_provider = json.loads(previous.removeprefix("model.catalog.complete:"))
+            if provider == complete_provider:
+                return True
+            if (
+                complete_provider not in ("", "openrouter")
+                and provider not in ("", "openrouter")
+                and provider.startswith(complete_provider)
+            ):
+                return True
+        elif previous.startswith("model.catalog.list:"):
+            previous_provider, previous_limit = json.loads(previous.removeprefix("model.catalog.list:"))
+            if previous_provider == provider and previous_limit >= limit:
+                return True
+    return False
+
+
+def _resolved_discovery_information_keys(call: _ParsedToolCall, discovery: AdmittedDiscoveryResult) -> tuple[str, ...]:
+    """Add complete provider coverage only when the real listing is complete."""
+    keys = planner_discovery_information_keys(call)
+    if call.name != "list_models" or not discovery.result.success:
+        return keys
+    provider = call.arguments["provider"] if "provider" in call.arguments else None
+    if provider is None:
+        return keys  # The unfiltered response contains only provider counts.
+    assert type(provider) is str  # Successful dispatch admitted the arguments.
+    assert discovery.response is not None
+    data = discovery.response.to_wire()
+    assert type(data) is dict
+    truncated = data["truncated"]
+    assert type(truncated) is bool
+    if truncated:
+        return keys
+    count = data["count"]
+    models = data["models"]
+    assert type(count) is int and isinstance(models, (list, tuple)) and len(models) == count
+    normalized = "openrouter" if provider.rstrip("/") == "openrouter" else provider
+    return (*keys, "model.catalog.complete:" + canonical_json(normalized))
 
 
 def _intent_selected_schema_keys(intent: str) -> frozenset[str]:
@@ -933,6 +1005,7 @@ _PLANNER_INFORMATION_EXACT: Final[Mapping[str, ComposerPlannerInformationClass]]
     }
 }
 _PLANNER_INFORMATION_PREFIXES: Final[tuple[tuple[str, ComposerPlannerInformationClass], ...]] = (
+    ("model.catalog.", ComposerPlannerInformationClass.MODEL_CATALOG),
     ("pipeline.component:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
     ("plugin.schema:", ComposerPlannerInformationClass.PLUGIN_SCHEMA),
     ("plugin.assistance:", ComposerPlannerInformationClass.PLUGIN_ASSISTANCE),
@@ -4269,7 +4342,10 @@ async def _plan_pipeline_inner(
         escalating_no_gain_calls = tuple(
             call
             for call in no_gain_calls
-            if not all(key in discovery_policy.aid_supplied_information for key in information_keys[call.call_id])
+            if not all(
+                ("model.catalog" if key.startswith("model.catalog.") else key) in discovery_policy.aid_supplied_information
+                for key in information_keys[call.call_id]
+            )
         )
         no_gain_calls_in_round += len(escalating_no_gain_calls)
         escalate_no_gain = bool(escalating_no_gain_calls) and no_gain_calls_in_round >= 2
@@ -4496,8 +4572,9 @@ async def _plan_pipeline_inner(
                 argument_retry.record_success()
                 last_argument_failure = None
                 consecutive_argument_failures = 0
+                assert isinstance(discovery_result, AdmittedDiscoveryResult)
                 information_manifest = information_manifest.with_result(
-                    information_keys[call.call_id],
+                    _resolved_discovery_information_keys(call, discovery_result),
                     available=information_available,
                 )
                 new_information.extend(_planner_information_classes(newly_covered_keys))

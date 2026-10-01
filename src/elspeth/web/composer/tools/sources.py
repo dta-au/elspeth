@@ -740,7 +740,9 @@ def _planner_guarantee_stamp_error(
             "not LLM-authored (uploaded or path-bound), so its header is a sample and the observed-mode "
             "guarantee stamp is the user's own recorded promise. Either request the data-contract review "
             "with request_interpretation_review (kind=source_data_contract) and let the user acknowledge "
-            "it (the stamp is written server-side on acknowledgement), or declare an explicit runtime "
+            "it when the intended source and demanding consumers are already saved with a pending review site "
+            "(the review reads the saved graph, never this rejected candidate; the stamp is written server-side "
+            "on acknowledgement), or declare an explicit runtime "
             "contract instead (schema mode 'flexible'/'fixed' with 'fields'), which validation enforces "
             "per row."
         )
@@ -842,7 +844,7 @@ def _resolve_source_blob(
         tool_name=tool_name,
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error)
+        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
     merged_options: Mapping[str, Any] = {
         **caller_options,
         **mime_extra,
@@ -1070,7 +1072,7 @@ def _execute_set_source(
         tool_name="set_source",
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error)
+        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
@@ -1455,7 +1457,7 @@ def _execute_set_source_from_blobs(
         tool_name="set_source_from_blobs",
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error)
+        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
     on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
     resolved = _resolve_source_blobs(
         blob_ids=validated.blob_ids,
@@ -1817,13 +1819,19 @@ _INSPECT_SOURCE_DECLARATION = ToolDeclaration(
     kind=ToolKind.BLOB_DISCOVERY,
     description=(
         "Return bounded structural facts about a blob-backed source: `source_kind`, "
-        "`observed_headers`, `sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
+        "`observed_headers`, `runtime_headers`, `field_name_mapping` (raw CSV labels to runtime row keys), "
+        "`sample_row_count`, `inferred_types` (lexical scalar-type observations per column, not runtime coercions), "
         "`url_candidates`, and `warnings`, plus `byte_range_inspected` (the byte window that "
         "was read) and `redacted_identity` (`filename`, `mime_type`, `byte_size`, `blob_id`, "
         "`content_hash_prefix` — nothing secret). Reads at most 8 KiB of the blob and parses at most 100 rows. Use this "
         "before declaring a fixed CSV/JSON schema — observed_headers are raw headers. "
-        "Declare the normalized name (First Name becomes first_name), or the source field_mapping target; "
-        "headerless columns are carried as written. Inferred types are lexical observations that tell you what numeric coercion is "
+        "For CSV, declare runtime_headers exactly (case_study_ becomes case_study), or the source field_mapping target; "
+        "field_name_mapping preserves the raw-label provenance and headerless columns are carried as written. "
+        "Null runtime_headers means the bounded header could not be resolved reliably because of naming, parsing, "
+        "truncation, or encoding; follow warnings to correct or inspect the input before declaring fields. "
+        "Uploaded/path-bound headers are samples, not guaranteed_fields: use a flexible/fixed schema with "
+        "non-optional fields for a runtime contract, or source_data_contract review and user acknowledgement "
+        "for observed-mode guarantees. Inferred types are lexical observations that tell you what numeric coercion is "
         "needed before any gate or value_transform numeric op. Never returns raw row "
         "content; only summary facts."
     ),
@@ -1914,7 +1922,7 @@ def _execute_patch_source_options(
         tool_name="patch_source_options",
     )
     if guarantee_stamp_error is not None:
-        return _failure_result(state, guarantee_stamp_error)
+        return _failure_result(state, guarantee_stamp_error, error_code="source_data_contract_required")
     # Check the LLM-supplied PATCH delta (not the merged result): a patch that
     # carries a forged "resolved" INVENTED_SOURCE requirement is the live review
     # bypass vector. Checking the delta — mirroring patch_node_options — leaves a

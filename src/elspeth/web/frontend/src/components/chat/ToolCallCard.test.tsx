@@ -48,6 +48,19 @@ const proposal: CompositionProposal = {
 };
 
 describe("ToolCallCard", () => {
+  it("shows safe repair guidance for a rejected mutation without its arguments", () => {
+    render(<ToolCallCard toolCall={{
+      ...toolCall, outcome: "rejected",
+      rejection: {
+        error_code: "source_data_contract_required",
+        guidance: ["Declare an explicit runtime schema or request a source data contract review."],
+      },
+    }} proposal={null} />);
+    expect(screen.getByText("Validation issue")).toBeInTheDocument();
+    expect(screen.getByText("Declare an explicit runtime schema or request a source data contract review.")).toBeInTheDocument();
+    expect(screen.queryByText(toolCall.function.arguments)).not.toBeInTheDocument();
+  });
+
   it.each([
     ["get_blob_content", /text content of a session file/],
     ["get_blob_metadata", /session file's name, size, and status/],

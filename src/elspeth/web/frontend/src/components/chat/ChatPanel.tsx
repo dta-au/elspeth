@@ -66,6 +66,7 @@ import type {
   ChatMessage,
   CompositionState,
   InlineSourceSummary,
+  ToolCall,
 } from "@/types/api";
 
 function isTerminalComposerPhase(
@@ -564,6 +565,37 @@ export function ChatPanelContent({
     isComposing ||
     (isTerminalComposerPhase(composerProgress?.phase) &&
       !terminalComposerProgressRetired);
+  const interruptedRequest =
+    !isComposing &&
+    !terminalComposerProgressRetired &&
+    composerProgress?.phase === "cancelled" &&
+    composerProgress.session_id === activeSessionId &&
+    composerProgress.inflight_requests === 0
+      ? messages.find((message) =>
+          message.role === "user" && message.id === composerProgress.request_id,
+        )
+      : undefined;
+  const lastComposerRejection = useMemo(() => {
+    if (
+      composerProgress === null ||
+      composerProgress.session_id !== activeSessionId ||
+      terminalComposerProgressRetired
+    ) return undefined;
+    const requestIndex = messages.findIndex((message) =>
+      message.role === "user" && message.id === composerProgress.request_id,
+    );
+    if (requestIndex === -1) return undefined;
+    let rejection: ToolCall["rejection"];
+    for (const message of messages.slice(requestIndex + 1)) {
+      if (message.role === "user") break;
+      for (const call of message.tool_calls ?? []) {
+        if (call.outcome === "rejected") {
+          rejection = call.rejection;
+        }
+      }
+    }
+    return rejection;
+  }, [activeSessionId, composerProgress, messages, terminalComposerProgressRetired]);
 
   // Auto-scroll to bottom when new messages arrive (unless user scrolled up).
   // Empty sessions render template cards above the sentinel; scrolling to the
@@ -1455,6 +1487,11 @@ export function ChatPanelContent({
             composerProgress={composerProgress}
             completionOutcome={freeformCompletionOutcome}
             liveToolCalls={liveToolCalls}
+            lastRejection={lastComposerRejection}
+            onRetryInterruptedRequest={interruptedRequest === undefined
+              ? undefined
+              : () => { void retryMessage(interruptedRequest.id); }}
+            retryDisabledReason={composeTimeoutReady ? null : decisionApplyDisabledReason}
           />
         )}
 

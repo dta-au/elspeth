@@ -943,7 +943,6 @@ allowed_dict_patterns:
   # OpenAI-format chat completion list. Each entry is the documented chat
   # message shape ({role, content, ...}) which is inherently dynamic.
   - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_proof_repair:llm_messages (list)"
-  - "src/elspeth/web/composer/composition_completion.py:CompositionCompletion._attempt_empty_state_uploaded_blob_repair:llm_messages (list)"
   # Deterministic advisor checkpoints (elspeth-dac6602a2b): the early/preflight
   # advisory passes append their guidance to the SAME OpenAI chat-completion
   # ``llm_messages`` list ({role, content, ...}) shared across the compose loop,
