@@ -4611,8 +4611,9 @@ class TestMultiQueryTemplateVariableBindings:
 
     def test_shared_node_template_column_check_does_not_scale_with_query_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Queries without an override share the node-level prompt_template; the
-        required-input column check must analyse it a constant number of times,
-        not once per query (#230: O(queries x template) on a composer edit)."""
+        required-input column and generated-input checks must analyse it a
+        constant number of times, not once per query (#230: O(queries x
+        template) on a composer edit)."""
         from elspeth.web.composer import state as state_module
 
         template = "Assess {{ row.input_1 }} against {{ row.source_row.column_0 }}"
@@ -4638,11 +4639,13 @@ class TestMultiQueryTemplateVariableBindings:
                 options={
                     "prompt_template": template,
                     "model": "test-model",
+                    "schema": {"mode": "observed"},
                     "required_input_fields": [f"column_{index}" for index in range(query_count)],
                     "queries": [{"name": f"query_{index}", "input_fields": {"input_1": f"column_{index}"}} for index in range(query_count)],
                 },
             )
             assert state_module._validate_multi_query_required_input_columns(node) == ()
+            assert state_module._validate_multi_query_generated_input_requirements(node) == ()
             return shared_template_calls
 
         assert calls_for(1) == calls_for(50)

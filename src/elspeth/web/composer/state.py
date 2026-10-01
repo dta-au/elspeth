@@ -4428,8 +4428,10 @@ def _validate_multi_query_generated_input_requirements(node: NodeSpec) -> tuple[
             required.update(name for image in images for name in (image.field, image.format_field) if name is not None)
         response_field = TypeAdapter(str).validate_python(node.options.get("response_field", "llm_response"))
         node_template: str | None = TypeAdapter(str | None).validate_python(node.options.get("prompt_template"))
-        for spec in specs:
-            template = spec.template if spec.template is not None else node_template
+        # Every query without an override renders the one node-level template;
+        # analyse each distinct effective template once, not once per query.
+        effective_templates = {spec.template if spec.template is not None else node_template for spec in specs}
+        for template in effective_templates:
             if template is not None:
                 required.update(multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)))
     except (ValueError, TemplateSyntaxError):
