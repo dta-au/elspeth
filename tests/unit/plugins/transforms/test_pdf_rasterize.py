@@ -353,6 +353,47 @@ def test_page_bytes_that_change_after_admission_are_never_published(store: Files
     assert not store.exists(hashlib.sha256(PNG).hexdigest())
 
 
+def test_worker_output_over_max_total_bytes_is_refused_before_publishing(store: FilesystemPayloadStore) -> None:
+    """``max_total_bytes`` is decided by the bytes the parent read, not the worker's own total.
+
+    The stub stands in for a worker that ignored the aggregate limit: every page passes
+    the per-page checks, and together they exceed the cap by one byte.
+    """
+    ref = store.store(minimal_pdf(2))
+    response = RasterizeResponse(page_count=2, rendered=(_page(1), _page(2)), refused=())
+    fits = (PNG + b"one", PNG + b"two")
+    at_cap = _transform(store, _StubRenderer(response, fits), max_total_bytes=sum(map(len, fits)))
+    result = at_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert [store.retrieve(row["page_blob_ref"]) for row in result.rows] == list(fits)
+
+    over = (PNG + b"ONE", PNG + b"TWO")
+    over_cap = _transform(store, _StubRenderer(response, over), max_total_bytes=sum(map(len, over)) - 1)
+    refused = over_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert refused.status == "error" and refused.retryable is False
+    assert refused.reason["reason"] == "pdf_output_too_large"
+    assert refused.reason["page_count"] == 2
+    assert not any(store.exists(hashlib.sha256(page).hexdigest()) for page in over)
+
+
+def test_page_bytes_that_grow_after_admission_cannot_exceed_max_total_bytes(
+    store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-read page can still be a valid PNG within max_page_bytes yet larger than admitted.
+
+    Admission sums two minimal PNGs, exactly the cap; the storage read of page 2 returns a
+    larger, still-admissible PNG that takes the total over it, and that page is never stored.
+    """
+    ref = store.store(minimal_pdf(2))
+    grown = PNG + b"grown-after-admission"
+    reads = iter((PNG, PNG, PNG, grown))
+    monkeypatch.setattr(pdf_rasterize_module, "_read_page_output", lambda path, max_page_bytes: next(reads))
+    renderer = _StubRenderer(RasterizeResponse(page_count=2, rendered=(_page(1), _page(2)), refused=()), (PNG, PNG))
+    with pytest.raises(RuntimeError, match="grew past max_total_bytes"):
+        _transform(store, renderer, max_total_bytes=2 * len(PNG)).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(grown).hexdigest())
+
+
 def test_a_page_file_swapped_for_a_symlink_after_admission_is_never_followed(
     store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

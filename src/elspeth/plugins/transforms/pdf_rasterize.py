@@ -424,7 +424,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fe7337d93e379826"
+    source_file_hash: str | None = "sha256:16a1d8c599b42132"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -902,9 +902,11 @@ class PDFRasterize(BaseTransform):
 
         The worker parses hostile PDF bytes, so what it says it rendered is checked
         here rather than believed: the page partition, that every page file lies in
-        its own render output directory, and that every page file is a PNG within
-        ``max_page_bytes``. A page failing the last check becomes a typed refusal,
-        exactly as if the worker had refused it.
+        its own render output directory, that every page file is a PNG within
+        ``max_page_bytes``, and that the admitted pages total at most
+        ``max_total_bytes``. A page failing the per-page check becomes a typed
+        refusal, and an aggregate overrun refuses the document, exactly as if the
+        worker had refused it.
         """
         if type(result) is DocumentRefusal or type(result) is RenderTimedOut:
             return result
@@ -935,6 +937,7 @@ class PDFRasterize(BaseTransform):
         resolved_output_dir = output_dir.resolve()
         admitted: list[RenderedPage] = []
         refused: list[RefusedPage] = list(result.refused)
+        admitted_bytes = 0
         for page in result.rendered:
             resolved_png_path = page.png_path.resolve()
             if not resolved_png_path.is_relative_to(resolved_output_dir):
@@ -949,6 +952,18 @@ class PDFRasterize(BaseTransform):
             data = _read_page_output(resolved_png_path, self._limits.max_page_bytes)
             refusal = _page_output_refusal(page.page_number, data, self._limits.max_page_bytes)
             if refusal is None:
+                # The worker stops at max_total_bytes too, but its running total is a
+                # claim like any other; the sum of the bytes read here decides.
+                admitted_bytes += len(data)
+                if admitted_bytes > self._limits.max_total_bytes:
+                    return DocumentRefusal(
+                        kind=DocumentRefusalKind.OVERSIZE_OUTPUT,
+                        detail=(
+                            f"render worker output exceeds max_total_bytes={self._limits.max_total_bytes} "
+                            f"at page {page.page_number} ({admitted_bytes} bytes)"
+                        ),
+                        page_count=result.page_count,
+                    )
                 admitted.append(replace(page, png_path=resolved_png_path))
             else:
                 refused.append(refusal)
@@ -1068,6 +1083,7 @@ class PDFRasterize(BaseTransform):
 
         base = row.to_dict()
         output_rows: list[dict[str, Any]] = []
+        stored_bytes = 0
         for page in sorted(response.rendered, key=lambda item: item.page_number):
             # Admission looked at the file; these are the bytes that get stored, so they are
             # checked again. The render pool's workers outlive the call, and a page file that
@@ -1078,6 +1094,14 @@ class PDFRasterize(BaseTransform):
                 raise RuntimeError(
                     f"pdf_rasterize worker output for page {page.page_number} changed after the parent admitted it "
                     "— worker containment breach"
+                )
+            # Each page can still be a valid PNG within max_page_bytes yet larger than the
+            # one admitted, so the aggregate is re-summed over the bytes actually stored.
+            stored_bytes += len(data)
+            if stored_bytes > self._limits.max_total_bytes:
+                raise RuntimeError(
+                    f"pdf_rasterize worker output grew past max_total_bytes at page {page.page_number} after the parent "
+                    "admitted it — worker containment breach"
                 )
             page_ref = self._payload_store.store(data)
             output = copy.deepcopy(base)
