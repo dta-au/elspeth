@@ -24,6 +24,7 @@ from elspeth.plugins.infrastructure.rasterize.protocol import (
     RenderedPage,
 )
 from elspeth.plugins.infrastructure.rasterize.renderer import RenderTimedOut
+from elspeth.plugins.transforms import pdf_rasterize as pdf_rasterize_module
 from elspeth.plugins.transforms.pdf_rasterize import PDFRasterize
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -274,6 +275,81 @@ def test_emitted_page_size_is_the_real_byte_length_not_the_workers_claim(store: 
     assert result.status == "success"
     assert result.rows[0]["page_size_bytes"] == len(real_bytes)
     assert store.retrieve(result.rows[0]["page_blob_ref"]) == real_bytes
+
+
+NOT_A_PNG = b"NOT_A_PNG"
+
+
+def test_worker_output_over_max_page_bytes_is_refused_before_publishing(store: FilesystemPayloadStore) -> None:
+    """``max_page_bytes`` is a boundary the parent enforces, not a claim the worker makes.
+
+    A worker that wrote ~1 MiB of non-PNG bytes for a 64-byte cap used to succeed:
+    the parent read the whole file, persisted it and labelled it ``image/png``.
+    """
+    ref = store.store(minimal_pdf(1))
+    oversized = NOT_A_PNG * (1024 * 1024 // len(NOT_A_PNG))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (oversized,))
+    result = _transform(store, renderer, max_page_bytes=64).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "error" and result.retryable is False
+    assert result.reason["reason"] == "pdf_page_too_large"
+    assert [(entry["page_number"], entry["kind"]) for entry in result.reason["refused_pages"]] == [(1, "oversize_bytes")]
+    assert not store.exists(hashlib.sha256(oversized).hexdigest())
+
+
+def test_worker_output_that_is_not_a_png_is_refused_before_publishing(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(1))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (NOT_A_PNG,))
+    result = _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "error" and result.retryable is False
+    assert result.reason["reason"] == "pdf_page_render_failed"
+    assert [(entry["page_number"], entry["kind"]) for entry in result.reason["refused_pages"]] == [(1, "render_error")]
+    assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+
+
+def test_a_png_at_exactly_max_page_bytes_publishes_and_one_byte_more_is_refused(store: FilesystemPayloadStore) -> None:
+    """The parent checks discriminate: they refuse a violation, not every page."""
+    ref = store.store(minimal_pdf(1))
+    response = RasterizeResponse(page_count=1, rendered=(_page(1),), refused=())
+    at_cap = _transform(store, _StubRenderer(response, (PNG,)), max_page_bytes=len(PNG))
+    result = at_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert result.rows[0]["page_size_bytes"] == len(PNG)
+    assert result.rows[0]["page_mime_type"] == "image/png"
+    assert store.retrieve(result.rows[0]["page_blob_ref"]) == PNG
+
+    over_cap = _transform(store, _StubRenderer(response, (PNG + b"\x00",)), max_page_bytes=len(PNG))
+    refused = over_cap.process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert refused.status == "error" and refused.reason["reason"] == "pdf_page_too_large"
+    assert not store.exists(hashlib.sha256(PNG + b"\x00").hexdigest())
+
+
+def test_emit_rendered_skips_a_parent_refused_page_and_publishes_the_rest(store: FilesystemPayloadStore) -> None:
+    ref = store.store(minimal_pdf(2))
+    response = RasterizeResponse(page_count=2, rendered=(_page(1, "one"), _page(2, "two")), refused=())
+    renderer = _StubRenderer(response, (PNG + b"one", NOT_A_PNG))
+    result = _transform(store, renderer, on_page_failure="emit_rendered").process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert result.status == "success"
+    assert [row["page_number"] for row in result.rows] == [1]
+    assert store.retrieve(result.rows[0]["page_blob_ref"]) == PNG + b"one"
+    assert [(entry["page_number"], entry["kind"]) for entry in result.success_reason["metadata"]["refused_pages"]] == [(2, "render_error")]
+    assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+
+
+def test_page_bytes_that_change_after_admission_are_never_published(store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check that matters is on the bytes stored, not on an earlier look at the file.
+
+    The render pool's workers outlive the call, so the file the parent admitted is not
+    guaranteed to be the file it later reads. Admission sees a PNG here; the bytes read
+    for storage are not one, and they must not reach the payload store.
+    """
+    ref = store.store(minimal_pdf(1))
+    reads = iter((PNG, NOT_A_PNG))
+    monkeypatch.setattr(pdf_rasterize_module, "_read_page_output", lambda path, max_page_bytes: next(reads))
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (PNG,))
+    with pytest.raises(RuntimeError, match="containment breach"):
+        _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+    assert not store.exists(hashlib.sha256(PNG).hexdigest())
 
 
 def test_encrypted_document_is_a_typed_row_error_not_a_crash(store: FilesystemPayloadStore) -> None:
