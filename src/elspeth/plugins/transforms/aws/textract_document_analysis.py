@@ -87,6 +87,16 @@ from elspeth.plugins.transforms.aws.textract_result import (
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
 
+# Hard ceilings on what an author may configure. Each row holds the shared
+# execution worker until its job reaches a terminal status or the poll deadline
+# passes, and retains the whole result in memory, so these may be lowered but
+# never raised; the defaults sit at the ceilings.
+MAX_POLL_TIMEOUT_SECONDS = 3600.0
+MAX_BATCH_WAIT_TIMEOUT_SECONDS = 3900.0
+MAX_RESULT_PAGES = 1000
+MAX_BLOCKS = 200_000
+MAX_RESULT_BYTES = 50_000_000
+
 # Textract raises InvalidS3ObjectException whenever it cannot READ the object —
 # it does not distinguish authorization failures from missing or corrupt files.
 # In scoped deployments the most common cause is an object outside the S3 read
@@ -186,11 +196,28 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     poll_interval_seconds: float = Field(default=1.0, gt=0, description="Initial delay between non-terminal job-status polls.")
     poll_backoff_multiplier: float = Field(default=1.5, ge=1, description="Multiplier applied to successive job-status poll delays.")
     poll_max_interval_seconds: float = Field(default=10.0, gt=0, description="Maximum delay between job-status polls.")
-    poll_timeout_seconds: float = Field(default=3600.0, gt=0, description="Total submit-through-terminal-status deadline in seconds.")
-    batch_wait_timeout_seconds: float = Field(default=3900.0, gt=0, description="Maximum engine wait for one pipelined document row.")
-    max_result_pages: int = Field(default=1000, gt=0, description="Maximum GetDocumentAnalysis result pages retained for one document.")
-    max_blocks: int = Field(default=200_000, gt=0, description="Maximum combined Textract block count for one document.")
-    max_result_bytes: int = Field(default=50_000_000, gt=0, description="Maximum canonical JSON bytes retained for one document result.")
+    poll_timeout_seconds: float = Field(
+        default=MAX_POLL_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_POLL_TIMEOUT_SECONDS,
+        description="Total submit-through-terminal-status deadline in seconds.",
+    )
+    batch_wait_timeout_seconds: float = Field(
+        default=MAX_BATCH_WAIT_TIMEOUT_SECONDS,
+        gt=0,
+        le=MAX_BATCH_WAIT_TIMEOUT_SECONDS,
+        description="Maximum engine wait for one pipelined document row.",
+    )
+    max_result_pages: int = Field(
+        default=MAX_RESULT_PAGES,
+        gt=0,
+        le=MAX_RESULT_PAGES,
+        description="Maximum GetDocumentAnalysis result pages retained for one document.",
+    )
+    max_blocks: int = Field(default=MAX_BLOCKS, gt=0, le=MAX_BLOCKS, description="Maximum combined Textract block count for one document.")
+    max_result_bytes: int = Field(
+        default=MAX_RESULT_BYTES, gt=0, le=MAX_RESULT_BYTES, description="Maximum canonical JSON bytes retained for one document result."
+    )
 
     @field_validator(
         "poll_interval_seconds",
@@ -313,7 +340,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ea759d2fa66d9e85"
+    source_file_hash: str | None = "sha256:bd472cf7bdb1f53b"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     content_trust = ContentTrust.UNTRUSTED

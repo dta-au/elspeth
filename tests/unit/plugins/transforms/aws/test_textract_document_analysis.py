@@ -224,6 +224,24 @@ def test_positive_bounds_reject_zero(field: str) -> None:
         _load(**{field: 0})
 
 
+@pytest.mark.parametrize(
+    ("field", "ceiling", "over"),
+    [
+        ("poll_timeout_seconds", 3600.0, 3600.5),
+        ("batch_wait_timeout_seconds", 3900.0, 3900.5),
+        ("max_result_pages", 1000, 1001),
+        ("max_blocks", 200_000, 200_001),
+        ("max_result_bytes", 50_000_000, 50_000_001),
+    ],
+)
+def test_worker_occupancy_and_retention_bounds_have_hard_ceilings(field: str, ceiling: float, over: float) -> None:
+    """An author may lower, never raise, how long one row can hold the shared
+    execution worker or how much result it retains (#231)."""
+    assert _load(**{field: ceiling}).model_dump()[field] == ceiling
+    with pytest.raises(PluginConfigError, match=field):
+        _load(**{field: over})
+
+
 def test_poll_backoff_multiplier_must_be_at_least_one() -> None:
     with pytest.raises(PluginConfigError, match="poll_backoff_multiplier"):
         _load(poll_backoff_multiplier=0.5)
