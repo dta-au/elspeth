@@ -763,8 +763,9 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   a bare `check` exits 2, and a cwd root walks `.venv`. The
   `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing`
   prefix lets a contributor without the operator key run it; shape-only
-  verification cannot detect forged judge metadata, so CI re-verifies with
-  the key before a merge is authoritative.
+  verification cannot detect forged judge metadata. CI runs the active
+  honesty and contract checks without the operator key; signed allowlist
+  clearance remains an operator step in a trusted context.
 - The `trust_tier.tier_model` allowlist under `config/cicd/enforce_tier_model/*.yaml`
   seals each judged suppression with an operator-held HMAC signature. A
   signed entry binds by `scope_fingerprint` of the enclosing function, not by
@@ -774,8 +775,8 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
   `pattern:`/`max_hits:` ratchet blocks suppress without a ruling; driving a
   pattern to zero fails the gate with `Unused tier-model per-file rule`, so
   lower the ceiling in the same change.
-- A keyless run reports a signed site as a finding anyway (verification is
-  fail-closed without the key). If the right code change removes a finding at
+- A keyless shape-only diagnostic does not establish signed allowlist
+  clearance. If the right code change removes a finding at
   a signed site, make it; the entry becomes `stale_delete` and the operator
   re-signs once. Do not write a rationale that restates a still-binding
   ruling for code you did not change. Contributors never hold the signing
