@@ -8361,12 +8361,9 @@ class CompositionState:
         def runtime_connection_lineage(origin: str, target: str) -> tuple[bool, tuple[NodeSpec, ...]]:
             """Resolve one lineage query at most once during this validation walk."""
             cache_key = (origin, target)
-            cached = runtime_lineage_cache.get(cache_key)
-            if cached is not None:
-                return cached
-            resolved = _runtime_connection_lineage(origin, target, self.sources, self.nodes)
-            runtime_lineage_cache[cache_key] = resolved
-            return resolved
+            if cache_key not in runtime_lineage_cache:
+                runtime_lineage_cache[cache_key] = _runtime_connection_lineage(origin, target, self.sources, self.nodes)
+            return runtime_lineage_cache[cache_key]
 
         # 1. Source exists
         if not self.sources:
