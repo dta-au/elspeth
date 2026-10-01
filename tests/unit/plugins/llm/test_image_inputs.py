@@ -287,6 +287,18 @@ class TestErrorVocabulary:
         assert isinstance(result, TransformResult)
         assert result.reason == {"reason": "too_many_images", "max_images": 2, "actual": "3"}
         assert result.retryable is False
+        assert store.retrieve_calls == []
+
+    def test_duplicate_refs_are_retrieved_once(self) -> None:
+        store = FakePayloadStore({PNG_SHA256: PNG_BYTES})
+        row = make_pipeline_row({"pictures": [PNG_SHA256, PNG_SHA256]})
+        spec = ImageInputConfig(field="pictures", format="png")
+
+        result = _resolve(row, [spec], store=store, max_images_per_call=2)
+
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert store.retrieve_calls == [PNG_SHA256]
 
 
 # ---------------------------------------------------------------------------

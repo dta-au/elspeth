@@ -307,7 +307,8 @@ class LLMConfig(TransformDataConfig):
     max_images_per_call: int = Field(
         20,
         gt=0,
-        description="Maximum resolved images per LLM call",
+        le=20,
+        description="Maximum resolved images per LLM call (hard upper bound 20)",
         json_schema_extra={"composer_tier": "advanced"},
     )
 
@@ -625,9 +626,7 @@ class LLMConfig(TransformDataConfig):
                 duplicates.add(spec.field)
             names.add(spec.field)
         if duplicates:
-            raise ValueError(
-                f"Duplicate image_inputs field names: {sorted(duplicates)}. Each entry's field must be unique"
-            )
+            raise ValueError(f"Duplicate image_inputs field names: {sorted(duplicates)}. Each entry's field must be unique")
         return self
 
     def _field_extraction_templates(self) -> tuple[tuple[str, str], ...]:

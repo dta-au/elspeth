@@ -145,7 +145,10 @@ def resolve_image_parts(
     max_image_bytes: int,
     max_images_per_call: int,
 ) -> tuple[ImagePart, ...] | TransformResult:
-    parts: list[ImagePart] = []
+    # Count the complete reference set before retrieving any payload, so a
+    # row over max_images_per_call is refused without first allocating up to
+    # max_images_per_call * max_image_bytes of image data.
+    prepared: list[tuple[ImageInputConfig, ImageFormat, int | None, object]] = []
     for spec in specs:
         if spec.field not in row or row[spec.field] is None:
             if spec.required:
@@ -165,23 +168,36 @@ def resolve_image_parts(
             refs = [(None, raw_value)]
 
         for list_index, ref in refs:
-            resolved = _resolve_one_ref(
-                spec,
-                ref,
-                image_format,
-                payload_store=payload_store,
-                max_image_bytes=max_image_bytes,
-                list_index=list_index,
-            )
-            if isinstance(resolved, TransformResult):
-                return resolved
-            parts.append(resolved)
-            if len(parts) > max_images_per_call:
+            prepared.append((spec, image_format, list_index, ref))
+            if len(prepared) > max_images_per_call:
                 too_many_reason: TransformErrorReason = {
                     "reason": "too_many_images",
                     "max_images": max_images_per_call,
-                    "actual": str(len(parts)),
+                    "actual": str(len(prepared)),
                 }
                 return TransformResult.error(too_many_reason, retryable=False)
+
+    # A ref repeated within one row resolves to the same immutable ImagePart;
+    # retrieve and decode it once rather than once per occurrence.
+    resolved_by_ref: dict[tuple[str, ImageFormat], ImagePart] = {}
+    parts: list[ImagePart] = []
+    for spec, image_format, list_index, ref in prepared:
+        cache_key = (ref, image_format) if type(ref) is str else None
+        if cache_key is not None and cache_key in resolved_by_ref:
+            parts.append(resolved_by_ref[cache_key])
+            continue
+        resolved = _resolve_one_ref(
+            spec,
+            ref,
+            image_format,
+            payload_store=payload_store,
+            max_image_bytes=max_image_bytes,
+            list_index=list_index,
+        )
+        if isinstance(resolved, TransformResult):
+            return resolved
+        if cache_key is not None:
+            resolved_by_ref[cache_key] = resolved
+        parts.append(resolved)
 
     return tuple(parts)

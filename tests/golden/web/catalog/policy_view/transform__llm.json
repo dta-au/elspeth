@@ -412,8 +412,9 @@
       "max_images_per_call": {
         "composer_tier": "advanced",
         "default": 20,
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "exclusiveMinimum": 0,
+        "maximum": 20,
         "title": "Max Images Per Call",
         "type": "integer"
       },
@@ -616,7 +617,7 @@
         "type": "integer"
       },
       {
-        "description": "Maximum resolved images per LLM call",
+        "description": "Maximum resolved images per LLM call (hard upper bound 20)",
         "name": "max_images_per_call",
         "required": false,
         "tier": "advanced",
