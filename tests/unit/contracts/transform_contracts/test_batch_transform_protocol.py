@@ -66,9 +66,11 @@ from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.engine.batch_adapter import ExceptionResult
+from elspeth.plugins.infrastructure import templates
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import OutputPort
 from elspeth.plugins.infrastructure.batching.mixin import BatchTransformMixin
+from elspeth.plugins.infrastructure.templates import SandboxedTemplate
 from elspeth.testing import make_contract, make_pipeline_row, make_row
 from tests.fixtures.mock_audit import mock_item_audit_authority
 
@@ -217,6 +219,26 @@ def _assert_frozenset_of_str(value: object, *, attr_name: str) -> frozenset[str]
 _MOCKED_RESULT_TIMEOUT_SECONDS = 3.0
 
 
+def _start_template_render_workers() -> None:
+    """Pay the template render workers' one-time start before any timed wait.
+
+    A transform renders its templates in spawned worker processes started on
+    first use (``templates._start_worker``), a cost production budgets on its
+    own (``_WORKER_START_TIMEOUT_SECONDS``) and never counts against a render.
+    Each start is a fresh interpreter importing ELSPETH -- measured at ~0.75 s
+    per worker on a lightly loaded host and several times that under a loaded
+    xdist run -- so a cold first result could miss
+    ``_MOCKED_RESULT_TIMEOUT_SECONDS`` with nothing wrong in the transform.
+    Other suites stop the workers on purpose, so this runs for every started
+    transform. Slots are handed out in FIFO order, so one render per slot
+    starts each of them.
+    """
+    probe = SandboxedTemplate("{{ run_id }}")
+    for _ in range(templates._WORKER_COUNT):
+        probe.render(run_id="template-worker-warm-up")
+    assert all(entry is not None and entry[0].is_alive() for entry in templates._WORKERS), "template render workers did not start"
+
+
 def _submit_and_wait_for_single_result(
     started_transform: TransformProtocol,
     valid_input: dict[str, Any],
@@ -359,6 +381,9 @@ class BatchTransformContractTestBase(ABC):
         mock_ctx_factory: Any,
     ) -> Generator[TransformProtocol, None, None]:
         """Provide a fully initialized and started batch transform."""
+        # Outside every timed wait: see _start_template_render_workers.
+        _start_template_render_workers()
+
         # Connect output port (BatchTransformMixin method)
         batch_transform.connect_output(output_port)  # type: ignore[attr-defined]
 

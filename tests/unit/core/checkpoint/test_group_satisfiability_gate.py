@@ -10,8 +10,10 @@ refuse (ADR-020 batch posture, made structural).
 
 from __future__ import annotations
 
+import time
+
 import pytest
-from sqlalchemy import update
+from sqlalchemy import insert, update
 
 from elspeth.contracts.checkpoint import ResumeRefusalCause
 from elspeth.contracts.enums import FrameKind
@@ -23,7 +25,7 @@ from elspeth.core.checkpoint.recovery import (
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.scheduler.work_items import collector_barrier_key
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
-from elspeth.core.landscape.schema import group_records_table, token_work_items_table
+from elspeth.core.landscape.schema import group_records_table, token_lineage_frames_table, token_work_items_table, tokens_table
 from tests.fixtures.group_lineage import (
     COALESCE_NODE_ID,
     EXPAND_GROUP,
@@ -295,3 +297,71 @@ class TestExpandGroups:
             conn.execute(update(group_records_table).where(group_records_table.c.group_id == EXPAND_GROUP).values(member_count=3))
         with pytest.raises(AuditIntegrityError, match="member_count"):
             check_group_satisfiability_resumable(db, RUN_ID, _SCOPE_BINDINGS)
+
+
+class TestForkGroupMembership:
+    def test_each_bound_group_is_judged_on_its_own_members_only(self) -> None:
+        """Two bound groups share branch names; a terminal member of one never taints the other."""
+        db = make_landscape_db()
+        seed_run(db)
+        seed_fork_member(db, token_id="tok-1a", member_key="path_a", group_id="fork-1")
+        seed_fork_member(db, token_id="tok-2a", member_key="path_a", group_id="fork-2")
+        seed_fork_member(db, token_id="tok-1b", member_key="path_b", group_id="fork-1")
+        seed_fork_member(db, token_id="tok-2b", member_key="path_b", group_id="fork-2")
+        terminalize(db, "tok-2b")
+        gate = check_group_satisfiability_resumable(db, RUN_ID, _FORK_BINDINGS)
+        assert [(member.group_id, member.member_key) for member in gate.unsatisfiable_members] == [("fork-2", "path_b")]
+
+    def test_whole_roster_closure_is_judged_per_group(self) -> None:
+        """An unbound member in one group is an integrity error even when another group is clean."""
+        db = make_landscape_db()
+        seed_run(db)
+        seed_fork_member(db, token_id="tok-1a", member_key="path_a", group_id="fork-1")
+        seed_fork_member(db, token_id="tok-1b", member_key="path_b", group_id="fork-1")
+        seed_fork_member(db, token_id="tok-2a", member_key="path_a", group_id="fork-2")
+        seed_fork_member(db, token_id="tok-2x", member_key="unbound_branch", group_id="fork-2")
+        with pytest.raises(AuditIntegrityError, match=r"'fork-2'.*unbound_branch"):
+            check_group_satisfiability_resumable(db, RUN_ID, _FORK_BINDINGS)
+
+
+class TestForkGroupScale:
+    def test_member_grouping_is_linear_in_the_number_of_groups(self) -> None:
+        """The member set of each group is built in one pass over the query result.
+
+        Rescanning every (group, member) pair once per group made the check quadratic:
+        measured on this suite's host, 2k/4k/8k unbound two-arm groups took
+        0.14 s / 0.46 s / 1.84 s, so 16k groups would take about 7 s. A single pass
+        over 32k frames is well under the bound below even on a loaded worker.
+        """
+        groups = 16_000
+        db = make_landscape_db()
+        seed_run(db)
+        with db.engine.begin() as conn:
+            conn.execute(
+                insert(tokens_table),
+                [
+                    {"token_id": f"tok-{group}-{arm}", "row_id": "row-1", "run_id": RUN_ID, "created_at": NOW}
+                    for group in range(groups)
+                    for arm in ("a", "b")
+                ],
+            )
+            conn.execute(
+                insert(token_lineage_frames_table),
+                [
+                    {
+                        "token_id": f"tok-{group}-{arm}",
+                        "run_id": RUN_ID,
+                        "depth": 0,
+                        "kind": FrameKind.FORK.value,
+                        "group_id": f"fork-{group}",
+                        "member_key": f"path_{arm}",
+                    }
+                    for group in range(groups)
+                    for arm in ("a", "b")
+                ],
+            )
+        started = time.perf_counter()
+        gate = check_group_satisfiability_resumable(db, RUN_ID, _UNBOUND)
+        elapsed = time.perf_counter() - started
+        assert gate.check.can_resume
+        assert elapsed < 1.5, f"group satisfiability over {groups} fork groups took {elapsed:.2f}s"

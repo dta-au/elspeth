@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import Engine, func, insert, select
+from sqlalchemy import Engine, func, insert, select, text
 from tests.fixtures.identities import ensure_test_identity
 
 from elspeth.contracts.blobs import blob_record_snapshot_hash
@@ -787,6 +787,28 @@ def test_run_event_append_rejects_naive_timestamp_before_write(engine: Engine) -
         )
     with engine.connect() as conn:
         assert conn.execute(select(func.count()).select_from(run_events_table)).scalar_one() == 0
+
+
+def test_soft_archive_stores_a_non_utc_archived_at_as_the_same_instant(engine: Engine) -> None:
+    """SQLite writes an aware datetime's wall-clock digits and drops the offset (#194).
+
+    ``decide_and_soft_archive`` normalises through the repository's own ``_ensure_utc``,
+    so a ``+10:00`` value naming the same instant as the UTC control must store the
+    same text, not ten hours later.
+    """
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    instant = datetime.now(UTC).replace(microsecond=0)
+    stored: dict[str, object] = {}
+    for label, archived_at in (("utc", instant), ("offset", instant.astimezone(timezone(timedelta(hours=10))))):
+        session = _create(authority, title=label)
+        # A run is durable history, so the archive is SOFT and writes archived_at.
+        _seed_run_and_blob(engine, session_id=session.id, content_hash="a" * 64, size_bytes=3)
+        fence = _acquire(authority, session_id=session.id)
+        authority.mutate(fence, lambda transaction, value=archived_at: transaction.session.decide_and_soft_archive(archived_at=value))
+        with engine.connect() as conn:
+            stored[label] = conn.execute(text("SELECT archived_at FROM sessions WHERE id = :id"), {"id": str(session.id)}).scalar_one()
+    assert stored["utc"] is not None
+    assert stored["offset"] == stored["utc"]
 
 
 def test_run_event_immediate_and_replay_records_are_canonical_and_deeply_immutable(engine: Engine) -> None:

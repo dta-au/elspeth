@@ -14,12 +14,12 @@ a cycle seeded through the tree), not merely on the happy path.
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 
 from elspeth.web.auth.models import AuthenticationError, IdentityClaims
 from elspeth.web.coordination.approval_lifecycle_authority import RepositoryApprovalLifecycleAuthority
@@ -64,6 +64,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.identity_repository import IdentityRecord
 from elspeth.web.sessions.models import (
     identities_table,
+    identity_relationships_table,
     identity_roles_table,
     quota_policies_table,
 )
@@ -2522,6 +2523,72 @@ def test_re_granting_an_expired_role_renews_it_instead_of_colliding(engine, auth
     assert rows[before.role_id].revoked_at is not None
     assert rows[renewed.role_id].revoked_at is None
     assert [grant.role for grant in authority.active_roles(identity_id=ada.identity_id)] == ["user"]
+
+
+_SYDNEY = timezone(timedelta(hours=10))
+
+
+def test_a_non_utc_grant_expiry_is_stored_as_the_same_instant(engine, authority) -> None:
+    """An administrator's offset never moves the instant a grant expires.
+
+    SQLite's ``DateTime(timezone=True)`` writes the wall-clock digits of
+    whatever it is handed and drops the offset, so an aware ``+10:00`` expiry
+    that reached the insert unconverted was read back as UTC and outlived its
+    stated instant by ten hours -- the grant kept authorising the whole time.
+    The UTC control and the ``+10:00`` grant name the same moment, so the
+    stored text must be identical and the returned grant canonical UTC.
+    """
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    control = _provision(authority, actor, "control")
+    offset = _provision(authority, actor, "offset")
+    instant = (datetime.now(UTC) + timedelta(days=2)).replace(microsecond=0)
+
+    control_grant = _grant(authority, actor, control.record.identity_id, "reviewer", expires_at=instant)
+    offset_grant = _grant(authority, actor, offset.record.identity_id, "reviewer", expires_at=instant.astimezone(_SYDNEY))
+
+    with engine.connect() as conn:
+        stored = dict(
+            conn.execute(
+                text("SELECT identity_id, expires_at FROM identity_roles WHERE role = 'reviewer'"),
+            ).all()
+        )
+    assert stored[offset.record.identity_id] == stored[control.record.identity_id]
+    (offset_row,) = [row for row in _role_rows(engine, offset.record.identity_id) if row.role == "reviewer"]
+    assert offset_row.expires_at.replace(tzinfo=UTC) == instant
+    assert offset_grant.expires_at is not None
+    assert offset_grant.expires_at.tzinfo is UTC
+    assert offset_grant.expires_at == control_grant.expires_at == instant
+
+
+def test_a_non_utc_relationship_window_is_stored_as_the_same_instants(engine, authority) -> None:
+    """``assert_relationship`` writes caller-supplied instants the same way."""
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    lead = _provision(authority, actor, "lead", role="approver")
+    member = _provision(authority, actor, "member")
+    effective_from = (datetime.now(UTC) + timedelta(days=1)).replace(microsecond=0)
+    effective_until = effective_from + timedelta(days=30)
+
+    edge = _edge(
+        authority,
+        actor,
+        lead.record.identity_id,
+        member.record.identity_id,
+        effective_from=effective_from.astimezone(_SYDNEY),
+        effective_until=effective_until.astimezone(_SYDNEY),
+    )
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(identity_relationships_table).where(identity_relationships_table.c.relationship_id == edge.relationship_id)
+        ).one()
+    assert row.effective_from.replace(tzinfo=UTC) == effective_from
+    assert row.effective_until.replace(tzinfo=UTC) == effective_until
+    assert edge.effective_from is not None
+    assert edge.effective_until is not None
+    assert edge.effective_from.tzinfo is UTC
+    assert edge.effective_until.tzinfo is UTC
 
 
 def test_stripping_a_re_pended_admin_is_a_revoke_then_a_re_admission(engine, authority) -> None:

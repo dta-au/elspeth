@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
 import re
 import shutil
 import tempfile
 import time
+from dataclasses import replace
 from itertools import chain
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
@@ -72,6 +74,35 @@ _INVARIANT_PROBE_BLOB_REF = "0" * 64
 _INVARIANT_PROBE_PNG = b"\x89PNG\r\n\x1a\n" + b"pdf-rasterize-invariant-probe"
 
 _SIZE_REFUSALS = frozenset({PageRefusalKind.OVERSIZE_PIXELS, PageRefusalKind.OVERSIZE_BYTES, PageRefusalKind.OVERSIZE_TEXT})
+
+
+def _read_page_output(path: Path, max_page_bytes: int) -> bytes:
+    """Read a worker-written page file, at most one byte past ``max_page_bytes``.
+
+    The extra byte is how an oversized file is detected without an unbounded read.
+    ``path`` is already resolved and contained, so it names a file, never a link:
+    ``O_NOFOLLOW`` refuses (ELOOP) a symbolic link a worker swapped in after
+    resolution rather than following it out of the render directory.
+    """
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+        return handle.read(max_page_bytes + 1)
+
+
+def _page_output_refusal(page_number: int, data: bytes, max_page_bytes: int) -> RefusedPage | None:
+    """The parent's own verdict on one worker-written page, in the worker's refusal vocabulary.
+
+    The worker parses hostile PDF bytes, so its claim that a page fits ``max_page_bytes``
+    and is a PNG is not evidence. ``data`` is the output of ``_read_page_output``.
+    """
+    if len(data) > max_page_bytes:
+        return RefusedPage(
+            page_number=page_number,
+            kind=PageRefusalKind.OVERSIZE_BYTES,
+            detail=f"render worker output exceeds max_page_bytes ({max_page_bytes})",
+        )
+    if not binary_document_signature_matches("png", data):
+        return RefusedPage(page_number=page_number, kind=PageRefusalKind.RENDER_ERROR, detail="render worker output is not a PNG")
+    return None
 
 
 def _build_invariant_probe_pdf() -> bytes:
@@ -393,7 +424,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9b7b6e83cb9679ba"
+    source_file_hash: str | None = "sha256:fe7337d93e379826"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -630,7 +661,10 @@ class PDFRasterize(BaseTransform):
         started = time.perf_counter()
         result, output_dir = self._renderer.render(body)
         try:
-            mapped = self._map_document_result(result, blob_ref=blob_ref, row=row, output_dir=output_dir)
+            # The receipt records the ADMITTED response: a page the parent refused is a
+            # refusal there too, so replay's one-row-per-rendered-page check holds.
+            result = self._admit_render_result(result, output_dir=output_dir)
+            mapped = self._map_document_result(result, blob_ref=blob_ref, row=row)
             if call_index is None:
                 if ctx.run_mode is RunMode.VERIFY:
                     raise AuditIntegrityError("PDF verify requires a node-state call parent")
@@ -863,7 +897,64 @@ class PDFRasterize(BaseTransform):
             source_call_id=source_call_id,
         )
 
-    def _map_document_result(self, result: RenderResult, *, blob_ref: str, row: PipelineRow, output_dir: Path | None) -> TransformResult:
+    def _admit_render_result(self, result: RenderResult, *, output_dir: Path | None) -> RenderResult:
+        """Admit the worker's response before policy, receipt or storage sees it.
+
+        The worker parses hostile PDF bytes, so what it says it rendered is checked
+        here rather than believed: the page partition, that every page file lies in
+        its own render output directory, and that every page file is a PNG within
+        ``max_page_bytes``. A page failing the last check becomes a typed refusal,
+        exactly as if the worker had refused it.
+        """
+        if type(result) is DocumentRefusal or type(result) is RenderTimedOut:
+            return result
+        if type(result) is not RasterizeResponse:
+            # Exhaustive, like ``_render_receipt``: anything else would fall through
+            # ``_map_document_result`` into page publishing without these checks.
+            raise FrameworkBugError(f"Unknown PDF renderer result type: {type(result).__name__}")
+        if output_dir is None:
+            raise FrameworkBugError(
+                "PDFRasterize renderer returned rendered pages with no output_dir — cannot verify page path containment."
+            )
+        # Assert the worker's complete partition before policy handling or page IO.
+        # A broken worker protocol is a framework bug, not a document refusal.
+        if type(result.page_count) is not int or not 0 <= result.page_count <= self._max_pages:
+            raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: page_count outside configured bounds")
+        seen: set[int] = set()
+        for page_result in chain[RenderedPage | RefusedPage](result.rendered, result.refused):
+            number = page_result.page_number
+            if type(number) is not int or not 1 <= number <= result.page_count:
+                raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: page number outside document bounds")
+            if number in seen:
+                raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: duplicate page number")
+            seen.add(number)
+        # Unique in-range members with this cardinality cover exactly 1..page_count.
+        if len(seen) != result.page_count:
+            raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: missing pages")
+
+        resolved_output_dir = output_dir.resolve()
+        admitted: list[RenderedPage] = []
+        refused: list[RefusedPage] = list(result.refused)
+        for page in result.rendered:
+            resolved_png_path = page.png_path.resolve()
+            if not resolved_png_path.is_relative_to(resolved_output_dir):
+                # The spawn worker parses hostile PDF bytes; a compromised worker returning
+                # an arbitrary readable path (e.g. a credentials file) must never be trusted
+                # to name what gets read and published into the payload store. This is our
+                # code's own containment invariant, not a document-shaped row error.
+                raise RuntimeError(
+                    f"pdf_rasterize worker returned page {page.page_number} at path {page.png_path!r}, "
+                    f"outside its own render output directory {output_dir!r} — worker containment breach"
+                )
+            data = _read_page_output(resolved_png_path, self._limits.max_page_bytes)
+            refusal = _page_output_refusal(page.page_number, data, self._limits.max_page_bytes)
+            if refusal is None:
+                admitted.append(replace(page, png_path=resolved_png_path))
+            else:
+                refused.append(refusal)
+        return RasterizeResponse(page_count=result.page_count, rendered=tuple(admitted), refused=tuple(refused))
+
+    def _map_document_result(self, result: RenderResult, *, blob_ref: str, row: PipelineRow) -> TransformResult:
         if isinstance(result, DocumentRefusal):
             return self._map_document_refusal(result, blob_ref=blob_ref)
         if isinstance(result, RenderTimedOut):
@@ -876,11 +967,7 @@ class PDFRasterize(BaseTransform):
                 },
                 retryable=False,
             )
-        if output_dir is None:
-            raise FrameworkBugError(
-                "PDFRasterize renderer returned rendered pages with no output_dir — cannot verify page path containment."
-            )
-        return self._map_rasterize_response(result, blob_ref=blob_ref, row=row, output_dir=output_dir)
+        return self._map_rasterize_response(result, blob_ref=blob_ref, row=row)
 
     def _map_document_refusal(self, result: DocumentRefusal, *, blob_ref: str) -> TransformResult:
         field_name = self._blob_ref_field
@@ -930,23 +1017,9 @@ class PDFRasterize(BaseTransform):
             }
         return TransformResult.error(reason, retryable=False)
 
-    def _map_rasterize_response(self, response: RasterizeResponse, *, blob_ref: str, row: PipelineRow, output_dir: Path) -> TransformResult:
-        # Assert the worker's complete partition before policy handling or page IO.
-        # A broken worker protocol is a framework bug, not a document refusal.
-        if type(response.page_count) is not int or not 0 <= response.page_count <= self._max_pages:
-            raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: page_count outside configured bounds")
-        seen: set[int] = set()
-        for page_result in chain[RenderedPage | RefusedPage](response.rendered, response.refused):
-            number = page_result.page_number
-            if type(number) is not int or not 1 <= number <= response.page_count:
-                raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: page number outside document bounds")
-            if number in seen:
-                raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: duplicate page number")
-            seen.add(number)
-        # Unique in-range members with this cardinality cover exactly 1..page_count.
-        if len(seen) != response.page_count:
-            raise FrameworkBugError("pdf_rasterize worker returned an invalid page partition: missing pages")
-
+    def _map_rasterize_response(self, response: RasterizeResponse, *, blob_ref: str, row: PipelineRow) -> TransformResult:
+        # ``response`` is the admitted one (``_admit_render_result``): its partition is
+        # complete and every rendered page is a contained PNG within max_page_bytes.
         field_name = self._blob_ref_field
         refused_entries: list[dict[str, Any]] = [
             {"page_number": refused.page_number, "kind": refused.kind.value, "detail": refused.detail}
@@ -995,19 +1068,17 @@ class PDFRasterize(BaseTransform):
 
         base = row.to_dict()
         output_rows: list[dict[str, Any]] = []
-        resolved_output_dir = output_dir.resolve()
         for page in sorted(response.rendered, key=lambda item: item.page_number):
-            resolved_png_path = page.png_path.resolve()
-            if not resolved_png_path.is_relative_to(resolved_output_dir):
-                # The spawn worker parses hostile PDF bytes; a compromised worker returning
-                # an arbitrary readable path (e.g. a credentials file) must never be trusted
-                # to name what gets read and published into the payload store. This is our
-                # code's own containment invariant, not a document-shaped row error.
+            # Admission looked at the file; these are the bytes that get stored, so they are
+            # checked again. The render pool's workers outlive the call, and a page file that
+            # stopped being an admissible PNG after admission was written by something other
+            # than the render that produced it.
+            data = _read_page_output(page.png_path, self._limits.max_page_bytes)
+            if _page_output_refusal(page.page_number, data, self._limits.max_page_bytes) is not None:
                 raise RuntimeError(
-                    f"pdf_rasterize worker returned page {page.page_number} at path {page.png_path!r}, "
-                    f"outside its own render output directory {output_dir!r} — worker containment breach"
+                    f"pdf_rasterize worker output for page {page.page_number} changed after the parent admitted it "
+                    "— worker containment breach"
                 )
-            data = resolved_png_path.read_bytes()
             page_ref = self._payload_store.store(data)
             output = copy.deepcopy(base)
             output[self._page_blob_ref_field] = page_ref

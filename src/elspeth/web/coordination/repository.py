@@ -455,7 +455,7 @@ def _ensure_utc(value: object) -> datetime:
     """Normalise one exact datetime row value to UTC; anything else is a malformed row."""
     if not isinstance(value, datetime):
         raise AuditIntegrityError("expected a datetime row value")
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _composition_state_column(value: Any) -> Any:

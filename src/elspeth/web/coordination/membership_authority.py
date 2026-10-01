@@ -48,7 +48,15 @@ _DATABASE_CLOCK_SQL: dict[str, str] = {
 
 
 def _ensure_utc(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    """Return ``value`` as an aware UTC datetime.
+
+    Naive values are UTC by construction (SQLite reads ``DateTime(timezone=True)``
+    back without an offset), so they are stamped. Aware values are CONVERTED:
+    SQLite writes an aware datetime's wall-clock digits and drops the offset,
+    so a caller-supplied ``+10:00`` expiry handed to an insert unconverted is
+    stored ten hours late. ``database_clock.database_now`` makes the same choice.
+    """
+    return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _database_clock_value(value: object) -> datetime:

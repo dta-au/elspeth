@@ -182,3 +182,80 @@ def test_verify_missing_source_request_does_not_launch_renderer(tmp_path: Path) 
         _transform(store, renderer).process(make_pipeline_row({"blob_ref": pdf_ref}), context)
     assert renderer.calls == 0
     assert not context.landscape.record_call.called
+
+
+class _TwoPageRenderer:
+    """Page 1 is a PNG; page 2 is bytes the parent must refuse."""
+
+    def __init__(self, *, fail_if_called: bool = False) -> None:
+        self.calls = 0
+        self.fail_if_called = fail_if_called
+
+    def render(self, pdf_bytes: bytes) -> tuple[RasterizeResponse, Path]:
+        self.calls += 1
+        if self.fail_if_called:
+            raise AssertionError("replay launched the PDF renderer")
+        directory = Path(tempfile.mkdtemp(prefix="pdf-receipt-test-"))
+        pages = []
+        for number, data in ((1, _PNG), (2, b"NOT_A_PNG")):
+            path = directory / f"page-{number}.png"
+            path.write_bytes(data)
+            pages.append(RenderedPage(page_number=number, png_path=path, width_px=20, height_px=10, size_bytes=len(data), text="page"))
+        return RasterizeResponse(page_count=2, rendered=tuple(pages), refused=()), directory
+
+    def discard(self, output_dir: Path | None) -> None:
+        if output_dir is not None:
+            shutil.rmtree(output_dir)
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_parent_refused_page_is_a_receipt_refusal_and_replays(tmp_path: Path) -> None:
+    """The receipt records the parent's verdict, so replay agrees with the live run.
+
+    Replay requires one row per receipt ``rendered`` entry. A page the parent refused
+    must therefore leave ``rendered`` for ``refused``, or every replay of an
+    ``emit_rendered`` run with a refused page would fail as inconsistent evidence.
+    """
+    source_store = FilesystemPayloadStore(tmp_path / "source")
+    pdf_ref = source_store.store(minimal_pdf(2))
+    row = make_pipeline_row({"blob_ref": pdf_ref})
+    live_ctx = _context(RunMode.LIVE)
+    live = PDFRasterize({"schema": {"mode": "observed"}, "on_page_failure": "emit_rendered"})
+    live.on_start(SimpleNamespace(payload_store=source_store))
+    live._renderer = _TwoPageRenderer()
+    live_result = live.process(row, live_ctx)
+    assert live_result.status == "success"
+    assert [item.to_dict()["page_number"] for item in live_result.rows] == [1]
+    receipt = live_ctx.landscape.record_call.call_args.kwargs["response_data"].to_dict()
+    assert [page["page_number"] for page in receipt["rendered"]] == [1]
+    assert [(page["page_number"], page["kind"]) for page in receipt["refused"]] == [(2, "render_error")]
+
+    page_ref = hashlib.sha256(_PNG).hexdigest()
+    current_store = FilesystemPayloadStore(tmp_path / "new-audit")
+    bounded_store = SourceBoundPayloadStore(
+        mode=RunMode.REPLAY,
+        source_store=source_store,
+        current_store=current_store,
+        source_refs={pdf_ref},
+        output_refs={page_ref},
+    )
+    replay_ctx = _context(RunMode.REPLAY)
+    replay_ctx.call_mode_session = SimpleNamespace(
+        replay_call=lambda **kwargs: ReplayCallEvidence(
+            source_call_id="source-render-call",
+            status=CallStatus.SUCCESS,
+            response_data=receipt,
+            error_data=None,
+            latency_ms=1.0,
+        )
+    )
+    replay = PDFRasterize({"schema": {"mode": "observed"}, "on_page_failure": "emit_rendered"})
+    replay.on_start(SimpleNamespace(payload_store=bounded_store))
+    replay_renderer = _TwoPageRenderer(fail_if_called=True)
+    replay._renderer = replay_renderer
+    replayed = replay.process(row, replay_ctx)
+
+    assert replay_renderer.calls == 0
+    assert [item.to_dict() for item in replayed.rows] == [item.to_dict() for item in live_result.rows]

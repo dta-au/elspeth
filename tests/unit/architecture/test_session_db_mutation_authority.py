@@ -2783,7 +2783,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "9d42ab43e8714140",
         1,
         "WebInstanceMembershipAuthority",
-        line=225,
+        line=233,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2793,7 +2793,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "9d42ab43e8714140",
         1,
         "WebInstanceMembershipAuthority",
-        line=231,
+        line=239,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2803,7 +2803,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "fd9264070f18566f",
         1,
         "WebInstanceMembershipAuthority",
-        line=251,
+        line=259,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2813,7 +2813,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "16ca50d5443ff62b",
         1,
         "WebInstanceMembershipAuthority",
-        line=273,
+        line=281,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2823,7 +2823,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "46a0b81f64e195f0",
         1,
         "WebInstanceMembershipAuthority",
-        line=295,
+        line=303,
     ),
     # ── identity substrate (P4-D6 elspeth-e483fe7f85): RepositoryIdentityAuthority,
     # method-exact; every acquisition stays inside its method ─────────────
@@ -3283,7 +3283,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "98fd14f12508e73a",
         1,
         "WebInstanceMembershipAuthority",
-        line=270,
+        line=278,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -3293,7 +3293,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "71b4334a0f438add",
         1,
         "WebInstanceMembershipAuthority",
-        line=248,
+        line=256,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -3303,7 +3303,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "4152160f19e026da",
         1,
         "WebInstanceMembershipAuthority",
-        line=203,
+        line=211,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -3313,7 +3313,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "476bbd10507b185c",
         1,
         "WebInstanceMembershipAuthority",
-        line=292,
+        line=300,
     ),
     # src/elspeth/web/coordination/repository.py :: SessionBlobMutationAuthority
     WriterIdentity(
@@ -5399,7 +5399,8 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         # Source snapshot admission imports moved all three recovery readers
         # down 27 lines; the scanner confirms identical owned identities.
-        line=134,
+        # #187's ``defaultdict`` import moved all three down one more line.
+        line=135,
     ),
     # Fingerprint re-pinned by elspeth-5dd23f4df9: the refuse reason this
     # function builds dropped its phantom "source-aware resume path" clause
@@ -5418,20 +5419,23 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4a125a85b3de2efa",
         1,
         None,
-        line=244,
+        line=245,
     ),
     # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
     # same-module private callee that executes on it, which the forwarding
     # proof now inspects; same acquisition, same fingerprint, no escape.
+    # Fingerprint re-pinned by #187: the fork-member grouping inside this
+    # connection's block became one pass over the query result instead of a
+    # rescan per group. Same acquisition, same reads, same non-session domain.
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
         "check_group_satisfiability_resumable",
         "<non-session-write-connection>",
         "write_connection",
-        "56688d7122f39718",
+        "84ae91f9ab3fd929",
         1,
         None,
-        line=439,
+        line=440,
     ),
     # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
     # ONLY -- same symbol, same fingerprint, same domain -- because the
@@ -11949,7 +11953,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "4152160f19e026da",
             1,
             "WebInstanceMembershipAuthority",
-            line=203,
+            line=211,
         ),
         WriterIdentity(
             authority_relpath,
@@ -11959,7 +11963,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "71b4334a0f438add",
             1,
             "WebInstanceMembershipAuthority",
-            line=248,
+            line=256,
         ),
         WriterIdentity(
             authority_relpath,
@@ -11969,7 +11973,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "98fd14f12508e73a",
             1,
             "WebInstanceMembershipAuthority",
-            line=270,
+            line=278,
         ),
         WriterIdentity(
             authority_relpath,
@@ -11979,7 +11983,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "476bbd10507b185c",
             1,
             "WebInstanceMembershipAuthority",
-            line=292,
+            line=300,
         ),
     ]
     assert connection_authority_violations(authority_live) == []
