@@ -9,7 +9,7 @@ ImageParts — never in error dicts or logs.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -161,11 +161,13 @@ def resolve_image_parts(
             return image_format
 
         raw_value = row[spec.field]
-        refs: list[tuple[int | None, object]]
+        # Iterate lazily: the count guard below must stop at ref
+        # max_images_per_call + 1, not after indexing every ref in the row.
+        refs: Iterable[tuple[int | None, object]]
         if isinstance(raw_value, (list, tuple)):
-            refs = list(enumerate(raw_value))
+            refs = enumerate(raw_value)
         else:
-            refs = [(None, raw_value)]
+            refs = ((None, raw_value),)
 
         for list_index, ref in refs:
             prepared.append((spec, image_format, list_index, ref))

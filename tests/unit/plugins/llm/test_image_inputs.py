@@ -289,6 +289,28 @@ class TestErrorVocabulary:
         assert result.retryable is False
         assert store.retrieve_calls == []
 
+    def test_over_count_row_is_refused_without_materialising_its_references(self) -> None:
+        """The count preflight stops at ref max+1; it must not first build an
+        index for every reference the row carries (a 200k-ref row allocated
+        ~88 MiB before refusal when the refs were listed up front)."""
+        import tracemalloc
+
+        store = FakePayloadStore({PNG_SHA256: PNG_BYTES})
+        row = make_pipeline_row({"pictures": [PNG_SHA256] * 200_000})
+        spec = ImageInputConfig(field="pictures", format="png")
+
+        tracemalloc.start()
+        try:
+            result = _resolve(row, [spec], store=store, max_images_per_call=20)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert isinstance(result, TransformResult)
+        assert result.reason == {"reason": "too_many_images", "max_images": 20, "actual": "21"}
+        assert store.retrieve_calls == []
+        assert peak < 1_000_000
+
     def test_duplicate_refs_are_retrieved_once(self) -> None:
         store = FakePayloadStore({PNG_SHA256: PNG_BYTES})
         row = make_pipeline_row({"pictures": [PNG_SHA256, PNG_SHA256]})
