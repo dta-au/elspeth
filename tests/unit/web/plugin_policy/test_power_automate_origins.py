@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
 import pytest
@@ -60,6 +61,15 @@ def test_operator_origins_refuse_wildcards_paths_and_private_bypasses(origin: st
 
 
 def test_power_automate_origins_decode_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Supply required settings explicitly; CI has no operator .env file.
+    for name in tuple(os.environ):
+        if name.startswith("ELSPETH_WEB__"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS", "4")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", "4")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE", "20")
+    monkeypatch.setenv("ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY", "0" * 64)
     monkeypatch.setenv("ELSPETH_WEB__POWER_AUTOMATE_ALLOWED_ORIGINS", '["https://FLOW.example:443"]')
     assert settings_from_env().power_automate_allowed_origins == ("https://flow.example",)
 

@@ -23,6 +23,12 @@ from tests.fixtures.mock_audit import mock_audit_authority
 from tests.unit.plugins.clients.test_http import _CallRecorder, _ExecutionRepositoryFake
 
 
+@pytest.fixture(autouse=True)
+def _fingerprint_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Power Automate requires fingerprints even with the development switch."""
+    monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-only-power-automate-policy-key")
+
+
 def client(policy=HTTPAuditPolicy.POWER_AUTOMATE_V1, *, cap=20000, limiter=None):
     execution = _ExecutionRepositoryFake()
     telemetry = _CallRecorder()
