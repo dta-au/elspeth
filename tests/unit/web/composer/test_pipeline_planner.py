@@ -4269,8 +4269,13 @@ async def test_pre_dispatch_failure_does_not_invent_provider_call(
     monkeypatch.setattr("elspeth.web.composer.pipeline_planner.build_planner_request_kwargs", fail_request_construction)
     completion = _ScriptedCompletion()
     recorder = BufferingRecorder()
+    loop = asyncio.get_running_loop()
+    clock_origin = loop.time()
 
-    with pytest.raises(ValueError, match="pre-dispatch"):
+    # This tests request-construction audit attribution, not deadline behavior.
+    # Host scheduling must not expire the unrelated budget before the rejection;
+    # the dedicated deadline tests separately exercise timeout enforcement.
+    with patch.object(loop, "time", lambda: clock_origin), pytest.raises(ValueError, match="pre-dispatch"):
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     assert completion.requests == []
