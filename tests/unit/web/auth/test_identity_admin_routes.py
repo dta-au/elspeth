@@ -717,6 +717,79 @@ async def test_a_window_from_the_first_utc_instant_is_asserted_and_one_microseco
     assert asserted.effective_from == datetime.min.replace(tzinfo=UTC)
 
 
+# The database clock decides whether an expiry is in the future, so only the
+# authority can refuse one that is not. It raised ``ValueError``, which no
+# route translates, so the client saw a 500.
+async def test_an_expiry_that_is_not_in_the_future_is_a_refusal_not_a_crash(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        response = await client.post(
+            "/api/auth/admin/roles",
+            headers=root,
+            json={"identity_id": bob_id, "role": "approver", "expires_at": "2001-01-01T00:00:00Z"},
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["refusal"] == "expiry_not_in_future"
+    assert harness.authority.list_roles(identity_id=bob_id, include_revoked=True, limit=50, offset=0) == ()
+    assert harness.audit.calls == []
+
+
+# A window that does not open before it closes is wrong in the body alone, so
+# the request model refuses it. The authority raised ``ValueError`` -- a 500.
+# ``empty`` names one instant in two offsets: the comparison is by instant.
+@pytest.mark.parametrize(
+    "window",
+    [
+        {"effective_from": "2027-01-02T00:00:00Z", "effective_until": "2027-01-01T00:00:00Z"},
+        {"effective_from": "2027-01-01T10:00:00+10:00", "effective_until": "2027-01-01T00:00:00Z"},
+    ],
+    ids=["inverted", "empty"],
+)
+async def test_a_relationship_window_that_does_not_open_before_it_closes_is_refused_as_invalid_input(
+    harness: _Harness, window: dict[str, str]
+) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        response = await client.post(
+            "/api/auth/admin/relationships",
+            headers=root,
+            json={"from_identity_id": bob_id, "to_identity_id": carol_id, "relationship_type": "approver", **window},
+        )
+    assert response.status_code == 422, response.text
+    assert [error["loc"] for error in response.json()["detail"]] == [["body"]]
+    assert harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0) == ()
+    assert [call.method for call in harness.audit.calls] == ["record_role_changed"]
+
+
+async def test_a_relationship_window_one_microsecond_long_is_asserted(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        await _approver_role(client, root, bob_id)
+        response = await client.post(
+            "/api/auth/admin/relationships",
+            headers=root,
+            json={
+                "from_identity_id": bob_id,
+                "to_identity_id": carol_id,
+                "relationship_type": "approver",
+                "effective_from": "2027-01-01T00:00:00Z",
+                "effective_until": "2027-01-01T00:00:00.000001Z",
+            },
+        )
+    assert response.status_code == 201, response.text
+    (asserted,) = harness.authority.list_relationships(identity_id=carol_id, include_revoked=True, limit=50, offset=0)
+    assert (asserted.effective_from, asserted.effective_until) == (
+        datetime(2027, 1, 1, tzinfo=UTC),
+        datetime(2027, 1, 1, 0, 0, 0, 1, tzinfo=UTC),
+    )
+
+
 # ── delegated curator administration ────────────────────────────────────
 
 
@@ -766,6 +839,24 @@ async def test_approver_appoints_curator_over_direct_report_and_records_audit(ha
     assert len(calls) == 1
     assert calls[0].kwargs["actor_identity_id"] == bob_id
     assert calls[0].request_bound
+
+
+async def test_a_delegated_curator_grant_expiring_in_the_past_is_a_refusal_not_a_crash(harness: _Harness) -> None:
+    bob_id = _active(harness, "bob")
+    carol_id = _active(harness, "carol")
+    async with _client(harness.app) as client:
+        root = await _bearer(client, "root")
+        bob = await _bearer(client, "bob")
+        await _approver_role(client, root, bob_id)
+        await _edge(client, root, bob_id, carol_id)
+        _govern(harness)
+        response = await client.post(
+            "/api/auth/admin/roles", headers=bob, json={"identity_id": carol_id, "role": "curator", "expires_at": "2001-01-01T00:00:00Z"}
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["refusal"] == "expiry_not_in_future"
+    assert _curator_grants(harness, carol_id) == []
+    assert [call for call in harness.audit.calls if call.method == "record_role_changed" and call.kwargs["role"] == "curator"] == []
 
 
 async def test_delegated_grant_requires_live_direct_edge_and_role(harness: _Harness) -> None:

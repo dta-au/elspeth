@@ -261,6 +261,11 @@ class RelationshipAlreadyRevoked(IdentityAuthorityRefusal):
     _MESSAGE = "relationship is already revoked"
 
 
+@final
+class ExpiryNotInFuture(IdentityAuthorityRefusal):
+    _MESSAGE = "the expiry must be in the future"
+
+
 # ---------------------------------------------------------------------------
 # Owned types.
 # ---------------------------------------------------------------------------
@@ -2875,7 +2880,7 @@ class RepositoryIdentityAuthority:
             if row.access_state != "active":
                 raise IdentityNotActive()
             if expires_at is not None and _ensure_utc(expires_at) <= now:
-                raise ValueError("expires_at must be in the future")
+                raise ExpiryNotInFuture()
             kind = _parsed_kind(row.kind, identity_id=identity_id)
             role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
             held = _active_grants(role_rows, now)
@@ -3006,7 +3011,7 @@ class RepositoryIdentityAuthority:
             if row.access_state != "active":
                 raise IdentityNotActive()
             if expires_at is not None and _ensure_utc(expires_at) <= now:
-                raise ValueError("expires_at must be in the future")
+                raise ExpiryNotInFuture()
             kind = _parsed_kind(row.kind, identity_id=identity_id)
             _refuse_role_conflict(kind=kind, role="curator", held=_active_grants(target_role_rows, now))
             occupant = _unrevoked_grant_row(locked_curator_rows, role="curator", scope=None)

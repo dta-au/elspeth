@@ -30,6 +30,7 @@ from elspeth.web.coordination.identity_authority import (
     ApproverRoleRequired,
     CannotDisableSelf,
     DefaultApproverAlreadyAssigned,
+    ExpiryNotInFuture,
     IdentityActivated,
     IdentityAdminActor,
     IdentityAlreadyDisabled,
@@ -340,6 +341,7 @@ def test_every_refusal_is_an_exact_typed_subclass() -> None:
         RelationshipAlreadyActive,
         RelationshipNotFound,
         RelationshipAlreadyRevoked,
+        ExpiryNotInFuture,
     )
     for refusal in refusals:
         assert issubclass(refusal, IdentityAuthorityRefusal)
@@ -991,7 +993,7 @@ def test_role_grant_refusals(authority) -> None:
         _grant(authority, actor, pending.identity_id, "user")
     with pytest.raises(IdentityNotFound):
         _grant(authority, actor, "missing", "user")
-    with pytest.raises(ValueError, match="future"):
+    with pytest.raises(ExpiryNotInFuture):
         _grant(authority, actor, user.record.identity_id, "reviewer", expires_at=datetime.now(UTC) - timedelta(seconds=5))
     with pytest.raises(ValueError, match="role"):
         _grant(authority, actor, user.record.identity_id, "owner")
