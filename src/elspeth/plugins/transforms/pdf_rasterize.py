@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
 import re
 import shutil
 import tempfile
@@ -77,8 +78,11 @@ def _read_page_output(path: Path, max_page_bytes: int) -> bytes:
     """Read a worker-written page file, at most one byte past ``max_page_bytes``.
 
     The extra byte is how an oversized file is detected without an unbounded read.
+    ``path`` is already resolved and contained, so it names a file, never a link:
+    ``O_NOFOLLOW`` refuses (ELOOP) a symbolic link a worker swapped in after
+    resolution rather than following it out of the render directory.
     """
-    with path.open("rb") as handle:
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
         return handle.read(max_page_bytes + 1)
 
 
@@ -408,7 +412,7 @@ class PDFRasterize(BaseTransform):
     name = "pdf_rasterize"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:80e74895578cb9d8"
+    source_file_hash: str | None = "sha256:a7d06100168b682f"
     config_model = PDFRasterizeConfig
     usage_when_to_use: str = (
         "Use when each row carries a payload-store content hash for a PDF (from the blob_rows source or blob_fetch) "
@@ -889,8 +893,12 @@ class PDFRasterize(BaseTransform):
         ``max_page_bytes``. A page failing the last check becomes a typed refusal,
         exactly as if the worker had refused it.
         """
-        if type(result) is not RasterizeResponse:
+        if type(result) is DocumentRefusal or type(result) is RenderTimedOut:
             return result
+        if type(result) is not RasterizeResponse:
+            # Exhaustive, like ``_render_receipt``: anything else would fall through
+            # ``_map_document_result`` into page publishing without these checks.
+            raise FrameworkBugError(f"Unknown PDF renderer result type: {type(result).__name__}")
         if output_dir is None:
             raise FrameworkBugError(
                 "PDFRasterize renderer returned rendered pages with no output_dir — cannot verify page path containment."

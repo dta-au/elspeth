@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import shutil
 import tempfile
@@ -349,6 +350,59 @@ def test_page_bytes_that_change_after_admission_are_never_published(store: Files
     with pytest.raises(RuntimeError, match="containment breach"):
         _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
     assert not store.exists(hashlib.sha256(NOT_A_PNG).hexdigest())
+    assert not store.exists(hashlib.sha256(PNG).hexdigest())
+
+
+def test_a_page_file_swapped_for_a_symlink_after_admission_is_never_followed(
+    store: FilesystemPayloadStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Re-checking content is not enough: a link to a PNG outside the render dir passes it.
+
+    Admission resolved and contained the path; the page is then replaced by a symbolic
+    link to an outside PNG before the bytes are read for storage. The storage read must
+    refuse the link (``O_NOFOLLOW``), not publish what it points at.
+    """
+    ref = store.store(minimal_pdf(1))
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(PNG + b"outside-the-render-dir")
+    real_read = pdf_rasterize_module._read_page_output
+    reads: list[Path] = []
+
+    def read_then_swap(path: Path, max_page_bytes: int) -> bytes:
+        reads.append(path)
+        data = real_read(path, max_page_bytes)
+        if len(reads) == 1:  # admission has read the real page; swap it before the storage read
+            path.unlink()
+            path.symlink_to(outside)
+        return data
+
+    monkeypatch.setattr(pdf_rasterize_module, "_read_page_output", read_then_swap)
+    renderer = _StubRenderer(RasterizeResponse(page_count=1, rendered=(_page(1),), refused=()), (PNG,))
+    with pytest.raises(OSError) as raised:
+        _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
+    assert raised.value.errno == errno.ELOOP
+    assert len(reads) == 2
+    assert not store.exists(hashlib.sha256(outside.read_bytes()).hexdigest())
+
+
+class _SubclassedResponse(RasterizeResponse):
+    __slots__ = ()
+
+
+def test_an_unknown_render_result_type_is_a_framework_bug_not_a_publish(store: FilesystemPayloadStore, tmp_path: Path) -> None:
+    """Admission is exhaustive over the renderer's result types.
+
+    ``_map_document_result`` dispatches with ``isinstance`` and treats anything that is
+    not a refusal or a timeout as a response, so a result admission did not recognise
+    would reach page publishing with no partition or containment check at all.
+    """
+    ref = store.store(minimal_pdf(1))
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(PNG)
+    page = RenderedPage(page_number=1, png_path=outside, width_px=10, height_px=10, size_bytes=len(PNG), text="")
+    renderer = _StubRenderer(_SubclassedResponse(page_count=5, rendered=(page,), refused=()))
+    with pytest.raises(FrameworkBugError, match="Unknown PDF renderer result type: _SubclassedResponse"):
+        _transform(store, renderer).process(make_pipeline_row({"blob_ref": ref}), make_context())
     assert not store.exists(hashlib.sha256(PNG).hexdigest())
 
 
