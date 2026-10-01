@@ -8,7 +8,7 @@ and pool configuration (flat fields assembled into PoolConfig).
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Any, Final, Literal
 
 from jinja2 import TemplateSyntaxError
@@ -150,6 +150,25 @@ def multi_query_context_names(template: str) -> frozenset[str]:
     from elspeth.core.templates import extract_jinja2_context_fields
 
     return extract_jinja2_context_fields(template, row_attribute=_MULTI_QUERY_SOURCE_ROW) - _MULTI_QUERY_IMPLICIT_ROW_NAMES
+
+
+def _memoized_per_template(analysis: Callable[[str], frozenset[str]]) -> Callable[[str], frozenset[str]]:
+    """Memoize one template analysis for the lifetime of a single validation pass.
+
+    Every query without a template override renders the one node-level
+    ``prompt_template``, so a per-query loop calling ``analysis`` directly
+    re-parses that shared template once per query — O(queries x template
+    size) on an authored config. The cache lives only as long as the caller's
+    local reference, so nothing is retained across configs.
+    """
+    results: dict[str, frozenset[str]] = {}
+
+    def analysed(template: str) -> frozenset[str]:
+        if template not in results:
+            results[template] = analysis(template)
+        return results[template]
+
+    return analysed
 
 
 def multi_query_undeclared_columns_message(query_name: str, undeclared: Sequence[str], declared: Iterable[str]) -> str:
@@ -511,8 +530,9 @@ class LLMConfig(TransformDataConfig):
         specs = resolve_queries(self.queries)
         required = set(self.declared_input_fields)
         required.update(self.schema_config.required_fields or ())
+        source_row_columns = _memoized_per_template(multi_query_source_row_columns)
         for spec in specs:
-            required.update(multi_query_source_row_columns(self.effective_template(spec.template)))
+            required.update(source_row_columns(self.effective_template(spec.template)))
         conflicts = multi_query_generated_input_conflicts(specs, self.response_field, required)
         if conflicts:
             raise ValueError(multi_query_generated_input_message(conflicts))
@@ -727,10 +747,11 @@ class LLMConfig(TransformDataConfig):
                 # reads in its effective template. Never its row.<variable>
                 # names: those are the query's own bindings.
                 extracted: set[str] = set()
+                source_row_columns = _memoized_per_template(multi_query_source_row_columns)
                 for spec in resolve_queries(self.queries):
                     extracted.update(spec.input_fields.values())
                     effective_template = self.effective_template(spec.template)
-                    extracted.update(multi_query_source_row_columns(effective_template))
+                    extracted.update(source_row_columns(effective_template))
             else:
                 # Single-query mode: detect row references in the template
                 extracted = set(extract_jinja2_fields(self.effective_template()))
@@ -931,6 +952,7 @@ class LLMConfig(TransformDataConfig):
             return self
 
         node_template_specs: list[str] = []
+        context_names = _memoized_per_template(multi_query_context_names)
         for spec in resolve_queries(self.queries):
             if spec.template is not None:
                 template = spec.template
@@ -952,7 +974,7 @@ class LLMConfig(TransformDataConfig):
                 node_template_specs.append(spec.name)
 
             bound = frozenset(spec.input_fields)
-            unbound_fields = sorted(multi_query_context_names(template) - bound)
+            unbound_fields = sorted(context_names(template) - bound)
             if unbound_fields:
                 fields = ", ".join(f"'{name}'" for name in unbound_fields)
                 bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
@@ -994,13 +1016,14 @@ class LLMConfig(TransformDataConfig):
         # None (the sibling validator above rejects that) and for [], the
         # documented opt-out.
         if self.required_input_fields:
+            source_row_columns = _memoized_per_template(multi_query_source_row_columns)
             for spec in resolve_queries(self.queries):
                 effective_template = self.effective_template(spec.template)
                 undeclared_columns = tuple(
                     sorted(
                         {
                             *undeclared_row_fields(spec.input_fields.values(), self.declared_input_fields),
-                            *undeclared_row_fields(multi_query_source_row_columns(effective_template), self.required_input_fields),
+                            *undeclared_row_fields(source_row_columns(effective_template), self.required_input_fields),
                         }
                     )
                 )
@@ -1053,12 +1076,11 @@ class LLMConfig(TransformDataConfig):
         if self.queries is None:
             return header_spelled_row_lookups(extract_jinja2_field_usage(self.effective_template()).fields, self.required_input_fields)
         lookups: dict[str, str] = {}
+        source_row_columns = _memoized_per_template(multi_query_source_row_columns)
         for spec in resolve_queries(self.queries):
             lookups.update(header_spelled_row_lookups(spec.input_fields.values(), self.declared_input_fields))
             lookups.update(
-                header_spelled_row_lookups(
-                    multi_query_source_row_columns(self.effective_template(spec.template)), self.required_input_fields
-                )
+                header_spelled_row_lookups(source_row_columns(self.effective_template(spec.template)), self.required_input_fields)
             )
         return lookups
 

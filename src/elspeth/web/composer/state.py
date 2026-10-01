@@ -4355,6 +4355,9 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
 
     node_template = node.options.get("prompt_template")
     errors: list[ValidationEntry] = []
+    # Every query without an override renders the one node-level template;
+    # analyse each distinct effective template once, not once per query.
+    source_row_columns_by_template: dict[str, frozenset[str]] = {}
     for label, entry in _well_formed_query_entries(queries):
         input_fields = entry.get("input_fields")
         if not isinstance(input_fields, Mapping):
@@ -4365,12 +4368,17 @@ def _validate_multi_query_required_input_columns(node: NodeSpec) -> tuple[Valida
         override = entry.get("template")
         effective_template = override if isinstance(override, str) else (node_template if override is None else None)
         if isinstance(effective_template, str):
-            # Plugin-config admission owns the syntax rejection, so an
-            # unparseable template contributes no source_row columns — its
-            # input_fields values are still checked without it.
-            parsed, _syntax_error = _parse_template_names(effective_template)
-            if parsed is not None:
-                source_row_columns = multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", effective_template))
+            if effective_template not in source_row_columns_by_template:
+                # Plugin-config admission owns the syntax rejection, so an
+                # unparseable template contributes no source_row columns — its
+                # input_fields values are still checked without it.
+                parsed, _syntax_error = _parse_template_names(effective_template)
+                source_row_columns_by_template[effective_template] = (
+                    multi_query_source_row_columns(INTERPRETATION_PLACEHOLDER_RE.sub(" ", effective_template))
+                    if parsed is not None
+                    else frozenset()
+                )
+            source_row_columns = source_row_columns_by_template[effective_template]
 
         undeclared = tuple(sorted({*undeclared_row_fields(columns, covering), *undeclared_row_fields(source_row_columns, declared_set)}))
         if undeclared:

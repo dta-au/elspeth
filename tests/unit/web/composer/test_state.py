@@ -4609,6 +4609,44 @@ class TestMultiQueryTemplateVariableBindings:
     def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
         return [e for e in state.validate().errors if e.error_code == code]
 
+    def test_shared_node_template_column_check_does_not_scale_with_query_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Queries without an override share the node-level prompt_template; the
+        required-input column check must analyse it a constant number of times,
+        not once per query (#230: O(queries x template) on a composer edit)."""
+        from elspeth.web.composer import state as state_module
+
+        template = "Assess {{ row.input_1 }} against {{ row.source_row.column_0 }}"
+        shared_template_calls = 0
+
+        def counting(original: Any) -> Any:
+            def wrapper(candidate: str, *args: Any, **kwargs: Any) -> Any:
+                nonlocal shared_template_calls
+                if template in candidate:
+                    shared_template_calls += 1
+                return original(candidate, *args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(state_module, "_parse_template_names", counting(state_module._parse_template_names))
+        monkeypatch.setattr(state_module, "multi_query_source_row_columns", counting(state_module.multi_query_source_row_columns))
+
+        def calls_for(query_count: int) -> int:
+            nonlocal shared_template_calls
+            shared_template_calls = 0
+            node = replace(
+                self._state(template, {}).nodes[0],
+                options={
+                    "prompt_template": template,
+                    "model": "test-model",
+                    "required_input_fields": [f"column_{index}" for index in range(query_count)],
+                    "queries": [{"name": f"query_{index}", "input_fields": {"input_1": f"column_{index}"}} for index in range(query_count)],
+                },
+            )
+            assert state_module._validate_multi_query_required_input_columns(node) == ()
+            return shared_template_calls
+
+        assert calls_for(1) == calls_for(50)
+
     def test_bare_name_in_query_override_is_rejected(self) -> None:
         """The task-shaped defect: an override interpolating a bare input_fields
         variable — the binding idiom is ``{{ row.text }}``, never ``{{ text }}``."""
