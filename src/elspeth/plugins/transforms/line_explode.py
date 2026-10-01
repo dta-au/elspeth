@@ -18,6 +18,7 @@ Per the plugin protocol, transforms distinguish contract violations from bad row
 from __future__ import annotations
 
 import copy
+import sys
 from typing import TYPE_CHECKING, Any
 
 from pydantic import Field, field_validator, model_validator
@@ -63,7 +64,7 @@ class LineExplodeConfig(TransformDataConfig):
         default=DEFAULT_MAX_OUTPUT_BYTES,
         gt=0,
         le=DEFAULT_MAX_OUTPUT_BYTES,
-        description="Maximum estimated serialized size of all rows emitted for one input row",
+        description="Maximum estimated size of all rows emitted for one input row (serialized bytes plus copied-container memory)",
     )
 
     @field_validator("source_field", "output_field", "index_field")
@@ -268,6 +269,38 @@ def _build_line_explode_output_semantics(
     )
 
 
+#: Allowance on top of sys.getsizeof() for each container deepcopy() rebuilds:
+#: GC header, allocator slack and the per-object memo entry it keeps while
+#: copying. Calibrated against traced peaks (an empty dict copies at ~190 B).
+_COPIED_CONTAINER_OVERHEAD_BYTES = 128
+
+#: Container copies each emitted row holds at peak: process() deep-copies the
+#: retained fields, then PipelineRow deep-freezes its own copy while the
+#: deep-copied rows are still alive.
+_CONTAINER_COPIES_PER_EMITTED_ROW = 2
+
+
+def _copied_container_bytes(value: Any) -> int:
+    """Approximate memory one deepcopy() of a thawed row value allocates.
+
+    deepcopy() rebuilds every dict, list and tuple but shares immutable
+    scalars, so one copy costs each container's own size; the caller charges
+    scalar content through the canonical-bytes term.
+    """
+    total = 0
+    pending: list[Any] = [value]
+    while pending:
+        current = pending.pop()
+        if type(current) is dict:
+            pending.extend(current.values())
+        elif type(current) is list or type(current) is tuple:
+            pending.extend(current)
+        else:
+            continue
+        total += sys.getsizeof(current) + _COPIED_CONTAINER_OVERHEAD_BYTES
+    return total
+
+
 def _splitlines_bounded(source_value: str, *, max_lines: int) -> tuple[list[str] | None, int]:
     """Split like str.splitlines(), stopping once the configured cap is exceeded."""
     lines: list[str] = []
@@ -309,7 +342,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:782d23c326f9ea66"
+    source_file_hash: str | None = "sha256:9650af524c9f0b51"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -509,12 +542,19 @@ class LineExplode(BaseTransform):
         # Refuse the amplification before deepcopy() materializes it.  A line
         # count alone is not a memory bound: every output retains a full copy
         # of the other fields, so a modest nested value multiplied by thousands
-        # of lines can exhaust the process.  Canonical bytes give a stable,
-        # content-sensitive estimate; the per-row allowance covers emitted
-        # field names, the optional integer index, and container overhead.
+        # of lines can exhaust the process.  Each emitted row is charged its
+        # canonical bytes (what serializing it downstream costs) plus the
+        # memory of every container rebuilt for it (by deepcopy() here and
+        # again by PipelineRow's freeze) — scalars are shared, containers are
+        # not, so canonical bytes alone undercount a container-heavy value
+        # (``{}`` is 2 bytes of JSON but ~190 bytes per copy).  The per-row
+        # allowance covers the emitted field and index.
         retained_bytes = len(canonical_json(base).encode("utf-8"))
+        copied_container_bytes = _copied_container_bytes(base)
         emitted_line_bytes = sum(len(line.encode("utf-8")) for line in lines)
-        estimated_output_bytes = (retained_bytes + 64) * len(lines) + emitted_line_bytes
+        estimated_output_bytes = (retained_bytes + _CONTAINER_COPIES_PER_EMITTED_ROW * copied_container_bytes + 64) * len(
+            lines
+        ) + emitted_line_bytes
         if estimated_output_bytes > self._max_output_bytes:
             return TransformResult.error(
                 {

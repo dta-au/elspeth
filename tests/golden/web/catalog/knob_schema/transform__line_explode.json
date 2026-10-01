@@ -73,7 +73,7 @@
       },
       {
         "default": 67108864,
-        "description": "Maximum estimated serialized size of all rows emitted for one input row",
+        "description": "Maximum estimated size of all rows emitted for one input row (serialized bytes plus copied-container memory)",
         "kind": "number-int",
         "label": "Max Output Bytes",
         "name": "max_output_bytes",
