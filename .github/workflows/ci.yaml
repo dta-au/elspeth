@@ -768,7 +768,8 @@ jobs:
           # were selected, tests/conftest.py refused them with a UsageError
           # inside every xdist worker, and xdist reported that as a crashed
           # first item on every push (elspeth-6128fc7f95 / elspeth-515183ac5a).
-          uv run pytest tests/ \
+          # Bound concurrency on the hosted runner; retain the full selection.
+          uv run pytest tests/ -n 2 \
             --cov=src/elspeth \
             --cov-report=xml \
             --cov-report=term-missing \
@@ -803,7 +804,8 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           # No `-m`: same reason as the coverage step above.
-          uv run pytest tests/ \
+          # Same worker budget as the coverage lane; no marker override.
+          uv run pytest tests/ -n 2 \
             -v
 
       - name: Upload coverage report
