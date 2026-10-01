@@ -9,6 +9,7 @@ The actual resume logic (Orchestrator.resume()) is implemented separately.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -446,10 +447,14 @@ def check_group_satisfiability_resumable(
             )
             .distinct()
         ).fetchall()
-        fork_member_pairs = [(str(row.group_id), str(row.member_key)) for row in fork_rows]
+        # One pass over the result: rescanning every (group, member) pair once per
+        # group made this check quadratic in the group count (#187).
+        fork_members_by_group: defaultdict[str, set[str]] = defaultdict(set)
+        for row in fork_rows:
+            fork_members_by_group[str(row.group_id)].add(str(row.member_key))
 
-        for group_id in sorted({pair_group_id for pair_group_id, _ in fork_member_pairs}):
-            seen = {member_key for pair_group_id, member_key in fork_member_pairs if pair_group_id == group_id}
+        for group_id in sorted(fork_members_by_group):
+            seen = fork_members_by_group[group_id]
             bound = {member for member in seen if member in bindings.fork_branch_closers}
             if not bound:
                 continue  # fully unbound fork: pure fan-out, no roster watching
