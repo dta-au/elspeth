@@ -62,7 +62,7 @@ class PowerAutomateSource(BaseSource, CanonicalJSONSourceReadCapability):
     name = "power_automate"
     plugin_version = "1.0.0"
     determinism = Determinism.EXTERNAL_CALL
-    source_file_hash: str | None = "sha256:9b1068d67de13183"
+    source_file_hash: str | None = "sha256:d3d5582f9968f4f5"
     config_model = PowerAutomateSourceConfig
     _normalizes_external_names = True
     observed_value_type: ClassVar[str | None] = None
@@ -216,7 +216,7 @@ class PowerAutomateSource(BaseSource, CanonicalJSONSourceReadCapability):
             if self.get_schema_contract() is None:
                 self.set_schema_contract(create_contract_from_config(self._schema_config).with_locked())
         finally:
-            self.close()
+            self._close_operation_client()
 
     def _reject_candidate(self, candidate: object, ctx: SourceContext, *, source_row_index: int, code: str) -> SourceRow | None:
         ctx.record_validation_error(
@@ -282,12 +282,15 @@ class PowerAutomateSource(BaseSource, CanonicalJSONSourceReadCapability):
             return None
         return self._field_resolution.resolution_mapping, self._field_resolution.normalization_version
 
-    def close(self) -> None:
-        self._closed = True
+    def _close_operation_client(self) -> None:
         client = self._client
         self._client = None
         if client is not None:
             client.close()
+
+    def close(self) -> None:
+        self._closed = True
+        self._close_operation_client()
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

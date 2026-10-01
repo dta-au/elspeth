@@ -385,6 +385,8 @@ media type, redirect behavior and all ordered row/validation decisions.
 Bearer renewal is allowed for the admitted source identity. Missing/corrupt
 payloads or configuration/archive drift refuse verification before
 publication. Sink status/write calls are never replayed as external effects.
+Strict request admission can also refuse verification after the endpoint's
+DNS resolution or pinned IP addresses change, even when its rows are identical.
 
 ## Credential-free verification
 

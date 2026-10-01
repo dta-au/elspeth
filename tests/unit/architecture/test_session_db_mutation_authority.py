@@ -3879,7 +3879,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c569a38e8104cade",
         1,
         "ApprovalAuthority",
-        line=522,
+        line=524,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -3889,7 +3889,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "c28afff08b74f188",
         1,
         "ApprovalAuthority",
-        line=532,
+        line=534,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -3899,7 +3899,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "6fe838fe433f806f",
         1,
         "ApprovalAuthority",
-        line=544,
+        line=546,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -3909,7 +3909,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "2faba18c5b689ec7",
         1,
         "ApprovalAuthority",
-        line=636,
+        line=638,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -3919,7 +3919,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "5b088eab323c8df5",
         1,
         "ApprovalAuthority",
-        line=472,
+        line=474,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -3929,7 +3929,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "9cfb13353c200db5",
         1,
         "ApprovalAuthority",
-        line=588,
+        line=590,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -3939,7 +3939,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ac140b482c767c7b",
         1,
         "ApprovalAuthority",
-        line=431,
+        line=433,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/audit_access_log_authority.py",
@@ -4932,7 +4932,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "0f528cfef4940359",
         1,
         None,
-        line=673,
+        line=675,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -4942,7 +4942,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "29021cc5f54842e6",
         1,
         None,
-        line=679,
+        line=681,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -4952,7 +4952,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ce77dc5e8665a307",
         1,
         None,
-        line=707,
+        line=709,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/approval_authority.py",
@@ -4962,7 +4962,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "c4cddb94685264c8",
         1,
         None,
-        line=668,
+        line=670,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/library_authority.py",

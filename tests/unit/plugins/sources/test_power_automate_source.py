@@ -4,12 +4,16 @@ import json
 import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
 from elspeth.contracts import RunMode
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.plugin_context import PluginContext, ValidationErrorToken
 from elspeth.contracts.sink_effect_http import SinkEffectHTTPPostResponse
+from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
+from elspeth.plugins.infrastructure.clients.power_automate import PowerAutomateOperationClient
 
 
 def options(**overrides: Any) -> dict[str, Any]:
@@ -31,8 +35,8 @@ def page(rows: list[object], cursor: str | None = None, snapshot: str = "snap") 
 def client(monkeypatch: pytest.MonkeyPatch) -> Mock:
     from elspeth.plugins.sources import power_automate
 
-    fake = Mock()
-    monkeypatch.setattr(power_automate, "PowerAutomateOperationClient", Mock(return_value=fake))
+    fake = create_autospec(PowerAutomateOperationClient, instance=True, spec_set=True)
+    monkeypatch.setattr(power_automate, "PowerAutomateOperationClient", create_autospec(PowerAutomateOperationClient, return_value=fake))
     return fake
 
 
@@ -40,19 +44,22 @@ def responses(client: Mock, *bodies: bytes) -> None:
     client.post_json.side_effect = [SinkEffectHTTPPostResponse(200, "application/json", b, "call", "a" * 64, "b" * 64) for b in bodies]
 
 
-def context() -> Any:
-    return SimpleNamespace(
-        landscape=Mock(),
+def context() -> PluginContext:
+    ctx = PluginContext(
+        config={},
+        landscape=create_autospec(PluginAuditWriterAdapter, instance=True, spec_set=True),
         run_id="run",
         operation_id="operation",
+        node_id="source",
         shutdown_event=threading.Event(),
-        require_coordination_token=Mock(return_value=Mock()),
-        telemetry_emit=Mock(),
-        record_validation_error=Mock(),
-        run_mode=RunMode.LIVE,
-        call_mode_session=None,
-        rate_limit_registry=None,
+        coordination_token=CoordinationToken(run_id="run", worker_id="source-test-worker", leader_epoch=1),
     )
+    ctx.record_validation_error = create_autospec(
+        ctx.record_validation_error,
+        spec_set=True,
+        return_value=ValidationErrorToken(row_id="invalid-row", node_id="source", destination="quarantine"),
+    )
+    return ctx
 
 
 def source(**overrides: Any) -> Any:
@@ -308,7 +315,7 @@ def test_schema_failure_preserves_original_header_and_payload(client: Mock) -> N
 def test_startup_never_creates_client_or_credentials(client: Mock, monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.plugins.sources import power_automate
 
-    constructor = Mock(side_effect=AssertionError("client startup allocation"))
+    constructor = create_autospec(PowerAutomateOperationClient, spec_set=True, side_effect=AssertionError("client startup allocation"))
     monkeypatch.setattr(power_automate, "PowerAutomateOperationClient", constructor)
     src = source()
     src.on_start(context())
@@ -388,3 +395,36 @@ def test_audit_failure_does_not_retain_external_validation_exception(
     with pytest.raises(FrameworkBugError, match="controlled audit failure") as raised:
         list(source(schema=schema).load(ctx))
     assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("termination", ["exhausted", "transport_error", "generator_close", "cancelled"])
+def test_operation_cleanup_preserves_engine_owned_lifecycle(client: Mock, termination: str) -> None:
+    responses(client, page([{"id": 1}, {"id": 2}], None if termination == "exhausted" else "next"))
+    src = source()
+    ctx = context()
+    src.on_start(ctx)
+    stream = src.load(ctx)
+    if termination == "transport_error":
+        client.post_json.side_effect = RuntimeError("controlled transport failure")
+        with pytest.raises(RuntimeError, match="controlled transport failure"):
+            list(stream)
+    elif termination == "exhausted":
+        assert [row.row["id"] for row in stream] == [1, 2]
+    else:
+        assert next(stream).row == {"id": 1}
+        if termination == "generator_close":
+            stream.close()
+        else:
+            ctx.shutdown_event.set()
+            with pytest.raises(ValueError, match="source_cancelled"):
+                next(stream)
+
+    client.close.assert_called_once()
+    assert src._closed is False
+    assert src._on_complete_called is False
+    src.on_complete(ctx)
+    assert src._on_complete_called is True
+    src.close()
+    src.close()
+    assert src._closed is True
+    client.close.assert_called_once()

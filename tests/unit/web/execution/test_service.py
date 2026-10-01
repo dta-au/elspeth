@@ -51,7 +51,7 @@ from elspeth.contracts.chargeable_admission import (
     ChargeableAdmissionRefused,
     QuotaDisposition,
 )
-from elspeth.contracts.enums import CreationModality, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import CreationModality, RunMode, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, ExecutionError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
@@ -476,6 +476,7 @@ def _mock_pipeline_settings() -> _ModelCopyNamespace:
     objects for the runtime conversion boundary.
     """
     return _ModelCopyNamespace(
+        run_mode=RunMode.LIVE,
         sources={},
         transforms=[],
         aggregations=[],

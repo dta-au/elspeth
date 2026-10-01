@@ -90,6 +90,7 @@ def _drive_quarantined_stream(
 
     source = MagicMock(spec=SourceProtocol)
     source.name = "fake"
+    source.config = {}
     source.on_success = "default"
     sink = MagicMock(spec=SinkProtocol)
     sink.name = "default"
@@ -198,6 +199,7 @@ def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_f
     processor.collector_executor = None
     source = MagicMock(spec=SourceProtocol)
     source.name = "llm"
+    source.config = {}
     source.on_success = "default"
     sink = MagicMock(spec=SinkProtocol)
     sink.name = "default"

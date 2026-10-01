@@ -11,7 +11,7 @@ tests/unit/engine/test_bootstrap_preflight.py.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,13 +19,18 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts import SourceProtocol
 from elspeth.contracts.enums import RunMode
 from elspeth.contracts.errors import CommencementGateFailedError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.preflight import DependencyRunResult
+from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectRuntimeBinding
+from elspeth.core.config import SourceSettings
 from elspeth.core.dependency_config import (
     CommencementGateConfig,
 )
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
+from tests.fixtures.plugins import CollectSink, ListSource
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +102,29 @@ def _make_plugin_bundle() -> PluginBundle:
         sinks={},
         aggregations={},
         sink_effect_bindings={},
+    )
+
+
+def _make_context_plugin_bundle(sources: Mapping[str, SourceProtocol]) -> PluginBundle:
+    """Retain the factory contract for the CLI context's exact sink instance."""
+    sink = CollectSink("out")
+    purpose = SinkEffectExecutionPurpose.FRESH
+    return PluginBundle(
+        sources=sources,
+        source_settings_map={name: SourceSettings(plugin=source.name, on_success="out") for name, source in sources.items()},
+        transforms=[],
+        sinks={"out": sink},
+        aggregations={},
+        sink_effect_bindings={
+            "out": SinkEffectRuntimeBinding(
+                sink_name="out",
+                sink=sink,
+                sink_type=type(sink),
+                config_fingerprint=stable_hash({}),
+                purpose=purpose,
+                effect_mode=type(sink)._resolve_sink_effect_mode({}, purpose=purpose),
+            )
+        },
     )
 
 
@@ -294,17 +322,9 @@ class TestBootstrapProgrammaticExecution:
 
         mock_config = _make_bootstrap_config()
         mock_config.checkpoint.enabled = False
-        source = object()
+        source = ListSource([], name="source", on_success="out")
         mock_graph = _GraphStub()
-        mock_plugins = SimpleNamespace(
-            transforms=[],
-            aggregations={},
-            source=source,
-            sources={"source": source},
-            source_settings_map={},
-            sinks={"out": object()},
-            sink_effect_modes={},
-        )
+        mock_plugins = _make_context_plugin_bundle({"source": source})
         mock_db = _CloseableDouble()
 
         with (
@@ -329,20 +349,13 @@ class TestBootstrapProgrammaticExecution:
     def test_orchestrator_context_preserves_named_sources(self) -> None:
         """CLI PipelineConfig assembly carries plural source instances into runtime."""
         from elspeth.cli import _orchestrator_context
-        from tests.fixtures.plugins import ListSource
 
         mock_config = _make_bootstrap_config()
         mock_config.checkpoint.enabled = False
         mock_graph = _GraphStub()
         first_source = ListSource([], name="orders", on_success="out")
         second_source = ListSource([], name="refunds", on_success="out")
-        mock_plugins = SimpleNamespace(
-            transforms=[],
-            aggregations={},
-            sources={"orders": first_source, "refunds": second_source},
-            sinks={"out": object()},
-            sink_effect_modes={},
-        )
+        mock_plugins = _make_context_plugin_bundle({"orders": first_source, "refunds": second_source})
         mock_db = _CloseableDouble()
 
         with (

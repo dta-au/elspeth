@@ -12,13 +12,14 @@ from unittest.mock import patch
 import pytest
 import yaml
 from click.testing import Result
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from typer.testing import CliRunner
 
 from elspeth.cli import app
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import (
     calls_table,
+    node_states_table,
     nodes_table,
     rows_table,
     runs_table,
@@ -27,6 +28,7 @@ from elspeth.core.landscape.schema import (
     validation_errors_table,
 )
 from elspeth.core.payload_store import FilesystemPayloadStore
+from elspeth.plugins.infrastructure.power_automate_nonlive import DeferredPowerAutomateCredential
 from elspeth.plugins.sinks.power_automate import PowerAutomateSink
 from elspeth.plugins.sources.power_automate import PowerAutomateSource
 from elspeth.plugins.transforms.passthrough import PassThrough
@@ -396,3 +398,107 @@ def test_replay_and_verify_preserve_ordered_bad_candidate_decisions(tmp_path: Pa
     assert all(decision == decisions[0] for decision in decisions[1:])
     assert len(flow.requests("read")) == 2
     assert len(flow.requests("write")) == len(flow.actions()) == 1
+
+
+def _mapping_quarantine_settings(tmp_path: Path, schema_mode: str) -> tuple[dict[str, object], dict[str, object]]:
+    settings = pipeline_settings(tmp_path)
+    options = settings["sources"]["records"]["options"]
+    options["on_validation_failure"] = "quarantine"
+    options["schema"]["mode"] = schema_mode
+    if schema_mode == "observed":
+        options["schema"] = {"mode": "observed"}
+        invalid = {"a-b": "candidate", "a b": "collision"}
+    else:
+        invalid = {"bad": "candidate"}
+    settings["sinks"]["quarantine"] = {
+        "plugin": "json",
+        "on_write_failure": "discard",
+        "options": {"path": str(tmp_path / "quarantine.jsonl"), "format": "jsonl", "mode": "append", "schema": {"mode": "observed"}},
+    }
+    return settings, invalid
+
+
+@pytest.mark.parametrize("schema_mode", ["fixed", "flexible", "observed"])
+def test_mapping_quarantine_decisions_survive_replay_chain_and_verify(tmp_path: Path, credentials: None, schema_mode: str) -> None:
+    settings, invalid = _mapping_quarantine_settings(tmp_path, schema_mode)
+    flow = DurablePowerAutomateFlow(tmp_path / "target.db", pages=[[invalid, {"record_id": "A", "result": "ok"}]])
+    with flow.transport():
+        live = invoke(tmp_path, settings)
+    assert live.exit_code == 1, live.output
+    original_id = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    run_ids = [original_id]
+    for mode in ("replay", "replay", "verify"):
+        settings.update(run_mode=mode, replay_from=run_ids[-1] if mode == "replay" else original_id)
+        with (
+            flow.transport(),
+            patch.object(PowerAutomateSink, "make_http_post_factory", side_effect=AssertionError("nonlive composed sink HTTP")),
+        ):
+            result = invoke(tmp_path, settings)
+        assert result.exit_code == 1, result.output
+        run_ids.append(json.loads(result.output.strip().splitlines()[-1])["run_id"])
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        ledgers = [
+            connection.execute(select(validation_errors_table).where(validation_errors_table.c.run_id == run_id)).mappings().all()
+            for run_id in run_ids
+        ]
+        source_rows = connection.execute(select(rows_table)).mappings().all()
+    row_ids_by_run = {run_id: {row["row_id"] for row in source_rows if row["run_id"] == run_id} for run_id in run_ids}
+    assert all(len(ledger) == 1 for ledger in ledgers)
+    assert all(json.loads(ledger[0]["row_data_json"]) == invalid for ledger in ledgers)
+    assert all(ledger[0]["row_id"] in row_ids_by_run[run_id] for run_id, ledger in zip(run_ids, ledgers, strict=True))
+    assert len({ledger[0]["error_id"] for ledger in ledgers}) == 4
+    assert len(flow.requests("read")) == 2
+    assert len(flow.requests("write")) == len(flow.actions()) == 1
+
+
+@pytest.mark.parametrize("schema_mode", ["fixed", "flexible", "observed"])
+@pytest.mark.parametrize("run_mode", ["replay", "verify"])
+def test_mapping_quarantine_missing_decision_refuses_before_auth_and_lifecycle(
+    tmp_path: Path, credentials: None, monkeypatch: pytest.MonkeyPatch, schema_mode: str, run_mode: str
+) -> None:
+    settings, invalid = _mapping_quarantine_settings(tmp_path, schema_mode)
+    flow = DurablePowerAutomateFlow(tmp_path / "target.db", pages=[[invalid, {"record_id": "A", "result": "ok"}]])
+    with flow.transport():
+        live = invoke(tmp_path, settings)
+    assert live.exit_code == 1, live.output
+    original_id = json.loads(live.output.strip().splitlines()[-1])["run_id"]
+    tables = (nodes_table, rows_table, node_states_table, token_outcomes_table)
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.begin() as connection:
+        ledger = connection.execute(select(validation_errors_table).where(validation_errors_table.c.run_id == original_id)).mappings().all()
+        assert len(ledger) == 1
+        assert json.loads(ledger[0]["row_data_json"]) == invalid
+        retained = [connection.execute(select(table)).mappings().all() for table in tables]
+        deleted = connection.execute(delete(validation_errors_table).where(validation_errors_table.c.run_id == original_id))
+        assert deleted.rowcount == 1
+        assert [connection.execute(select(table)).mappings().all() for table in tables] == retained
+    requests = flow.requests()
+    artifact = (tmp_path / "quarantine.jsonl").read_bytes()
+    settings.update(run_mode=run_mode, replay_from=original_id)
+    monkeypatch.delenv("POWER_AUTOMATE_READ_TRIGGER_URL")
+    monkeypatch.delenv("POWER_AUTOMATE_WRITE_TRIGGER_URL")
+    with (
+        patch.object(
+            DeferredPowerAutomateCredential, "resolve", side_effect=AssertionError("corrupt archive resolved credential")
+        ) as credential,
+        patch.object(PowerAutomateSource, "on_start", side_effect=AssertionError("corrupt archive started source")) as source_start,
+        patch.object(PowerAutomateSource, "load", side_effect=AssertionError("corrupt archive loaded source")) as source_load,
+        patch.object(PassThrough, "on_start", side_effect=AssertionError("corrupt archive started transform")) as transform_start,
+        patch.object(
+            PowerAutomateSink, "make_http_post_factory", side_effect=AssertionError("corrupt archive composed sink HTTP")
+        ) as sink_factory,
+        patch("socket.getaddrinfo", side_effect=AssertionError("corrupt archive resolved DNS")) as dns,
+    ):
+        refused = invoke(tmp_path, settings)
+    assert refused.exit_code != 0, refused.output
+    assert "quarantine validation evidence missing" in refused.output + str(refused.exception)
+    credential.assert_not_called()
+    source_start.assert_not_called()
+    source_load.assert_not_called()
+    transform_start.assert_not_called()
+    sink_factory.assert_not_called()
+    dns.assert_not_called()
+    assert flow.requests() == requests
+    assert len(flow.actions()) == 1
+    assert (tmp_path / "quarantine.jsonl").read_bytes() == artifact
+    with LandscapeDB.from_url(f"sqlite:///{tmp_path / 'landscape.db'}", create_tables=False) as db, db.engine.connect() as connection:
+        assert connection.execute(select(validation_errors_table)).mappings().all() == []

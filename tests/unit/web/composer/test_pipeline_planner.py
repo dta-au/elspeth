@@ -177,7 +177,15 @@ _FIXED_SCAFFOLDING_BASELINE_BYTES = 106 * 1024
 # repair guidance is per-ERROR text rather than scaffolding, and
 # pipeline_composer.md is not the skill this request carries (the harness
 # renders pipeline_capabilities.md), so both measured +0 B.
-_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10)
+# Power Automate source/sink catalog expansion (2026-10-01): measured with the
+# same live request, omitting only those two summaries in the catalog control.
+# The scaffold is 119,326 B without them and 120,149 B with them: +823 B,
+# comprising +759 B in the discovery digest and +64 B in outer JSON escaping.
+# System-message and tool-palette bytes are identical. This additive allowance
+# preserves the existing 72 B headroom and the original 10% band for prior
+# scaffolding; it does not reset the general baseline to the grown request.
+_POWER_AUTOMATE_CATALOG_CANONICAL_BYTES = 823
+_FIXED_SCAFFOLDING_MAX_CANONICAL_BYTES = int(_FIXED_SCAFFOLDING_BASELINE_BYTES * 1.10) + _POWER_AUTOMATE_CATALOG_CANONICAL_BYTES
 
 
 @dataclass

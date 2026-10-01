@@ -341,7 +341,9 @@ def test_private_validation_refuses_nonlive_before_secret_access(
     result = load_runtime_settings(
         materialized,
         operator_settings=None,
-        secret_service=cast(WebSecretResolver, MagicMock()) if secret_resolver_present else None,
+        secret_service=cast(WebSecretResolver, create_autospec(WebSecretResolver, instance=True, spec_set=True))
+        if secret_resolver_present
+        else None,
         user_id="test",
         load_yaml=load_bounded_pipeline_yaml,
         load_settings_yaml=load_settings_yaml,
@@ -362,14 +364,14 @@ def test_private_validation_live_invocation_reaches_ordinary_secret_resolution(i
     materialized = _materialized(pipeline_yaml=f"{invocation}sources: {{}}\nsinks: {{}}\nprivate: {{secret_ref: FLOW_URL}}\n")
     materialized = replace(materialized, authored=replace(materialized.authored, all_secret_refs=(("FLOW_URL", None),)))
     parsed_config = load_bounded_pipeline_yaml(materialized.pipeline_yaml)
-    resolve = MagicMock(return_value=(parsed_config, ()))
+    resolve = _autospec_callable(_validation_runtime.resolve_secret_refs, spec_set=True, return_value=(parsed_config, ()))
     monkeypatch.setattr(_validation_runtime, "resolve_secret_refs", resolve)
     parsed_settings = _settings()
     loader = _autospec_callable(load_settings_from_config_dict, return_value=parsed_settings)
     result = load_runtime_settings(
         materialized,
         operator_settings=None,
-        secret_service=cast(WebSecretResolver, MagicMock()),
+        secret_service=cast(WebSecretResolver, create_autospec(WebSecretResolver, instance=True, spec_set=True)),
         user_id="test",
         load_yaml=load_bounded_pipeline_yaml,
         load_settings_yaml=_autospec_callable(load_settings_from_yaml_string),

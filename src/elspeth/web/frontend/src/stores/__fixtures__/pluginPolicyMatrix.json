@@ -14,8 +14,8 @@
     {
       "name": "core_only",
       "principal_scope": "local:core_only",
-      "snapshot_fingerprint": "7872761d0f932841fb868e60f72c9dc326cf6ce3d115deda5f0162a93a557957",
-      "policy_hash": "c92e5b1a32e17c0e5d1efb9274cb49d13964d66c1143c1fe559f67a32cf730c3",
+      "snapshot_fingerprint": "cee18ac6d7045913eda698db4a0436fa75da018484ceaf1532aceee6c82d5758",
+      "policy_hash": "fbe753f514bafb91e6da92621d75f8c5a7cb2be1cf0c23e08c571df6279b6d6a",
       "authorized_control_ids": [],
       "available_control_ids": [],
       "available_plugin_ids": [
@@ -48,8 +48,8 @@
     {
       "name": "azure_only",
       "principal_scope": "local:azure_only",
-      "snapshot_fingerprint": "ec2e31cb9edcc363fdade0fa73cdb37ed650712acede883fe350edfd5bcd98fe",
-      "policy_hash": "d646a457f90efe7104328bdd066c20aa21c7869d085bc0f75b9b6004de95ff44",
+      "snapshot_fingerprint": "c911c932874828f95cb90e619ca21ada277abbc9042d8e3ba357846329eaee2c",
+      "policy_hash": "b295241e9ae90e3980a845fc307c61d8b548296b8edf0a14e50d1e64aacfb587",
       "authorized_control_ids": [
         "transform:azure_prompt_shield",
         "transform:azure_content_safety"
@@ -98,8 +98,8 @@
     {
       "name": "aws_only",
       "principal_scope": "local:aws_only",
-      "snapshot_fingerprint": "bb5c6cbe04f588c2d08b09c08225bda8642abe5f101ca9546421d24c19d70118",
-      "policy_hash": "edf8edb13f09390932ee4fd9c32ad828891b0282b389ff92ca9fcdb36bdeda83",
+      "snapshot_fingerprint": "94ec359be03a02c802e891c9e11889db29d13ce1ff8ae091000b0e6d8c76477b",
+      "policy_hash": "a5f8b83288bf9be1fc0817e2a744b8f118807b6efac9afed254e535d8d4c327c",
       "authorized_control_ids": [
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_bedrock_content_safety"
@@ -148,8 +148,8 @@
     {
       "name": "both_with_azure_preference",
       "principal_scope": "local:both_with_azure_preference",
-      "snapshot_fingerprint": "4dffb5e3977229f32b9d064653e83f4a3e2ccbef205d7fe3a8f4208776359818",
-      "policy_hash": "76694b7a4c2e958383412ef6b05a4f83487079477e5d65883923279bd1b2e0b9",
+      "snapshot_fingerprint": "d0e8aec4fa4550665eeea5fbaf39a743e44dfe18891bc30daba12355d2a686e6",
+      "policy_hash": "7a0ae7be808f62c3ed9c7b38587d0b03eb02834a96bd05a888944b0a8213376b",
       "authorized_control_ids": [
         "transform:azure_prompt_shield",
         "transform:azure_content_safety",
@@ -210,8 +210,8 @@
     {
       "name": "neither_control_implementation",
       "principal_scope": "local:neither_control_implementation",
-      "snapshot_fingerprint": "3666a2892afe49fde5ced7ec25e169f9d594099254d5aaa199829d253a436652",
-      "policy_hash": "a8971937a91c808bc5b653589f984c2b02f8da12b1014df45b11440b13cc61b8",
+      "snapshot_fingerprint": "d0775cbda9b00482e6da414da60e907525598d752ac24002098a8dce1ec25746",
+      "policy_hash": "55d03fa57227dd8d6f6b08302b2b9458dd0caf932b70382996efeea29bb39a36",
       "authorized_control_ids": [
         "transform:azure_prompt_shield",
         "transform:azure_content_safety",

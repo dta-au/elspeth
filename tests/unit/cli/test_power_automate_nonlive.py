@@ -1,6 +1,6 @@
 """CLI admission rejects damaged archives before any secret effects."""
 
-from unittest.mock import Mock
+from typing import Never
 
 import pytest
 import yaml
@@ -19,6 +19,18 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import nodes_table, run_sources_table, runs_table
 from elspeth.plugins.infrastructure.power_automate_nonlive import PowerAutomateArchive
 from tests.fixtures.landscape import leader_coordination_token
+
+
+class _ForbiddenExternalCall:
+    """Record and refuse any external-effect entry point reached by admission."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> Never:
+        self.calls.append((args, kwargs))
+        raise AssertionError(self.message)
 
 
 @pytest.fixture
@@ -97,7 +109,7 @@ def test_cli_loading_never_resolves_unused_source_secret(archived_pipeline, monk
     import elspeth.cli as cli
 
     path, _ = archived_pipeline
-    trap = Mock(side_effect=AssertionError("secret loader reached"))
+    trap = _ForbiddenExternalCall("secret loader reached")
     monkeypatch.setattr(cli, "load_secrets_from_config", trap)
     _, _, archive = _admit_raw_cli_nonlive_run(path)
     assert type(archive) is PowerAutomateArchive
@@ -105,7 +117,7 @@ def test_cli_loading_never_resolves_unused_source_secret(archived_pipeline, monk
     assert loaded.secret_resolutions == ()
     assert loaded.power_automate_nonlive.source_credentials == {}
     assert loaded.settings.sources["input"].options == dict(archive.sources["input"].safe_options)
-    trap.assert_not_called()
+    assert trap.calls == []
 
 
 @pytest.mark.parametrize("field", ["run_mode", "replay_from", "concurrency.max_workers", "checkpoint"])
@@ -125,12 +137,12 @@ def test_owned_archive_fields_cannot_be_deleted_even_with_recomputed_hash(archiv
             connection.execute(update(runs_table).values(settings_json=canonical_json(raw), config_hash=stable_hash(raw)))
     finally:
         db.close()
-    trap = Mock(side_effect=AssertionError("secret loader reached"))
+    trap = _ForbiddenExternalCall("secret loader reached")
     monkeypatch.setattr(cli, "load_secrets_from_config", trap)
     with pytest.raises(AuditIntegrityError, match="power_automate_archive_settings_invalid"):
         _, _, archive = _admit_raw_cli_nonlive_run(path)
         _load_runtime_settings_with_secrets(path, source_settings=archive)
-    trap.assert_not_called()
+    assert trap.calls == []
 
 
 @pytest.mark.parametrize(
@@ -160,12 +172,12 @@ def test_masked_archive_values_refused_even_with_recomputed_hash(archived_pipeli
             connection.execute(update(runs_table).values(settings_json=canonical_json(raw), config_hash=stable_hash(raw)))
     finally:
         db.close()
-    trap = Mock(side_effect=AssertionError("secret loader reached"))
+    trap = _ForbiddenExternalCall("secret loader reached")
     monkeypatch.setattr(cli, "load_secrets_from_config", trap)
     with pytest.raises(AuditIntegrityError, match="power_automate_archive_settings_invalid"):
         _, _, archive = _admit_raw_cli_nonlive_run(path)
         _load_runtime_settings_with_secrets(path, source_settings=archive)
-    trap.assert_not_called()
+    assert trap.calls == []
 
 
 def test_live_archive_ignored_string_replay_reference_preserves_producer_behavior(archived_pipeline):
@@ -250,12 +262,12 @@ def test_archive_corruption_precedes_secret_loading(archived_pipeline, monkeypat
                 connection.execute(update(nodes_table).values(plugin_version="unknown"))
     finally:
         db.close()
-    trap = Mock(side_effect=AssertionError("secret loader reached"))
+    trap = _ForbiddenExternalCall("secret loader reached")
     monkeypatch.setattr(cli, "load_secrets_from_config", trap)
     if command == "bootstrap":
         with pytest.raises(AuditIntegrityError, match="power_automate_archive"):
             bootstrap_and_run(path)
-        trap.assert_not_called()
+        assert trap.calls == []
         return
     args = [command, "--settings", str(path)]
     if command == "run":
@@ -264,7 +276,7 @@ def test_archive_corruption_precedes_secret_loading(archived_pipeline, monkeypat
     assert result.exit_code == 1, result.output
     assert isinstance(result.exception, AuditIntegrityError)
     assert str(result.exception).startswith("power_automate_archive")
-    trap.assert_not_called()
+    assert trap.calls == []
 
 
 def test_outer_execution_drift_precedes_secrets(archived_pipeline, monkeypatch):
@@ -274,12 +286,12 @@ def test_outer_execution_drift_precedes_secrets(archived_pipeline, monkeypatch):
     raw = yaml.safe_load(path.read_text())
     raw["checkpoint"] = {"enabled": False}
     path.write_text(yaml.safe_dump(raw))
-    trap = Mock(side_effect=AssertionError("secret loader reached"))
+    trap = _ForbiddenExternalCall("secret loader reached")
     monkeypatch.setattr(cli, "load_secrets_from_config", trap)
     _, _, archive = _admit_raw_cli_nonlive_run(path)
     with pytest.raises(ValueError, match="execution_settings_differ"):
         _load_runtime_settings_with_secrets(path, source_settings=archive)
-    trap.assert_not_called()
+    assert trap.calls == []
 
 
 @pytest.mark.parametrize("mode", ["replay", "verify"])
@@ -295,7 +307,7 @@ def test_real_cli_validate_has_no_source_or_sink_credential_effects(archived_pip
     raw = yaml.safe_load(path.read_text())
     raw["run_mode"] = mode
     path.write_text(yaml.safe_dump(raw))
-    trap = Mock(side_effect=AssertionError("external startup reached"))
+    trap = _ForbiddenExternalCall("external startup reached")
     monkeypatch.setattr(cli, "load_secrets_from_config", trap)
     monkeypatch.setattr(socket, "getaddrinfo", trap)
     monkeypatch.setattr(azure.identity, "ClientSecretCredential", trap)
@@ -303,4 +315,4 @@ def test_real_cli_validate_has_no_source_or_sink_credential_effects(archived_pip
     monkeypatch.setattr(client, "PowerAutomateOperationClient", trap)
     result = CliRunner().invoke(app, ["validate", "--settings", str(path)])
     assert result.exit_code == 0, result.output
-    trap.assert_not_called()
+    assert trap.calls == []

@@ -220,6 +220,7 @@ payload_store:
         preferences=(),
         control_modes=snapshot.control_modes,
         plugin_code_identities=(),
+        power_automate_allowed_origins=snapshot.power_automate_allowed_origins,
         policy_hash=snapshot.policy_hash,
     )
     loop = asyncio.get_running_loop()

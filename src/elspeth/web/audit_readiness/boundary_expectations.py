@@ -176,6 +176,7 @@ EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
     "json": Determinism.IO_READ,
     "llm": Determinism.NON_DETERMINISTIC,
     "null": Determinism.DETERMINISTIC,
+    "power_automate": Determinism.EXTERNAL_CALL,
     "text": Determinism.IO_READ,
 }
 
@@ -188,6 +189,7 @@ EXPECTED_SINK_DETERMINISMS: dict[str, Determinism] = {
     "dataverse": Determinism.EXTERNAL_CALL,
     "document": Determinism.IO_WRITE,
     "json": Determinism.IO_WRITE,
+    "power_automate": Determinism.EXTERNAL_CALL,
     "text": Determinism.IO_WRITE,
 }
 

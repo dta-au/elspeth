@@ -128,6 +128,7 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 | [`azure_blob_sentiment`](azure_blob_sentiment/) | Azure Blob Storage source with LLM processing |
 | [`azure_keyvault_secrets`](azure_keyvault_secrets/) | Secret resolution from Azure Key Vault |
 | [`multi_query_assessment`](multi_query_assessment/) | Azure-backed multi-query assessment matrix |
+| [`power_automate`](power_automate/) | HTTP-triggered paginated source and inspectable member sink, with secret-backed callbacks and durable delivery reconciliation |
 
 ### AWS (requires AWS credentials)
 

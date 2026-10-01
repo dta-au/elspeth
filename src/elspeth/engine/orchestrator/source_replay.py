@@ -30,6 +30,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json_loads
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.source_read_verification import SourceReadVerificationPolicy
 from elspeth.contracts.type_normalization import CONTRACT_TYPE_MAP
 from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import sanitize_for_canonical, stable_hash
@@ -291,6 +292,7 @@ def prepare_audited_sources(
     schema_by_source: dict[str, type[Any]] = {}
     contract_by_source: dict[str, SchemaContract | None] = {}
     schema_json_by_source: dict[str, str] = {}
+    mandatory_quarantine_ledger_sources: set[str] = set()
 
     for name, source in sources.items():
         record = by_name[name]
@@ -314,6 +316,12 @@ def prepare_audited_sources(
             or node.source_file_hash != source.source_file_hash
         ):
             raise AuditIntegrityError(f"Source replay run {replay_from}: source {name!r} implementation or configuration differs")
+        if source_read_verification_policy(source) is SourceReadVerificationPolicy.POWER_AUTOMATE_CANONICAL_JSON_V1:
+            # L3 issues this nominal policy only for the exact reviewed
+            # builtin, which records every rejected candidate before yield.
+            # Its quarantine decision must survive even for ordinary dicts
+            # whose payload shape alone can be reconstructed unambiguously.
+            mandatory_quarantine_ledger_sources.add(name)
         _, contract = factory.data_flow.get_node_contracts(replay_from, record.source_node_id)
         contract_by_source[name] = contract
         if record.source_schema_json is None:
@@ -379,6 +387,8 @@ def prepare_audited_sources(
             quarantine = _quarantine_details(factory, replay_from, row.row_id, row.source_node_id)
             validation_error = quarantine_errors_by_row.get(row.row_id)
             if quarantine is not None:
+                if validation_error is None and row_source_name in mandatory_quarantine_ledger_sources:
+                    raise AuditIntegrityError(f"Source replay row {row.row_id}: quarantine validation evidence missing")
                 if stable_hash(data) != row.source_data_hash:
                     raise AuditIntegrityError(f"Source replay row {row.row_id}: quarantine payload hash mismatch")
                 raw_data: Any = data
