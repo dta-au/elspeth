@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from sqlalchemy import ColumnElement, and_, func, or_, select
 
 from elspeth.contracts.scheduler import TokenWorkStatus
-from elspeth.core.landscape.database import Tier1Engine
+from elspeth.core.landscape.database import Tier1Engine, _maybe_serialize_shared_connection
 from elspeth.core.landscape.schema import token_work_items_table
 
 
@@ -89,7 +89,7 @@ class SchedulerReadModel:
         chunk_size = 900
         ids = list(work_item_ids)
         total = 0
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             for start in range(0, len(ids), chunk_size):
                 chunk = ids[start : start + chunk_size]
                 result = conn.execute(
@@ -121,7 +121,7 @@ class SchedulerReadModel:
         chunk_size = 900
         ids = list(work_item_ids)
         total = 0
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             for start in range(0, len(ids), chunk_size):
                 chunk = ids[start : start + chunk_size]
                 result = conn.execute(
@@ -167,7 +167,7 @@ class SchedulerReadModel:
         else:
             ids = list(work_item_ids)
             chunks = tuple(ids[start : start + 900] for start in range(0, len(ids), 900))
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             for chunk in chunks:
                 query = (
                     select(token_work_items_table.c.work_item_id)
@@ -192,7 +192,7 @@ class SchedulerReadModel:
             TokenWorkStatus.BLOCKED.value,
             TokenWorkStatus.PENDING_SINK.value,
         )
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -203,7 +203,7 @@ class SchedulerReadModel:
 
     def count_unquiesced_work(self, *, run_id: str) -> int:
         """Count work items still able to deposit new barrier arrivals (§D step 2)."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -214,7 +214,7 @@ class SchedulerReadModel:
 
     def summarize_unquiesced_work(self, *, run_id: str) -> tuple[str, ...]:
         """Summarize §D step-2 unquiesced work for invariant diagnostics."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(
@@ -245,7 +245,7 @@ class SchedulerReadModel:
 
     def count_unresolved_work(self, *, run_id: str) -> int:
         """Count scheduler work not yet resolved into a durable sink handoff."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -256,7 +256,7 @@ class SchedulerReadModel:
 
     def summarize_unresolved_work(self, *, run_id: str) -> tuple[str, ...]:
         """Summarize unresolved work grouped by status and blocking keys."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(
@@ -293,7 +293,7 @@ class SchedulerReadModel:
             TokenWorkStatus.BLOCKED.value,
             TokenWorkStatus.PENDING_SINK.value,
         )
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(

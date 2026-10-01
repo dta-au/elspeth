@@ -32,7 +32,7 @@ from elspeth.contracts.scheduler import (
 )
 from elspeth.core.landscape.bind_budget import bind_budget_chunks
 from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcomes_guarded
-from elspeth.core.landscape.database import Tier1Engine
+from elspeth.core.landscape.database import Tier1Engine, _maybe_serialize_shared_connection
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
@@ -94,7 +94,7 @@ class BarrierJournalRepository:
         database, so a leader whose process clock has drifted cannot fire
         or starve a timeout by the size of its drift.
         """
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             return read_landscape_transaction_time(conn)
 
     def complete_barrier(
@@ -1032,7 +1032,7 @@ class BarrierJournalRepository:
         ``batch_members.ordinal``, not from this verb. Read-only: no
         scheduler_event is recorded.
         """
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(token_work_items_table)
@@ -1051,7 +1051,7 @@ class BarrierJournalRepository:
 
     def count_blocked_barrier_items(self, *, run_id: str) -> int:
         """Count journal BLOCKED barrier holds for a run."""
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             result = conn.execute(
                 select(func.count())
                 .select_from(token_work_items_table)
@@ -1075,7 +1075,7 @@ class BarrierJournalRepository:
         predicate must wait until ALL BLOCKED rows are terminalized, not just
         the pending-epoch ones.
         """
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     select(token_work_items_table)

@@ -88,7 +88,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.canonical import canonical_json
-from elspeth.core.landscape.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas
+from elspeth.core.landscape.database import Tier1Engine, _maybe_serialize_shared_connection, begin_write, verify_sqlite_tier1_pragmas
 from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.lease_deadlines import (
     DeadlineKey,
@@ -1216,7 +1216,7 @@ class RunCoordinationRepository:
         Check-then-act at the caller is acceptable because the leadership CAS
         is the arbiter.
         """
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             database_now = read_landscape_decision_time(conn)
             # Liveness is decided in SQL against the bound database time — the
             # same comparison the takeover CAS makes. This remains advisory:
@@ -1699,7 +1699,7 @@ class RunCoordinationRepository:
         The caller then calls ``evict_worker`` for each, which is idempotent
         (benign skip if the worker heartbeated or holds a live lease).
         """
-        with self._engine.connect() as conn:
+        with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
             grace_threshold = read_landscape_decision_time(conn) - timedelta(seconds=grace_seconds)
             rows = conn.execute(
                 select(run_workers_table.c.worker_id)

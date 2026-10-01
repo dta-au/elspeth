@@ -9795,11 +9795,15 @@ def _cancelled_permit_caller_is_proven(unit: SourceUnit, call: ast.Call, proof: 
 # The prepared retry may read back only the epoch of the worker just minted
 # by that invocation. Pin this authoritative reader before admitting that
 # constructor branch; changing its body withdraws the whole proof.
+# The read takes the StaticPool serialization guard (a no-op on per-thread
+# production pools): an unguarded autobegin on the tests' shared in-memory
+# connection broke a concurrent sink-effect heartbeat's BEGIN. It is still one
+# fresh database sample and one seat read on one connection.
 _COORDINATION_FINALIZATION_RECIPES[
     ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
 ] = """
 def live_leader(self, *, run_id: str) -> LeaderInfo | None:
-    with self._engine.connect() as conn:
+    with _maybe_serialize_shared_connection(self._engine), self._engine.connect() as conn:
         database_now = read_landscape_decision_time(conn)
         seat = conn.execute(select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch, run_coordination_table.c.leader_heartbeat_expires_at, (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label('seat_live')).where(run_coordination_table.c.run_id == run_id)).one_or_none()
     if seat is None or seat.leader_worker_id is None:
@@ -9810,6 +9814,7 @@ _COORDINATION_FINALIZATION_DEPENDENCIES[
     ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.live_leader")
 ] = {
     "LeaderInfo": "elspeth.contracts.coordination.LeaderInfo",
+    "_maybe_serialize_shared_connection": "elspeth.core.landscape.database._maybe_serialize_shared_connection",
     "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
     "select": "sqlalchemy.select",
     "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
@@ -10217,8 +10222,8 @@ def test_finalization_current_closed_caller_graph(finalization_source_units):
             "    getattr(conn, 'rollback')()\n    context_json = canonical_json({} if context is None else dict(context))",
         ),
         (
-            "from elspeth.core.landscape.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas",
-            "from foreign.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas",
+            "from elspeth.core.landscape.database import Tier1Engine, _maybe_serialize_shared_connection, begin_write, verify_sqlite_tier1_pragmas",
+            "from foreign.database import Tier1Engine, _maybe_serialize_shared_connection, begin_write, verify_sqlite_tier1_pragmas",
         ),
     ],
 )
@@ -10916,7 +10921,7 @@ _NULL_DEADLINE_IMPORT_RECIPES = {
         "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='BarrierTerminalOutcomeSpec'), alias(name='BatchMembershipSpec'), alias(name='BlockedPendingSinkHandoff'), alias(name='BufferedOutcomeSpec'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.bind_budget', names=[alias(name='bind_budget_chunks')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.data_flow.outcomes', names=[alias(name='record_buffered_outcome_guarded'), alias(name='record_terminal_outcomes_guarded')], level=0)",
-        "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine'), alias(name='_maybe_serialize_shared_connection')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
         "ImportFrom(module='elspeth.core.landscape.execution.batches', names=[alias(name='add_batch_member_guarded')], level=0)",

@@ -246,6 +246,13 @@ def _shared_connection_lock(engine: Engine) -> "threading.RLock | None":
 def _maybe_serialize_shared_connection(engine: Engine) -> Iterator[None]:
     """Hold the StaticPool serialization lock for the duration of a transaction,
     or do nothing on per-thread-connection (production) engines.
+
+    Every Landscape connection acquisition takes it, reads included: a plain
+    ``engine.connect()`` read autobegins a transaction on the shared connection,
+    and a locked writer on another thread that BEGINs inside it fails with
+    "cannot start a transaction within a transaction". Repositories that hold a
+    bare engine wrap their plain reads as
+    ``with _maybe_serialize_shared_connection(engine), engine.connect() as conn:``.
     """
     lock = _shared_connection_lock(engine)
     if lock is None:
