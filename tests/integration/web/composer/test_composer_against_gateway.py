@@ -146,10 +146,12 @@ _MAX_SCHEMA_DEPTH = "15"
 class _HostRoutedTransport(httpx.AsyncBaseTransport):
     """Dispatches by request URL host to one of several registered transports."""
 
-    def __init__(self, routes: dict[str, httpx.AsyncBaseTransport]) -> None:
+    def __init__(self, routes: dict[str, httpx.AsyncBaseTransport], requests: list[httpx.Request]) -> None:
         self._routes = routes
+        self._requests = requests
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self._requests.append(request)
         host = request.url.host
         transport = self._routes.get(host)
         if transport is None:
@@ -157,7 +159,7 @@ class _HostRoutedTransport(httpx.AsyncBaseTransport):
         return await transport.handle_async_request(request)
 
 
-def _build_gateway_app() -> Any:
+def _build_gateway_app(requests: list[httpx.Request]) -> Any:
     """Build one gateway ASGI app backed by the reference adapter + mock OAuth + mock upstream."""
     oauth_app = create_mock_oauth_app(client_id=_OAUTH_CLIENT_ID, client_secret=_OAUTH_CLIENT_SECRET)
     upstream_app = create_mock_upstream_app()
@@ -165,7 +167,8 @@ def _build_gateway_app() -> Any:
         {
             _OAUTH_HOST: httpx.ASGITransport(app=oauth_app),
             _UPSTREAM_HOST: httpx.ASGITransport(app=upstream_app),
-        }
+        },
+        requests,
     )
     # Never closed explicitly: wraps two in-process ASGITransports (no real
     # sockets, nothing pooled to leak) and is used exclusively from the
@@ -246,7 +249,13 @@ def _running_gateway_server(app: Any) -> Iterator[str]:
 
 
 @pytest.fixture(scope="module")
-def gateway_base_url() -> Iterator[str]:
+def gateway_requests() -> list[httpx.Request]:
+    """Actual OAuth/upstream requests observed by the in-process transport."""
+    return []
+
+
+@pytest.fixture(scope="module")
+def gateway_base_url(gateway_requests: list[httpx.Request]) -> Iterator[str]:
     """One gateway stack shared across every test in this module.
 
     The mock upstream and mock OAuth app are both stateless pure functions
@@ -254,7 +263,7 @@ def gateway_base_url() -> Iterator[str]:
     instance across tests is safe and keeps this module's total wall-clock
     cost to one server startup.
     """
-    app = _build_gateway_app()
+    app = _build_gateway_app(gateway_requests)
     with _running_gateway_server(app) as base_url:
         yield base_url
 
@@ -550,22 +559,57 @@ async def test_boot_probe_succeeds_against_gateway(gateway_base_url: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(gateway_base_url: str) -> None:
+async def test_boot_probe_with_operator_sampling_succeeds_against_gateway(
+    gateway_base_url: str, gateway_requests: list[httpx.Request]
+) -> None:
     """The probe's other real payload shape: temperature + seed alongside the
     translated token cap. ``seed`` is a gated capability the reference
     adapter declares, so this also proves the alias did not disturb the
     capability path."""
     from elspeth.web.composer.boot_probe import probe_composer_config
 
+    gateway_requests.clear()
     probed = await probe_composer_config(
         model=_MODEL_ALIAS,
-        temperature=0.2,
+        # GPT-5.5's default reasoning mode accepts only temperature=1.
+        temperature=1.0,
         seed=7,
         api_base=f"{gateway_base_url}/v1",
         api_key=_INBOUND_BEARER,
     )
 
     assert probed is True
+    upstream_requests = [request for request in gateway_requests if request.url.host == _UPSTREAM_HOST]
+    assert len(upstream_requests) == 1
+    assert json.loads(upstream_requests[0].content)["generation"] == {
+        "target": _MODEL_TARGET,
+        "temperature": 1.0,
+        "seed": 7,
+        "max_output": 16,
+    }
+
+
+@pytest.mark.asyncio
+async def test_boot_probe_rejects_unsupported_operator_sampling_before_gateway_upstream(
+    gateway_base_url: str, gateway_requests: list[httpx.Request]
+) -> None:
+    """The SDK's GPT-5.5 rejection stays fatal rather than silently dropping temperature."""
+    from litellm.exceptions import UnsupportedParamsError
+
+    from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
+
+    gateway_requests.clear()
+    with pytest.raises(ComposerBootConfigError, match=r"temperature=0\.2, seed=7") as excinfo:
+        await probe_composer_config(
+            model=_MODEL_ALIAS,
+            temperature=0.2,
+            seed=7,
+            api_base=f"{gateway_base_url}/v1",
+            api_key=_INBOUND_BEARER,
+        )
+
+    assert isinstance(excinfo.value.__cause__, UnsupportedParamsError)
+    assert gateway_requests == []
 
 
 # ---------------------------------------------------------------------------
