@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +28,13 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from tests.unit.web.auth.conftest import build_local_auth_provider
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _restore_cli_environment() -> Iterator[None]:
+    """Restore CLI environment bridging and dotenv changes after each test."""
+    with patch.dict("os.environ"):
+        yield
 
 
 @dataclass(frozen=True)
